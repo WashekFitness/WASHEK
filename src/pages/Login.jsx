@@ -109,10 +109,6 @@ export default function Login() {
             WASHEK
           </h1>
 
-          <p className="text-xs uppercase tracking-wide text-muted-foreground mt-1">
-            Weighted Athletic System for Hybrid &amp; Elite Kalisthenics
-          </p>
-
           <p className="text-muted-foreground mt-2">
             Your AI-powered training coach.
           </p>
@@ -157,7 +153,7 @@ export default function Login() {
           {mode === 'login' && (
             <button
               type="button"
-              className="w-full text-right text-sm text-muted-foreground hover:text-foreground"
+              className="w-full text-center text-sm text-muted-foreground hover:text-foreground"
               onClick={() => {
                 setForgotEmail(email);
                 setShowForgotPassword(true);
