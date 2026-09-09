@@ -109,6 +109,10 @@ export default function Login() {
             WASHEK
           </h1>
 
+          <p className="text-xs uppercase tracking-wide text-muted-foreground mt-1">
+            Weighted Athletic System for Hybrid &amp; Elite Kalisthenics
+          </p>
+
           <p className="text-muted-foreground mt-2">
             Your AI-powered training coach.
           </p>
