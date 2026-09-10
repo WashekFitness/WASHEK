@@ -1143,18 +1143,24 @@ export default function FormLab() {
     (
       val
     ) => {
-      const next =
+      const requested =
         Math.max(
           0,
           Math.min(
             Number(
               val
             ) || 0,
-            Math.max(
-              0,
-              trimEnd -
-                0.1
-            )
+            videoDuration
+          )
+        );
+
+      const next =
+        Math.min(
+          requested,
+          Math.max(
+            0,
+            trimEnd -
+              0.1
           )
         );
 
@@ -1175,16 +1181,25 @@ export default function FormLab() {
     (
       val
     ) => {
-      const next =
+      const requested =
         Math.max(
+          0,
           Math.min(
             videoDuration,
             Number(
               val
-            ) || videoDuration
-          ),
-          trimStart +
-            0.1
+            ) || 0
+          )
+        );
+
+      const next =
+        Math.max(
+          requested,
+          Math.min(
+            videoDuration,
+            trimStart +
+              0.1
+          )
         );
 
       setTrimEnd(
@@ -1965,11 +1980,7 @@ export default function FormLab() {
                     aria-label="Trim start time"
                     type="range"
                     min={0}
-                    max={Math.max(
-                      0,
-                      trimEnd -
-                        0.1
-                    )}
+                    max={videoDuration}
                     step={0.1}
                     value={
                       trimStart
@@ -2012,14 +2023,8 @@ export default function FormLab() {
                   <input
                     aria-label="Trim end time"
                     type="range"
-                    min={Math.min(
-                      videoDuration,
-                      trimStart +
-                        0.1
-                    )}
-                    max={
-                      videoDuration
-                    }
+                    min={0}
+                    max={videoDuration}
                     step={0.1}
                     value={
                       trimEnd
