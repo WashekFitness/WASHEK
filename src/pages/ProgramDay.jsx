@@ -3,7 +3,7 @@ import { useParams, useNavigate, useLocation } from 'react-router-dom';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import DayWorkout from '@/components/program/DayWorkout';
-import { expandMicrocycles } from '@/lib/expandMicrocycles';
+import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 import { toast } from 'sonner';
 
 export default function ProgramDay() {
@@ -29,7 +29,7 @@ export default function ProgramDay() {
     },
   });
 
-  const program = programs[0] ? expandMicrocycles(programs[0]) : null;
+  const program = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
   const weekNumber = location.state?.week || program?.current_week || 1;
   const microcycle = program?.microcycles?.find(m => m.week_number === weekNumber);
   const day = microcycle?.days?.[parseInt(dayIndex)];
