@@ -1150,6 +1150,67 @@ function sleep(
   );
 }
 
+/*
+ * ============================================================
+ * HARD DEADLINE
+ * ============================================================
+ *
+ * AbortController.abort() is supposed to cut an in-flight
+ * fetch off at a fixed time, but it is only a request to the
+ * underlying connection to stop — if a remote provider hangs
+ * in a way that doesn't tear down cleanly, the awaited promise
+ * can still sit unresolved well past the abort timer. When
+ * that happens here, Supabase's own platform-level idle
+ * timeout (around 150s) is what finally kills the function,
+ * which shows up to the user as a long silent hang instead of
+ * a fast, clean error.
+ *
+ * withDeadline() is a second, unconditional layer: it always
+ * settles at `ms`, regardless of what the wrapped promise is
+ * doing. If the underlying call is still stuck, we simply stop
+ * waiting on it here and return control to our own retry loop
+ * — the abandoned request is discarded once this function
+ * finishes and returns a response.
+ */
+function withDeadline<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  return new Promise<T>(
+    (resolve, reject) => {
+      const timer =
+        setTimeout(
+          () => {
+            const timeoutError =
+              new Error(
+                `${label} timed out.`
+              );
+
+            (
+              timeoutError as any
+            ).status = 504;
+
+            reject(
+              timeoutError
+            );
+          },
+          ms
+        );
+
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    }
+  );
+}
+
 /* ============================================================
  * OPENROUTER REQUEST
  * ============================================================ */
@@ -1242,7 +1303,7 @@ async function callOpenRouter(
     setTimeout(
       () =>
         controller.abort(),
-      45000
+      25000
     );
 
   let response:
@@ -1728,12 +1789,16 @@ Deno.serve(
         ) {
           try {
             const result =
-              await callOpenRouter(
-                apiKey,
-                model,
-                type,
-                prompt,
-                fileUrls
+              await withDeadline(
+                callOpenRouter(
+                  apiKey,
+                  model,
+                  type,
+                  prompt,
+                  fileUrls
+                ),
+                30000,
+                'OpenRouter request'
               );
 
             /*
