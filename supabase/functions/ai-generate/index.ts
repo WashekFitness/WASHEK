@@ -1303,7 +1303,7 @@ async function callOpenRouter(
     setTimeout(
       () =>
         controller.abort(),
-      25000
+      16000
     );
 
   let response:
@@ -1772,11 +1772,21 @@ Deno.serve(
        * a router, retrying it gives OpenRouter
        * another opportunity to select an
        * available free endpoint.
+       *
+       * More attempts with a longer gap between
+       * them give a temporarily-overloaded free
+       * backend more real chance to recover than
+       * two quick back-to-back tries did. Each
+       * attempt still has its own hard deadline
+       * (see withDeadline() below), so the total
+       * worst-case time for this whole loop stays
+       * well under Supabase's own platform limit
+       * even with more attempts.
        */
       const MAX_ATTEMPTS =
         hasMedia
           ? 3
-          : 2;
+          : 4;
 
       for (
         let attempt = 0;
@@ -1797,7 +1807,7 @@ Deno.serve(
                   prompt,
                   fileUrls
                 ),
-                30000,
+                20000,
                 'OpenRouter request'
               );
 
@@ -1920,15 +1930,18 @@ Deno.serve(
         }
 
         /*
-         * Brief pause before giving the
-         * free router another opportunity.
+         * Longer pause before giving the free
+         * router another opportunity — enough for
+         * its internal state to plausibly shift to
+         * a different backend, not just an instant
+         * retry against the same overloaded one.
          */
         if (
           attempt <
           MAX_ATTEMPTS - 1
         ) {
           await sleep(
-            750
+            2000
           );
         }
       }
