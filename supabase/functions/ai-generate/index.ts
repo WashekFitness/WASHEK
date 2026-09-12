@@ -536,7 +536,17 @@ async function claimKaelMessageServerSide(
     );
 
     throw new Error(
-      'Unable to verify your Kael message quota. Please try again.'
+      'Unable to verify your Kael message quota.'
+    );
+  }
+
+  if (
+    !data ||
+    typeof data !==
+      'object'
+  ) {
+    throw new Error(
+      'Unable to verify your Kael message quota.'
     );
   }
 
@@ -544,180 +554,106 @@ async function claimKaelMessageServerSide(
 }
 
 /* ============================================================
- * STORAGE / MEDIA
+ * MEDIA
  * ============================================================ */
 
-function isHttpUrl(
+function isPrivateStoragePath(
   value: string
 ) {
-  return /^https?:\/\//i.test(
-    value
+  return (
+    value.startsWith(
+      'storage://'
+    ) ||
+    value.startsWith(
+      'private://'
+    )
   );
 }
 
-function isDataUrl(
+function cleanStoragePath(
   value: string
 ) {
-  return /^data:/i.test(
-    value
-  );
+  return value
+    .replace(
+      /^storage:\/\//,
+      ''
+    )
+    .replace(
+      /^private:\/\//,
+      ''
+    )
+    .replace(
+      /^\/+/,
+      ''
+    );
 }
 
-function looksLikeVideoUrl(
+async function resolveMediaUrl(
+  client: any,
+  userId: string,
   value: string
 ) {
-  return /\.(mp4|mpeg|mov|webm|m4v)(\?|$)/i.test(
-    value
-  );
-}
-
-async function resolveStoragePath(
-  rawValue: string,
-  userId: string
-) {
-  const value =
+  const raw =
     String(
-      rawValue || ''
+      value || ''
     ).trim();
 
-  if (!value) {
-    throw new Error(
-      'Empty media path.'
-    );
+  if (!raw) {
+    return null;
   }
 
   /*
-   * Already usable URLs/data URLs
-   * do not need conversion.
+   * Public/external URLs can be passed through.
    */
   if (
-    isHttpUrl(value) ||
-    isDataUrl(value)
+    /^https?:\/\//i.test(
+      raw
+    )
   ) {
-    return value;
+    return raw;
   }
 
-  let path = value;
-
   /*
-   * Normalize a possible Supabase
-   * Storage URL.
+   * Private media is represented by a storage path.
+   *
+   * We only allow the authenticated user's own
+   * media directory.
    */
-  const objectMarker =
-    '/storage/v1/object/';
-
-  const markerIndex =
-    path.indexOf(
-      objectMarker
+  const path =
+    cleanStoragePath(
+      raw
     );
 
-  if (markerIndex >= 0) {
-    const afterMarker =
-      path.slice(
-        markerIndex +
-          objectMarker.length
-      );
-
-    const parts =
-      afterMarker.split('/');
-
-    if (
-      parts.length >= 2
-    ) {
-      parts.shift();
-
-      const bucket =
-        parts.shift();
-
-      if (
-        bucket ===
-          MEDIA_BUCKET &&
-        parts.length > 0
-      ) {
-        path =
-          decodeURIComponent(
-            parts.join('/')
-          );
-      }
-    }
-  }
-
-  /*
-   * Security:
-   *
-   * Uploaded media must belong to
-   * the authenticated user.
-   */
-  const expectedPrefix =
-    `${userId}/`;
-
   if (
+    !path ||
     !path.startsWith(
-      expectedPrefix
+      `${userId}/`
     )
   ) {
     throw new Error(
-      'The requested media does not belong to the authenticated user.'
+      'Invalid private media path.'
     );
   }
-
-  const serviceRoleKey =
-    getServiceRoleKey();
-
-  const supabaseUrl =
-    Deno.env.get(
-      'SUPABASE_URL'
-    );
-
-  if (
-    !serviceRoleKey ||
-    !supabaseUrl
-  ) {
-    throw new Error(
-      'SERVICE_ROLE_KEY is not configured for private media access.'
-    );
-  }
-
-  const admin =
-    createClient(
-      supabaseUrl,
-      serviceRoleKey
-    );
 
   const {
     data,
     error,
   } =
-    await admin.storage
+    await client.storage
       .from(
         MEDIA_BUCKET
       )
       .createSignedUrl(
         path,
-        3600
+        60 * 15
       );
 
   if (
     error ||
     !data?.signedUrl
   ) {
-    console.error(
-      '[AI] STORAGE SIGNED URL ERROR',
-      {
-        path,
-        bucket:
-          MEDIA_BUCKET,
-        message:
-          error?.message ||
-          'No signed URL returned.',
-      }
-    );
-
     throw new Error(
-      `Unable to access uploaded media: ${
-        error?.message ||
-        'signed URL could not be created.'
-      }`
+      'Unable to create a temporary media URL.'
     );
   }
 
@@ -725,61 +661,86 @@ async function resolveStoragePath(
 }
 
 async function resolveAllMedia(
-  fileUrls: unknown[],
+  values: string[],
   userId: string
 ) {
+  const supabaseUrl =
+    Deno.env.get(
+      'SUPABASE_URL'
+    );
+
+  const serviceRoleKey =
+    getServiceRoleKey();
+
   if (
-    !Array.isArray(
-      fileUrls
-    )
+    !supabaseUrl ||
+    !serviceRoleKey
   ) {
-    return [];
+    throw new Error(
+      'Supabase service configuration is missing.'
+    );
   }
 
-  /*
-   * Hard safety limit.
-   */
-  const limited =
-    fileUrls
-      .slice(0, 8)
-      .map(
-        (value) =>
-          String(
-            value || ''
-          ).trim()
-      )
-      .filter(Boolean);
+  const client =
+    createClient(
+      supabaseUrl,
+      serviceRoleKey
+    );
 
   const resolved: string[] =
     [];
 
   for (
-    const value of limited
+    const value of values
   ) {
-    const resolvedUrl =
-      await resolveStoragePath(
-        value,
-        userId
+    const url =
+      await resolveMediaUrl(
+        client,
+        userId,
+        value
       );
 
-    resolved.push(
-      resolvedUrl
-    );
+    if (url) {
+      resolved.push(
+        url
+      );
+    }
   }
 
   return resolved;
 }
 
 /* ============================================================
- * OPENROUTER MESSAGE BUILDING
+ * OPENROUTER HELPERS
  * ============================================================ */
+
+function getModelsForRequest(
+  type: string,
+  hasMedia: boolean
+) {
+  /*
+   * Keep the FREE router as the only model.
+   */
+  if (
+    hasMedia ||
+    VISUAL_TYPES.has(type)
+  ) {
+    return [
+      FREE_VISION_MODEL,
+    ];
+  }
+
+  return [
+    DEFAULT_TEXT_MODEL,
+  ];
+}
 
 function buildMessageContent(
   prompt: string,
   fileUrls: string[]
 ) {
   if (
-    !fileUrls?.length
+    !fileUrls.length
   ) {
     return prompt;
   }
@@ -795,77 +756,8 @@ function buildMessageContent(
   ];
 
   for (
-    const rawUrl of fileUrls
+    const url of fileUrls
   ) {
-    const url =
-      String(
-        rawUrl || ''
-      ).trim();
-
-    if (!url) {
-      continue;
-    }
-
-    const lower =
-      url.toLowerCase();
-
-    /*
-     * Data URLs.
-     */
-    if (
-      lower.startsWith(
-        'data:video/'
-      )
-    ) {
-      content.push({
-        type: 'video_url',
-        video_url: {
-          url,
-        },
-      });
-
-      continue;
-    }
-
-    if (
-      lower.startsWith(
-        'data:image/'
-      )
-    ) {
-      content.push({
-        type: 'image_url',
-        image_url: {
-          url,
-        },
-      });
-
-      continue;
-    }
-
-    /*
-     * Hosted video.
-     */
-    if (
-      looksLikeVideoUrl(
-        lower
-      )
-    ) {
-      content.push({
-        type: 'video_url',
-        video_url: {
-          url,
-        },
-      });
-
-      continue;
-    }
-
-    /*
-     * Supabase signed image URLs do not
-     * reliably preserve file extensions,
-     * so unknown hosted media is treated
-     * as an image.
-     */
     content.push({
       type: 'image_url',
       image_url: {
@@ -877,20 +769,53 @@ function buildMessageContent(
   return content;
 }
 
-/* ============================================================
- * RESPONSE PARSING
- * ============================================================ */
+function getErrorMessage(
+  raw: any,
+  fallback: string
+) {
+  const candidates = [
+    raw?.error?.message,
+    raw?.message,
+    raw?.error,
+  ];
+
+  for (
+    const candidate of candidates
+  ) {
+    if (
+      typeof candidate ===
+      'string'
+    ) {
+      const trimmed =
+        candidate.trim();
+
+      if (trimmed) {
+        return trimmed;
+      }
+    }
+  }
+
+  return fallback;
+}
+
+function shouldRetryStatus(
+  status: number
+) {
+  return (
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+  );
+}
 
 function extractText(
-  responseJson: any
+  raw: any
 ) {
-  const message =
-    responseJson
-      ?.choices?.[0]
-      ?.message;
-
   const content =
-    message?.content;
+    raw?.choices?.[0]
+      ?.message?.content;
 
   if (
     typeof content ===
@@ -899,25 +824,22 @@ function extractText(
     return content.trim();
   }
 
+  /*
+   * Some OpenRouter-compatible
+   * providers may return content
+   * as an array of text blocks.
+   */
   if (
     Array.isArray(content)
   ) {
     return content
       .map(
-        (part) => {
-          if (
-            typeof part ===
-            'string'
-          ) {
-            return part;
-          }
-
-          return (
-            part?.text ||
-            part?.content ||
-            ''
-          );
-        }
+        (item: any) =>
+          typeof item ===
+          'string'
+            ? item
+            : item?.text ||
+              ''
       )
       .join('')
       .trim();
@@ -926,11 +848,22 @@ function extractText(
   return '';
 }
 
-function stripMarkdownCodeFence(value: string) {
+function stripMarkdownCodeFence(
+  value: string
+) {
   return String(value || '')
-    .replace(/^\uFEFF/, '')
-    .replace(/^```(?:json)?\s*/i, '')
-    .replace(/\s*```$/i, '')
+    .replace(
+      /^\uFEFF/,
+      ''
+    )
+    .replace(
+      /^```(?:json)?\s*/i,
+      ''
+    )
+    .replace(
+      /\s*```$/i,
+      ''
+    )
     .trim();
 }
 
@@ -950,8 +883,13 @@ function stripMarkdownCodeFence(value: string) {
  * for balanced JSON objects. This keeps structured generation from failing
  * just because a free model added one stray character around the payload.
  */
-function tryParseJson(value: string) {
-  const cleaned = stripMarkdownCodeFence(value);
+function tryParseJson(
+  value: string
+) {
+  const cleaned =
+    stripMarkdownCodeFence(
+      value
+    );
 
   if (!cleaned) {
     return null;
@@ -959,32 +897,53 @@ function tryParseJson(value: string) {
 
   // 1. Normal JSON.
   try {
-    return JSON.parse(cleaned);
+    return JSON.parse(
+      cleaned
+    );
   } catch {
     // Continue with recovery.
   }
 
   // 2. Exact recovery for an extra outer opening/closing brace.
   if (
-    cleaned.startsWith('{{') &&
-    cleaned.endsWith('}}')
+    cleaned.startsWith(
+      '{{'
+    ) &&
+    cleaned.endsWith(
+      '}}'
+    )
   ) {
     try {
-      return JSON.parse(cleaned.slice(1, -1).trim());
+      return JSON.parse(
+        cleaned
+          .slice(
+            1,
+            -1
+          )
+          .trim()
+      );
     } catch {
       // Continue with balanced-object recovery.
     }
   }
 
   // 3. Extract balanced JSON objects from prose or malformed wrappers.
-  const candidates: string[] = [];
+  const candidates: string[] =
+    [];
+
   let depth = 0;
   let start = -1;
   let inString = false;
   let escaped = false;
 
-  for (let i = 0; i < cleaned.length; i += 1) {
-    const char = cleaned[i];
+  for (
+    let i = 0;
+    i <
+    cleaned.length;
+    i += 1
+  ) {
+    const char =
+      cleaned[i];
 
     if (inString) {
       if (escaped) {
@@ -992,72 +951,185 @@ function tryParseJson(value: string) {
         continue;
       }
 
-      if (char === '\\') {
+      if (
+        char === '\\'
+      ) {
         escaped = true;
         continue;
       }
 
-      if (char === '"') {
+      if (
+        char === '"'
+      ) {
         inString = false;
       }
 
       continue;
     }
 
-    if (char === '"') {
+    if (
+      char === '"'
+    ) {
       inString = true;
       continue;
     }
 
-    if (char === '{') {
-      if (depth === 0) {
+    if (
+      char === '{'
+    ) {
+      if (
+        depth === 0
+      ) {
         start = i;
       }
+
       depth += 1;
       continue;
     }
 
-    if (char === '}') {
-      if (depth > 0) {
+    if (
+      char === '}'
+    ) {
+      if (
+        depth > 0
+      ) {
         depth -= 1;
       }
 
-      if (depth === 0 && start >= 0) {
-        candidates.push(cleaned.slice(start, i + 1));
+      if (
+        depth === 0 &&
+        start >= 0
+      ) {
+        candidates.push(
+          cleaned.slice(
+            start,
+            i + 1
+          )
+        );
+
         start = -1;
       }
     }
   }
 
-  candidates.sort((a, b) => b.length - a.length);
+  /*
+   * Prefer the largest valid object because the actual response
+   * normally contains the complete workout object.
+   */
+  candidates.sort(
+    (a, b) =>
+      b.length -
+      a.length
+  );
 
-  for (const candidate of candidates) {
+  for (
+    const candidate of candidates
+  ) {
     try {
-      return JSON.parse(candidate);
+      return JSON.parse(
+        candidate
+      );
     } catch {
       // Try the next candidate.
     }
   }
 
-  // 4. Exact fallback for the observed "{{ ... }}" pattern even if the
-  // balanced scan could not identify the desired candidate.
-  const firstBrace = cleaned.indexOf('{');
-  const secondBrace =
-    firstBrace >= 0
-      ? cleaned.indexOf('{', firstBrace + 1)
-      : -1;
-  const lastBrace = cleaned.lastIndexOf('}');
-
-  if (
-    secondBrace >= 0 &&
-    lastBrace > secondBrace
+  /*
+   * 4. Occasionally a model returns a JSON object followed by
+   * additional text that prevents balanced extraction from being
+   * useful. Try every opening brace as a possible beginning.
+   */
+  for (
+    let startIndex = 0;
+    startIndex <
+    cleaned.length;
+    startIndex += 1
   ) {
-    try {
-      return JSON.parse(
-        cleaned.slice(secondBrace, lastBrace + 1)
-      );
-    } catch {
-      // No recoverable JSON.
+    if (
+      cleaned[startIndex] !==
+      '{'
+    ) {
+      continue;
+    }
+
+    let localDepth = 0;
+    let localInString =
+      false;
+    let localEscaped =
+      false;
+
+    for (
+      let i =
+        startIndex;
+      i <
+      cleaned.length;
+      i += 1
+    ) {
+      const char =
+        cleaned[i];
+
+      if (
+        localInString
+      ) {
+        if (
+          localEscaped
+        ) {
+          localEscaped =
+            false;
+          continue;
+        }
+
+        if (
+          char === '\\'
+        ) {
+          localEscaped =
+            true;
+          continue;
+        }
+
+        if (
+          char === '"'
+        ) {
+          localInString =
+            false;
+        }
+
+        continue;
+      }
+
+      if (
+        char === '"'
+      ) {
+        localInString =
+          true;
+        continue;
+      }
+
+      if (
+        char === '{'
+      ) {
+        localDepth += 1;
+      } else if (
+        char === '}'
+      ) {
+        localDepth -= 1;
+
+        if (
+          localDepth ===
+            0
+        ) {
+          try {
+            return JSON.parse(
+              cleaned.slice(
+                startIndex,
+                i + 1
+              )
+            );
+          } catch {
+            break;
+          }
+        }
+      }
     }
   }
 
@@ -1065,79 +1137,9 @@ function tryParseJson(value: string) {
 }
 
 /* ============================================================
- * MODEL SELECTION
+ * RETRY
  * ============================================================ */
 
-function getModelsForRequest(
-  type: string,
-  hasMedia: boolean
-) {
-  /*
-   * Both visual and text requests use
-   * OpenRouter's free router.
-   *
-   * For visual requests, OpenRouter filters
-   * the free pool to models that support the
-   * supplied image/video input.
-   */
-  if (
-    hasMedia ||
-    VISUAL_TYPES.has(type)
-  ) {
-    return [
-      FREE_VISION_MODEL,
-    ];
-  }
-
-  return [
-    DEFAULT_TEXT_MODEL,
-  ];
-}
-
-/* ============================================================
- * OPENROUTER ERROR HELPERS
- * ============================================================ */
-
-function getErrorMessage(
-  raw: any,
-  fallback: string
-) {
-  const message =
-    raw?.error?.message ||
-    raw?.message ||
-    raw?.error;
-
-  if (
-    typeof message ===
-    'string'
-  ) {
-    return message;
-  }
-
-  return fallback;
-}
-
-function shouldRetryStatus(
-  status: number
-) {
-  return (
-    status === 408 ||
-    status === 409 ||
-    status === 425 ||
-    status === 429 ||
-    status === 500 ||
-    status === 502 ||
-    status === 503 ||
-    status === 504
-  );
-}
-
-/*
- * Wait briefly before retrying the free router.
- *
- * This is intentionally short because we don't
- * want a user request hanging for a long time.
- */
 function sleep(
   milliseconds: number
 ) {
@@ -1147,67 +1149,6 @@ function sleep(
         resolve,
         milliseconds
       )
-  );
-}
-
-/*
- * ============================================================
- * HARD DEADLINE
- * ============================================================
- *
- * AbortController.abort() is supposed to cut an in-flight
- * fetch off at a fixed time, but it is only a request to the
- * underlying connection to stop — if a remote provider hangs
- * in a way that doesn't tear down cleanly, the awaited promise
- * can still sit unresolved well past the abort timer. When
- * that happens here, Supabase's own platform-level idle
- * timeout (around 150s) is what finally kills the function,
- * which shows up to the user as a long silent hang instead of
- * a fast, clean error.
- *
- * withDeadline() is a second, unconditional layer: it always
- * settles at `ms`, regardless of what the wrapped promise is
- * doing. If the underlying call is still stuck, we simply stop
- * waiting on it here and return control to our own retry loop
- * — the abandoned request is discarded once this function
- * finishes and returns a response.
- */
-function withDeadline<T>(
-  promise: Promise<T>,
-  ms: number,
-  label: string
-): Promise<T> {
-  return new Promise<T>(
-    (resolve, reject) => {
-      const timer =
-        setTimeout(
-          () => {
-            const timeoutError =
-              new Error(
-                `${label} timed out.`
-              );
-
-            (
-              timeoutError as any
-            ).status = 504;
-
-            reject(
-              timeoutError
-            );
-          },
-          ms
-        );
-
-      promise
-        .then((value) => {
-          clearTimeout(timer);
-          resolve(value);
-        })
-        .catch((error) => {
-          clearTimeout(timer);
-          reject(error);
-        });
-    }
   );
 }
 
@@ -1232,46 +1173,47 @@ async function callOpenRouter(
     );
 
   const payload:
-    Record<string, unknown> = {
-    model,
+    Record<string, unknown> =
+    {
+      model,
 
-    messages: [
-      {
-        role: 'user',
-        content,
-      },
-    ],
+      messages: [
+        {
+          role: 'user',
+          content,
+        },
+      ],
 
-    stream: false,
+      stream: false,
 
-    temperature: 0.2,
+      temperature: 0.2,
 
-    max_tokens:
-      type === 'microcycle'
-        ? 6500
-        : type === 'structure'
-          ? 2500
-          : type ===
-              'form_analysis'
-            ? 3000
+      max_tokens:
+        type === 'microcycle'
+          ? 6500
+          : type === 'structure'
+            ? 2500
             : type ===
-                'food_scan'
-              ? 2500
+                'form_analysis'
+              ? 3000
               : type ===
-                  'progress_photo'
+                  'food_scan'
                 ? 2500
-                : 4000,
+                : type ===
+                    'progress_photo'
+                  ? 2500
+                  : 4000,
 
-    /*
-     * Tell OpenRouter it is allowed to use
-     * alternative providers.
-     *
-     * We still remain on the FREE model.
-     */
-    provider: {
-      allow_fallbacks: true,
-    },
-  };
+      /*
+       * Tell OpenRouter it is allowed to use
+       * alternative providers.
+       *
+       * We still remain on the FREE model.
+       */
+      provider: {
+        allow_fallbacks: true,
+      },
+    };
 
   /*
    * Do not send response_format for visual
@@ -1303,7 +1245,7 @@ async function callOpenRouter(
     setTimeout(
       () =>
         controller.abort(),
-      16000
+      45000
     );
 
   let response:
@@ -1357,7 +1299,8 @@ async function callOpenRouter(
       new Error(
         aborted
           ? 'OpenRouter request timed out.'
-          : error instanceof Error
+          : error instanceof
+              Error
             ? error.message
             : 'OpenRouter request failed.'
       );
@@ -1599,7 +1542,8 @@ Deno.serve(
        * it runs here regardless of what the caller sent.
        * ------------------------------------------------------ */
 
-      let kaelQuota: any = null;
+      let kaelQuota: any =
+        null;
 
       if (type === 'kael') {
         try {
@@ -1772,21 +1716,11 @@ Deno.serve(
        * a router, retrying it gives OpenRouter
        * another opportunity to select an
        * available free endpoint.
-       *
-       * More attempts with a longer gap between
-       * them give a temporarily-overloaded free
-       * backend more real chance to recover than
-       * two quick back-to-back tries did. Each
-       * attempt still has its own hard deadline
-       * (see withDeadline() below), so the total
-       * worst-case time for this whole loop stays
-       * well under Supabase's own platform limit
-       * even with more attempts.
        */
       const MAX_ATTEMPTS =
         hasMedia
           ? 3
-          : 4;
+          : 2;
 
       for (
         let attempt = 0;
@@ -1798,17 +1732,34 @@ Deno.serve(
           const model of models
         ) {
           try {
+            let resultPrompt =
+              prompt;
+
+            /*
+             * Microcycle generation is intentionally reinforced here at the
+             * server boundary. This does not change the workout-generation
+             * function in the client; it simply makes the free OpenRouter
+             * model's required response shape unambiguous and gives us a
+             * deterministic recovery path for common wrapper mistakes.
+             */
+            if (
+              type ===
+              'microcycle'
+            ) {
+              resultPrompt = `${prompt}
+
+SERVER OUTPUT CONTRACT — MANDATORY:
+Return ONLY valid JSON. Do not use Markdown fences. Do not add commentary before or after the JSON. The top-level object MUST contain exactly one key named "microcycle". "microcycle" MUST be an object containing a non-empty "days" array. Each day MUST contain "day_name", "workout_type", and a non-empty "exercises" array. Each exercise MUST contain "name", "sets", "reps", "rest_seconds", "notes", and "activation_cue".
+Do not return a top-level array. Do not return "microcycles". Do not return the microcycle object directly without the "microcycle" wrapper.`;
+            }
+
             const result =
-              await withDeadline(
-                callOpenRouter(
-                  apiKey,
-                  model,
-                  type,
-                  prompt,
-                  fileUrls
-                ),
-                20000,
-                'OpenRouter request'
+              await callOpenRouter(
+                apiKey,
+                model,
+                type,
+                resultPrompt,
+                fileUrls
               );
 
             /*
@@ -1821,32 +1772,126 @@ Deno.serve(
             // All structured requests are parsed server-side. In particular,
             // microcycle generation must never return malformed/raw model text
             // to onboarding as if it were a valid workout object.
-            const parsed =
+            let parsed =
               tryParseJson(
                 result.outputText
               );
 
-            if (type === 'microcycle') {
+            if (
+              type ===
+              'microcycle'
+            ) {
+              /*
+               * Free models sometimes return one of these semantically
+               * equivalent shapes even when the prompt requests the wrapper:
+               *
+               *   { days: [...] }
+               *   { microcycles: [{ days: [...] }] }
+               *   { microcycle: { days: [...] } }
+               *
+               * Normalize only the wrapper. The actual workout contents are
+               * left untouched so the user's generation logic is unchanged.
+               */
               if (
-                !parsed ||
-                typeof parsed !== 'object' ||
-                !(parsed as any).microcycle ||
-                !Array.isArray((parsed as any).microcycle.days) ||
-                (parsed as any).microcycle.days.length === 0
+                parsed &&
+                typeof parsed ===
+                  'object'
+              ) {
+                const candidate =
+                  parsed as any;
+
+                if (
+                  !candidate.microcycle &&
+                  Array.isArray(
+                    candidate.days
+                  )
+                ) {
+                  parsed = {
+                    microcycle:
+                      candidate,
+                  };
+                } else if (
+                  !candidate.microcycle &&
+                  Array.isArray(
+                    candidate.microcycles
+                  ) &&
+                  candidate
+                    .microcycles
+                    .length > 0 &&
+                  candidate
+                    .microcycles[0] &&
+                  Array.isArray(
+                    candidate
+                      .microcycles[0]
+                      .days
+                  )
+                ) {
+                  parsed = {
+                    microcycle:
+                      candidate
+                        .microcycles[0],
+                  };
+                }
+              }
+
+              const microcycle =
+                parsed &&
+                typeof parsed ===
+                  'object'
+                  ? (parsed as any)
+                      .microcycle
+                  : null;
+
+              const validDays =
+                Array.isArray(
+                  microcycle?.days
+                ) &&
+                microcycle.days
+                  .length > 0;
+
+              const validExercises =
+                validDays &&
+                microcycle.days.every(
+                  (day: any) =>
+                    day &&
+                    typeof day ===
+                      'object' &&
+                    Array.isArray(
+                      day.exercises
+                    ) &&
+                    day.exercises
+                      .length > 0
+                );
+
+              if (
+                !microcycle ||
+                !validDays ||
+                !validExercises
               ) {
                 console.error(
                   '[AI] Expected valid microcycle JSON but received an invalid structured response',
                   {
-                    userId: user.id,
+                    userId:
+                      user.id,
                     type,
-                    outputSnippet: result.outputText.slice(0, 2000),
+                    outputSnippet:
+                      result.outputText.slice(
+                        0,
+                        3000
+                      ),
                   }
                 );
 
-                const structuredError = new Error(
-                  'The AI returned an invalid workout structure. Please try again.'
-                );
-                (structuredError as any).status = 502;
+                const structuredError =
+                  new Error(
+                    'The AI returned an invalid workout structure. Please try again.'
+                  );
+
+                (
+                  structuredError as any
+                ).status =
+                  502;
+
                 throw structuredError;
               }
             }
@@ -1930,18 +1975,15 @@ Deno.serve(
         }
 
         /*
-         * Longer pause before giving the free
-         * router another opportunity — enough for
-         * its internal state to plausibly shift to
-         * a different backend, not just an instant
-         * retry against the same overloaded one.
+         * Brief pause before giving the
+         * free router another opportunity.
          */
         if (
           attempt <
           MAX_ATTEMPTS - 1
         ) {
           await sleep(
-            2000
+            750
           );
         }
       }
