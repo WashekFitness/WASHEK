@@ -1355,7 +1355,7 @@ export default function Onboarding() {
             <p className="text-muted-foreground mb-4">
               {hasSkills
                 ? 'Describe your goals, what you want to achieve, and any limitations. The more detail you give, the more personalized your program will be.'
-                : 'List your available equipment and any requirements. This helps us build the perfect program for you.'}
+                : 'Add any detail behind your goals, list your available equipment, and note any requirements. The more detail you give, the more personalized your program will be.'}
             </p>
 
             <div className="flex-1 flex flex-col gap-3">
@@ -1390,19 +1390,47 @@ export default function Onboarding() {
               )}
 
               {!hasSkills && (
-                <div className="bg-muted/50 rounded-2xl p-4 border border-border">
-                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-                    📋 Goals summary
-                  </p>
+                <>
+                  <div className="bg-muted/50 rounded-2xl p-4 border border-border">
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                      📋 Goals summary
+                    </p>
 
-                  <p className="text-sm text-muted-foreground">
-                    You selected:{' '}
-                    <span className="font-semibold text-foreground">
-                      {weightGoals.join(', ') ||
-                        'General fitness'}
-                    </span>
-                  </p>
-                </div>
+                    <p className="text-sm text-muted-foreground">
+                      You selected:{' '}
+                      <span className="font-semibold text-foreground">
+                        {weightGoals.join(', ') ||
+                          'General fitness'}
+                      </span>
+                    </p>
+                  </div>
+
+                  <Textarea
+                    value={goalDescription}
+                    onChange={e =>
+                      setGoalDescription(
+                        e.target.value
+                      )
+                    }
+                    placeholder={`e.g. "I want to add 50 lbs to my squat and bring up my chest. I've been lifting for a year, currently squat 185 for 5. I have some lower back tightness so go easy on heavy spinal loading."`}
+                    className="min-h-[140px] text-sm resize-none bg-card border-border focus:border-primary rounded-2xl p-4 leading-relaxed"
+                  />
+
+                  <div className="bg-muted/50 rounded-2xl p-4 border border-border">
+                    <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+                      ⏱ Timeframe for your goals
+                    </p>
+
+                    <Textarea
+                      value={timeframe}
+                      onChange={e =>
+                        setTimeframe(e.target.value)
+                      }
+                      placeholder={`e.g. "Add 50 lbs to my squat in 4 months."`}
+                      className="min-h-[60px] text-sm resize-none bg-card border-border focus:border-primary rounded-xl p-3 leading-relaxed"
+                    />
+                  </div>
+                </>
               )}
 
               <div className="bg-muted/50 rounded-2xl p-4 border border-border">
