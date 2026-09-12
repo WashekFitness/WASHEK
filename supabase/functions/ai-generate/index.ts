@@ -24,9 +24,6 @@ const MEDIA_BUCKET =
  * free models and filters for capabilities required by the request,
  * including image understanding.
  *
- * This is safer than hard-coding a small list of individual free
- * providers that may all be rate-limited at the same time.
- *
  * We NEVER fall back to a paid model.
  */
 const FREE_VISION_MODEL =
@@ -52,10 +49,6 @@ const ALLOWED_TYPES = new Set([
   'food_barcode',
 ]);
 
-/*
- * These features contain visual media and therefore require
- * a multimodal model.
- */
 const VISUAL_TYPES = new Set([
   'form_analysis',
   'progress_photo',
@@ -63,13 +56,6 @@ const VISUAL_TYPES = new Set([
   'food_barcode',
 ]);
 
-/*
- * Server-side subscription requirements.
- *
- * Live Workout itself remains FREE.
- * Elite is only required for the adjustment flow.
- * Weekly Update remains FREE.
- */
 const SERVER_FEATURE_PLANS: Record<string, string> = {
   form_analysis: 'elite',
   progress_photo: 'performance',
@@ -84,24 +70,11 @@ const PLAN_HIERARCHY = [
   'elite',
 ];
 
-/*
- * Statuses where the subscription is fully paid and current.
- * These are always entitled to the stored plan, no time limit.
- */
 const FULLY_ACTIVE_STATUSES = new Set([
   'active',
   'trialing',
 ]);
 
-/*
- * Statuses where the most recent payment failed.
- *
- * These remain entitled to the stored plan ONLY until the
- * profile's subscription_grace_until deadline passes. That
- * deadline is set once, by the Stripe webhook, the first time
- * a subscription enters one of these statuses (see
- * stripe-webhooks/index.ts -> syncSubscriptionToProfile).
- */
 const GRACE_ELIGIBLE_STATUSES = new Set([
   'past_due',
   'unpaid',
@@ -157,13 +130,6 @@ function getSupabaseAnonKey() {
 }
 
 function getServiceRoleKey() {
-  /*
-   * SERVICE_ROLE_KEY is a manually-configured project secret.
-   * Fall back to SUPABASE_SERVICE_ROLE_KEY, which Supabase
-   * always provides automatically to every Edge Function, so
-   * this never silently breaks if the manual secret is missing
-   * or gets lost on a redeploy.
-   */
   return (
     Deno.env.get(
       'SERVICE_ROLE_KEY'
@@ -358,17 +324,6 @@ async function getUserPlan(
         ''
     ).toLowerCase();
 
-  /*
-   * A subscription that is fully paid (active/trialing) is
-   * always entitled to its stored plan.
-   *
-   * A subscription with a recently failed payment
-   * (past_due/unpaid) is ONLY entitled to its stored plan
-   * until the grace deadline set by the Stripe webhook
-   * passes. Once that deadline is in the past, treat the
-   * user as Free — matching the same rule enforced by the
-   * kael_effective_plan() database function.
-   */
   const graceUntil =
     data?.subscription_grace_until
       ? new Date(
@@ -411,12 +366,6 @@ async function enforcePlanAccess(
   user: any,
   type: string
 ) {
-  /*
-   * Live Workout basic AI is FREE.
-   *
-   * Only the dedicated adjustment flow
-   * requires Elite.
-   */
   const requiredPlan =
     type ===
     'live_workout_adjustment'
@@ -461,22 +410,8 @@ async function enforcePlanAccess(
 }
 
 /* ============================================================
- * KAEL MESSAGE QUOTA (SERVER-ENFORCED)
- * ============================================================
- *
- * IMPORTANT:
- *
- * The Kael monthly message limit MUST be claimed here, inside
- * this Edge Function, and not merely trusted from the browser.
- *
- * The `claim_kael_message()` Postgres function is SECURITY
- * DEFINER and atomically reserves one message slot for
- * whichever user's JWT is attached to the request. Because we
- * call it here — server-side, after the caller is already
- * authenticated — a user cannot get free/unlimited Kael
- * messages by calling this function directly and skipping
- * whatever the frontend normally does first.
- */
+ * KAEL MESSAGE QUOTA
+ * ============================================================ */
 
 async function claimKaelMessageServerSide(
   req: Request
@@ -602,9 +537,6 @@ async function resolveMediaUrl(
     return null;
   }
 
-  /*
-   * Public/external URLs can be passed through.
-   */
   if (
     /^https?:\/\//i.test(
       raw
@@ -613,12 +545,6 @@ async function resolveMediaUrl(
     return raw;
   }
 
-  /*
-   * Private media is represented by a storage path.
-   *
-   * We only allow the authenticated user's own
-   * media directory.
-   */
   const path =
     cleanStoragePath(
       raw
@@ -637,7 +563,7 @@ async function resolveMediaUrl(
 
   const {
     data,
-    error,
+    error
   } =
     await client.storage
       .from(
@@ -718,9 +644,6 @@ function getModelsForRequest(
   type: string,
   hasMedia: boolean
 ) {
-  /*
-   * Keep the FREE router as the only model.
-   */
   if (
     hasMedia ||
     VISUAL_TYPES.has(type)
@@ -810,42 +733,233 @@ function shouldRetryStatus(
   );
 }
 
+/*
+ * OpenRouter normally returns:
+ *
+ * choices[0].message.content
+ *
+ * Depending on the provider selected by
+ * openrouter/free, however, compatible response
+ * shapes can vary.
+ *
+ * IMPORTANT:
+ *
+ * We intentionally DO NOT use reasoning as the
+ * assistant answer. Reasoning is not the workout.
+ */
 function extractText(
   raw: any
 ) {
-  const content =
+  const message =
     raw?.choices?.[0]
-      ?.message?.content;
+      ?.message;
+
+  const content =
+    message?.content;
 
   if (
     typeof content ===
     'string'
   ) {
-    return content.trim();
+    const trimmed =
+      content.trim();
+
+    if (trimmed) {
+      return trimmed;
+    }
   }
 
   /*
-   * Some OpenRouter-compatible
-   * providers may return content
-   * as an array of text blocks.
+   * Some providers return content as an
+   * array of blocks.
    */
   if (
     Array.isArray(content)
   ) {
-    return content
-      .map(
-        (item: any) =>
-          typeof item ===
-          'string'
-            ? item
-            : item?.text ||
-              ''
-      )
-      .join('')
-      .trim();
+    const text =
+      content
+        .map(
+          (item: any) => {
+            if (
+              typeof item ===
+              'string'
+            ) {
+              return item;
+            }
+
+            if (
+              typeof item?.text ===
+              'string'
+            ) {
+              return item.text;
+            }
+
+            if (
+              typeof item?.content ===
+              'string'
+            ) {
+              return item.content;
+            }
+
+            return '';
+          }
+        )
+        .join('')
+        .trim();
+
+    if (text) {
+      return text;
+    }
+  }
+
+  /*
+   * A few OpenAI-compatible endpoints can
+   * expose the completion under choices[].text.
+   */
+  const choiceText =
+    raw?.choices?.[0]?.text;
+
+  if (
+    typeof choiceText ===
+    'string' &&
+    choiceText.trim()
+  ) {
+    return choiceText.trim();
+  }
+
+  /*
+   * Some compatible gateways expose an output
+   * array. We only accept actual text content.
+   */
+  if (
+    Array.isArray(
+      raw?.output
+    )
+  ) {
+    const outputText =
+      raw.output
+        .flatMap(
+          (item: any) => {
+            if (
+              typeof item ===
+              'string'
+            ) {
+              return [item];
+            }
+
+            if (
+              typeof item?.text ===
+              'string'
+            ) {
+              return [item.text];
+            }
+
+            if (
+              Array.isArray(
+                item?.content
+              )
+            ) {
+              return item.content
+                .map(
+                  (part: any) =>
+                    typeof part ===
+                    'string'
+                      ? part
+                      : part?.text ||
+                        ''
+                );
+            }
+
+            return [];
+          }
+        )
+        .join('')
+        .trim();
+
+    if (outputText) {
+      return outputText;
+    }
   }
 
   return '';
+}
+
+function summarizeEmptyResponse(
+  raw: any
+) {
+  const choice =
+    raw?.choices?.[0];
+
+  const message =
+    choice?.message;
+
+  return {
+    id:
+      raw?.id ||
+      null,
+
+    model:
+      raw?.model ||
+      null,
+
+    choices:
+      Array.isArray(
+        raw?.choices
+      )
+        ? raw.choices.length
+        : 0,
+
+    finishReason:
+      choice?.finish_reason ||
+      null,
+
+    hasMessage:
+      Boolean(message),
+
+    messageKeys:
+      message &&
+      typeof message ===
+        'object'
+        ? Object.keys(
+            message
+          )
+        : [],
+
+    hasContent:
+      typeof message?.content ===
+      'string'
+        ? Boolean(
+            message.content.trim()
+          )
+        : Array.isArray(
+            message?.content
+          )
+          ? message.content
+              .length > 0
+          : false,
+
+    hasReasoning:
+      Boolean(
+        message?.reasoning
+      ),
+
+    reasoningDetails:
+      Array.isArray(
+        message?.reasoning_details
+      )
+        ? message
+            .reasoning_details
+            .length
+        : 0,
+
+    usage:
+      raw?.usage ||
+      null,
+
+    error:
+      raw?.error ||
+      null,
+  };
 }
 
 function stripMarkdownCodeFence(
@@ -868,20 +982,8 @@ function stripMarkdownCodeFence(
 }
 
 /*
- * Parse JSON returned by an LLM as defensively as possible.
- *
- * The free OpenRouter router can occasionally return a response such as:
- *
- * {
- * {
- *   "microcycle": { ... }
- * }
- * }
- *
- * The second opening brace is the actual JSON object. This parser first
- * tries normal JSON, then removes one accidental outer brace, then searches
- * for balanced JSON objects. This keeps structured generation from failing
- * just because a free model added one stray character around the payload.
+ * Parse JSON returned by an LLM as defensively
+ * as possible.
  */
 function tryParseJson(
   value: string
@@ -895,16 +997,14 @@ function tryParseJson(
     return null;
   }
 
-  // 1. Normal JSON.
   try {
     return JSON.parse(
       cleaned
     );
   } catch {
-    // Continue with recovery.
+    // Continue.
   }
 
-  // 2. Exact recovery for an extra outer opening/closing brace.
   if (
     cleaned.startsWith(
       '{{'
@@ -923,11 +1023,10 @@ function tryParseJson(
           .trim()
       );
     } catch {
-      // Continue with balanced-object recovery.
+      // Continue.
     }
   }
 
-  // 3. Extract balanced JSON objects from prose or malformed wrappers.
   const candidates: string[] =
     [];
 
@@ -1012,10 +1111,6 @@ function tryParseJson(
     }
   }
 
-  /*
-   * Prefer the largest valid object because the actual response
-   * normally contains the complete workout object.
-   */
   candidates.sort(
     (a, b) =>
       b.length -
@@ -1030,15 +1125,10 @@ function tryParseJson(
         candidate
       );
     } catch {
-      // Try the next candidate.
+      // Continue.
     }
   }
 
-  /*
-   * 4. Occasionally a model returns a JSON object followed by
-   * additional text that prevents balanced extraction from being
-   * useful. Try every opening brace as a possible beginning.
-   */
   for (
     let startIndex = 0;
     startIndex <
@@ -1116,7 +1206,7 @@ function tryParseJson(
 
         if (
           localDepth ===
-            0
+          0
         ) {
           try {
             return JSON.parse(
@@ -1205,24 +1295,24 @@ async function callOpenRouter(
                   : 4000,
 
       /*
-       * Tell OpenRouter it is allowed to use
-       * alternative providers.
+       * Important:
        *
-       * We still remain on the FREE model.
+       * Prevent thinking/reasoning from consuming the
+       * output budget when the dynamically selected free
+       * model supports the OpenRouter reasoning parameter.
+       *
+       * Models that do not expose reasoning simply ignore
+       * the setting through OpenRouter's normalized API.
        */
+      reasoning: {
+        effort: 'none',
+      },
+
       provider: {
         allow_fallbacks: true,
       },
     };
 
-  /*
-   * Do not send response_format for visual
-   * requests because free multimodal providers
-   * have inconsistent structured-output support.
-   *
-   * JSON is requested in the prompt and parsed
-   * after the response.
-   */
   if (!hasMedia) {
     // Text-only requests intentionally remain
     // provider-compatible without forcing a schema.
@@ -1241,11 +1331,15 @@ async function callOpenRouter(
   const controller =
     new AbortController();
 
+  /*
+   * Free-router endpoints can occasionally
+   * take longer than 45 seconds.
+   */
   const timeout =
     setTimeout(
       () =>
         controller.abort(),
-      45000
+      60000
     );
 
   let response:
@@ -1365,15 +1459,42 @@ async function callOpenRouter(
     );
 
   if (!outputText) {
+    /*
+     * This is the exact condition that was producing:
+     *
+     * "OpenRouter returned no assistant content."
+     *
+     * Do not treat reasoning as workout content.
+     * Instead, expose the response shape in logs so
+     * the retry system can try another free endpoint
+     * and future failures are diagnosable.
+     */
+    console.warn(
+      '[AI] OpenRouter returned no usable assistant content',
+      {
+        type,
+        model,
+        response:
+          summarizeEmptyResponse(
+            raw
+          ),
+      }
+    );
+
     const error =
       new Error(
-        'OpenRouter returned no assistant content.'
+        'OpenRouter returned no usable assistant content.'
       );
 
     (
       error as any
     ).status =
       502;
+
+    (
+      error as any
+    ).raw =
+      raw;
 
     throw error;
   }
@@ -1536,10 +1657,6 @@ Deno.serve(
 
       /* --------------------------------------------------------
        * KAEL MESSAGE QUOTA
-       *
-       * This is the actual enforcement point. It cannot be
-       * bypassed by skipping a client-side RPC call, because
-       * it runs here regardless of what the caller sent.
        * ------------------------------------------------------ */
 
       let kaelQuota: any =
@@ -1559,6 +1676,7 @@ Deno.serve(
             {
               userId:
                 user.id,
+
               error:
                 quotaError instanceof
                 Error
@@ -1593,6 +1711,7 @@ Deno.serve(
             {
               userId:
                 user.id,
+
               quota:
                 kaelQuota,
             }
@@ -1712,15 +1831,18 @@ Deno.serve(
         > = [];
 
       /*
-       * Because openrouter/free is itself
-       * a router, retrying it gives OpenRouter
-       * another opportunity to select an
-       * available free endpoint.
+       * The free router is itself a router.
+       *
+       * We deliberately retry it several times because a
+       * temporary provider failure, timeout, or empty
+       * response should not immediately fail generation.
        */
       const MAX_ATTEMPTS =
         hasMedia
-          ? 3
-          : 2;
+          ? 4
+          : type === 'microcycle'
+            ? 4
+            : 3;
 
       for (
         let attempt = 0;
@@ -1736,11 +1858,12 @@ Deno.serve(
               prompt;
 
             /*
-             * Microcycle generation is intentionally reinforced here at the
-             * server boundary. This does not change the workout-generation
-             * function in the client; it simply makes the free OpenRouter
-             * model's required response shape unambiguous and gives us a
-             * deterministic recovery path for common wrapper mistakes.
+             * Microcycle generation is reinforced here at
+             * the server boundary.
+             *
+             * This does NOT change the client's workout
+             * generation function. It only tells the model
+             * exactly what the server will accept.
              */
             if (
               type ===
@@ -1749,8 +1872,33 @@ Deno.serve(
               resultPrompt = `${prompt}
 
 SERVER OUTPUT CONTRACT — MANDATORY:
-Return ONLY valid JSON. Do not use Markdown fences. Do not add commentary before or after the JSON. The top-level object MUST contain exactly one key named "microcycle". "microcycle" MUST be an object containing a non-empty "days" array. Each day MUST contain "day_name", "workout_type", and a non-empty "exercises" array. Each exercise MUST contain "name", "sets", "reps", "rest_seconds", "notes", and "activation_cue".
-Do not return a top-level array. Do not return "microcycles". Do not return the microcycle object directly without the "microcycle" wrapper.`;
+Return ONLY valid JSON. Do not use Markdown fences. Do not add commentary before or after the JSON.
+
+The top-level object MUST contain exactly one key named "microcycle".
+
+"microcycle" MUST be an object containing a non-empty "days" array.
+
+Each day MUST contain:
+- "day_name"
+- "workout_type"
+- "exercises"
+
+Each day MUST contain a non-empty "exercises" array.
+
+Each exercise MUST contain:
+- "name"
+- "sets"
+- "reps"
+- "rest_seconds"
+- "notes"
+- "activation_cue"
+
+Do not return a top-level array.
+Do not return "microcycles".
+Do not return the microcycle object directly without the "microcycle" wrapper.
+Do not return prose.
+Do not return Markdown.
+Do not return an empty response.`;
             }
 
             const result =
@@ -1762,16 +1910,6 @@ Do not return a top-level array. Do not return "microcycles". Do not return the 
                 fileUrls
               );
 
-            /*
-             * Visual features expect JSON.
-             * Parse it ourselves because we
-             * deliberately don't force
-             * response_format on free
-             * multimodal providers.
-             */
-            // All structured requests are parsed server-side. In particular,
-            // microcycle generation must never return malformed/raw model text
-            // to onboarding as if it were a valid workout object.
             let parsed =
               tryParseJson(
                 result.outputText
@@ -1781,17 +1919,6 @@ Do not return a top-level array. Do not return "microcycles". Do not return the 
               type ===
               'microcycle'
             ) {
-              /*
-               * Free models sometimes return one of these semantically
-               * equivalent shapes even when the prompt requests the wrapper:
-               *
-               *   { days: [...] }
-               *   { microcycles: [{ days: [...] }] }
-               *   { microcycle: { days: [...] } }
-               *
-               * Normalize only the wrapper. The actual workout contents are
-               * left untouched so the user's generation logic is unchanged.
-               */
               if (
                 parsed &&
                 typeof parsed ===
@@ -1873,7 +2000,9 @@ Do not return a top-level array. Do not return "microcycles". Do not return the 
                   {
                     userId:
                       user.id,
+
                     type,
+
                     outputSnippet:
                       result.outputText.slice(
                         0,
@@ -1951,18 +2080,18 @@ Do not return a top-level array. Do not return "microcycles". Do not return the 
               '[AI] Free model attempt failed',
               {
                 type,
+
                 attempt:
                   attempt + 1,
+
                 model,
+
                 status,
+
                 message,
               }
             );
 
-            /*
-             * Permanent request errors should
-             * not be retried repeatedly.
-             */
             if (
               status &&
               !shouldRetryStatus(
@@ -1974,16 +2103,18 @@ Do not return a top-level array. Do not return "microcycles". Do not return the 
           }
         }
 
-        /*
-         * Brief pause before giving the
-         * free router another opportunity.
-         */
         if (
           attempt <
           MAX_ATTEMPTS - 1
         ) {
+          /*
+           * Slightly increasing delay between attempts
+           * prevents hammering the same free router.
+           */
           await sleep(
-            750
+            1000 +
+              attempt *
+                500
           );
         }
       }
@@ -2006,7 +2137,7 @@ Do not return a top-level array. Do not return "microcycles". Do not return the 
             false,
 
           error:
-            'The free AI vision service is temporarily unavailable. Please try again shortly.',
+            'The free AI service is temporarily unavailable. Please try again shortly.',
 
           error_code:
             'FREE_AI_UNAVAILABLE',
