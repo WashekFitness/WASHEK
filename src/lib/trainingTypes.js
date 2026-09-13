@@ -4,7 +4,7 @@ export const TRAINING_TYPES = [
     value: 'calisthenics',
     label: 'Calisthenics',
     iconName: 'PersonStanding',
-    desc: 'Bodyweight training using progressive overload through harder variations, increased reps/sets, improved range of motion, tempo, density, and other bodyweight methods. Skill work is included only when Learn Skills is selected.',
+    desc: 'Bodyweight training focused on mastering skills like muscle-ups, handstands, planches, and levers. Progressive overload through harder variations, not added weight.',
     hasSkills: true,
     hasLevel: true,
     hasTimeframe: true,
@@ -14,7 +14,7 @@ export const TRAINING_TYPES = [
     value: 'weighted_calisthenics',
     label: 'Weighted Calisthenics',
     iconName: 'Dumbbell',
-    desc: 'Bodyweight movements with added weight (dip belt, weighted vest) to build strength and muscle through loaded progressive overload. Skill work is included only when Learn Skills is selected.',
+    desc: 'Bodyweight movements with added weight (dip belt, weighted vest) to build raw strength and push past plateaus. Combines skill work with loaded progressions for faster gains.',
     hasSkills: true,
     hasLevel: true,
     hasTimeframe: true,
@@ -34,7 +34,7 @@ export const TRAINING_TYPES = [
     value: 'hybrid',
     label: 'Hybrid Training',
     iconName: 'Layers',
-    desc: 'A combination of calisthenics and weight training. The balance, exercise selection, and progression method are determined by the athlete\'s selected goals, equipment, limitations, and schedule. Skill work is included only when Learn Skills is selected.',
+    desc: 'The best of both worlds. Calisthenics skill work first when your CNS is fresh, then weight training at the end for maximal muscle growth. Weights are chosen to accelerate your calisthenics goals too.',
     hasSkills: true,
     hasLevel: true,
     hasTimeframe: true,
@@ -132,20 +132,6 @@ function buildContext(data = {}) {
   if (weightGoals?.length) {
     parts.push(
       `WEIGHT TRAINING GOALS: ${weightGoals.join(', ')}`
-    );
-  }
-
-  const selectedFitnessGoals = Array.isArray(fitnessGoals)
-    ? fitnessGoals
-    : [];
-
-  if (selectedFitnessGoals.includes('learn_skills')) {
-    parts.push(
-      'SKILL RULE: Learn Skills is explicitly selected. Skill acquisition may be programmed when appropriate to the athlete\'s goals, training type, equipment, limitations, and recovery.'
-    );
-  } else {
-    parts.push(
-      'SKILL RULE: Learn Skills is NOT selected. Do not program dedicated calisthenics skill acquisition. Do not add muscle-ups, handstands, planches, levers, L-sits, or similar skill-practice blocks merely because the training type is calisthenics, weighted calisthenics, or hybrid. Use progressive overload through harder appropriate variations, additional reps/sets, increased load when available, improved range of motion, tempo, density, or other methods that directly serve the selected goals.'
     );
   }
 
@@ -262,11 +248,9 @@ The activation_cue field is critical for compound lifts — it should tell the a
 // ------------------------------------------------------------
 
 const LEG_TRAINING_MANDATE = `── LEG TRAINING — MANDATORY FOR ALL TRAINING TYPES ──
-Unless the athlete has EXPLICITLY stated in their own goals, requirements, or notes that they do NOT want leg training (e.g., "upper body only", "no legs", "skip legs"), you MUST include dedicated leg work in EVERY WEEK of the program. Legs are NOT optional and there is NO UI selection that makes them optional. A missing leg preference is NOT permission to omit legs.
+Unless the athlete has EXPLICITLY stated in their goals, requirements, or notes that they do NOT want leg training (e.g., "upper body only", "no legs", "skip legs"), you MUST include dedicated leg work throughout the program.
 
-Do not treat legs as optional accessory work. Every week must contain meaningful lower-body training appropriate to the athlete's training type, goals, equipment, recovery capacity, and schedule.
-
-Target the major lower-body patterns/muscles across the week as appropriate: quads, hamstrings, glutes, and calves.
+Do not treat legs as optional accessory work. Program lower-body training appropriate to the athlete's training type, goals, equipment, recovery capacity, and schedule.
 
 For calisthenics, use bodyweight unilateral work, squats, split squats, lunges, Nordic progressions, hip thrust/bridge variations, calf work, and other appropriate bodyweight progressions.
 
@@ -274,11 +258,9 @@ For weighted calisthenics, use appropriate loaded lower-body movements in additi
 
 For weights, use appropriate compound and isolation lower-body movements such as squats, deadlift variations, Romanian deadlifts, split squats, leg presses, hamstring curls, extensions, calves, and other movements appropriate to the athlete's equipment.
 
-For hybrid training, balance lower-body strength/hypertrophy with calisthenics work according to the athlete's selected goals.
+For hybrid training, balance lower-body strength/hypertrophy with calisthenics skill demands.
 
-Deload weeks still require leg work unless the athlete explicitly requested no legs; reduce the lower-body training stress appropriately rather than removing it.
-
-Never omit leg training simply because the athlete's primary goals emphasize the upper body unless the athlete explicitly requests that in writing.`;
+Never omit leg training simply because the athlete's primary goals emphasize the upper body unless the athlete explicitly requests that.`;
 
 // ------------------------------------------------------------
 // Program construction
@@ -288,22 +270,18 @@ function getTrainingTypeRules(trainingType) {
   switch (trainingType) {
     case 'calisthenics':
       return `TRAINING TYPE: CALISTHENICS
-- Prioritize bodyweight strength, relative strength, mobility, and progressive exercise variations according to the athlete's selected goals.
+- Prioritize bodyweight strength, skill acquisition, relative strength, mobility, and progressive exercise variations.
 - Do not prescribe external weights unless the athlete's equipment/goals explicitly support weighted work.
-- DEDICATED SKILL WORK IS PERMITTED ONLY WHEN LEARN_SKILLS IS SELECTED.
-- If LEARN_SKILLS is not selected, do not program muscle-ups, handstands, planches, levers, L-sits, or similar skill-practice blocks merely because the athlete chose calisthenics. Use harder variations, additional reps/sets, improved ROM, tempo, density, or other goal-appropriate progression instead.
-- When LEARN_SKILLS is selected, skill work should generally be performed early in the session while the athlete is fresh.
-- Use progressions/regressions appropriate to the athlete's level and actual goals.
-- Build toward the athlete's stated goals and skills rather than randomly rotating advanced movements.`;
+- Skill work should generally be performed early in the session while the athlete is fresh.
+- Use progressions/regressions appropriate to the athlete's level.
+- Build toward the athlete's stated skills rather than randomly rotating advanced movements.`;
 
     case 'weighted_calisthenics':
       return `TRAINING TYPE: WEIGHTED CALISTHENICS
-- Prioritize weighted pull-ups, weighted dips, loaded bodyweight movements, and goal-appropriate calisthenics strength work.
-- DEDICATED SKILL WORK IS PERMITTED ONLY WHEN LEARN_SKILLS IS SELECTED.
-- If LEARN_SKILLS is not selected, do not program muscle-ups, handstands, planches, levers, L-sits, or similar skill-practice blocks merely because the athlete chose weighted calisthenics. Use load, harder variations, reps/sets, ROM, tempo, density, or other goal-appropriate progressive overload instead.
-- When LEARN_SKILLS is selected, skill work should generally occur before heavy loaded work when technical quality matters.
+- Prioritize weighted pull-ups, weighted dips, loaded bodyweight movements, and skill-specific calisthenics.
+- Skill work should generally occur before heavy loaded work when technical quality matters.
 - Progress external load gradually while preserving full range of motion and strict technique.
-- Do not include skill practice simply to maintain a skill unless the athlete selected Learn Skills.`;
+- Include sufficient unweighted skill practice to maintain movement quality.`;
 
     case 'weights':
       return `TRAINING TYPE: WEIGHT TRAINING
@@ -314,12 +292,10 @@ function getTrainingTypeRules(trainingType) {
 
     case 'hybrid':
       return `TRAINING TYPE: HYBRID
-- Combine calisthenics and weight training according to the athlete's actual selected goals, equipment, limitations, and schedule.
-- DEDICATED CALISTHENICS SKILL WORK IS PERMITTED ONLY WHEN LEARN_SKILLS IS SELECTED.
-- If LEARN_SKILLS is not selected, do not insert muscle-ups, handstands, planches, levers, L-sits, or similar skill-practice blocks merely because the athlete chose hybrid. Use calisthenics movements and weights strictly as progressive overload for the selected goals.
-- When LEARN_SKILLS is selected, place technically demanding calisthenics skill work earlier in sessions when appropriate.
-- Use weight training to strengthen muscles and patterns that support the athlete's selected goals.
-- Balance fatigue carefully so one modality does not undermine the athlete's primary goals or recovery.`;
+- Combine calisthenics skill/strength work with weight training.
+- Place technically demanding calisthenics skill work earlier in sessions when appropriate.
+- Use weight training to strengthen muscles and patterns that support the athlete's calisthenics goals.
+- Balance fatigue carefully so weight training does not undermine skill quality.`;
 
     default:
       return `TRAINING TYPE: GENERAL FITNESS
@@ -439,13 +415,6 @@ ${buildAdaptationRules(adaptationHistory)}
 16. Rest must be expressed in seconds.
 17. Keep exercise notes concise but useful.
 18. Make the program realistic for the athlete's stated schedule and experience.
-19. Do not introduce a training objective that the athlete did not select.
-20. Dedicated calisthenics skill acquisition is allowed ONLY when the athlete selected Learn Skills.
-21. If Learn Skills is not selected, progressive overload must be achieved through methods that serve the athlete's selected goals, such as harder variations, additional reps/sets, increased load when available, improved range of motion, tempo, density, or other appropriate methods.
-22. Use ONLY the equipment the athlete actually has. Never assume access to equipment that was not provided.
-23. Treat every injury, limitation, restriction, requirement, and scheduling constraint in the athlete profile as a hard programming constraint. Do not knowingly prescribe an exercise that conflicts with one of them; choose an appropriate alternative instead.
-24. Unless the athlete explicitly writes that they do not want leg training, include meaningful leg training in EVERY WEEK.
-25. Before returning the program, audit every week for goal alignment, equipment, injuries/limitations, schedule, written requirements, skill permission, recovery, and the mandatory leg rule. Fix any violation before returning JSON.
 
 ${OUTPUT_FORMAT}
 
@@ -695,7 +664,7 @@ OUTPUT: Return ONLY a JSON object containing ONE weekly microcycle for week ${sa
 The microcycle must use mesocycle_index ${mesocycleIndex} and week_type appropriate for the week.
 
 Each day has day_name, workout_type, and exercises array.
-Each exercise has name, sets (number), reps (string), rest_seconds (number), notes (coaching cue string), and activation_cue (concise activation and form cue string).
+Each exercise has name, sets (number), reps (string), rest_seconds (number), notes (a short coaching cue, 6 words or fewer — a phrase, not a sentence), and activation_cue (a short activation/form cue, 6 words or fewer — a phrase, not a sentence). Keep both fields brief on every exercise; this keeps the response fast to generate without losing the cue itself.
 
 Respond with exactly this structure:
 {
