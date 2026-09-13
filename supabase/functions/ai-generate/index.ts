@@ -29,14 +29,29 @@ const MEDIA_BUCKET =
  *
  * We NEVER fall back to a paid model.
  */
-const FREE_VISION_MODEL =
-  'openrouter/free';
+/*
+ * Do not depend on openrouter/free for program generation.
+ * OpenRouter's free router is dynamic, so the exact model/provider
+ * selected can change from day to day. We instead give OpenRouter
+ * an explicit FREE fallback chain. Provider-level fallback remains
+ * enabled below, so each model can still fail over between providers.
+ *
+ * These are current OpenRouter free models as of September 2026.
+ */
+const FREE_TEXT_MODELS = [
+  'google/gemma-4-26b-a4b-it:free',
+  'google/gemma-4-31b-it:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+];
 
 /*
- * Text-only requests remain on OpenRouter's free router too.
+ * Visual requests need models that accept image/video input.
  */
-const DEFAULT_TEXT_MODEL =
-  'openrouter/free';
+const FREE_VISION_MODELS = [
+  'google/gemma-4-26b-a4b-it:free',
+  'google/gemma-4-31b-it:free',
+  'nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free',
+];
 
 const ALLOWED_TYPES = new Set([
   'general',
@@ -102,36 +117,16 @@ const STRICT_JSON_TYPES = new Set([
 function getResponseFormat(
   type: string
 ) {
+  /*
+   * Keep microcycle on plain JSON-object mode. The free fallback
+   * chain contains models with different levels of JSON-schema
+   * enforcement, while all of the selected models can return JSON.
+   * The server-side validation below still requires the exact
+   * microcycle wrapper and a non-empty days array.
+   */
   if (type === 'microcycle') {
     return {
-      type: 'json_schema',
-      json_schema: {
-        name: 'microcycle_response',
-        strict: false,
-        schema: {
-          type: 'object',
-          properties: {
-            microcycle: {
-              type: 'object',
-              properties: {
-                days: {
-                  type: 'array',
-                  minItems: 1,
-                  items: {
-                    type: 'object',
-                  },
-                },
-              },
-              required: [
-                'days',
-              ],
-            },
-          },
-          required: [
-            'microcycle',
-          ],
-        },
-      },
+      type: 'json_object',
     };
   }
 
@@ -1157,26 +1152,14 @@ function getModelsForRequest(
   type: string,
   hasMedia: boolean
 ) {
-  /*
-   * Both visual and text requests use
-   * OpenRouter's free router.
-   *
-   * For visual requests, OpenRouter filters
-   * the free pool to models that support the
-   * supplied image/video input.
-   */
   if (
     hasMedia ||
     VISUAL_TYPES.has(type)
   ) {
-    return [
-      FREE_VISION_MODEL,
-    ];
+    return FREE_VISION_MODELS;
   }
 
-  return [
-    DEFAULT_TEXT_MODEL,
-  ];
+  return FREE_TEXT_MODELS;
 }
 
 /*
@@ -1353,7 +1336,7 @@ function withDeadline<T>(
 
 async function callOpenRouter(
   apiKey: string,
-  model: string,
+  models: string[],
   type: string,
   prompt: string,
   fileUrls: string[],
@@ -1402,7 +1385,13 @@ async function callOpenRouter(
 
   const payload:
     Record<string, unknown> = {
-    model,
+    /*
+     * OpenRouter's `models` parameter performs model-level fallback
+     * inside one API request. This is different from provider
+     * fallback: if every provider for model #1 fails, OpenRouter
+     * moves to model #2, then #3.
+     */
+    models,
 
     messages,
 
@@ -1458,10 +1447,10 @@ async function callOpenRouter(
   }
 
   console.log(
-    '[AI] Trying OpenRouter free router',
+    '[AI] Trying OpenRouter FREE model fallback chain',
     {
       type,
-      model,
+      models,
       mediaCount:
         fileUrls.length,
     }
@@ -1516,9 +1505,7 @@ async function callOpenRouter(
             controller.signal,
         }
       );
-  } catch (
-    error
-  ) {
+  } catch (error) {
     const aborted =
       (error as any)
         ?.name ===
@@ -1559,7 +1546,7 @@ async function callOpenRouter(
       '[AI] OpenRouter error:',
       {
         type,
-        model,
+        models,
         status:
           response.status,
         error: raw,
@@ -1612,7 +1599,9 @@ async function callOpenRouter(
       type,
       model:
         raw?.model ||
-        model,
+        models[0],
+      requestedModels:
+        models,
       usage:
         raw?.usage ||
         null,
@@ -1624,7 +1613,7 @@ async function callOpenRouter(
 
     model:
       raw?.model ||
-      model,
+      models[0],
 
     usage:
       raw?.usage ||
@@ -1778,9 +1767,7 @@ Deno.serve(
             await claimKaelMessageServerSide(
               req
             );
-        } catch (
-          quotaError
-        ) {
+        } catch (quotaError) {
           console.error(
             '[AI] KAEL QUOTA ERROR',
             {
@@ -1884,9 +1871,7 @@ Deno.serve(
               rawFileUrls,
               user.id
             );
-        } catch (
-          mediaError
-        ) {
+        } catch (mediaError) {
           console.error(
             '[AI] MEDIA RESOLUTION ERROR',
             {
@@ -1939,14 +1924,12 @@ Deno.serve(
         > = [];
 
       /*
-       * Because openrouter/free is itself
-       * a router, retrying it gives OpenRouter
-       * another opportunity to select an
-       * available free endpoint.
+       * Each attempt sends the complete FREE model fallback chain
+       * to OpenRouter. OpenRouter handles provider failover within
+       * a model and model failover across this list.
        *
-       * The shape of that retry (how many attempts,
-       * how long each one gets) depends on what kind
-       * of request this is — see getRetryBudget().
+       * The retry budget is intentionally small because one attempt
+       * can already try several models inside OpenRouter.
        */
       const {
         maxAttempts,
@@ -1965,23 +1948,20 @@ Deno.serve(
         maxAttempts;
         attempt++
       ) {
-        for (
-          const model of models
-        ) {
-          try {
-            const result =
-              await withDeadline(
-                callOpenRouter(
-                  apiKey,
-                  model,
-                  type,
-                  prompt,
-                  fileUrls,
-                  abortMs
-                ),
-                perAttemptMs,
-                'OpenRouter request'
-              );
+        try {
+          const result =
+            await withDeadline(
+              callOpenRouter(
+                apiKey,
+                models,
+                type,
+                prompt,
+                fileUrls,
+                abortMs
+              ),
+              perAttemptMs,
+              'OpenRouter request'
+            );
 
             /*
              * Visual features expect JSON.
@@ -2045,9 +2025,7 @@ Deno.serve(
               },
               200
             );
-          } catch (
-            error
-          ) {
+          } catch (error) {
             const status =
               Number(
                 (error as any)
@@ -2066,7 +2044,7 @@ Deno.serve(
                 attempt:
                   attempt + 1,
 
-                model,
+                models,
 
                 status,
 
@@ -2080,7 +2058,7 @@ Deno.serve(
                 type,
                 attempt:
                   attempt + 1,
-                model,
+                models,
                 status,
                 message,
               }
@@ -2099,14 +2077,11 @@ Deno.serve(
               break;
             }
           }
-        }
 
         /*
-         * Longer pause before giving the free
-         * router another opportunity — enough for
-         * its internal state to plausibly shift to
-         * a different backend, not just an instant
-         * retry against the same overloaded one.
+         * Brief pause before a second complete fallback-chain
+         * attempt. The first attempt already performs model-
+         * and provider-level failover inside OpenRouter.
          */
         if (
           attempt <
@@ -2119,7 +2094,7 @@ Deno.serve(
       }
 
       console.error(
-        '[AI] All free OpenRouter attempts failed',
+        '[AI] All free OpenRouter model fallback attempts failed',
         {
           type,
 
@@ -2136,7 +2111,7 @@ Deno.serve(
             false,
 
           error:
-            'The free AI vision service is temporarily unavailable. Please try again shortly.',
+            'The free AI service is temporarily unavailable. Please try again shortly.',
 
           error_code:
             'FREE_AI_UNAVAILABLE',
@@ -2148,9 +2123,7 @@ Deno.serve(
         },
         503
       );
-    } catch (
-      error
-    ) {
+    } catch (error) {
       console.error(
         '[AI] Edge function error:',
         error
