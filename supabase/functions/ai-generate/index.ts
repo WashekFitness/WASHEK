@@ -15,13 +15,9 @@ const MEDIA_BUCKET =
   'user-media';
 
 /*
- * Do not depend on openrouter/free for program generation.
- * OpenRouter's free router is dynamic, so the exact model/provider
- * selected can change from day to day. We instead give OpenRouter
- * an explicit FREE fallback chain. Provider-level fallback remains
- * enabled below, so each model can still fail over between providers.
- *
- * These are current OpenRouter free models as of September 2026.
+ * Explicit FREE fallback chain (September 2026).
+ * Provider-level fallback stays enabled so each model can still
+ * fail over between providers.
  */
 const FREE_TEXT_MODELS = [
   'google/gemma-4-26b-a4b-it:free',
@@ -29,9 +25,6 @@ const FREE_TEXT_MODELS = [
   'nvidia/nemotron-3-super-120b-a12b:free',
 ];
 
-/*
- * Visual requests need models that accept image/video input.
- */
 const FREE_VISION_MODELS = [
   'google/gemma-4-26b-a4b-it:free',
   'google/gemma-4-31b-it:free',
@@ -52,10 +45,6 @@ const ALLOWED_TYPES = new Set([
   'food_barcode',
 ]);
 
-/*
- * These features contain visual media and therefore require
- * a multimodal model.
- */
 const VISUAL_TYPES = new Set([
   'form_analysis',
   'progress_photo',
@@ -63,20 +52,13 @@ const VISUAL_TYPES = new Set([
   'food_barcode',
 ]);
 
-/*
- * These features expect the ENTIRE response to be a single
- * JSON object (parsed server-side in the retry loop below).
- */
 const STRICT_JSON_TYPES = new Set([
   'structure',
   'microcycle',
 ]);
 
 function getResponseFormat(type: string) {
-  if (type === 'microcycle') {
-    return { type: 'json_object' };
-  }
-  if (STRICT_JSON_TYPES.has(type)) {
+  if (type === 'microcycle' || STRICT_JSON_TYPES.has(type)) {
     return { type: 'json_object' };
   }
   return null;
@@ -124,9 +106,7 @@ function getSupabaseAnonKey() {
   if (publishableKeysRaw) {
     try {
       const keys = JSON.parse(publishableKeysRaw);
-      if (keys?.default) {
-        return keys.default;
-      }
+      if (keys?.default) return keys.default;
     } catch {
       // Fall through.
     }
@@ -155,11 +135,7 @@ async function requireUser(req: Request) {
     );
   }
   const client = createClient(supabaseUrl, supabaseKey, {
-    global: {
-      headers: {
-        Authorization: authHeader,
-      },
-    },
+    global: { headers: { Authorization: authHeader } },
   });
   const { data, error } = await client.auth.getUser();
   if (error || !data.user) {
@@ -196,11 +172,7 @@ async function getUserPlan(req: Request, user: any) {
     );
   }
   const client = createClient(supabaseUrl, supabaseKey, {
-    global: {
-      headers: {
-        Authorization: authHeader,
-      },
-    },
+    global: { headers: { Authorization: authHeader } },
   });
   const { data, error } = await client
     .from('profiles')
@@ -234,7 +206,6 @@ async function getUserPlan(req: Request, user: any) {
   const plan = normalizePlan(
     isEntitled ? data?.subscription_plan : 'free'
   );
-
   return { plan, status };
 }
 
@@ -249,26 +220,14 @@ async function enforcePlanAccess(
       : SERVER_FEATURE_PLANS[type] || null;
 
   if (!requiredPlan) {
-    return {
-      allowed: true,
-      plan: null,
-      requiredPlan: null,
-    };
+    return { allowed: true, plan: null, requiredPlan: null };
   }
 
   const { plan } = await getUserPlan(req, user);
   if (!hasRequiredPlan(plan, requiredPlan)) {
-    return {
-      allowed: false,
-      plan,
-      requiredPlan,
-    };
+    return { allowed: false, plan, requiredPlan };
   }
-  return {
-    allowed: true,
-    plan,
-    requiredPlan,
-  };
+  return { allowed: true, plan, requiredPlan };
 }
 
 /* ============================================================
@@ -284,11 +243,7 @@ async function claimKaelMessageServerSide(req: Request) {
     );
   }
   const client = createClient(supabaseUrl, supabaseKey, {
-    global: {
-      headers: {
-        Authorization: authHeader,
-      },
-    },
+    global: { headers: { Authorization: authHeader } },
   });
   const { data, error } = await client.rpc('claim_kael_message');
   if (error) {
@@ -317,13 +272,9 @@ function looksLikeVideoUrl(value: string) {
 
 async function resolveStoragePath(rawValue: string, userId: string) {
   const value = String(rawValue || '').trim();
-  if (!value) {
-    throw new Error('Empty media path.');
-  }
+  if (!value) throw new Error('Empty media path.');
 
-  if (isHttpUrl(value) || isDataUrl(value)) {
-    return value;
-  }
+  if (isHttpUrl(value) || isDataUrl(value)) return value;
 
   let path = value;
   const objectMarker = '/storage/v1/object/';
@@ -376,9 +327,7 @@ async function resolveStoragePath(rawValue: string, userId: string) {
 }
 
 async function resolveAllMedia(fileUrls: unknown[], userId: string) {
-  if (!Array.isArray(fileUrls)) {
-    return [];
-  }
+  if (!Array.isArray(fileUrls)) return [];
   const limited = fileUrls
     .slice(0, 8)
     .map((value) => String(value || '').trim())
@@ -386,8 +335,7 @@ async function resolveAllMedia(fileUrls: unknown[], userId: string) {
 
   const resolved: string[] = [];
   for (const value of limited) {
-    const resolvedUrl = await resolveStoragePath(value, userId);
-    resolved.push(resolvedUrl);
+    resolved.push(await resolveStoragePath(value, userId));
   }
   return resolved;
 }
@@ -396,49 +344,30 @@ async function resolveAllMedia(fileUrls: unknown[], userId: string) {
  * OPENROUTER MESSAGE BUILDING
  * ============================================================ */
 function buildMessageContent(prompt: string, fileUrls: string[]) {
-  if (!fileUrls?.length) {
-    return prompt;
-  }
+  if (!fileUrls?.length) return prompt;
 
   const content: Array<Record<string, unknown>> = [
-    {
-      type: 'text',
-      text: prompt,
-    },
+    { type: 'text', text: prompt },
   ];
 
   for (const rawUrl of fileUrls) {
     const url = String(rawUrl || '').trim();
-    if (!url) {
-      continue;
-    }
+    if (!url) continue;
     const lower = url.toLowerCase();
 
     if (lower.startsWith('data:video/')) {
-      content.push({
-        type: 'video_url',
-        video_url: { url },
-      });
+      content.push({ type: 'video_url', video_url: { url } });
       continue;
     }
     if (lower.startsWith('data:image/')) {
-      content.push({
-        type: 'image_url',
-        image_url: { url },
-      });
+      content.push({ type: 'image_url', image_url: { url } });
       continue;
     }
     if (looksLikeVideoUrl(lower)) {
-      content.push({
-        type: 'video_url',
-        video_url: { url },
-      });
+      content.push({ type: 'video_url', video_url: { url } });
       continue;
     }
-    content.push({
-      type: 'image_url',
-      image_url: { url },
-    });
+    content.push({ type: 'image_url', image_url: { url } });
   }
   return content;
 }
@@ -449,15 +378,11 @@ function buildMessageContent(prompt: string, fileUrls: string[]) {
 function extractText(responseJson: any) {
   const message = responseJson?.choices?.[0]?.message;
   const content = message?.content;
-  if (typeof content === 'string') {
-    return content.trim();
-  }
+  if (typeof content === 'string') return content.trim();
   if (Array.isArray(content)) {
     return content
       .map((part) => {
-        if (typeof part === 'string') {
-          return part;
-        }
+        if (typeof part === 'string') return part;
         return part?.text || part?.content || '';
       })
       .join('')
@@ -474,26 +399,54 @@ function stripMarkdownCodeFence(value: string) {
     .trim();
 }
 
+/*
+ * Defensive JSON recovery for free models.
+ *
+ * Free models frequently return one of these defective shapes:
+ *
+ *   {\n
+ *   {
+ *     "microcycle": { ... }
+ *   }
+ *
+ *   {{ "microcycle": { ... } }}
+ *
+ *   Some prose then { "microcycle": { ... } }
+ *
+ * This parser:
+ * 1. Tries normal JSON.parse
+ * 2. Strips a single extra outer brace pair
+ * 3. Finds every balanced {...} object and prefers the one
+ *    that actually contains a "microcycle" key
+ * 4. Falls back to the longest balanced object
+ */
 function tryParseJson(value: string) {
-  const cleaned = stripMarkdownCodeFence(value);
-  if (!cleaned) {
-    return null;
-  }
+  let cleaned = stripMarkdownCodeFence(value);
+  if (!cleaned) return null;
 
+  // Normalise common leading/trailing junk that free models add.
+  cleaned = cleaned
+    .replace(/^\s*\{\s*\{\s*/, '{') // leading {{\n  or {\n{
+    .replace(/\s*\}\s*\}\s*$/, '}') // trailing }}
+    .trim();
+
+  // 1. Straight parse.
   try {
     return JSON.parse(cleaned);
   } catch {
-    // Continue with recovery.
+    // continue
   }
 
+  // 2. Exact {{ ... }} recovery (after the normalisation above this is rare).
   if (cleaned.startsWith('{{') && cleaned.endsWith('}}')) {
     try {
       return JSON.parse(cleaned.slice(1, -1).trim());
     } catch {
-      // Continue with balanced-object recovery.
+      // continue
     }
   }
 
+  // 3. Collect every balanced JSON object.
   const candidates: string[] = [];
   let depth = 0;
   let start = -1;
@@ -511,9 +464,7 @@ function tryParseJson(value: string) {
         escaped = true;
         continue;
       }
-      if (char === '"') {
-        inString = false;
-      }
+      if (char === '"') inString = false;
       continue;
     }
     if (char === '"') {
@@ -521,16 +472,12 @@ function tryParseJson(value: string) {
       continue;
     }
     if (char === '{') {
-      if (depth === 0) {
-        start = i;
-      }
+      if (depth === 0) start = i;
       depth += 1;
       continue;
     }
     if (char === '}') {
-      if (depth > 0) {
-        depth -= 1;
-      }
+      if (depth > 0) depth -= 1;
       if (depth === 0 && start >= 0) {
         candidates.push(cleaned.slice(start, i + 1));
         start = -1;
@@ -538,15 +485,44 @@ function tryParseJson(value: string) {
     }
   }
 
-  candidates.sort((a, b) => b.length - a.length);
-  for (const candidate of candidates) {
-    try {
-      return JSON.parse(candidate);
-    } catch {
-      // Try the next candidate.
-    }
+  // Prefer objects that look like our microcycle payload.
+  const scored = candidates
+    .map((c) => {
+      try {
+        const obj = JSON.parse(c);
+        const hasMicrocycle =
+          obj &&
+          typeof obj === 'object' &&
+          obj.microcycle &&
+          Array.isArray(obj.microcycle.days);
+        return {
+          raw: c,
+          obj,
+          score: hasMicrocycle ? 2 : 1,
+          len: c.length,
+        };
+      } catch {
+        return null;
+      }
+    })
+    .filter(Boolean) as Array<{
+    raw: string;
+    obj: any;
+    score: number;
+    len: number;
+  }>;
+
+  scored.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.len - a.len;
+  });
+
+  if (scored.length > 0) {
+    return scored[0].obj;
   }
 
+  // 4. Last-ditch: second opening brace → last closing brace
+  //    (covers the exact log you posted).
   const firstBrace = cleaned.indexOf('{');
   const secondBrace =
     firstBrace >= 0 ? cleaned.indexOf('{', firstBrace + 1) : -1;
@@ -555,9 +531,10 @@ function tryParseJson(value: string) {
     try {
       return JSON.parse(cleaned.slice(secondBrace, lastBrace + 1));
     } catch {
-      // No recoverable JSON.
+      // no recoverable JSON
     }
   }
+
   return null;
 }
 
@@ -571,11 +548,6 @@ function getModelsForRequest(type: string, hasMedia: boolean) {
   return FREE_TEXT_MODELS;
 }
 
-/*
- * ============================================================
- * RETRY BUDGET
- * ============================================================
- */
 function getRetryBudget(type: string, hasMedia: boolean) {
   if (type === 'microcycle') {
     return {
@@ -606,9 +578,7 @@ function getRetryBudget(type: string, hasMedia: boolean) {
  * ============================================================ */
 function getErrorMessage(raw: any, fallback: string) {
   const message = raw?.error?.message || raw?.message || raw?.error;
-  if (typeof message === 'string') {
-    return message;
-  }
+  if (typeof message === 'string') return message;
   return fallback;
 }
 
@@ -686,11 +656,7 @@ async function callOpenRouter(
     messages,
     stream: false,
     temperature: 0.2,
-    ...(responseFormat
-      ? {
-          response_format: responseFormat,
-        }
-      : {}),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
     max_tokens:
       type === 'microcycle'
         ? 8000
@@ -794,9 +760,7 @@ async function callOpenRouter(
  * ============================================================ */
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') {
-    return new Response('ok', {
-      headers: corsHeaders,
-    });
+    return new Response('ok', { headers: corsHeaders });
   }
 
   try {
