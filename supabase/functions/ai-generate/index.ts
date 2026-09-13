@@ -66,11 +66,11 @@ const VISUAL_TYPES = new Set([
 /*
  * These features expect the ENTIRE response to be a single
  * JSON object (parsed server-side in the retry loop below).
- * For these — and only these — we ask OpenRouter for its
- * "json_object" response format. That tells the free router to
- * pick a backend that actually supports constrained JSON
- * generation, instead of hoping a randomly-selected free model
- * happens to format plain-text-requested JSON correctly.
+ * For these — and only these — we ask OpenRouter for
+ * structured output. That tells the free router to pick a
+ * backend that actually supports constrained JSON generation,
+ * instead of hoping a randomly-selected free model happens to
+ * format plain-text-requested JSON correctly.
  *
  * This is deliberately NOT applied to visual/multimodal types:
  * requiring both image support AND structured-output support
@@ -83,6 +83,70 @@ const STRICT_JSON_TYPES = new Set([
   'structure',
   'microcycle',
 ]);
+
+/*
+ * "json_object" mode only guarantees the response IS valid
+ * JSON — it says nothing about its shape. A model can satisfy
+ * it with `{}` or with completely different keys than the ones
+ * our own validation checks for. For microcycle specifically we
+ * know exactly what shape is required (see the validation right
+ * after this response comes back), so we ask for that shape
+ * directly with a real JSON Schema — a much stronger guarantee
+ * than just "please be valid JSON".
+ *
+ * The schema is deliberately loose on everything below
+ * microcycle.days — we don't want to fight the model over
+ * per-exercise field names here, only guarantee the wrapper
+ * shape our own code actually depends on.
+ */
+function getResponseFormat(
+  type: string
+) {
+  if (type === 'microcycle') {
+    return {
+      type: 'json_schema',
+      json_schema: {
+        name: 'microcycle_response',
+        strict: false,
+        schema: {
+          type: 'object',
+          properties: {
+            microcycle: {
+              type: 'object',
+              properties: {
+                days: {
+                  type: 'array',
+                  minItems: 1,
+                  items: {
+                    type: 'object',
+                  },
+                },
+              },
+              required: [
+                'days',
+              ],
+            },
+          },
+          required: [
+            'microcycle',
+          ],
+        },
+      },
+    };
+  }
+
+  if (
+    STRICT_JSON_TYPES.has(
+      type
+    )
+  ) {
+    return {
+      type: 'json_object',
+    };
+  }
+
+  return null;
+}
 
 /*
  * Server-side subscription requirements.
@@ -1140,11 +1204,11 @@ function getRetryBudget(
   if (type === 'microcycle') {
     return {
       maxAttempts: 2,
-      perAttemptMs: 60000,
-      abortMs: 55000,
+      perAttemptMs: 65000,
+      abortMs: 60000,
       sleepMs: 2000,
     };
-    // Worst case: 2 * 60000 + 1 * 2000 = 122s.
+    // Worst case: 2 * 65000 + 1 * 2000 = 132s.
   }
 
   if (hasMedia) {
@@ -1298,11 +1362,12 @@ async function callOpenRouter(
   const hasMedia =
     fileUrls.length > 0;
 
-  const wantsStrictJson =
-    !hasMedia &&
-    STRICT_JSON_TYPES.has(
-      type
-    );
+  const responseFormat =
+    hasMedia
+      ? null
+      : getResponseFormat(
+          type
+        );
 
   const content =
     buildMessageContent(
@@ -1315,14 +1380,13 @@ async function callOpenRouter(
       Record<string, unknown>
     > = [];
 
-  if (wantsStrictJson) {
+  if (responseFormat) {
     /*
-     * Guarantee the "json_object" response format's
-     * requirement (the word "json" must appear
-     * somewhere in the conversation) is always met
-     * here, in the backend, rather than depending on
-     * the exact wording of whatever prompt the caller
-     * happens to send.
+     * Guarantee the response-format requirement that the
+     * word "json" must appear somewhere in the conversation
+     * is always met here, in the backend, rather than
+     * depending on the exact wording of whatever prompt the
+     * caller happens to send.
      */
     messages.push({
       role: 'system',
@@ -1346,11 +1410,10 @@ async function callOpenRouter(
 
     temperature: 0.2,
 
-    ...(wantsStrictJson
+    ...(responseFormat
       ? {
-          response_format: {
-            type: 'json_object',
-          },
+          response_format:
+            responseFormat,
         }
       : {}),
 
