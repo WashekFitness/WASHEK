@@ -64,65 +64,25 @@ const VISUAL_TYPES = new Set([
 ]);
 
 /*
- * Microcycle generation must return JSON.
- * Keep this schema intentionally focused on the fields the existing
- * server validates so the workout-generation structure itself is not changed.
+ * These features expect the ENTIRE response to be a single
+ * JSON object (parsed server-side in the retry loop below).
+ * For these — and only these — we ask OpenRouter for its
+ * "json_object" response format. That tells the free router to
+ * pick a backend that actually supports constrained JSON
+ * generation, instead of hoping a randomly-selected free model
+ * happens to format plain-text-requested JSON correctly.
+ *
+ * This is deliberately NOT applied to visual/multimodal types:
+ * requiring both image support AND structured-output support
+ * at once narrows the pool of compatible free backends, which
+ * is the opposite of what we want for those requests. It's also
+ * not applied to conversational types (kael, general), which
+ * are meant to return plain text, not JSON.
  */
-const MICROCYCLE_RESPONSE_SCHEMA = {
-  type: 'object',
-  additionalProperties: false,
-  properties: {
-    microcycle: {
-      type: 'object',
-      properties: {
-        days: {
-          type: 'array',
-          minItems: 1,
-          items: {
-            type: 'object',
-            properties: {
-              day_name: { type: 'string' },
-              workout_type: { type: 'string' },
-              exercises: {
-                type: 'array',
-                minItems: 1,
-                items: {
-                  type: 'object',
-                  properties: {
-                    name: { type: 'string' },
-                    sets: { type: 'integer' },
-                    reps: { type: 'string' },
-                    rest_seconds: { type: 'integer' },
-                    notes: { type: 'string' },
-                    activation_cue: { type: 'string' },
-                  },
-                  required: [
-                    'name',
-                    'sets',
-                    'reps',
-                    'rest_seconds',
-                    'notes',
-                    'activation_cue',
-                  ],
-                  additionalProperties: true,
-                },
-              },
-            },
-            required: [
-              'day_name',
-              'workout_type',
-              'exercises',
-            ],
-            additionalProperties: true,
-          },
-        },
-      },
-      required: ['days'],
-      additionalProperties: true,
-    },
-  },
-  required: ['microcycle'],
-};
+const STRICT_JSON_TYPES = new Set([
+  'structure',
+  'microcycle',
+]);
 
 /*
  * Server-side subscription requirements.
@@ -1155,6 +1115,57 @@ function getModelsForRequest(
   ];
 }
 
+/*
+ * ============================================================
+ * RETRY BUDGET
+ * ============================================================
+ *
+ * Not every request needs the same retry shape. A short chat
+ * reply or a compact analysis benefits from more, quicker
+ * attempts — the free router just needs another chance to pick
+ * a working backend. A full week of structured workout JSON
+ * (microcycle) is a much bigger generation: it genuinely needs
+ * more wall-clock time to finish, and cutting it off too early
+ * both times out AND produces truncated, invalid JSON. So it
+ * gets fewer attempts, each with much more room to breathe.
+ *
+ * Every combination here is chosen to keep the worst case
+ * (maxAttempts * perAttemptMs + (maxAttempts - 1) * sleepMs)
+ * safely under Supabase's own platform time limit.
+ */
+function getRetryBudget(
+  type: string,
+  hasMedia: boolean
+) {
+  if (type === 'microcycle') {
+    return {
+      maxAttempts: 2,
+      perAttemptMs: 60000,
+      abortMs: 55000,
+      sleepMs: 2000,
+    };
+    // Worst case: 2 * 60000 + 1 * 2000 = 122s.
+  }
+
+  if (hasMedia) {
+    return {
+      maxAttempts: 3,
+      perAttemptMs: 20000,
+      abortMs: 16000,
+      sleepMs: 2000,
+    };
+    // Worst case: 3 * 20000 + 2 * 2000 = 64s.
+  }
+
+  return {
+    maxAttempts: 4,
+    perAttemptMs: 20000,
+    abortMs: 16000,
+    sleepMs: 2000,
+  };
+  // Worst case: 4 * 20000 + 3 * 2000 = 86s.
+}
+
 /* ============================================================
  * OPENROUTER ERROR HELPERS
  * ============================================================ */
@@ -1211,6 +1222,67 @@ function sleep(
   );
 }
 
+/*
+ * ============================================================
+ * HARD DEADLINE
+ * ============================================================
+ *
+ * AbortController.abort() is supposed to cut an in-flight
+ * fetch off at a fixed time, but it is only a request to the
+ * underlying connection to stop — if a remote provider hangs
+ * in a way that doesn't tear down cleanly, the awaited promise
+ * can still sit unresolved well past the abort timer. When
+ * that happens here, Supabase's own platform-level idle
+ * timeout (around 150s) is what finally kills the function,
+ * which shows up to the user as a long silent hang instead of
+ * a fast, clean error.
+ *
+ * withDeadline() is a second, unconditional layer: it always
+ * settles at `ms`, regardless of what the wrapped promise is
+ * doing. If the underlying call is still stuck, we simply stop
+ * waiting on it here and return control to our own retry loop
+ * — the abandoned request is discarded once this function
+ * finishes and returns a response.
+ */
+function withDeadline<T>(
+  promise: Promise<T>,
+  ms: number,
+  label: string
+): Promise<T> {
+  return new Promise<T>(
+    (resolve, reject) => {
+      const timer =
+        setTimeout(
+          () => {
+            const timeoutError =
+              new Error(
+                `${label} timed out.`
+              );
+
+            (
+              timeoutError as any
+            ).status = 504;
+
+            reject(
+              timeoutError
+            );
+          },
+          ms
+        );
+
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    }
+  );
+}
+
 /* ============================================================
  * OPENROUTER REQUEST
  * ============================================================ */
@@ -1220,10 +1292,17 @@ async function callOpenRouter(
   model: string,
   type: string,
   prompt: string,
-  fileUrls: string[]
+  fileUrls: string[],
+  abortMs: number = 16000
 ) {
   const hasMedia =
     fileUrls.length > 0;
+
+  const wantsStrictJson =
+    !hasMedia &&
+    STRICT_JSON_TYPES.has(
+      type
+    );
 
   const content =
     buildMessageContent(
@@ -1231,24 +1310,53 @@ async function callOpenRouter(
       fileUrls
     );
 
+  const messages:
+    Array<
+      Record<string, unknown>
+    > = [];
+
+  if (wantsStrictJson) {
+    /*
+     * Guarantee the "json_object" response format's
+     * requirement (the word "json" must appear
+     * somewhere in the conversation) is always met
+     * here, in the backend, rather than depending on
+     * the exact wording of whatever prompt the caller
+     * happens to send.
+     */
+    messages.push({
+      role: 'system',
+      content:
+        'Respond with a single valid JSON object and nothing else — no prose, no markdown code fences.',
+    });
+  }
+
+  messages.push({
+    role: 'user',
+    content,
+  });
+
   const payload:
     Record<string, unknown> = {
     model,
 
-    messages: [
-      {
-        role: 'user',
-        content,
-      },
-    ],
+    messages,
 
     stream: false,
 
     temperature: 0.2,
 
+    ...(wantsStrictJson
+      ? {
+          response_format: {
+            type: 'json_object',
+          },
+        }
+      : {}),
+
     max_tokens:
       type === 'microcycle'
-        ? 6500
+        ? 8000
         : type === 'structure'
           ? 2500
           : type ===
@@ -1274,20 +1382,16 @@ async function callOpenRouter(
   };
 
   /*
-   * Microcycle generation is text-only structured generation.
-   * Force the response into the existing microcycle JSON shape so a
-   * free-routed model cannot satisfy the request with plain text such as
-   * "User Safety: safe". Other request types are left unchanged.
+   * Do not send response_format for visual
+   * requests because free multimodal providers
+   * have inconsistent structured-output support.
+   *
+   * JSON is requested in the prompt and parsed
+   * after the response.
    */
-  if (type === 'microcycle' && !hasMedia) {
-    payload.response_format = {
-      type: 'json_schema',
-      json_schema: {
-        name: 'washek_microcycle',
-        strict: true,
-        schema: MICROCYCLE_RESPONSE_SCHEMA,
-      },
-    };
+  if (!hasMedia) {
+    // Text-only requests intentionally remain
+    // provider-compatible without forcing a schema.
   }
 
   console.log(
@@ -1307,7 +1411,7 @@ async function callOpenRouter(
     setTimeout(
       () =>
         controller.abort(),
-      45000
+      abortMs
     );
 
   let response:
@@ -1776,16 +1880,26 @@ Deno.serve(
        * a router, retrying it gives OpenRouter
        * another opportunity to select an
        * available free endpoint.
+       *
+       * The shape of that retry (how many attempts,
+       * how long each one gets) depends on what kind
+       * of request this is — see getRetryBudget().
        */
-      const MAX_ATTEMPTS =
-        hasMedia
-          ? 3
-          : 2;
+      const {
+        maxAttempts,
+        perAttemptMs,
+        abortMs,
+        sleepMs,
+      } =
+        getRetryBudget(
+          type,
+          hasMedia
+        );
 
       for (
         let attempt = 0;
         attempt <
-        MAX_ATTEMPTS;
+        maxAttempts;
         attempt++
       ) {
         for (
@@ -1793,12 +1907,17 @@ Deno.serve(
         ) {
           try {
             const result =
-              await callOpenRouter(
-                apiKey,
-                model,
-                type,
-                prompt,
-                fileUrls
+              await withDeadline(
+                callOpenRouter(
+                  apiKey,
+                  model,
+                  type,
+                  prompt,
+                  fileUrls,
+                  abortMs
+                ),
+                perAttemptMs,
+                'OpenRouter request'
               );
 
             /*
@@ -1920,15 +2039,18 @@ Deno.serve(
         }
 
         /*
-         * Brief pause before giving the
-         * free router another opportunity.
+         * Longer pause before giving the free
+         * router another opportunity — enough for
+         * its internal state to plausibly shift to
+         * a different backend, not just an instant
+         * retry against the same overloaded one.
          */
         if (
           attempt <
-          MAX_ATTEMPTS - 1
+          maxAttempts - 1
         ) {
           await sleep(
-            750
+            sleepMs
           );
         }
       }
