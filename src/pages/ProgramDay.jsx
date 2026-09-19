@@ -12,13 +12,20 @@ export default function ProgramDay() {
   const location = useLocation();
   const queryClient = useQueryClient();
 
-  const [userEmail, setUserEmail] = useState(null);
-  useEffect(() => { supabaseApi.auth.me().then(u => setUserEmail(u?.email)); }, []);
+  const [user, setUser] = useState(null);
+  useEffect(() => {
+    supabaseApi.auth.me().then(setUser).catch(() => {});
+  }, []);
 
   const { data: programs = [], isLoading } = useQuery({
-    queryKey: ['programs', userEmail],
-    queryFn: () => supabaseApi.entities.WorkoutProgram.filter({ status: 'active', created_by: userEmail }, '-created_date', 1),
-    enabled: !!userEmail,
+    queryKey: ['programs', user?.id],
+    queryFn: () =>
+      supabaseApi.entities.WorkoutProgram.filter(
+        { status: 'active' },
+        '-created_at',
+        10
+      ),
+    enabled: !!user?.id,
   });
 
   const logMutation = useMutation({
@@ -30,9 +37,11 @@ export default function ProgramDay() {
   });
 
   const program = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
-  const weekNumber = location.state?.week || program?.current_week || 1;
-  const microcycle = program?.microcycles?.find(m => m.week_number === weekNumber);
-  const day = microcycle?.days?.[parseInt(dayIndex)];
+  const weekNumber = Number(location.state?.week) || Number(program?.current_week) || 1;
+  const microcycle = program?.microcycles?.find(
+    m => Number(m.week_number) === Number(weekNumber)
+  );
+  const day = microcycle?.days?.[parseInt(dayIndex, 10)];
 
   if (isLoading) {
     return (

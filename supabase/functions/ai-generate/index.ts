@@ -624,8 +624,91 @@ function withDeadline<T>(
 }
 
 /* ============================================================
- * OPENROUTER REQUEST
+ * GOOGLE GEMINI & OPENROUTER REQUESTS
  * ============================================================ */
+async function callGoogleGemini(
+  apiKey: string,
+  type: string,
+  prompt: string,
+  fileUrls: string[]
+) {
+  const parts: Array<Record<string, unknown>> = [];
+
+  for (const rawUrl of fileUrls) {
+    const url = String(rawUrl || '').trim();
+    if (!url) continue;
+
+    if (url.startsWith('data:')) {
+      const match = url.match(/^data:([^;]+);base64,(.+)$/);
+      if (match) {
+        parts.push({
+          inlineData: {
+            mimeType: match[1],
+            data: match[2],
+          },
+        });
+      }
+    } else if (url.startsWith('http://') || url.startsWith('https://')) {
+      try {
+        const res = await fetch(url);
+        if (res.ok) {
+          const buffer = await res.arrayBuffer();
+          const base64 = btoa(
+            String.fromCharCode(...new Uint8Array(buffer))
+          );
+          const mimeType = res.headers.get('content-type') || 'image/jpeg';
+          parts.push({
+            inlineData: {
+              mimeType,
+              data: base64,
+            },
+          });
+        }
+      } catch (fetchErr) {
+        console.warn('[Gemini Edge] Image fetch error:', fetchErr);
+      }
+    }
+  }
+
+  parts.push({ text: prompt });
+
+  const isJson =
+    STRICT_JSON_TYPES.has(type) ||
+    type === 'microcycle' ||
+    type === 'form_analysis' ||
+    type === 'food_scan' ||
+    type === 'progress_photo' ||
+    type === 'weekly_update';
+
+  const body: Record<string, unknown> = {
+    contents: [{ parts }],
+    generationConfig: isJson ? { responseMimeType: 'application/json' } : {},
+  };
+
+  const response = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    }
+  );
+
+  const raw = await response.json();
+  if (!response.ok) {
+    throw new Error(raw?.error?.message || `Google Gemini request failed with status ${response.status}`);
+  }
+
+  const outputText = raw?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+  return {
+    outputText,
+    model: 'gemini-3.8-flash',
+    usage: raw?.usageMetadata || null,
+  };
+}
+
 async function callOpenRouter(
   apiKey: string,
   models: string[],
@@ -861,14 +944,18 @@ Deno.serve(async (req) => {
     }
 
     /* --------------------------------------------------------
-     * OPENROUTER KEY
+     * AI PROVIDER & KEY
      * ------------------------------------------------------ */
-    const apiKey = Deno.env.get('OPENROUTER_API_KEY');
-    if (!apiKey) {
+    const geminiKey =
+      Deno.env.get('GEMINI_API_KEY') ||
+      Deno.env.get('GOOGLE_API_KEY');
+    const openrouterKey = Deno.env.get('OPENROUTER_API_KEY');
+
+    if (!geminiKey && !openrouterKey) {
       return json(
         {
           success: false,
-          error: 'OPENROUTER_API_KEY is not configured in Supabase.',
+          error: 'GEMINI_API_KEY is not configured.',
         },
         500
       );
@@ -915,16 +1002,18 @@ Deno.serve(async (req) => {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const result = await withDeadline(
-          callOpenRouter(
-            apiKey,
-            models,
-            type,
-            prompt,
-            fileUrls,
-            abortMs
-          ),
+          geminiKey
+            ? callGoogleGemini(geminiKey, type, prompt, fileUrls)
+            : callOpenRouter(
+                openrouterKey!,
+                models,
+                type,
+                prompt,
+                fileUrls,
+                abortMs
+              ),
           perAttemptMs,
-          'OpenRouter request'
+          geminiKey ? 'Google Gemini request' : 'OpenRouter request'
         );
 
         const parsed = tryParseJson(result.outputText);

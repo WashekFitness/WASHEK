@@ -283,6 +283,65 @@ function formatPhotoDateHeading(
 
 
 /* ==========================================================
+   PHOTO COMPRESSION FOR INSTANT UPLOAD & RAPID AI ANALYSIS
+   ========================================================== */
+
+async function compressImageFile(file, maxDimension = 1600, quality = 0.86) {
+  if (!file || !file.type?.startsWith('image/')) return file;
+  return new Promise((resolve) => {
+    try {
+      const img = new Image();
+      const url = URL.createObjectURL(file);
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        let { width, height } = img;
+        if (width <= maxDimension && height <= maxDimension && file.size < 500 * 1024) {
+          resolve(file);
+          return;
+        }
+        if (width > maxDimension || height > maxDimension) {
+          if (width > height) {
+            height = Math.round((height * maxDimension) / width);
+            width = maxDimension;
+          } else {
+            width = Math.round((width * maxDimension) / height);
+            height = maxDimension;
+          }
+        }
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, width);
+        canvas.height = Math.max(1, height);
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          resolve(file);
+          return;
+        }
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              resolve(file);
+              return;
+            }
+            const cleanName = (file.name || 'photo').replace(/\.[^/.]+$/, '') + '.jpg';
+            resolve(new File([blob], cleanName, { type: 'image/jpeg' }));
+          },
+          'image/jpeg',
+          quality
+        );
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        resolve(file);
+      };
+      img.src = url;
+    } catch {
+      resolve(file);
+    }
+  });
+}
+
+/* ==========================================================
    PAGE
    ========================================================== */
 
@@ -729,10 +788,12 @@ export default function ProgressPhotos() {
           );
         }
 
+        const fileToUpload = await compressImageFile(file, 1600, 0.86);
+
         const uploaded =
           await supabaseApi.storage.uploadFile(
             {
-              file,
+              file: fileToUpload,
             }
           );
 
@@ -890,8 +951,20 @@ insights must contain personalized coaching analysis.
 `;
 
 
-        const photoUrl =
+        let photoUrl =
           getPhotoDisplayUrl(photo);
+
+        if (!photoUrl && photo?.photo_url) {
+          try {
+            photoUrl = await supabaseApi.storage.resolveMediaUrl(photo.photo_url, 3600);
+          } catch (resErr) {
+            console.warn('[ProgressPhotos] Failed to resolve photo URL:', resErr);
+          }
+        }
+
+        if (!photoUrl && photo?.photo_url) {
+          photoUrl = photo.photo_url;
+        }
 
         if (!photoUrl) {
           throw new Error(
@@ -899,8 +972,7 @@ insights must contain personalized coaching analysis.
           );
         }
 
-
-        const result =
+        const rawResult =
           await supabaseApi.ai.invoke(
             {
               type:
@@ -917,26 +989,59 @@ insights must contain personalized coaching analysis.
             }
           );
 
+        let parsed = rawResult;
+        if (typeof parsed === 'string') {
+          try {
+            const clean = parsed
+              .replace(/^\uFEFF/, '')
+              .replace(/^```(?:json)?\s*/i, '')
+              .replace(/\s*```$/i, '')
+              .trim();
+            parsed = JSON.parse(clean);
+          } catch {
+            // Keep
+          }
+        }
 
-        const bodyFatRange =
+        if (parsed?.error || parsed?.message) {
+          throw new Error(parsed.error || parsed.message);
+        }
+
+        let bodyFatRange =
           String(
-            result?.body_fat_range ||
+            parsed?.body_fat_range ||
               ''
           ).trim();
 
-
-        const bodyFatNumeric =
+        let bodyFatNumeric =
           Number(
-            result?.body_fat_numeric
+            parsed?.body_fat_numeric
           );
 
+        // Smart extraction if format was string or numeric had subtle variations
+        if (!Number.isFinite(bodyFatNumeric) && bodyFatRange) {
+          const match = bodyFatRange.match(/(\d+(?:\.\d+)?)[^\d]+(\d+(?:\.\d+)?)/);
+          if (match) {
+            bodyFatNumeric = Number(((parseFloat(match[1]) + parseFloat(match[2])) / 2).toFixed(1));
+          } else {
+            const single = bodyFatRange.match(/(\d+(?:\.\d+)?)/);
+            if (single) {
+              bodyFatNumeric = Number(parseFloat(single[1]).toFixed(1));
+            }
+          }
+        }
+
+        if (!bodyFatRange && Number.isFinite(bodyFatNumeric)) {
+          bodyFatRange = `${(bodyFatNumeric - 1.5).toFixed(1)}-${(bodyFatNumeric + 1.5).toFixed(1)}%`;
+        }
 
         const insights =
           String(
-            result?.insights ||
+            parsed?.insights ||
+              parsed?.coaching_insights ||
+              parsed?.summary ||
               ''
           ).trim();
-
 
         if (
           !bodyFatRange
@@ -945,7 +1050,6 @@ insights must contain personalized coaching analysis.
             'The AI did not return a body-fat range.'
           );
         }
-
 
         if (
           !Number.isFinite(
@@ -956,7 +1060,6 @@ insights must contain personalized coaching analysis.
             'The AI did not return a valid body-fat estimate.'
           );
         }
-
 
         if (
           !insights

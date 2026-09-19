@@ -120,6 +120,7 @@ export default function AppLayout() {
     });
   }, [
     location.pathname,
+    location.search,
   ]);
 
 

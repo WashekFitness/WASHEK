@@ -1,6 +1,7 @@
 import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { buildWeekPrompt } from '@/lib/trainingTypes';
+import { build12WeekMicrocycles } from '@/lib/periodizationEngine';
 
 /*
  * ============================================================
@@ -395,74 +396,141 @@ async function fetchProgram(
  * ============================================================
  */
 
-export async function getCalendarWeek(
-  programId
+export function calculateLocalCalendarWeek(
+  programCreatedAt,
+  durationWeeks = 12
 ) {
-  const {
-    data,
-    error,
-  } =
-    await supabase.rpc(
-      'get_current_program_week',
-      {
-        p_program_id:
-          programId,
+  if (!programCreatedAt) return 1;
+  try {
+    const created = new Date(programCreatedAt);
+    const now = new Date();
+
+    // Start of week (Monday) for created date
+    const createdMonday = new Date(created);
+    const cDay = createdMonday.getDay();
+    const cDiff = cDay === 0 ? -6 : 1 - cDay;
+    createdMonday.setDate(createdMonday.getDate() + cDiff);
+    createdMonday.setHours(0, 0, 0, 0);
+
+    // Start of week (Monday) for current date
+    const currentMonday = new Date(now);
+    const nDay = currentMonday.getDay();
+    const nDiff = nDay === 0 ? -6 : 1 - nDay;
+    currentMonday.setDate(currentMonday.getDate() + nDiff);
+    currentMonday.setHours(0, 0, 0, 0);
+
+    const msDiff = currentMonday.getTime() - createdMonday.getTime();
+    const weeksDiff = Math.floor(msDiff / (7 * 24 * 60 * 60 * 1000));
+    const calculated = Math.max(1, weeksDiff + 1);
+    const duration = Math.min(Number(durationWeeks) || 12, 12);
+    return Math.min(calculated, duration);
+  } catch {
+    return 1;
+  }
+}
+
+export async function getCalendarWeek(
+  programId,
+  programCreatedAt = null,
+  durationWeeks = 12
+) {
+  try {
+    const {
+      data,
+      error,
+    } =
+      await supabase.rpc(
+        'get_current_program_week',
+        {
+          p_program_id:
+            programId,
+        }
+      );
+
+    if (error) {
+      throw error;
+    }
+
+    if (
+      typeof data === 'number' &&
+      Number.isFinite(data)
+    ) {
+      return data;
+    }
+
+    if (
+      typeof data === 'string' &&
+      Number.isFinite(Number(data))
+    ) {
+      return Number(data);
+    }
+
+    const result =
+      rpcObject(data);
+
+    const candidates = [
+      result.current_week,
+      result.week_number,
+      result.get_current_program_week,
+    ];
+
+    for (
+      const candidate of candidates
+    ) {
+      const number =
+        Number(candidate);
+
+      if (
+        Number.isFinite(number)
+      ) {
+        return number;
       }
+    }
+  } catch (rpcErr) {
+    console.warn(
+      '[ProgramWeekGeneration] get_current_program_week RPC unavailable, calculating from timestamps:',
+      rpcErr?.message || rpcErr
     );
-
-  if (error) {
-    throw error;
   }
 
-  /*
-   * The SQL function returns an integer, but accepting an
-   * object here makes this tolerant of a future RPC shape.
-   */
+  return calculateLocalCalendarWeek(programCreatedAt, durationWeeks);
+}
 
-  if (
-    typeof data === 'number'
-  ) {
-    return data;
+
+/*
+ * ============================================================
+ * LOCAL CLAIM LEASE (RESILIENT DATABASE FALLBACK)
+ * ============================================================
+ *
+ * If the remote database has not migrated the generation tracking
+ * table, a memory-backed lease prevents duplicate simultaneous
+ * calls without crashing the app.
+ */
+
+const localClaims = new Map();
+
+function getLocalClaimLease(programId, weekNumber) {
+  const key = `${programId}:${weekNumber}`;
+  const now = Date.now();
+  const existing = localClaims.get(key);
+
+  if (existing && now - existing < 10 * 60 * 1000) {
+    return {
+      allowed: false,
+      reason: 'generation_in_progress',
+    };
   }
 
-  if (
-    typeof data === 'string'
-  ) {
-    const number =
-      Number(data);
+  localClaims.set(key, now);
+  return {
+    allowed: true,
+    reason: null,
+  };
+}
 
-    if (
-      Number.isFinite(number)
-    ) {
-      return number;
-    }
-  }
-
-  const result =
-    rpcObject(data);
-
-  const candidates = [
-    result.current_week,
-    result.week_number,
-    result.get_current_program_week,
-  ];
-
-  for (
-    const candidate of candidates
-  ) {
-    const number =
-      Number(candidate);
-
-    if (
-      Number.isFinite(number)
-    ) {
-      return number;
-    }
-  }
-
-  throw new Error(
-    'Could not determine the current program calendar week.'
-  );
+function releaseLocalClaimLease(programId, weekNumber) {
+  const key = `${programId}:${weekNumber}`;
+  localClaims.delete(key);
 }
 
 
@@ -476,26 +544,34 @@ async function claimWeek(
   programId,
   weekNumber
 ) {
-  const {
-    data,
-    error,
-  } =
-    await supabase.rpc(
-      'claim_program_week_generation',
-      {
-        p_program_id:
-          programId,
+  try {
+    const {
+      data,
+      error,
+    } =
+      await supabase.rpc(
+        'claim_program_week_generation',
+        {
+          p_program_id:
+            programId,
 
-        p_week_number:
-          weekNumber,
-      }
+          p_week_number:
+            weekNumber,
+        }
+      );
+
+    if (error) {
+      throw error;
+    }
+
+    return rpcObject(data);
+  } catch (err) {
+    console.warn(
+      `[ProgramWeekGeneration] Remote claim RPC unavailable for week ${weekNumber}, using fallback lease:`,
+      err?.message || err
     );
-
-  if (error) {
-    throw error;
+    return getLocalClaimLease(programId, weekNumber);
   }
-
-  return rpcObject(data);
 }
 
 
@@ -505,34 +581,84 @@ async function claimWeek(
  * ============================================================
  */
 
+async function directCompleteWeek(programId, weekNumber, microcycle) {
+  const freshProgram = await fetchProgram(programId);
+  const existingMicrocycles = asArray(freshProgram.microcycles);
+
+  const updatedMicrocycles = existingMicrocycles
+    .filter(w => Number(w?.week_number) !== Number(weekNumber))
+    .concat(microcycle)
+    .sort((a, b) => (Number(a?.week_number) || 0) - (Number(b?.week_number) || 0));
+
+  const currentWk = Number(freshProgram.current_week) || 1;
+  const newCurrentWeek = Math.max(
+    currentWk,
+    Number(weekNumber) === currentWk + 1
+      ? Number(weekNumber)
+      : currentWk
+  );
+
+  const { data, error } = await supabase
+    .from('workout_programs')
+    .update({
+      microcycles: updatedMicrocycles,
+      current_week: newCurrentWeek,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', programId)
+    .select('*')
+    .single();
+
+  if (error) {
+    console.error('[ProgramWeekGeneration] Direct program update error:', error);
+    return {
+      ...freshProgram,
+      microcycles: updatedMicrocycles,
+      current_week: newCurrentWeek,
+    };
+  }
+
+  return data;
+}
+
 async function completeWeek(
   programId,
   weekNumber,
   microcycle
 ) {
-  const {
-    data,
-    error,
-  } =
-    await supabase.rpc(
-      'complete_program_week_generation',
-      {
-        p_program_id:
-          programId,
+  try {
+    const {
+      data,
+      error,
+    } =
+      await supabase.rpc(
+        'complete_program_week_generation',
+        {
+          p_program_id:
+            programId,
 
-        p_week_number:
-          weekNumber,
+          p_week_number:
+            weekNumber,
 
-        p_microcycle:
-          microcycle,
-      }
+          p_microcycle:
+            microcycle,
+        }
+      );
+
+    if (error) {
+      throw error;
+    }
+
+    releaseLocalClaimLease(programId, weekNumber);
+    return rpcObject(data);
+  } catch (err) {
+    console.warn(
+      `[ProgramWeekGeneration] Remote complete RPC unavailable for week ${weekNumber}, updating directly:`,
+      err?.message || err
     );
-
-  if (error) {
-    throw error;
+    releaseLocalClaimLease(programId, weekNumber);
+    return directCompleteWeek(programId, weekNumber, microcycle);
   }
-
-  return rpcObject(data);
 }
 
 
@@ -546,9 +672,8 @@ async function failWeek(
   programId,
   weekNumber
 ) {
-  const {
-    error,
-  } =
+  releaseLocalClaimLease(programId, weekNumber);
+  try {
     await supabase.rpc(
       'fail_program_week_generation',
       {
@@ -559,11 +684,10 @@ async function failWeek(
           weekNumber,
       }
     );
-
-  if (error) {
-    console.error(
-      '[ProgramWeekGeneration] Failed to mark generation as failed:',
-      error
+  } catch (error) {
+    console.warn(
+      '[ProgramWeekGeneration] Remote fail RPC unavailable:',
+      error?.message || error
     );
   }
 }
@@ -954,14 +1078,42 @@ export async function ensureCurrentProgramWeek(
     );
 
   /*
+   * If the program has fewer than 12 weeks, expand to all 12 weeks
+   * so the entire periodized macrocycle is available immediately.
+   */
+  const existingWeeks = asArray(program.microcycles);
+  const weekOne = existingWeeks.find(w => Number(w.week_number) === 1);
+
+  if (weekOne && existingWeeks.length < 12) {
+    try {
+      const full12 = build12WeekMicrocycles(weekOne, {
+        trainingType: program.training_type || 'calisthenics',
+      });
+
+      const mergedWeeks = full12.map(w => {
+        const found = existingWeeks.find(e => Number(e.week_number) === Number(w.week_number));
+        return found || w;
+      });
+
+      await supabase
+        .from('workout_programs')
+        .update({
+          microcycles: mergedWeeks,
+          duration_weeks: 12,
+        })
+        .eq('id', program.id);
+
+      program.microcycles = mergedWeeks;
+      program.duration_weeks = 12;
+    } catch (expansionErr) {
+      console.warn('[ProgramWeekGeneration] Could not auto-expand to 12 weeks:', expansionErr);
+    }
+  }
+
+  /*
    * Ask the database what calendar week the athlete is actually
    * in. This is independent of how many workouts they completed.
    */
-
-  const targetWeek =
-    await getCalendarWeek(
-      program.id
-    );
 
   const durationWeeks =
     Math.min(
@@ -969,6 +1121,13 @@ export async function ensureCurrentProgramWeek(
         program.duration_weeks
       ) || 12,
       12
+    );
+
+  const targetWeek =
+    await getCalendarWeek(
+      program.id,
+      program.created_at,
+      durationWeeks
     );
 
   const cappedTargetWeek =
@@ -992,7 +1151,7 @@ export async function ensureCurrentProgramWeek(
     false;
 
   /*
-   * Generate at most ONE missing week per bootstrap check.
+   * Generate or advance at most ONE missing week per bootstrap check.
    *
    * If an athlete has been away for several weeks, do not fire
    * multiple AI generations back-to-back in one app load. Each
@@ -1007,66 +1166,109 @@ export async function ensureCurrentProgramWeek(
     const nextWeek =
       currentWeek + 1;
 
-    const result =
-      await generateOneWeek(
-        program,
-        user,
-        nextWeek
+    const microcycles =
+      asArray(
+        program.microcycles
       );
 
-    /*
-     * If another tab/device is currently generating the week,
-     * stop here. That other process owns the generation.
-     */
+    const alreadyPresent =
+      microcycles.find(
+        week =>
+          Number(
+            week?.week_number
+          ) ===
+          Number(
+            nextWeek
+          )
+      );
 
     if (
-      result.reason ===
-      'generation_in_progress'
+      alreadyPresent
     ) {
-      program =
-        await fetchProgram(
-          program.id
-        );
-    } else {
       /*
-       * Refresh regardless of whether the week already existed.
+       * Week already exists (e.g. from 12-week macrocycle expansion).
+       * Advance current_week directly without calling generative AI or failing claim RPC.
+       */
+      try {
+        await supabase
+          .from('workout_programs')
+          .update({
+            current_week: nextWeek,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', program.id);
+
+        program.current_week = nextWeek;
+        currentWeek = nextWeek;
+        generatedAny = false;
+      } catch (updErr) {
+        console.warn(
+          '[ProgramWeekGeneration] Failed to advance current_week directly:',
+          updErr
+        );
+      }
+    } else {
+      const result =
+        await generateOneWeek(
+          program,
+          user,
+          nextWeek
+        );
+
+      /*
+       * If another tab/device is currently generating the week,
+       * stop here. That other process owns the generation.
        */
 
-      program =
-        result.program ||
-        await fetchProgram(
-          program.id
-        );
-
-      const microcycles =
-        asArray(
-          program.microcycles
-        );
-
-      const weekNowExists =
-        microcycles.some(
-          week =>
-            Number(
-              week?.week_number
-            ) ===
-            Number(
-              nextWeek
-            )
-        );
-
       if (
-        weekNowExists
+        result.reason ===
+        'generation_in_progress'
       ) {
-        currentWeek =
-          Math.max(
-            currentWeek,
-            nextWeek
+        program =
+          await fetchProgram(
+            program.id
+          );
+      } else {
+        /*
+         * Refresh regardless of whether the week already existed.
+         */
+
+        program =
+          result.program ||
+          await fetchProgram(
+            program.id
           );
 
-        generatedAny =
-          Boolean(
-            result.generated
+        const updatedMicrocycles =
+          asArray(
+            program.microcycles
           );
+
+        const weekNowExists =
+          updatedMicrocycles.some(
+            week =>
+              Number(
+                week?.week_number
+              ) ===
+              Number(
+                nextWeek
+              )
+          );
+
+        if (
+          weekNowExists
+        ) {
+          currentWeek =
+            Math.max(
+              currentWeek,
+              nextWeek
+            );
+
+          generatedAny =
+            Boolean(
+              result.generated
+            );
+        }
       }
     }
   }

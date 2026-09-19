@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { ArrowLeft, Check, Timer, MessageSquare, Zap } from 'lucide-react';
+import { ArrowLeft, Check, Timer, MessageSquare, Zap, TrendingUp, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { getLocalDateKey } from '@/lib/dateUtils';
 
 export default function DayWorkout({ day, weekNumber, onBack, onComplete }) {
   const [completedSets, setCompletedSets] = useState({});
@@ -26,7 +27,7 @@ export default function DayWorkout({ day, weekNumber, onBack, onComplete }) {
   const handleFinish = () => {
     const duration = Math.round((Date.now() - startTime) / 60000);
     onComplete({
-      date: new Date().toISOString().split('T')[0],
+      date: getLocalDateKey(),
       week_number: weekNumber,
       day_name: day.day_name,
       exercises_completed: day.exercises?.map((ex, i) => ({
@@ -58,7 +59,15 @@ export default function DayWorkout({ day, weekNumber, onBack, onComplete }) {
           )}>
             <div className="flex items-start justify-between mb-3">
               <div className="flex-1">
-                <p className="font-heading font-bold">{ex.name}</p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <p className="font-heading font-bold">{ex.name}</p>
+                  {ex.recalibrated_by_kael && (
+                    <span className="text-[10px] font-semibold bg-primary/15 text-primary px-1.5 py-0.5 rounded border border-primary/25 flex items-center gap-1">
+                      <Sparkles className="w-2.5 h-2.5" />
+                      Kael Calibrated
+                    </span>
+                  )}
+                </div>
                 <div className="flex items-center gap-3 mt-1 text-xs text-muted-foreground">
                   <span>{ex.sets} sets × {ex.reps}</span>
                   <span className="flex items-center gap-0.5">
@@ -78,6 +87,15 @@ export default function DayWorkout({ day, weekNumber, onBack, onComplete }) {
               <div className="flex items-start gap-1.5 mb-3 text-xs text-muted-foreground bg-muted/50 rounded-lg p-2">
                 <MessageSquare className="w-3 h-3 mt-0.5 shrink-0" />
                 <span>{ex.notes}</span>
+              </div>
+            )}
+            {ex.predicted_progress && (
+              <div className="flex items-start gap-1.5 mb-3 text-xs bg-primary/10 border border-primary/20 rounded-lg p-2 text-primary font-medium">
+                <TrendingUp className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                <div>
+                  <span className="font-bold">Predicted Progress: </span>
+                  <span className="text-foreground">{ex.predicted_progress}</span>
+                </div>
               </div>
             )}
             {ex.activation_cue && (

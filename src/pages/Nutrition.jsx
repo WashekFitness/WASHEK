@@ -27,7 +27,7 @@ import PullToRefresh from '@/components/layout/PullToRefresh';
 import PageHeader from '@/components/layout/PageHeader';
 
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
-import { getLocalDateKey } from '@/lib/messageLimit';
+import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 export default function Nutrition() {
   const queryClient =
@@ -35,20 +35,47 @@ export default function Nutrition() {
 
   /*
    * ============================================================
-   * CURRENT LOCAL DATE
+   * USER & TIMEZONE SYNCHRONIZATION
    * ============================================================
-   *
-   * This MUST use the browser's local calendar date.
-   *
-   * Do NOT use:
-   *
-   * new Date().toISOString().split('T')[0]
-   *
-   * because that uses UTC and can cause food to appear on the
-   * wrong day for users in US time zones and other time zones.
    */
-  const today =
-    getLocalDateKey();
+  const [
+    user,
+    setUser,
+  ] = useState(null);
+
+  /*
+   * Synchronized to the user's specific calendar day and timezone.
+   * At exactly 12:00:00 AM midnight in their timezone, todayKey
+   * automatically advances, instantly resetting macro tracking for
+   * the fresh day and invalidating relevant queries.
+   */
+  const { todayKey: today, timeZone } = useMidnightSync(user);
+
+  useEffect(() => {
+    let active = true;
+
+    supabaseApi.auth
+      .me()
+      .then((currentUser) => {
+        if (!active) {
+          return;
+        }
+
+        setUser(
+          currentUser
+        );
+      })
+      .catch((error) => {
+        console.error(
+          '[Nutrition] Failed to load user:',
+          error
+        );
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
 
   const [
@@ -78,45 +105,6 @@ export default function Nutrition() {
         next
       );
     };
-
-
-  /*
-   * ============================================================
-   * USER
-   * ============================================================
-   */
-
-  const [
-    user,
-    setUser,
-  ] = useState(null);
-
-
-  useEffect(() => {
-    let active = true;
-
-    supabaseApi.auth
-      .me()
-      .then((currentUser) => {
-        if (!active) {
-          return;
-        }
-
-        setUser(
-          currentUser
-        );
-      })
-      .catch((error) => {
-        console.error(
-          '[Nutrition] Failed to load user:',
-          error
-        );
-      });
-
-    return () => {
-      active = false;
-    };
-  }, []);
 
 
   /*

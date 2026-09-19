@@ -15,6 +15,7 @@ import { AuthProvider, useAuth } from '@/lib/AuthContext';
 
 import AppLayout from '@/components/layout/AppLayout';
 import ProgramWeekBootstrap from '@/components/program/ProgramWeekBootstrap';
+import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 import PageNotFound from '@/lib/PageNotFound';
 
@@ -46,6 +47,12 @@ function PageLoader() {
   );
 }
 
+function GlobalMidnightWatcher() {
+  const { user } = useAuth();
+  useMidnightSync(user);
+  return null;
+}
+
 function AuthenticatedApp() {
   const { isLoadingAuth, isAuthenticated } = useAuth();
   const location = useLocation();
@@ -57,7 +64,8 @@ function AuthenticatedApp() {
   if (
     !isAuthenticated &&
     location.pathname !== '/login' &&
-    location.pathname !== '/reset-password'
+    location.pathname !== '/reset-password' &&
+    location.pathname !== '/subscription-return'
   ) {
     return <Navigate to="/login" replace />;
   }
@@ -71,6 +79,7 @@ function AuthenticatedApp() {
 
   return (
     <>
+      {isAuthenticated && <GlobalMidnightWatcher />}
       {isAuthenticated && <ProgramWeekBootstrap />}
 
       <Suspense fallback={<PageLoader />}>

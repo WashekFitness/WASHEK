@@ -8,7 +8,9 @@ const SUPABASE_ANON_KEY =
   ''
 
 const STRIPE_SECRET_KEY = Deno.env.get('STRIPE_SECRET_KEY') ?? ''
-const APP_URL = Deno.env.get('APP_URL') ?? ''
+const APP_URL =
+  Deno.env.get('APP_URL') ||
+  'https://washek.ai.studio'
 
 if (
   !SUPABASE_URL ||
@@ -292,6 +294,7 @@ async function createCheckoutSession(params: {
   plan: Plan
   customerId: string | null
   oldSubscriptionId: string | null
+  appUrl?: string
 }) {
   const {
     userId,
@@ -299,7 +302,10 @@ async function createCheckoutSession(params: {
     plan,
     customerId,
     oldSubscriptionId,
+    appUrl = APP_URL,
   } = params
+
+  const baseUrl = (appUrl || APP_URL).replace(/\/+$/, '')
 
   const body = new URLSearchParams()
 
@@ -315,12 +321,12 @@ async function createCheckoutSession(params: {
 
   body.set(
     'success_url',
-    `${APP_URL}/subscription-return?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}`,
+    `${baseUrl}/subscription-return?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}`,
   )
 
   body.set(
     'cancel_url',
-    `${APP_URL}/profile`,
+    `${baseUrl}/profile`,
   )
 
   body.set(
@@ -426,6 +432,11 @@ Deno.serve(async (req) => {
         ? requestBody.plan.toLowerCase().trim()
         : ''
 
+    const requestedAppUrl =
+      typeof requestBody?.app_url === 'string' && requestBody.app_url.trim()
+        ? requestBody.app_url.trim()
+        : undefined
+
     if (!VALID_PLANS.has(requestedPlan)) {
       return jsonResponse(
         {
@@ -523,6 +534,7 @@ Deno.serve(async (req) => {
         plan,
         customerId,
         oldSubscriptionId,
+        appUrl: requestedAppUrl,
       })
 
     if (!session?.url) {

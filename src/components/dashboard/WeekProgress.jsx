@@ -2,29 +2,15 @@ import { Link } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
 import { CalendarCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { getWeekDaysForDate, getUserTimeZone } from '@/lib/dateUtils';
 
-export default function WeekProgress({ logs }) {
-  const weekDays = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+export default function WeekProgress({ logs, user, timeZone }) {
+  const effectiveTz = timeZone || getUserTimeZone(user);
+  const weekDays = getWeekDaysForDate(new Date(), effectiveTz);
 
-  const getThisWeekStart = () => {
-    const d = new Date();
-    const day = d.getDay();
-    const diff = d.getDate() - day + (day === 0 ? -6 : 1);
-    return new Date(d.setDate(diff));
-  };
-
-  const weekStart = getThisWeekStart();
-  const today = new Date();
-
-  const completedDays = weekDays.map((_, i) => {
-    const date = new Date(weekStart);
-    date.setDate(weekStart.getDate() + i);
-    const dateStr = date.toISOString().split('T')[0];
-    return logs.some(l => l.date === dateStr);
-  });
-
-  const todayIndex = (today.getDay() + 6) % 7;
-  const workoutsThisWeek = completedDays.filter(Boolean).length;
+  const completedDays = weekDays.map(dayObj =>
+    logs?.some(l => l.date === dayObj.dateStr)
+  );
 
   return (
     <Card className="p-5">
@@ -41,17 +27,17 @@ export default function WeekProgress({ logs }) {
       </div>
 
       <div className="flex items-center justify-between gap-1">
-        {weekDays.map((day, i) => (
-          <div key={day} className="flex flex-col items-center gap-1.5">
+        {weekDays.map((dayObj, i) => (
+          <div key={dayObj.dateStr} className="flex flex-col items-center gap-1.5">
             <div className={cn(
               'w-9 h-9 rounded-xl flex items-center justify-center text-xs font-semibold transition-all',
               completedDays[i]
                 ? 'bg-primary text-primary-foreground'
-                : i === todayIndex
+                : dayObj.isToday
                   ? 'bg-primary/20 text-primary border border-primary/40'
                   : 'bg-muted text-muted-foreground'
             )}>
-              {day[0]}
+              {dayObj.dayShort[0]}
             </div>
           </div>
         ))}

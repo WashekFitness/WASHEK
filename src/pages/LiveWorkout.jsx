@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { canAccess } from '@/lib/subscription';
+import { applyPostWorkoutAdaptation } from '@/lib/periodizationEngine';
+import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -27,6 +29,7 @@ import {
 import { cn } from '@/lib/utils';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { toast } from 'sonner';
+import { getLocalDateKey } from '@/lib/dateUtils';
 
 // ─── Timer ─────────────────────────────────────────────
 function useTimer() {
@@ -220,7 +223,7 @@ function MovementBaseline({ trainingType }) {
   const queryClient = useQueryClient();
   const { settings } = useAppSettings();
 
-  const today = new Date().toISOString().split('T')[0];
+  const today = getLocalDateKey();
 
   const [values, setValues] = useState({});
   const [customEntries, setCustomEntries] = useState([]);
@@ -743,7 +746,7 @@ function PostWorkoutCheckin({
         )
         .join('\n');
 
-      if (canAdjust && program) {
+      if (program) {
         const currentWeek = program.current_week || 1;
 
         const nextMicrocycle =
@@ -762,7 +765,7 @@ function PostWorkoutCheckin({
           hybrid: 'hybrid training',
         }[trainingType];
 
-        const elitePrompt = `You are Kael, an elite ${typeLabel} coach. An athlete just finished a workout and gave you feedback.
+        const elitePrompt = `You are Kael, an elite ${typeLabel} coach. An athlete just finished a workout and gave you feedback to adapt their 12-week program and recalibrate their predicted progression.
 
 POST-WORKOUT FEEDBACK:
 "${checkin}"
@@ -771,9 +774,9 @@ EXERCISES COMPLETED TODAY:
 ${exerciseSummary}
 
 CURRENT WEEK:
-${currentWeek}
+Week ${currentWeek} of 12
 
-NEXT WEEK'S PROGRAM TO ADJUST:
+UPCOMING PROGRAMMED WORKOUT FOR THIS DAY:
 ${
   nextMicrocycle
     ? JSON.stringify(
@@ -784,22 +787,26 @@ ${
         null,
         2
       )
-    : 'No next week programmed yet.'
+    : 'No upcoming workout found.'
 }
 
 Based on the athlete's feedback AND their actual reps/sets completed today:
 
-1. Give a 1-2 sentence direct human response.
-2. If performance was strong, recommend specific progressions for next week.
-3. If performance was poor, fatigue was high, or pain was reported, reduce training stress appropriately.
-4. Return the adjusted exercises array for next week's same day.
-5. Preserve activation cues and useful coaching notes.
-6. Do not diagnose injuries or medical conditions.
+1. Give a 1-2 sentence direct, personal human coaching response.
+2. Determine their progress trajectory: "accelerating" (if they crushed targets or felt it was too easy), "steady" (progressing well on track), or "recovering" (if they reported discomfort, fatigue, or missed reps).
+3. If performance was strong/easy, recommend specific progressive overload targets for future weeks.
+4. If fatigue was high, discomfort/pain was reported, or form broke down, reduce stress or substitute safer exercise variations.
+5. Provide a 1-sentence projected outlook of what their progress will look like over the upcoming weeks.
+6. Return the calibrated exercises array for this training day to apply across remaining weeks.
+7. Preserve activation cues and clear coaching notes.
+8. Do not diagnose injuries or medical conditions.
 
 Respond in JSON:
 {
   "coach_response": "...",
   "adjustments_summary": "...",
+  "progress_trajectory": "accelerating | steady | recovering",
+  "projected_outlook": "...",
   "adjusted_exercises": [
     {
       "name": "...",
@@ -822,6 +829,13 @@ Respond in JSON:
                 type: 'string',
               },
               adjustments_summary: {
+                type: 'string',
+              },
+              progress_trajectory: {
+                type: 'string',
+                enum: ['accelerating', 'steady', 'recovering'],
+              },
+              projected_outlook: {
                 type: 'string',
               },
               adjusted_exercises: {
@@ -854,50 +868,34 @@ Respond in JSON:
           },
         });
 
-        const note = `${result.coach_response}\n\n📋 Next workout adjusted: ${result.adjustments_summary}`;
+        const note = `${result.coach_response}\n\n📋 12-Week Program Recalibrated: ${result.adjustments_summary}${
+          result.projected_outlook ? `\n🎯 Projected Outlook: ${result.projected_outlook}` : ''
+        }`;
 
         setAiNote(note);
 
         await onSave(checkin, note);
 
         if (
-          nextMicrocycle &&
           result.adjusted_exercises?.length > 0
         ) {
-          const updatedMicrocycles =
-            program.microcycles.map(mc => {
-              if (
-                mc.week_number !==
-                currentWeek + 1
-              ) {
-                return mc;
-              }
-
-              const updatedDays = mc.days.map(d => {
-                if (
-                  d.day_name ===
-                  log?.day_name
-                ) {
-                  return {
-                    ...d,
-                    exercises:
-                      result.adjusted_exercises,
-                  };
-                }
-
-                return d;
-              });
-
-              return {
-                ...mc,
-                days: updatedDays,
-              };
-            });
+          const adaptedProgram = applyPostWorkoutAdaptation({
+            currentProgram: program,
+            currentWeek,
+            dayName: log?.day_name,
+            adjustedExercises: result.adjusted_exercises,
+            checkinSummary: result.adjustments_summary,
+            coachResponse: result.coach_response,
+            trajectory: result.progress_trajectory || 'steady',
+            projectedOutlook: result.projected_outlook || '',
+          });
 
           await supabaseApi.entities.WorkoutProgram.update(
             program.id,
             {
-              microcycles: updatedMicrocycles,
+              microcycles: adaptedProgram.microcycles,
+              adaptation_history: adaptedProgram.adaptation_history,
+              last_adapted_by_kael: adaptedProgram.last_adapted_by_kael,
             }
           );
 
@@ -1176,7 +1174,7 @@ export default function LiveWorkout() {
       }),
   });
 
-  const program = programs[0];
+  const program = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
 
   const currentWeekNum =
     program?.current_week || 1;
@@ -1335,9 +1333,7 @@ export default function LiveWorkout() {
 
     logMutation.mutate({
       program_id: program?.id,
-      date: new Date()
-        .toISOString()
-        .split('T')[0],
+      date: getLocalDateKey(),
       week_number: currentWeekNum,
       day_name: day?.day_name,
       exercises_completed:

@@ -22,11 +22,17 @@ import {
   Trash2,
   Save,
   X,
+  Sparkles,
+  Loader2,
+  TrendingUp,
+  Shield,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
 import { hasPlan } from '@/lib/subscription';
 import { supabaseApi } from '@/lib/supabaseApi';
+import { build12WeekMicrocycles, WEEK_CONFIGS } from '@/lib/periodizationEngine';
+import { toast } from 'sonner';
 
 const weekTypeConfig = {
   foundation: {
@@ -400,20 +406,90 @@ export default function WeeklyPlan({
     setSavingEdit,
   ] = useState(false);
 
-  const allWeeks = useMemo(
-    () =>
-      Array.isArray(
-        program?.microcycles
-      )
-        ? program.microcycles
-        : [],
-    [program]
-  );
+  const [
+    isGeneratingWeeks,
+    setIsGeneratingWeeks,
+  ] = useState(false);
 
-  const totalWeeks =
-    program?.duration_weeks ||
-    allWeeks.length ||
-    12;
+  const allWeeks = useMemo(() => {
+    const rawWeeks = Array.isArray(program?.microcycles)
+      ? program.microcycles
+      : [];
+
+    if (rawWeeks.length >= 12) {
+      return rawWeeks;
+    }
+
+    const baseWeek =
+      rawWeeks.find(w => Number(w.week_number) === 1) || rawWeeks[0];
+
+    if (baseWeek) {
+      try {
+        const full12 = build12WeekMicrocycles(baseWeek, {
+          trainingType: program?.training_type || 'calisthenics',
+        });
+        return full12.map(w => {
+          const existing = rawWeeks.find(
+            e => Number(e.week_number) === Number(w.week_number)
+          );
+          return existing || w;
+        });
+      } catch (err) {
+        console.warn('[WeeklyPlan] build12WeekMicrocycles error:', err);
+      }
+    }
+
+    return rawWeeks;
+  }, [program]);
+
+  // Persist 12-week microcycles in the database if the active program only had 1 week
+  useEffect(() => {
+    if (
+      program?.id &&
+      Array.isArray(program.microcycles) &&
+      program.microcycles.length < 12 &&
+      allWeeks.length >= 12
+    ) {
+      supabaseApi.entities.WorkoutProgram.update(program.id, {
+        microcycles: allWeeks,
+        duration_weeks: 12,
+      }).catch(err => {
+        console.warn('[WeeklyPlan] Background sync 12 weeks:', err);
+      });
+    }
+  }, [program?.id, program?.microcycles, allWeeks]);
+
+  const handleGenerateAll12Weeks = async () => {
+    if (!program?.id) return;
+    setIsGeneratingWeeks(true);
+    try {
+      const baseWeek = allWeeks.find(w => Number(w.week_number) === 1) || allWeeks[0];
+      if (!baseWeek) {
+        toast.error('No baseline week found to build progression.');
+        return;
+      }
+      const full12Weeks = build12WeekMicrocycles(baseWeek, {
+        trainingType: program.training_type || 'calisthenics',
+      });
+      await supabaseApi.entities.WorkoutProgram.update(program.id, {
+        microcycles: full12Weeks,
+        duration_weeks: 12,
+      });
+      toast.success('Generated full 12-week periodized program!');
+      window.location.reload();
+    } catch (err) {
+      console.error('[WeeklyPlan] Failed to generate 12 weeks:', err);
+      toast.error('Could not generate 12 weeks. Please try again.');
+    } finally {
+      setIsGeneratingWeeks(false);
+    }
+  };
+
+  const totalWeeks = Math.max(
+    12,
+    Number(program?.duration_weeks) || 12,
+    allWeeks.length
+  );
 
   const currentWeek =
     program?.current_week ||
@@ -1140,46 +1216,108 @@ export default function WeeklyPlan({
           ====================================================== */}
 
       {!currentMicrocycle && (
-        <Card className="p-6 text-center border-dashed">
-
-          <Eye className="w-8 h-8 mx-auto mb-2 text-muted-foreground opacity-40" />
-
-          <p className="font-heading font-bold text-sm">
-            Week {selectedWeek} Not Yet Generated
-          </p>
-
-          <p className="text-xs text-muted-foreground mt-1">
-            This week's plan will be personalized based on your
-            program and workout history.
-          </p>
-
+        <Card className="p-6 text-center border-dashed space-y-3">
+          <Eye className="w-8 h-8 mx-auto text-muted-foreground opacity-40" />
+          <div>
+            <p className="font-heading font-bold text-sm">
+              Week {selectedWeek} Not Loaded
+            </p>
+            <p className="text-xs text-muted-foreground mt-1">
+              Generate the full 12-week periodized progression from your Week 1 foundation.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            onClick={handleGenerateAll12Weeks}
+            disabled={isGeneratingWeeks}
+            className="gap-2 mx-auto"
+          >
+            {isGeneratingWeeks ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <Sparkles className="w-4 h-4" />
+            )}
+            Generate Full 12-Week Plan
+          </Button>
         </Card>
       )}
 
 
       {/* ======================================================
-          FUTURE WEEK
+          PREDICTED PROGRESSION MODEL
           ====================================================== */}
 
-      {currentMicrocycle &&
-        isFutureWeek && (
-          <div className="flex items-start gap-2.5 p-3 rounded-xl bg-muted/40 border border-border/60">
+      {currentMicrocycle && (
+        <div
+          className={cn(
+            'p-4 rounded-xl border transition-all space-y-2.5',
+            isFutureWeek
+              ? 'bg-gradient-to-br from-primary/10 via-primary/5 to-transparent border-primary/25 shadow-sm'
+              : 'bg-muted/30 border-border'
+          )}
+        >
+          <div className="flex items-start justify-between gap-3 flex-wrap">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-primary/15 flex items-center justify-center text-primary flex-shrink-0">
+                <TrendingUp className="w-4 h-4" />
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-primary">
+                    {isFutureWeek ? 'Predicted Progress Model' : 'Current Training Focus'}
+                  </p>
+                  {currentMicrocycle.week_type && (
+                    <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20">
+                      {currentMicrocycle.week_type}
+                    </span>
+                  )}
+                </div>
+                <p className="text-xs font-semibold text-foreground mt-0.5 leading-snug">
+                  {currentMicrocycle.predicted_focus ||
+                    WEEK_CONFIGS[selectedWeek - 1]?.predicted_focus ||
+                    `Week ${selectedWeek} Periodized Progression`}
+                </p>
+              </div>
+            </div>
 
-            <Eye className="w-4 h-4 text-muted-foreground mt-0.5 flex-shrink-0" />
-
-            <p className="text-xs text-muted-foreground leading-relaxed">
-
-              <span className="font-semibold text-foreground/70">
-                Estimated plan.
-              </span>{' '}
-
-              These workouts are your projected baseline.
-              Live workout tracking remains available.
-
-            </p>
-
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {(currentMicrocycle.target_rir || WEEK_CONFIGS[selectedWeek - 1]?.target_rir) && (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-background border text-muted-foreground">
+                  Target: {currentMicrocycle.target_rir || WEEK_CONFIGS[selectedWeek - 1]?.target_rir}
+                </span>
+              )}
+              {(currentMicrocycle.volume_delta || WEEK_CONFIGS[selectedWeek - 1]?.volume_delta) && (
+                <span className="text-[10px] font-medium px-2 py-0.5 rounded-full bg-primary/15 text-primary border border-primary/20">
+                  {currentMicrocycle.volume_delta || WEEK_CONFIGS[selectedWeek - 1]?.volume_delta}
+                </span>
+              )}
+            </div>
           </div>
-        )}
+
+          {program?.last_adapted_by_kael ? (
+            <div className="pt-2 border-t border-primary/15 space-y-1">
+              <div className="flex items-start gap-2 text-xs text-muted-foreground">
+                <Sparkles className="w-3.5 h-3.5 text-primary flex-shrink-0 mt-0.5" />
+                <div className="flex-1">
+                  <span className="font-semibold text-foreground">Calibrated by Coach Kael: </span>
+                  <span>
+                    "{program.last_adapted_by_kael.summary}" (following Week {program.last_adapted_by_kael.week_number} check-in)
+                  </span>
+                </div>
+              </div>
+              {program.last_adapted_by_kael.projected_outlook && (
+                <p className="text-[11px] text-primary font-medium pl-5">
+                  🎯 Outlook: {program.last_adapted_by_kael.projected_outlook}
+                </p>
+              )}
+            </div>
+          ) : (
+            <p className="text-[11px] text-muted-foreground leading-relaxed">
+              ⚡ This predicted progression adapts continuously as you complete workouts and log post-workout feedback with Kael.
+            </p>
+          )}
+        </div>
+      )}
 
 
       {/* ======================================================
@@ -1367,14 +1505,14 @@ export default function WeeklyPlan({
 
                                     {exercise?.sets !==
                                       undefined && (
-                                      <span className="text-[11px] text-muted-foreground">
+                                      <span className="text-[11px] text-muted-foreground font-medium">
                                         {exercise.sets}{' '}
                                         sets
                                       </span>
                                     )}
 
                                     {exercise?.reps && (
-                                      <span className="text-[11px] text-muted-foreground">
+                                      <span className="text-[11px] text-muted-foreground font-medium">
                                         ×{' '}
                                         {exercise.reps}
                                       </span>
@@ -1390,7 +1528,21 @@ export default function WeeklyPlan({
                                       </span>
                                     )}
 
+                                    {exercise?.recalibrated_by_kael && (
+                                      <span className="text-[9px] font-semibold bg-primary/15 text-primary px-1.5 py-0.5 rounded border border-primary/25 flex items-center gap-1">
+                                        <Sparkles className="w-2.5 h-2.5" />
+                                        Kael Calibrated
+                                      </span>
+                                    )}
+
                                   </div>
+
+                                  {exercise?.predicted_progress && (
+                                    <div className="flex items-start gap-1.5 mt-1.5 text-[11px] text-primary font-medium bg-primary/5 border border-primary/15 px-2 py-1 rounded-md">
+                                      <TrendingUp className="w-3 h-3 flex-shrink-0 mt-0.5" />
+                                      <span className="leading-tight">{exercise.predicted_progress}</span>
+                                    </div>
+                                  )}
 
                                 </div>
 

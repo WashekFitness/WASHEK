@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 
@@ -13,7 +13,7 @@ import WeeklyUpdate from '@/components/dashboard/WeeklyUpdate';
 import PullToRefresh from '@/components/layout/PullToRefresh';
 import QuickAccess from '@/components/layout/QuickAccess';
 
-import { getLocalDateKey } from '@/lib/messageLimit';
+import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -21,16 +21,10 @@ export default function Dashboard() {
   const [user, setUser] = useState(null);
 
   /*
-   * Always use the browser's LOCAL calendar date.
-   *
-   * This keeps Dashboard nutrition synchronized with the Nutrition
-   * page and prevents the totals from changing/resetting at the
-   * wrong time because of UTC conversion.
+   * Synchronized to the user's specific calendar day and timezone.
+   * Automatically resets at exactly 12:00:00 AM midnight.
    */
-  const today = useMemo(
-    () => getLocalDateKey(),
-    []
-  );
+  const { todayKey: today, timeZone } = useMidnightSync(user);
 
   useEffect(() => {
     let mounted = true;
@@ -251,11 +245,15 @@ export default function Dashboard() {
 
           <StreakCard
             logs={logs}
+            user={user}
+            timeZone={timeZone}
           />
 
 
           <DailyWorkoutCard
             program={activeProgram}
+            user={user}
+            timeZone={timeZone}
           />
 
 
@@ -267,6 +265,8 @@ export default function Dashboard() {
 
           <WeekProgress
             logs={logs}
+            user={user}
+            timeZone={timeZone}
           />
 
 
@@ -276,6 +276,7 @@ export default function Dashboard() {
             photos={photos}
             user={user}
             program={activeProgram}
+            timeZone={timeZone}
           />
 
 

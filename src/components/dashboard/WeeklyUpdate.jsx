@@ -18,56 +18,31 @@ import {
 } from 'lucide-react';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { canAccess } from '@/lib/subscription';
+import {
+  getLocalDateKey,
+  isMondayInTimeZone,
+  getWeekDaysForDate,
+  getUserTimeZone,
+} from '@/lib/dateUtils';
 
 
 // ============================================================
 // DATE HELPERS
 // ============================================================
 
-function formatDateLocal(date) {
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
+function getPreviousWeekRange(timeZone = null) {
+  const currentWeekDays = getWeekDaysForDate(new Date(), timeZone);
+  const currentMondayStr = currentWeekDays[0].dateStr;
+  const [y, m, d] = currentMondayStr.split('-').map(Number);
+  const ref = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
 
-  return `${year}-${month}-${day}`;
-}
-
-
-function getMonday(date = new Date()) {
-  const d = new Date(date);
-  const day = d.getDay();
-
-  const diff = day === 0 ? -6 : 1 - day;
-
-  d.setDate(d.getDate() + diff);
-  d.setHours(0, 0, 0, 0);
-
-  return d;
-}
-
-
-function getPreviousWeekRange() {
-  const currentMonday = getMonday();
-
-  const previousMonday = new Date(currentMonday);
-  previousMonday.setDate(
-    previousMonday.getDate() - 7
-  );
-
-  const previousSunday = new Date(currentMonday);
-  previousSunday.setDate(
-    previousSunday.getDate() - 1
-  );
+  const prevMonDate = new Date(ref.getTime() - 7 * 86400000);
+  const prevSunDate = new Date(ref.getTime() - 1 * 86400000);
 
   return {
-    start: formatDateLocal(previousMonday),
-    end: formatDateLocal(previousSunday),
+    start: getLocalDateKey(prevMonDate, timeZone),
+    end: getLocalDateKey(prevSunDate, timeZone),
   };
-}
-
-
-function isMonday() {
-  return new Date().getDay() === 1;
 }
 
 
@@ -213,6 +188,7 @@ export default function WeeklyUpdate({
   photos = [],
   user,
   program,
+  timeZone,
 }) {
   const { settings } = useAppSettings();
 
@@ -236,7 +212,8 @@ export default function WeeklyUpdate({
   const [checkingWeeklyUpdate, setCheckingWeeklyUpdate] =
     useState(true);
 
-  const monday = isMonday();
+  const effectiveTz = timeZone || getUserTimeZone(user);
+  const monday = isMondayInTimeZone(new Date(), effectiveTz);
 
   const hasNutritionInsights = canAccess(
     user?.subscription_plan,
@@ -244,8 +221,8 @@ export default function WeeklyUpdate({
   );
 
   const previousWeek = useMemo(
-    () => getPreviousWeekRange(),
-    []
+    () => getPreviousWeekRange(effectiveTz),
+    [effectiveTz]
   );
 
   const weekStart =

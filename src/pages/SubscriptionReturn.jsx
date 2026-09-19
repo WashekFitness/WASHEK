@@ -66,6 +66,21 @@ export default function SubscriptionReturn() {
   ] =
     useState('');
 
+  /*
+   * Guarantee that any return from Stripe on another host
+   * immediately transfers to washek.ai.studio.
+   */
+  useEffect(() => {
+    if (
+      typeof window !== 'undefined' &&
+      window.location.hostname &&
+      !window.location.hostname.includes('washek.ai.studio')
+    ) {
+      const search = window.location.search || '';
+      window.location.replace(`https://washek.ai.studio/subscription-return${search}`);
+    }
+  }, []);
+
   useEffect(() => {
     let cancelled =
       false;

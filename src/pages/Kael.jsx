@@ -28,7 +28,11 @@ import {
 
 import {
   getServerMessageStats,
+  computeStats,
 } from '@/lib/messageLimit';
+import { useAuth } from '@/lib/AuthContext';
+import { useMidnightSync } from '@/hooks/useMidnightSync';
+import { getUserTimeZone } from '@/lib/dateUtils';
 
 import {
   useAppSettings,
@@ -63,17 +67,17 @@ const CONTEXT_MESSAGE_COUNT = 30;
  * appears on screen. It does not change AI quality or logic.
  */
 
-const TYPEWRITER_MIN_DELAY = 3;
-const TYPEWRITER_MAX_DELAY = 16;
-
-const TYPEWRITER_MAX_DURATION = 4200;
-
+const TYPEWRITER_MIN_DELAY = 1;
+const TYPEWRITER_MAX_DELAY = 14;
 
 /*
  * Calculate a typing delay based on plan and text length.
  *
- * Higher plans reveal responses faster while still keeping
- * enough pacing that the answer remains easy to read.
+ * Each plan tier noticeably accelerates the response speed:
+ * - Free: 11ms (deliberate, steady pacing)
+ * - Progress: 6ms (faster, responsive stream)
+ * - Performance: 3ms (high-speed delivery)
+ * - Elite: 1ms (lightning-fast, near-instant streaming)
  */
 
 function getTypingDelay(
@@ -82,11 +86,11 @@ function getTypingDelay(
 ) {
   const planDelay =
     plan === 'elite'
-      ? 4
+      ? 1
       : plan === 'performance'
-        ? 6
+        ? 3
         : plan === 'progress'
-          ? 8
+          ? 6
           : 11;
 
   if (
@@ -105,59 +109,95 @@ function getTypingDelay(
     textLength <= 600
   ) {
     return Math.max(
-      3,
+      1,
       planDelay - 1
     );
   }
 
   return Math.max(
-    3,
+    1,
     planDelay - 2
   );
 }
 
 
 /*
- * Split text into very small chunks.
- *
- * We use chunks rather than literally one character per render,
- * because rendering every single character can make mobile
- * devices feel sluggish.
+ * Split text into chunks that scale directly with the user's plan.
+ * Higher tiers stream multiple characters per tick for noticeably
+ * faster and smoother reveals.
  */
 
 function getTypingChunkSize(
-  textLength
+  textLength,
+  plan = 'free'
 ) {
+  const baseChunk =
+    plan === 'elite'
+      ? 10
+      : plan === 'performance'
+        ? 6
+        : plan === 'progress'
+          ? 3
+          : 1;
+
   if (
     textLength <= 150
   ) {
-    return 1;
+    return baseChunk;
   }
 
   if (
     textLength <= 400
   ) {
-    return 2;
+    return baseChunk + 1;
   }
 
   if (
     textLength <= 900
   ) {
-    return 3;
+    return baseChunk + 2;
   }
 
-  return 4;
+  return baseChunk + 3;
 }
 
 
 /*
  * Small natural pauses after punctuation.
- * These make the response feel more like deliberate typing.
+ * Pacing scales with plan so higher tiers reveal even more briskly.
  */
 
 function getPunctuationPause(
-  character
+  character,
+  plan = 'free'
 ) {
+  if (plan === 'elite') {
+    return 1;
+  }
+
+  if (plan === 'performance') {
+    if (
+      character === '.' ||
+      character === '!' ||
+      character === '?'
+    ) {
+      return 5;
+    }
+    return 2;
+  }
+
+  if (plan === 'progress') {
+    if (
+      character === '.' ||
+      character === '!' ||
+      character === '?'
+    ) {
+      return 9;
+    }
+    return 4;
+  }
+
+  // Free plan: deliberate, natural cadence
   if (
     character === '.' ||
     character === '!' ||
@@ -213,7 +253,10 @@ export default function Kael() {
     setStats,
   ] = useState(null);
 
+  const { user: authUser } = useAuth() || {};
+  const effectiveUser = user || authUser;
 
+  const { timeZone } = useMidnightSync(effectiveUser);
 
   const bottomRef =
     useRef(null);
@@ -238,7 +281,7 @@ export default function Kael() {
 
   /*
    * ==========================================================
-   * LOAD USER
+   * LOAD USER & TIMEZONE SYNCHRONIZATION
    * ==========================================================
    */
 
@@ -252,11 +295,15 @@ export default function Kael() {
           return;
         }
 
-        setUser(u);
+        const loadedUser = u || authUser;
+        if (loadedUser) {
+          setUser(loadedUser);
+        }
 
-        getServerMessageStats()
+        const effectiveTz = timeZone || getUserTimeZone(loadedUser);
+        getServerMessageStats(effectiveTz)
           .then((serverStats) => {
-            if (active) {
+            if (active && serverStats) {
               setStats(serverStats);
             }
           })
@@ -272,12 +319,50 @@ export default function Kael() {
           '[KAEL] Failed to load user:',
           error
         );
+        const effectiveTz = timeZone || getUserTimeZone(authUser);
+        getServerMessageStats(effectiveTz)
+          .then((serverStats) => {
+            if (active && serverStats) {
+              setStats(serverStats);
+            }
+          })
+          .catch(() => {});
       });
 
     return () => {
       active = false;
     };
+  }, [timeZone, authUser]);
+
+  // Real-time listener for quota updates dispatched anywhere in the app
+  useEffect(() => {
+    const handleQuotaUpdate = (e) => {
+      if (e?.detail) {
+        setStats(e.detail);
+      }
+    };
+
+    window.addEventListener('kael-quota-updated', handleQuotaUpdate);
+    return () => {
+      window.removeEventListener('kael-quota-updated', handleQuotaUpdate);
+    };
   }, []);
+
+  // Automatically refresh usage when midnight strikes in the user's timezone
+  useEffect(() => {
+    const handleMidnightReset = () => {
+      getServerMessageStats(timeZone)
+        .then((serverStats) => {
+          if (serverStats) setStats(serverStats);
+        })
+        .catch(() => {});
+    };
+
+    window.addEventListener('calendar-day-reset', handleMidnightReset);
+    return () => {
+      window.removeEventListener('calendar-day-reset', handleMidnightReset);
+    };
+  }, [timeZone]);
 
 
   /*
@@ -390,13 +475,22 @@ export default function Kael() {
    */
 
   const plan =
-    user?.subscription_plan ||
+    effectiveUser?.subscription_plan ||
     'free';
 
+  const effectiveTz = timeZone || getUserTimeZone(effectiveUser);
+
+  const displayStats =
+    stats ||
+    computeStats(
+      effectiveUser,
+      plan,
+      effectiveTz
+    );
 
   const atLimit =
-    stats
-      ? stats.remaining === 0
+    displayStats
+      ? displayStats.remaining === 0
       : false;
 
 
@@ -456,18 +550,18 @@ export default function Kael() {
 
 
     /*
-     * Response length increases by plan, but accuracy,
-     * reasoning quality, and safety standards remain the same.
+     * Response depth, detail, and coaching intelligence scale with plan,
+     * while accuracy, scientific reasoning, and safety are 100% rigorous on all tiers.
      */
 
     const responseDepthInstruction =
       plan === 'elite'
-        ? `\n\nRESPONSE DEPTH — ELITE: Give the most complete useful coaching answer. Usually aim for roughly 120–220 words when the question genuinely benefits from detail, but do not pad short/simple answers. Explain the key reasoning, practical application, important nuances, and relevant next steps. Use short bullets when they improve clarity. Never sacrifice accuracy, safety, or necessary context just to hit a word target.`
+        ? `\n\nRESPONSE DEPTH & INTELLIGENCE — ELITE: Provide the ultimate masterclass coaching answer (roughly 180–320 words when the question benefits from depth, or concise when a direct answer is best). Break down the exact biomechanics and kinetic chain, include at least one '🔐 Elite tip:' or '⚡ Secret:' with insider coaching nuance, and include '🛡️ Elite recovery:' or '🔋 Recovery call:' guidance when fatigue/rest is relevant. Never sacrifice accuracy, safety, or necessary context.`
         : plan === 'performance'
-          ? `\n\nRESPONSE DEPTH — PERFORMANCE: Give a moderately detailed coaching answer. Usually aim for roughly 90–160 words when the question genuinely benefits from detail, but do not pad short/simple answers. Include useful reasoning, practical application, and important details without becoming repetitive. Never sacrifice accuracy, safety, or necessary context just to hit a word target.`
+          ? `\n\nRESPONSE DEPTH & INTELLIGENCE — PERFORMANCE: Provide an advanced, highly detailed coaching answer (roughly 130–200 words when the question benefits from depth). Break down movement tempo (concentric/eccentric cadence), neuromuscular activation cues, exercise synergy, and practical performance tips. Never sacrifice accuracy, safety, or necessary context.`
           : plan === 'progress'
-            ? `\n\nRESPONSE DEPTH — PROGRESS: Give a concise but meaningfully explained coaching answer. Usually aim for roughly 60–120 words when the question genuinely benefits from detail, but do not pad short/simple answers. Give the recommendation plus the most useful explanation or application detail. Never sacrifice accuracy, safety, or necessary context just to hit a word target.`
-            : `\n\nRESPONSE DEPTH — FREE: Keep responses concise and direct. Usually aim for roughly 40–80 words when the question genuinely benefits from more than a one-sentence answer. Give the correct recommendation and only the most useful supporting detail. Do not add filler, long introductions, repeated conclusions, or unnecessary background. IMPORTANT: Free users must receive the same level of accuracy, careful reasoning, safety standards, and quality of recommendation as paid users. Shorter does NOT mean less intelligent or less accurate. If extra context is necessary to avoid a misleading or unsafe answer, include it even when it makes the response longer than the target.`;
+            ? `\n\nRESPONSE DEPTH & INTELLIGENCE — PROGRESS: Provide a smart, well-explained coaching answer (roughly 80–140 words when the question benefits from depth). Provide the exact recommendation, the biomechanical 'why' behind it, and clear actionable progression steps. Never sacrifice accuracy, safety, or necessary context.`
+            : `\n\nRESPONSE DEPTH & INTELLIGENCE — FREE: Keep responses concise and direct (roughly 40–80 words). Provide the 100% accurate recommendation, essential execution cue, and immediate next action without filler or long introductions. Remember: Free users receive the exact same 100% scientific and safety accuracy, delivered concisely.`;
 
 
     const recentHistory =
@@ -490,7 +584,7 @@ export default function Kael() {
     return `${getKaelSystemPrompt(
       trainingType,
       firstName,
-      isElite
+      plan
     )}${responseDepthInstruction}${langInstruction}\n\nCONVERSATION HISTORY (remember what the user has told you about their capabilities, limitations, and preferences — update your understanding if they say something new or different):\n${recentHistory}\n\nKael:`;
   };
 
@@ -528,9 +622,21 @@ export default function Kael() {
 
 
       /*
-       * Keep the complete visual typing animation under roughly
-       * 4.2 seconds for normal responses.
+       * Maximum animation duration scales by plan tier so upgraded users
+       * experience tangibly faster answer delivery:
+       * - Free: up to 4.2s (deliberate)
+       * - Progress: up to 2.4s (faster)
+       * - Performance: up to 1.3s (high speed)
+       * - Elite: up to 0.55s (lightning-fast near-instant stream)
        */
+      const planMaxDuration =
+        plan === 'elite'
+          ? 550
+          : plan === 'performance'
+            ? 1300
+            : plan === 'progress'
+              ? 2400
+              : 4200;
 
       const baseDelay =
         Math.min(
@@ -547,14 +653,14 @@ export default function Kael() {
 
       const chunkSize =
         getTypingChunkSize(
-          textLength
+          textLength,
+          plan
         );
 
 
       /*
        * Safety adjustment:
-       * never allow the typewriter to become excessively slow
-       * on a long response.
+       * never allow the typewriter to exceed the plan-specific duration cap.
        */
 
       const estimatedDuration =
@@ -567,14 +673,14 @@ export default function Kael() {
 
       const speedMultiplier =
         estimatedDuration >
-        TYPEWRITER_MAX_DURATION
-          ? TYPEWRITER_MAX_DURATION /
+        planMaxDuration
+          ? planMaxDuration /
             estimatedDuration
           : 1;
 
 
       const delay = Math.max(
-        2,
+        1,
         Math.round(
           baseDelay *
             speedMultiplier
@@ -645,7 +751,8 @@ export default function Kael() {
 
         const punctuationPause =
           getPunctuationPause(
-            lastCharacter
+            lastCharacter,
+            plan
           );
 
 
@@ -760,6 +867,9 @@ export default function Kael() {
               prompt,
               type:
                 'kael',
+              plan:
+                plan ||
+                'free',
             }
           );
 
@@ -781,6 +891,11 @@ export default function Kael() {
                 result.details
                   .quota
               );
+              if (typeof window !== 'undefined') {
+                window.dispatchEvent(
+                  new CustomEvent('kael-quota-updated', { detail: result.details.quota })
+                );
+              }
             }
 
             throw new Error(
@@ -806,34 +921,52 @@ export default function Kael() {
               '';
 
 
+        if (result?.quota) {
+          setStats(result.quota);
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('kael-quota-updated', { detail: result.quota })
+            );
+          }
+        }
+
         if (!responseText) {
           throw new Error(
             'Kael returned an empty response.'
           );
         }
 
-
         await typeAssistantResponse(
           responseText,
           temporaryId
         );
 
-
         typingCancelledRef.current =
           false;
-
 
         /*
          * Refresh the displayed remaining-message count from
          * the same server-authoritative source used to enforce
          * it. The browser never sets this value itself.
          */
-        getServerMessageStats()
+        getServerMessageStats(timeZone)
           .then(
             (serverStats) => {
-              setStats(
-                serverStats
-              );
+              if (serverStats) {
+                setStats(
+                  (prev) => {
+                    if (
+                      prev &&
+                      typeof prev.used === 'number' &&
+                      typeof serverStats.used === 'number' &&
+                      serverStats.used < prev.used
+                    ) {
+                      return prev;
+                    }
+                    return serverStats;
+                  }
+                );
+              }
             }
           )
           .catch(
@@ -844,7 +977,6 @@ export default function Kael() {
               );
             }
           );
-
 
         try {
           await supabaseApi.entities.KaelMessage.create(
@@ -875,19 +1007,12 @@ export default function Kael() {
           );
         }
 
-
-        /*
-         * The server quota was already claimed before the AI call.
-         * Do not increment usage from the browser.
-         */
-
       } catch (error) {
 
         console.error(
           '[KAEL] Failed to send message:',
           error
         );
-
 
         setMessages(
           (current) =>
@@ -898,6 +1023,14 @@ export default function Kael() {
             )
         );
 
+        const isLimitError =
+          error?.message?.includes('monthly') ||
+          error?.message?.includes('limit') ||
+          error?.message?.includes('KAEL_LIMIT_REACHED');
+
+        const errorMessageText = isLimitError
+          ? 'You have reached your monthly message limit for Coach Kael. Upgrade your plan to continue chatting with advanced guidance.'
+          : 'Sorry — I had trouble generating that response. Please try again.';
 
         setMessages(
           (current) => [
@@ -908,12 +1041,18 @@ export default function Kael() {
               role:
                 'assistant',
               content:
-                'Sorry — I had trouble generating that response. Please try again.',
+                errorMessageText,
               created_date:
                 new Date().toISOString(),
             },
           ]
         );
+
+        if (isLimitError) {
+          getServerMessageStats(timeZone).then((serverStats) => {
+            if (serverStats) setStats(serverStats);
+          }).catch(() => {});
+        }
 
       } finally {
 
@@ -1060,7 +1199,7 @@ export default function Kael() {
             " />
 
 
-            {stats && (
+            {displayStats && (
               <span
                 className={cn(
                   `
@@ -1085,7 +1224,7 @@ export default function Kael() {
                 )}
               >
                 {
-                  stats.remaining
+                  displayStats.remaining
                 }{' '}
                 msg left
               </span>
@@ -1308,7 +1447,7 @@ export default function Kael() {
               ">
                 You've used all{' '}
                 {
-                  stats?.limit
+                  displayStats?.limit
                 }{' '}
                 messages this month.
                 Upgrade your plan to keep
@@ -1326,7 +1465,7 @@ export default function Kael() {
           RESET NOTE
           ====================================================== */}
 
-      {stats &&
+      {displayStats &&
         !atLimit && (
           <p className="
             text-[10px]
@@ -1336,11 +1475,11 @@ export default function Kael() {
             px-4
           ">
             {
-              stats.remaining
+              displayStats.remaining
             }{' '}
             of{' '}
             {
-              stats.limit
+              displayStats.limit
             }{' '}
             messages left · resets monthly
           </p>

@@ -7,6 +7,7 @@ import {
   Flame,
   Loader2,
   XCircle,
+  ShieldCheck,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
@@ -14,6 +15,25 @@ import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 
 import { supabase } from '@/lib/supabase';
+
+const freePlan = {
+  name: 'Free',
+  planKey: 'free',
+  price: '$0',
+  period: '/forever',
+  icon: ShieldCheck,
+  color: 'text-muted-foreground',
+  borderColor: 'border-border/60',
+  bgColor: 'bg-muted/10',
+  badge: null,
+  features: [
+    '100 Kael AI messages/month',
+    'Super accurate baseline coaching (100% scientific & biomechanical accuracy on every answer)',
+    'Direct, concise guidance (~40–80 words) with essential execution cues',
+    'Full live workout tracker with auto-rest timer',
+    'Standard response streaming speed',
+  ],
+};
 
 const plans = [
   {
@@ -27,7 +47,8 @@ const plans = [
     bgColor: 'bg-accent/5',
     badge: null,
     features: [
-      '300 Kael AI messages/month',
+      '300 Kael AI messages/month (3x Free)',
+      'Faster & smarter Kael AI — answers quicker with biomechanical rationale & progression milestones',
       'Full custom workout adjustments',
       'Adaptive programming — Kael learns from your workout edits',
       'Food & package scan',
@@ -46,7 +67,8 @@ const plans = [
     bgColor: 'bg-primary/5',
     badge: 'Most Popular',
     features: [
-      '800 Kael AI messages/month',
+      '800 Kael AI messages/month (8x Free)',
+      'Even faster & higher-intelligence Kael — tempo breakdowns, activation cues & fueling synergy',
       'Everything in Progress',
       'AI body fat % scanner*',
       'Nutrition insights & suggestions',
@@ -66,7 +88,8 @@ const plans = [
     bgColor: 'bg-chart-4/5',
     badge: 'Best',
     features: [
-      '2,000 Kael AI messages/month',
+      '2,000 Kael AI messages/month (20x Free)',
+      'Lightning-fast, masterclass Kael AI — kinetic chain mastery, insider secrets & recovery diagnostics',
       'Everything in Performance',
       'Enhanced real-time workout adjustments',
       'AI calisthenics form analysis with video',
@@ -377,12 +400,17 @@ export default function PricingSection() {
             body: {
               plan:
                 plan.planKey,
+              app_url: 'https://washek.ai.studio',
             },
           }
         );
 
       if (functionError) {
         throw functionError;
+      }
+
+      if (data?.error || data?.success === false) {
+        throw new Error(data?.error || 'Unable to create Stripe Checkout session.');
       }
 
       if (
@@ -582,20 +610,81 @@ export default function PricingSection() {
         </div>
       )}
 
+      {/* =========================================================
+          SECTION HEADER
+          ========================================================= */}
       <div className="flex items-center gap-2 mb-1">
         <Crown className="w-4 h-4 text-chart-4" />
 
         <h3 className="font-heading font-bold text-sm text-muted-foreground uppercase tracking-wider">
-          Upgrade Your Plan
+          Plans & Upgrades
         </h3>
       </div>
 
       <p className="text-xs text-muted-foreground -mt-2 mb-3">
-        Unlock the full Washek experience. The Live Workout
-        Tracker is free for everyone; Elite adds real-time
-        workout adjustments.
+        The Live Workout Tracker and baseline coaching are free for everyone.
+        Upgrades unlock higher monthly Kael message volumes, progressively faster and deeper AI coaching, and specialized athletic tools.
       </p>
 
+      {/* =========================================================
+          FREE PLAN (BASELINE)
+          ========================================================= */}
+      <Card
+        className={`p-4 border-2 ${freePlan.borderColor} ${freePlan.bgColor} relative`}
+      >
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <ShieldCheck className={`w-5 h-5 ${freePlan.color}`} />
+
+            <span className="font-heading font-bold text-base">
+              {freePlan.name}
+            </span>
+          </div>
+
+          <div className="flex items-baseline gap-0.5">
+            <span className={`font-heading font-bold text-xl ${freePlan.color}`}>
+              {freePlan.price}
+            </span>
+
+            <span className="text-xs text-muted-foreground">
+              {freePlan.period}
+            </span>
+          </div>
+        </div>
+
+        <ul className="space-y-1.5 mb-3">
+          {freePlan.features.map((feature) => (
+            <li
+              key={feature}
+              className="flex items-start gap-2 text-sm"
+            >
+              <Check className="w-3.5 h-3.5 mt-0.5 text-muted-foreground flex-shrink-0" />
+
+              <span>
+                {feature}
+              </span>
+            </li>
+          ))}
+        </ul>
+
+        {currentPlan === 'free' ? (
+          <Button
+            className="w-full h-10 font-heading font-semibold"
+            variant="outline"
+            disabled
+          >
+            Current Plan
+          </Button>
+        ) : (
+          <div className="text-[11px] text-center text-muted-foreground italic py-1">
+            Included with your account baseline
+          </div>
+        )}
+      </Card>
+
+      {/* =========================================================
+          PAID UPGRADE PLANS
+          ========================================================= */}
       {plans.map((plan) => {
         const Icon =
           plan.icon;

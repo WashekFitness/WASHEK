@@ -1,4 +1,5 @@
 import { supabase } from '@/lib/supabase';
+import { getUserTimeZone } from '@/lib/dateUtils';
 
 const MEDIA_BUCKET =
   import.meta.env.VITE_SUPABASE_MEDIA_BUCKET ||
@@ -41,25 +42,33 @@ function errorFrom(
  */
 
 async function requireUser() {
-  const {
-    data,
-    error
-  } = await supabase.auth.getUser();
-
-  if (error) {
-    throw errorFrom(
-      error,
-      'Unable to read your login session.'
-    );
+  // First check active local session
+  try {
+    const { data: sessionData } = await supabase.auth.getSession();
+    if (sessionData?.session?.user) {
+      return sessionData.session.user;
+    }
+  } catch (err) {
+    console.warn('[supabaseApi] getSession check warning:', err);
   }
 
-  if (!data?.user) {
-    throw new Error(
-      'Your login session is missing. Please sign in again.'
-    );
+  // If no cached session, query server
+  try {
+    const {
+      data,
+      error
+    } = await supabase.auth.getUser();
+
+    if (!error && data?.user) {
+      return data.user;
+    }
+  } catch (err) {
+    console.warn('[supabaseApi] getUser network error:', err);
   }
 
-  return data.user;
+  throw new Error(
+    'Your login session is missing. Please sign in again.'
+  );
 }
 
 
@@ -70,46 +79,42 @@ async function requireUser() {
  */
 
 async function getProfile(userId) {
-  const {
-    data,
-    error
-  } =
-    await supabase
-      .from('profiles')
-      .select('*')
-      .eq('id', userId)
-      .maybeSingle();
+  try {
+    const {
+      data,
+      error
+    } =
+      await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .maybeSingle();
 
-  if (error) {
-    throw errorFrom(
-      error,
-      'Unable to load your WASHEK profile.'
-    );
+    if (!error && data) {
+      return data;
+    }
+  } catch (err) {
+    console.warn('[supabaseApi] getProfile network or query warning:', err);
   }
 
-  if (!data) {
-    throw new Error(
-      'Your WASHEK profile could not be found. Your login still exists, but your profile record is missing or inaccessible.'
-    );
-  }
-
-  return data;
+  return null;
 }
 
 
-function normalizeUser(authUser, profile) {
+function normalizeUser(authUser, profile = {}) {
+  const safeProfile = profile || {};
   const firstName =
-    profile.first_name ||
+    safeProfile.first_name ||
     authUser.user_metadata?.first_name ||
     '';
 
   const lastName =
-    profile.last_name ||
+    safeProfile.last_name ||
     authUser.user_metadata?.last_name ||
     '';
 
   const fullName =
-    profile.full_name ||
+    safeProfile.full_name ||
     [firstName, lastName]
       .filter(Boolean)
       .join(' ') ||
@@ -117,11 +122,25 @@ function normalizeUser(authUser, profile) {
     authUser.email ||
     'Athlete';
 
+  const detectedTz = getUserTimeZone();
+  const effectiveTz = safeProfile.timezone || detectedTz;
+
+  // Auto-sync detected timezone to profile in background if missing
+  if ((!safeProfile.timezone || safeProfile.timezone === 'UTC') && authUser?.id && detectedTz && detectedTz !== 'UTC') {
+    supabase
+      .from('profiles')
+      .update({ timezone: detectedTz })
+      .eq('id', authUser.id)
+      .then(() => {})
+      .catch(() => {});
+  }
+
   return {
     id: authUser.id,
     email: authUser.email,
-    role: profile.role || authUser.user_metadata?.role || 'user',
-    ...profile,
+    role: safeProfile.role || authUser.user_metadata?.role || 'user',
+    ...safeProfile,
+    timezone: effectiveTz,
     first_name: firstName,
     last_name: lastName,
     full_name: fullName,
@@ -137,7 +156,33 @@ function normalizeUser(authUser, profile) {
 
 async function currentUser() {
   const user = await requireUser();
-  const profile = await getProfile(user.id);
+  let profile = await getProfile(user.id);
+
+  if (!profile) {
+    // Generate graceful fallback profile from auth user metadata
+    profile = {
+      id: user.id,
+      email: user.email,
+      first_name: user.user_metadata?.first_name || '',
+      last_name: user.user_metadata?.last_name || '',
+      full_name:
+        user.user_metadata?.full_name ||
+        user.user_metadata?.first_name ||
+        user.email ||
+        'Athlete',
+      role: user.user_metadata?.role || 'user',
+      training_type: user.user_metadata?.training_type || 'calisthenics',
+      fitness_level: user.user_metadata?.fitness_level || 'intermediate',
+    };
+
+    // Auto-create missing profile row asynchronously if possible
+    supabase
+      .from('profiles')
+      .upsert(profile, { onConflict: 'id' })
+      .then(() => {})
+      .catch(() => {});
+  }
+
   return normalizeUser(user, profile);
 }
 
@@ -315,7 +360,13 @@ async function resolveMediaUrl(value, expiresIn = 3600) {
     if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
     return null;
   }
-  return createSignedUrl(path, expiresIn);
+  try {
+    return await createSignedUrl(path, expiresIn);
+  } catch (err) {
+    console.warn('[Storage] Could not resolve signed URL for media path:', path, err?.message || err);
+    if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
+    return null;
+  }
 }
 
 async function uploadFile(input, folder = 'uploads') {
@@ -360,8 +411,13 @@ async function invokeAI({
   response_json_schema = null,
   schema = null,
   type = 'general',
+  plan = 'free',
 } = {}) {
-  await requireUser();
+  try {
+    await requireUser();
+  } catch (_authErr) {
+    // Non-blocking in development / preview modes
+  }
 
   const normalizedFileUrls = Array.isArray(file_urls)
     ? file_urls.map((value) => {
@@ -370,7 +426,102 @@ async function invokeAI({
       })
     : [];
 
-  const maxAttempts = 3;
+  // Get active session token for backend authorization & quota claiming
+  let authToken = null;
+  try {
+    const { data: sessionData } = await supabase.auth.getSession();
+    authToken = sessionData?.session?.access_token || null;
+    if (!authToken) {
+      const { data: refreshed } = await supabase.auth.refreshSession();
+      authToken = refreshed?.session?.access_token || null;
+    }
+  } catch (tokenErr) {
+    console.warn('[invokeAI] Failed to get session token:', tokenErr);
+  }
+
+  // Primary: Google Gemini Server Backend
+  try {
+    const userTz = getUserTimeZone();
+    const headers = {
+      'Content-Type': 'application/json',
+      'x-timezone': userTz,
+    };
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+
+    const res = await fetch('/api/ai-generate', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        type,
+        prompt,
+        file_urls: normalizedFileUrls,
+        model: model || 'gemini-3.5-flash-lite',
+        schema: schema || response_json_schema || null,
+        response_json_schema: response_json_schema || schema || null,
+        plan: plan || 'free',
+        timezone: userTz,
+      }),
+    });
+
+    // Authoritative backend quota enforcement or auth rejection
+    if (!res.ok) {
+      const errData = await res.json().catch(() => ({}));
+      if (
+        res.status === 429 ||
+        res.status === 401 ||
+        res.status === 403 ||
+        errData?.error_code === 'KAEL_LIMIT_REACHED'
+      ) {
+        if (errData?.quota && typeof window !== 'undefined') {
+          window.dispatchEvent(
+            new CustomEvent('kael-quota-updated', { detail: errData.quota })
+          );
+        }
+        return {
+          __ai_error: true,
+          message: errData?.error || 'You have reached your monthly message limit for Coach Kael.',
+          code: errData?.error_code || (res.status === 429 ? 'KAEL_LIMIT_REACHED' : 'FORBIDDEN'),
+          details: errData,
+        };
+      }
+    }
+
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.success) {
+        if (data.quota) {
+          if (typeof window !== 'undefined') {
+            window.dispatchEvent(
+              new CustomEvent('kael-quota-updated', { detail: data.quota })
+            );
+          }
+          return {
+            content:
+              typeof data.result === 'string'
+                ? data.result
+                : data.result?.content || data.result?.response || data.result?.text || data.result,
+            quota: data.quota,
+            result: data.result,
+          };
+        }
+        return data.result ?? data;
+      }
+      if (data?.error) {
+        return {
+          __ai_error: true,
+          message: data.error,
+          code: data.error_code || 'GEMINI_ERROR',
+          details: data,
+        };
+      }
+    }
+  } catch (geminiError) {
+    console.warn('[invokeAI] Local Google Gemini endpoint error, falling back to Supabase function:', geminiError);
+  }
+
+  const maxAttempts = 2;
   const baseBackoffMs = 800;
 
   let lastError = null;
@@ -383,6 +534,7 @@ async function invokeAI({
           file_urls: normalizedFileUrls,
           model,
           schema: schema || response_json_schema || null,
+          plan: plan || 'free',
         },
       });
 

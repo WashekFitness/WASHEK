@@ -9,6 +9,7 @@ import {
 
 import {
   useQuery,
+  useQueryClient,
 } from '@tanstack/react-query';
 
 import {
@@ -49,7 +50,9 @@ import {
 
 import {
   computeStats,
+  getServerMessageStats,
 } from '@/lib/messageLimit';
+import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 import {
   toast,
@@ -59,9 +62,12 @@ import {
 
 export default function Profile() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
 
   const [user, setUser] =
     useState(null);
+
+  const { timeZone } = useMidnightSync(user);
 
   const [regenerating, setRegenerating] =
     useState(false);
@@ -143,19 +149,51 @@ export default function Profile() {
   const activeProgram =
     programs[0];
 
-
   const plan =
     user?.subscription_plan ||
     'free';
 
+  // Live server-authoritative Kael monthly quota stats
+  const {
+    data: serverKaelStats,
+  } = useQuery({
+    queryKey: ['kael-usage', user?.id, timeZone],
+    queryFn: async () => {
+      const live = await getServerMessageStats(timeZone);
+      if (live && typeof live.used === 'number') {
+        return live;
+      }
+      return null;
+    },
+    enabled: !!user?.id,
+    staleTime: 1000 * 15,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: true,
+  });
+
+  // Listen for real-time quota broadcast events from Kael chat or API
+  useEffect(() => {
+    const handleQuotaUpdate = (e) => {
+      if (e?.detail) {
+        queryClient.setQueryData(['kael-usage', user?.id, timeZone], e.detail);
+      }
+    };
+
+    window.addEventListener('kael-quota-updated', handleQuotaUpdate);
+    return () => {
+      window.removeEventListener('kael-quota-updated', handleQuotaUpdate);
+    };
+  }, [user?.id, timeZone, queryClient]);
 
   const stats =
-    user
+    serverKaelStats ||
+    (user
       ? computeStats(
           user,
-          plan
+          plan,
+          timeZone
         )
-      : null;
+      : null);
 
 
   const planLabels = {
@@ -461,7 +499,7 @@ export default function Profile() {
               text-muted-foreground
               mt-1
             ">
-              {stats.remaining} messages remaining · resets monthly
+              {stats.remaining} messages remaining · resets on the 1st at 12:00 AM ({timeZone})
             </p>
 
           </div>

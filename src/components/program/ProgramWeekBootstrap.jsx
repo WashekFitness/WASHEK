@@ -36,6 +36,8 @@ export default function ProgramWeekBootstrap() {
       runningRef.current =
         true;
 
+      let currentRunKey = null;
+
       try {
         const user =
           await supabaseApi.auth.me();
@@ -95,18 +97,18 @@ export default function ProgramWeekBootstrap() {
          * program.
          */
 
-        const runKey =
+        currentRunKey =
           `${program.id}:${program.current_week}`;
 
         if (
           lastRunRef.current ===
-          runKey
+          currentRunKey
         ) {
           return;
         }
 
         lastRunRef.current =
-          runKey;
+          currentRunKey;
 
         console.log(
           '[ProgramWeekBootstrap] Checking calendar week...'
@@ -117,6 +119,10 @@ export default function ProgramWeekBootstrap() {
             program,
             user
           );
+
+        if (result?.program) {
+          lastRunRef.current = `${result.program.id}:${result.program.current_week}`;
+        }
 
         if (
           result?.generated
@@ -132,17 +138,20 @@ export default function ProgramWeekBootstrap() {
          * app from loading.
          */
 
-        console.error(
-          '[ProgramWeekBootstrap] Weekly generation failed:',
-          error
+        console.warn(
+          '[ProgramWeekBootstrap] Weekly generation check skipped or failed:',
+          error?.message || error
         );
 
         /*
-         * Do not permanently suppress a failed generation.
-         * The next scheduled/visibility check can retry it.
+         * Throttle retries after an error to avoid continuous failure loops.
+         * The next run will be allowed after 5 minutes or on program transition.
          */
-        lastRunRef.current =
-          null;
+        setTimeout(() => {
+          if (lastRunRef.current === currentRunKey) {
+            lastRunRef.current = null;
+          }
+        }, 5 * 60 * 1000);
       } finally {
         runningRef.current =
           false;

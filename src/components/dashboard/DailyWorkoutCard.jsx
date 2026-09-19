@@ -2,12 +2,14 @@ import { Link } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Dumbbell, ChevronRight, Clock } from 'lucide-react';
+import { getDayOfWeekName, getUserTimeZone } from '@/lib/dateUtils';
 
-export default function DailyWorkoutCard({ program }) {
+export default function DailyWorkoutCard({ program, user, timeZone }) {
   if (!program) return null;
 
   const currentWeekData = program.microcycles?.find(m => m.week_number === program.current_week);
-  const today = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+  const effectiveTz = timeZone || getUserTimeZone(user);
+  const today = getDayOfWeekName(new Date(), effectiveTz);
   const todayWorkout = currentWeekData?.days?.find(d =>
     d.day_name.toLowerCase().includes(today.toLowerCase())
   ) || currentWeekData?.days?.[0];

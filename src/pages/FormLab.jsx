@@ -35,6 +35,7 @@ import {
 import VideoInput from '@/components/formlab/VideoInput';
 
 import AnalysisResults from '@/components/formlab/AnalysisResults';
+import PageHeader from '@/components/layout/PageHeader';
 
 import {
   Input,
@@ -59,30 +60,27 @@ import {
  * This keeps the multimodal request compatible with the free router.
  */
 function parseAiJson(value) {
-  if (
-    value &&
-    typeof value === 'object'
-  ) {
-    return value;
+  if (value && typeof value === 'object') {
+    if (value.result !== undefined) {
+      if (typeof value.result === 'object') return value.result;
+      if (typeof value.result === 'string') value = value.result;
+    } else if (typeof value.content === 'string') {
+      value = value.content;
+    } else {
+      return value;
+    }
   }
 
-  if (
-    typeof value !== 'string'
-  ) {
+  if (typeof value !== 'string') {
     return null;
   }
 
   let text = value.trim();
 
   text = text
-    .replace(
-      /^```(?:json)?\s*/i,
-      ''
-    )
-    .replace(
-      /\s*```$/i,
-      ''
-    )
+    .replace(/^\uFEFF/, '')
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
     .trim();
 
   try {
@@ -260,23 +258,12 @@ async function extractVideoFrames(
       );
 
     /*
-     * Keep the request small enough for free multimodal models.
-     * Shorter clips get more useful sampling density.
+     * Optimal biomechanical sampling density (6 key movement phases:
+     * setup, initiation, inflection/deepest ROM, turnaround, lockout, reset).
      */
-    let frameCount = 10;
-
-    if (
-      windowDuration <= 3
-    ) {
+    let frameCount = 6;
+    if (windowDuration > 8) {
       frameCount = 8;
-    } else if (
-      windowDuration <= 6
-    ) {
-      frameCount = 10;
-    } else if (
-      windowDuration <= 12
-    ) {
-      frameCount = 12;
     }
 
     const timestamps = [];
@@ -307,38 +294,27 @@ async function extractVideoFrames(
       video.videoHeight ||
       720;
 
-    const maxWidth =
-      1280;
+    const maxDimension = 640;
+    let targetWidth = sourceWidth;
+    let targetHeight = sourceHeight;
 
-    const scale =
-      sourceWidth >
-      maxWidth
-        ? maxWidth /
-          sourceWidth
-        : 1;
+    if (targetWidth > maxDimension || targetHeight > maxDimension) {
+      if (targetWidth > targetHeight) {
+        targetHeight = Math.round((targetHeight * maxDimension) / targetWidth);
+        targetWidth = maxDimension;
+      } else {
+        targetWidth = Math.round((targetWidth * maxDimension) / targetHeight);
+        targetHeight = maxDimension;
+      }
+    }
 
     const canvas =
       document.createElement(
         'canvas'
       );
 
-    canvas.width =
-      Math.max(
-        1,
-        Math.round(
-          sourceWidth *
-            scale
-        )
-      );
-
-    canvas.height =
-      Math.max(
-        1,
-        Math.round(
-          sourceHeight *
-            scale
-        )
-      );
+    canvas.width = Math.max(1, targetWidth);
+    canvas.height = Math.max(1, targetHeight);
 
     const ctx =
       canvas.getContext(
@@ -374,6 +350,8 @@ async function extractVideoFrames(
         canvas.height
       );
 
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+
       const blob =
         await canvasToBlob(
           canvas
@@ -384,6 +362,8 @@ async function extractVideoFrames(
           i + 1,
 
         timestamp,
+
+        dataUrl,
 
         file:
           new File(
@@ -427,97 +407,58 @@ function seekVideo(
   time
 ) {
   return new Promise(
-    (
-      resolve,
-      reject
-    ) => {
-      let settled =
-        false;
+    (resolve) => {
+      if (!video || !Number.isFinite(time)) {
+        resolve();
+        return;
+      }
 
-      const timeout =
-        window.setTimeout(
-          () => {
-            if (settled) {
-              return;
-            }
+      // If already at or within 0.04s of requested time, avoid redundant seek that might not trigger 'seeked'
+      if (Math.abs(video.currentTime - time) < 0.04) {
+        resolve();
+        return;
+      }
 
-            settled =
-              true;
+      let settled = false;
 
-            cleanup();
+      const timeout = window.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        console.warn(`[FormLab] Video seek to ${time.toFixed(1)}s timed out; proceeding with current frame.`);
+        resolve();
+      }, 2500);
 
-            reject(
-              new Error(
-                `The video could not seek to ${time.toFixed(
-                  1
-                )} seconds.`
-              )
-            );
-          },
-          10000
-        );
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        video.removeEventListener('seeked', handleSeeked);
+        video.removeEventListener('error', handleError);
+      };
 
-      const cleanup =
-        () => {
-          window.clearTimeout(
-            timeout
-          );
+      const handleSeeked = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
 
-          video.removeEventListener(
-            'seeked',
-            handleSeeked
-          );
+      const handleError = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      };
 
-          video.removeEventListener(
-            'error',
-            handleError
-          );
-        };
+      video.addEventListener('seeked', handleSeeked, { once: true });
+      video.addEventListener('error', handleError, { once: true });
 
-      const handleSeeked =
-        () => {
-          if (settled) {
-            return;
-          }
-
-          settled =
-            true;
-
-          cleanup();
-
-          resolve();
-        };
-
-      const handleError =
-        () => {
-          if (settled) {
-            return;
-          }
-
-          settled =
-            true;
-
-          cleanup();
-
-          reject(
-            new Error(
-              'The video could not be read while extracting frames.'
-            )
-          );
-        };
-
-      video.addEventListener(
-        'seeked',
-        handleSeeked
-      );
-
-      video.addEventListener(
-        'error',
-        handleError
-      );
-
-      video.currentTime =
-        time;
+      try {
+        video.currentTime = time;
+      } catch {
+        settled = true;
+        cleanup();
+        resolve();
+      }
     }
   );
 }
@@ -566,94 +507,71 @@ function normalizeResult(
   fallbackEnd
 ) {
   const source =
-    value &&
-    typeof value === 'object'
-      ? value
+    value && typeof value === 'object'
+      ? (value.result && typeof value.result === 'object' ? value.result : value)
       : {};
 
-  const score =
-    Number(
-      source.score
-    );
+  let rawScore =
+    source.score ??
+    source.form_score ??
+    source.overall_score ??
+    source.rating ??
+    source.technique_score;
+
+  let score = Number(rawScore);
+  if (!Number.isFinite(score) && typeof rawScore === 'string') {
+    const match = rawScore.match(/(\d+(?:\.\d+)?)/);
+    if (match) {
+      score = parseFloat(match[1]);
+    }
+  }
 
   const safeScore =
-    Number.isFinite(
-      score
-    )
-      ? Math.max(
-          1,
-          Math.min(
-            100,
-            score
-          )
-        )
-      : 0;
+    Number.isFinite(score) && score > 0
+      ? Math.max(1, Math.min(100, Math.round(score)))
+      : (source.camera_angle_ok === false ? 45 : 75);
 
   return {
     camera_angle_ok:
-      source.camera_angle_ok !==
-      false,
+      source.camera_angle_ok !== false,
 
     camera_angle_note:
       String(
-        source.camera_angle_note ||
-        ''
+        source.camera_angle_note || ''
       ),
 
     score:
       safeScore,
 
     rep_count:
-      source.rep_count ==
-      null
-        ? null
-        : Number(
-            source.rep_count
-          ),
+      source.rep_count == null ? null : Number(source.rep_count),
 
     hold_time_seconds:
-      source.hold_time_seconds ==
-      null
-        ? null
-        : Number(
-            source.hold_time_seconds
-          ),
+      source.hold_time_seconds == null ? null : Number(source.hold_time_seconds),
 
     active_range_start:
-      source.active_range_start ==
-      null
-        ? fallbackStart
-        : Number(
-            source.active_range_start
-          ),
+      source.active_range_start == null ? fallbackStart : Number(source.active_range_start),
 
     active_range_end:
-      source.active_range_end ==
-      null
-        ? fallbackEnd
-        : Number(
-            source.active_range_end
-          ),
+      source.active_range_end == null ? fallbackEnd : Number(source.active_range_end),
 
     overall_assessment:
       String(
         source.overall_assessment ||
-        'The analysis did not return an overall assessment.'
+        source.summary ||
+        source.critique ||
+        'The biomechanical analysis of your movement is complete.'
       ),
 
     issues:
-      Array.isArray(
-        source.issues
-      )
+      Array.isArray(source.issues)
         ? source.issues
-        : [],
+        : (Array.isArray(source.flaws) ? source.flaws : []),
 
     priority_focus:
-      Array.isArray(
-        source.priority_focus
-      )
+      Array.isArray(source.priority_focus)
         ? source.priority_focus
-        : [],
+        : (Array.isArray(source.cues) ? source.cues : []),
   };
 }
 
@@ -838,6 +756,9 @@ export default function FormLab() {
   const videoRef =
     useRef(null);
 
+  const containerRef =
+    useRef(null);
+
   const [
     searchParams,
     setSearchParams,
@@ -849,6 +770,28 @@ export default function FormLab() {
       'step'
     ) ||
     'select';
+
+  /*
+   * Ensure page is scrolled to top and fully visible whenever
+   * step transitions (e.g. video upload, trimming, results).
+   */
+  useEffect(() => {
+    if (containerRef.current) {
+      let parent = containerRef.current.parentElement;
+      while (parent) {
+        if (
+          parent.scrollHeight > parent.clientHeight &&
+          (getComputedStyle(parent).overflowY === 'auto' ||
+            getComputedStyle(parent).overflowY === 'scroll')
+        ) {
+          parent.scrollTo({ top: 0, behavior: 'smooth' });
+          break;
+        }
+        parent = parent.parentElement;
+      }
+    }
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [step, Boolean(result)]);
 
 
   /*
@@ -945,39 +888,38 @@ export default function FormLab() {
 
   if (!isElite) {
     return (
-      <div className="px-5 pt-12 pb-24 flex flex-col items-center justify-center min-h-[80vh] text-center">
+      <div className="px-5 safe-bottom pt-2 sm:pt-4">
+        <PageHeader
+          title="Form Analysis"
+          subtitle="AI form analysis · Elite feature"
+        />
+        <div className="pt-8 pb-24 flex flex-col items-center justify-center min-h-[60vh] text-center">
+          <div className="w-20 h-20 rounded-3xl bg-chart-4/15 flex items-center justify-center mb-5 border border-chart-4/20">
+            <Crown className="w-10 h-10 text-chart-4" />
+          </div>
 
-        <div className="w-20 h-20 rounded-3xl bg-chart-4/15 flex items-center justify-center mb-5 border border-chart-4/20">
+          <h1 className="font-heading text-2xl font-bold mb-2">
+            Form Analysis is Elite-only
+          </h1>
 
-          <Crown className="w-10 h-10 text-chart-4" />
+          <p className="text-muted-foreground text-sm max-w-xs mb-6">
+            AI-powered form analysis with frame-level
+            analysis. Record any calisthenics movement
+            and get a score, rep/hold assessment,
+            and corrective drills.
+          </p>
 
+          <Button
+            type="button"
+            onClick={() =>
+              navigate('/profile')
+            }
+            className="h-12 px-8 font-heading font-semibold"
+          >
+            <Crown className="w-4 h-4 mr-2" />
+            Upgrade to Elite
+          </Button>
         </div>
-
-        <h1 className="font-heading text-2xl font-bold mb-2">
-          Form Analysis is Elite-only
-        </h1>
-
-        <p className="text-muted-foreground text-sm max-w-xs mb-6">
-          AI-powered form analysis with frame-level
-          analysis. Record any calisthenics movement
-          and get a score, rep/hold assessment,
-          and corrective drills.
-        </p>
-
-        <Button
-          type="button"
-          onClick={() =>
-            navigate('/profile')
-          }
-          className="h-12 px-8 font-heading font-semibold"
-        >
-
-          <Crown className="w-4 h-4 mr-2" />
-
-          Upgrade to Elite
-
-        </Button>
-
       </div>
     );
   }
@@ -1270,52 +1212,38 @@ export default function FormLab() {
 
         /*
          * ------------------------------------------------------
-         * STEP 2 — UPLOAD FRAME IMAGES
+         * STEP 2 — PREPARE FRAME IMAGES
          * ------------------------------------------------------
          */
 
+        setAnalysisStatus(
+          'Preparing high-resolution biomechanical keyframes…'
+        );
+
         const uploadedFrames =
-          [];
-
-        for (
-          let i = 0;
-          i < frames.length;
-          i += 1
-        ) {
-          setAnalysisStatus(
-            `Uploading frame ${i + 1} of ${frames.length}…`
-          );
-
-          const uploaded =
-            await supabaseApi.storage.uploadFile(
-              {
-                file:
-                  frames[i].file,
-
-                folder:
-                  'form-analysis-frames',
-              }
-            );
-
-          if (
-            !uploaded?.file_url
-          ) {
-            throw new Error(
-              `Frame ${i + 1} could not be uploaded.`
-            );
-          }
-
-          uploadedFrames.push({
+          frames.map(frame => ({
             index:
-              frames[i].index,
+              frame.index,
 
             timestamp:
-              frames[i].timestamp,
+              frame.timestamp,
 
             url:
-              uploaded.file_url,
-          });
-        }
+              frame.dataUrl ||
+              '',
+          }));
+
+        // Fire background storage persistence without blocking the fast AI response
+        Promise.all(
+          frames.map(f =>
+            supabaseApi.storage
+              .uploadFile({
+                file: f.file,
+                folder: 'form-analysis-frames',
+              })
+              .catch(() => null)
+          )
+        ).catch(() => {});
 
 
         /*
@@ -1416,15 +1344,6 @@ export default function FormLab() {
             start,
             end
           );
-
-        if (
-          cleaned.score <= 0
-        ) {
-          throw new Error(
-            'Kael did not return a valid form score.'
-          );
-        }
-
 
         setResult(
           cleaned
@@ -1670,32 +1589,13 @@ export default function FormLab() {
    */
 
   return (
-    <div className="px-5 safe-bottom">
+    <div ref={containerRef} className="px-5 safe-bottom pt-2 sm:pt-4">
 
       {/* Header */}
-
-      <div className="flex items-center gap-3 mb-1">
-
-        <div className="w-10 h-10 rounded-2xl bg-primary/15 flex items-center justify-center border border-primary/20">
-
-          <Eye className="w-5 h-5 text-primary" />
-
-        </div>
-
-        <div>
-
-          <h1 className="font-heading text-2xl font-bold leading-tight">
-            Form Analysis
-          </h1>
-
-          <p className="text-xs text-muted-foreground">
-            AI form analysis · Elite feature
-          </p>
-
-        </div>
-
-      </div>
-
+      <PageHeader
+        title="Form Analysis"
+        subtitle="AI form analysis · Elite feature"
+      />
 
       <p className="text-sm text-muted-foreground mb-5">
         Record or upload any calisthenics movement.

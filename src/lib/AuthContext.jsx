@@ -40,9 +40,9 @@ export const AuthProvider = ({ children }) => {
 
       return profileUser;
     } catch (error) {
-      console.error(
-        '[AUTH] Unable to load application profile:',
-        error
+      console.warn(
+        '[AUTH] Using session profile fallback:',
+        error?.message || error
       );
 
       /*
@@ -181,10 +181,10 @@ export const AuthProvider = ({ children }) => {
               'Unable to load your account.',
           });
         } finally {
-          if (!mounted) return;
-
-          setAuthChecked(true);
-          setIsLoadingAuth(false);
+          if (mounted) {
+            setAuthChecked(true);
+            setIsLoadingAuth(false);
+          }
         }
       }
     );

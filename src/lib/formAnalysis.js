@@ -236,18 +236,23 @@ using the supplied chronological frame timestamps.
 Do not pretend these are exact continuous-video timestamps.
 
 ============================================================
-4. FORM SCORE
+4. FORM SCORE (FAIR & ACCURATE RATING SYSTEM)
 ============================================================
 
 Give an overall form score from 1-100.
 
-100 = textbook-perfect technique.
+Provide a balanced, objective, and FAIR rating. Do NOT be unrealistically harsh or give a low score if the athlete has not actually messed up their form:
 
-Be strict.
+- 90–100: Exceptional technique. Clean alignment, strong stability, full range of motion, and textbook mechanics with no noticeable flaws.
+- 80–89: Solid, good form. Safe, technically sound execution with proper joint tracking and control. Only minor nuances or slight fatigue indicators. If the athlete performed the movement well without messing up their form, they deserve a rating in this 80-89 range.
+- 70–79: Decent execution with moderate technique points to refine. The movement is functional and safe, but there are clear areas for improvement (e.g., slight knee cave, minor spinal shift, early elbow flare, or slight momentum).
+- 55–69: Inconsistent form with noticeable breakdown that impairs movement efficiency or increases injury risk.
+- Below 55: Significant breakdown or severe form collapse.
 
-Most ordinary athletes should not receive 80+.
-
-Do not inflate the score merely because the movement looks acceptable.
+SCORING PRINCIPLES:
+- Be fair and objective: Reward good mechanics, stability, and control with solid scores (80+).
+- Differentiate between natural anatomical variations (e.g. torso-to-femur ratios, arm span, individual stance width) versus actual mechanical breakdown.
+- Deduct points ONLY for actual visible flaws clearly supported by the frames. Never invent issues or penalize an athlete whose movement is clean and safe.
 
 ============================================================
 5. JOINT POSITION
@@ -369,9 +374,11 @@ PUSH-UP:
 11. ISSUES FOUND
 ============================================================
 
-Identify every meaningful issue supported by the frames.
+Identify only REAL, meaningful issues supported by the frames.
 
-For each issue:
+If the movement was performed cleanly with good mechanics, it is completely acceptable to return an empty issues list [] or list only 1 subtle refinement. Do not manufacture problems or penalize the athlete if their technique is sound.
+
+For each issue (if any):
 
 - area
 - problem

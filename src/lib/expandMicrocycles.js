@@ -1,3 +1,5 @@
+import { build12WeekMicrocycles } from './periodizationEngine';
+
 /**
  * Safely normalizes workout-program microcycle data.
  *
@@ -310,9 +312,54 @@ export function normalizeWorkoutProgram(program) {
   try {
     const source = asObject(program);
 
-    const microcycles = expandMicrocycles(
+    let microcycles = expandMicrocycles(
       source.microcycles
     );
+
+    // If fewer than 12 weeks are provided, generate the full 12-week macrocycle
+    if (microcycles.length > 0 && microcycles.length < 12) {
+      try {
+        const baseWeek =
+          microcycles.find(m => Number(m.week_number) === 1) ||
+          microcycles[0];
+
+        if (baseWeek) {
+          const full12 = build12WeekMicrocycles(baseWeek, {
+            trainingType: source.training_type || 'calisthenics',
+          });
+
+          microcycles = full12.map(w => {
+            const existing = microcycles.find(
+              e => Number(e.week_number) === Number(w.week_number)
+            );
+            if (!existing) return w;
+            return {
+              ...existing,
+              predicted_focus: existing.predicted_focus || w.predicted_focus,
+              target_rir: existing.target_rir || w.target_rir,
+              volume_delta: existing.volume_delta || w.volume_delta,
+              days: (existing.days || []).map((day, dIdx) => {
+                const wDay = w.days?.[dIdx];
+                return {
+                  ...day,
+                  recalibrated_by_kael: day.recalibrated_by_kael ?? wDay?.recalibrated_by_kael,
+                  exercises: (day.exercises || []).map((ex, exIdx) => {
+                    const wEx = wDay?.exercises?.[exIdx];
+                    return {
+                      ...ex,
+                      predicted_progress: ex.predicted_progress || wEx?.predicted_progress,
+                      predicted_metrics: ex.predicted_metrics || wEx?.predicted_metrics,
+                    };
+                  }),
+                };
+              }),
+            };
+          });
+        }
+      } catch (e) {
+        console.warn('Auto-expansion to 12 weeks failed:', e);
+      }
+    }
 
     const mesocycles = asArray(
       source.mesocycles
@@ -333,11 +380,14 @@ export function normalizeWorkoutProgram(program) {
           "My Workout Program"
         ),
 
-      duration_weeks: safeNumber(
-        source.duration_weeks ??
-          source.duration ??
-          microcycles.length,
-        microcycles.length || 1
+      duration_weeks: Math.max(
+        12,
+        safeNumber(
+          source.duration_weeks ??
+            source.duration ??
+            microcycles.length,
+          12
+        )
       ),
 
       current_week: safeNumber(

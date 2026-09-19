@@ -80,6 +80,7 @@ export async function createStripeCheckout(
       {
         body: {
           plan,
+          app_url: 'https://washek.ai.studio',
         },
       }
     );

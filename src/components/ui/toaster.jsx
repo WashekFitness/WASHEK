@@ -18,10 +18,12 @@ export function Toaster() {
   } =
     useToast();
 
+  const activeToasts = toasts.filter(t => t.open !== false);
+
   return (
     <ToastProvider>
 
-      {toasts.map(
+      {activeToasts.map(
         toast => {
 
           const {
@@ -40,7 +42,7 @@ export function Toaster() {
               {...props}
             >
 
-              <div className="grid gap-1 pr-2">
+              <div className="grid gap-1 pr-6">
 
                 {title && (
                   <ToastTitle>
@@ -65,11 +67,11 @@ export function Toaster() {
               <ToastClose
                 type="button"
                 aria-label="Close notification"
-                onClick={() =>
-                  dismiss(
-                    id
-                  )
-                }
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  dismiss(id);
+                }}
               />
 
             </Toast>
