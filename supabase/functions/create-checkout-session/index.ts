@@ -68,6 +68,12 @@ const PRICE_IDS = {
   elite: 'price_1TTYsWRuQpZftYKRKIm8V10E',
 } as const
 
+const PAYMENT_URLS: Record<string, string> = {
+  progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
+  performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
+  elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
+}
+
 const VALID_PLANS = new Set([
   'progress',
   'performance',

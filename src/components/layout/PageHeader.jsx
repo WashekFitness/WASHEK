@@ -61,29 +61,33 @@ export default function PageHeader({
             z-30
             flex
             items-center
-            gap-2
+            gap-2.5
             pointer-events-auto
           "
         >
 
-          <img
-            src="/washek-fitness-logo.jpg"
-            alt="WASHEK"
-            className="
-              w-7
-              h-7
-              rounded-xl
-              object-contain
-              shrink-0
-              pointer-events-none
-            "
-          />
+          <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-primary/5 border border-primary/25 shadow-sm shadow-primary/15 shrink-0">
+            <img
+              src="/washek-fitness-logo.jpg"
+              alt="WASHEK"
+              className="
+                w-7
+                h-7
+                rounded-[10px]
+                object-contain
+                shrink-0
+                pointer-events-none
+              "
+            />
+          </div>
 
           <span className="
             font-heading
-            font-bold
+            font-extrabold
             text-sm
-            text-primary
+            tracking-widest
+            uppercase
+            text-foreground
           ">
             WASHEK
           </span>
@@ -104,6 +108,9 @@ export default function PageHeader({
               w-10
               shrink-0
               -ml-2
+              rounded-xl
+              hover:bg-slate-100/90
+              dark:hover:bg-white/[0.08]
               pointer-events-auto
               touch-manipulation
             `
@@ -139,7 +146,10 @@ export default function PageHeader({
           <h1 className="
             font-heading
             text-2xl
-            font-bold
+            sm:text-3xl
+            font-extrabold
+            tracking-tight
+            text-foreground
             leading-tight
           ">
             {title}
@@ -148,8 +158,11 @@ export default function PageHeader({
 
           {subtitle && (
             <p className="
-              text-sm
+              text-xs
+              sm:text-sm
               text-muted-foreground
+              mt-0.5
+              leading-relaxed
             ">
               {subtitle}
             </p>

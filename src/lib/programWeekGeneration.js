@@ -2,6 +2,7 @@ import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { buildWeekPrompt } from '@/lib/trainingTypes';
 import { build12WeekMicrocycles } from '@/lib/periodizationEngine';
+import { hasPlan } from '@/lib/subscription';
 
 /*
  * ============================================================
@@ -892,10 +893,16 @@ async function generateOneWeek(
    * architecture.
    */
 
-  const adaptationHistory =
-    asArray(
-      freshProgram.adaptation_history
-    );
+  const canAdapt = hasPlan(
+    profile?.subscription_plan,
+    'progress'
+  );
+
+  const adaptationHistory = canAdapt
+    ? asArray(
+        freshProgram.adaptation_history
+      )
+    : [];
 
   const trainingType =
     freshProgram.training_type ||

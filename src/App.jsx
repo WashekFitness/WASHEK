@@ -18,6 +18,7 @@ import ProgramWeekBootstrap from '@/components/program/ProgramWeekBootstrap';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 import PageNotFound from '@/lib/PageNotFound';
+import ErrorBoundary from '@/components/ErrorBoundary';
 
 import Dashboard from '@/pages/Dashboard';
 import Onboarding from '@/pages/Onboarding';
@@ -25,17 +26,45 @@ import About from '@/pages/About';
 import Contact from '@/pages/Contact';
 import Login from '@/pages/Login';
 import ResetPassword from '@/pages/ResetPassword';
+import Terms from '@/pages/Terms';
+import Privacy from '@/pages/Privacy';
+import Profile from '@/pages/Profile';
 
-const Program = lazy(() => import('@/pages/Program'));
-const Nutrition = lazy(() => import('@/pages/Nutrition'));
-const Progress = lazy(() => import('@/pages/Progress'));
-const Profile = lazy(() => import('@/pages/Profile'));
-const Kael = lazy(() => import('@/pages/Kael'));
-const ProgressPhotos = lazy(() => import('@/pages/ProgressPhotos'));
-const FormLab = lazy(() => import('@/pages/FormLab'));
-const ProgramDay = lazy(() => import('@/pages/ProgramDay'));
-const LiveWorkout = lazy(() => import('@/pages/LiveWorkout'));
-const SubscriptionReturn = lazy(
+function lazyWithRetry(componentImport, retries = 3, interval = 350) {
+  return lazy(() =>
+    new Promise((resolve, reject) => {
+      const attempt = (remaining) => {
+        componentImport()
+          .then(resolve)
+          .catch((error) => {
+            if (remaining > 0) {
+              setTimeout(() => attempt(remaining - 1), interval);
+            } else {
+              console.warn('[App] Dynamic chunk import failed after retries, attempting reload...', error);
+              const lastReload = sessionStorage.getItem('chunk_reload_timestamp');
+              const now = Date.now();
+              if (!lastReload || now - parseInt(lastReload, 10) > 10000) {
+                sessionStorage.setItem('chunk_reload_timestamp', String(now));
+                window.location.reload();
+              }
+              reject(error);
+            }
+          });
+      };
+      attempt(retries);
+    })
+  );
+}
+
+const Program = lazyWithRetry(() => import('@/pages/Program'));
+const Nutrition = lazyWithRetry(() => import('@/pages/Nutrition'));
+const Progress = lazyWithRetry(() => import('@/pages/Progress'));
+const Kael = lazyWithRetry(() => import('@/pages/Kael'));
+const ProgressPhotos = lazyWithRetry(() => import('@/pages/ProgressPhotos'));
+const FormLab = lazyWithRetry(() => import('@/pages/FormLab'));
+const ProgramDay = lazyWithRetry(() => import('@/pages/ProgramDay'));
+const LiveWorkout = lazyWithRetry(() => import('@/pages/LiveWorkout'));
+const SubscriptionReturn = lazyWithRetry(
   () => import('@/pages/SubscriptionReturn')
 );
 
@@ -65,7 +94,9 @@ function AuthenticatedApp() {
     !isAuthenticated &&
     location.pathname !== '/login' &&
     location.pathname !== '/reset-password' &&
-    location.pathname !== '/subscription-return'
+    location.pathname !== '/subscription-return' &&
+    location.pathname !== '/terms' &&
+    location.pathname !== '/privacy'
   ) {
     return <Navigate to="/login" replace />;
   }
@@ -82,50 +113,56 @@ function AuthenticatedApp() {
       {isAuthenticated && <GlobalMidnightWatcher />}
       {isAuthenticated && <ProgramWeekBootstrap />}
 
-      <Suspense fallback={<PageLoader />}>
-        <Routes>
-          <Route path="/login" element={<Login />} />
-          <Route path="/reset-password" element={<ResetPassword />} />
+      <ErrorBoundary>
+        <Suspense fallback={<PageLoader />}>
+          <Routes>
+            <Route path="/login" element={<Login />} />
+            <Route path="/reset-password" element={<ResetPassword />} />
 
-          <Route path="/onboarding" element={<Onboarding />} />
+            <Route path="/onboarding" element={<Onboarding />} />
 
-          <Route path="/live-workout" element={<LiveWorkout />} />
-
-          <Route
-            path="/subscription-return"
-            element={<SubscriptionReturn />}
-          />
-
-          <Route element={<AppLayout />}>
-            <Route path="/" element={<Dashboard />} />
-
-            <Route path="/program" element={<Program />} />
+            <Route path="/live-workout" element={<LiveWorkout />} />
 
             <Route
-              path="/program/day/:dayIndex"
-              element={<ProgramDay />}
+              path="/subscription-return"
+              element={<SubscriptionReturn />}
             />
 
-            <Route path="/nutrition" element={<Nutrition />} />
+            <Route element={<AppLayout />}>
+              <Route path="/" element={<Dashboard />} />
 
-            <Route path="/progress" element={<Progress />} />
+              <Route path="/program" element={<Program />} />
 
-            <Route path="/profile" element={<Profile />} />
+              <Route
+                path="/program/day/:dayIndex"
+                element={<ProgramDay />}
+              />
 
-            <Route path="/kael" element={<Kael />} />
+              <Route path="/nutrition" element={<Nutrition />} />
 
-            <Route path="/photos" element={<ProgressPhotos />} />
+              <Route path="/progress" element={<Progress />} />
 
-            <Route path="/formlab" element={<FormLab />} />
+              <Route path="/profile" element={<Profile />} />
 
-            <Route path="/about" element={<About />} />
+              <Route path="/kael" element={<Kael />} />
 
-            <Route path="/contact" element={<Contact />} />
-          </Route>
+              <Route path="/photos" element={<ProgressPhotos />} />
 
-          <Route path="*" element={<PageNotFound />} />
-        </Routes>
-      </Suspense>
+              <Route path="/formlab" element={<FormLab />} />
+
+              <Route path="/about" element={<About />} />
+
+              <Route path="/contact" element={<Contact />} />
+
+              <Route path="/terms" element={<Terms />} />
+
+              <Route path="/privacy" element={<Privacy />} />
+            </Route>
+
+            <Route path="*" element={<PageNotFound />} />
+          </Routes>
+        </Suspense>
+      </ErrorBoundary>
     </>
   );
 }

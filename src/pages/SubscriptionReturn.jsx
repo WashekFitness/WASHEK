@@ -67,19 +67,8 @@ export default function SubscriptionReturn() {
     useState('');
 
   /*
-   * Guarantee that any return from Stripe on another host
-   * immediately transfers to washek.ai.studio.
+   * Keep the user on the current host/environment where they are logged in.
    */
-  useEffect(() => {
-    if (
-      typeof window !== 'undefined' &&
-      window.location.hostname &&
-      !window.location.hostname.includes('washek.ai.studio')
-    ) {
-      const search = window.location.search || '';
-      window.location.replace(`https://washek.ai.studio/subscription-return${search}`);
-    }
-  }, []);
 
   useEffect(() => {
     let cancelled =
@@ -295,7 +284,7 @@ export default function SubscriptionReturn() {
     'loading'
   ) {
     return (
-      <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 text-center">
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
 
         <div className="space-y-4">
 
@@ -343,7 +332,7 @@ export default function SubscriptionReturn() {
     'success'
   ) {
     return (
-      <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 text-center">
+      <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
 
         <div className="space-y-4">
 
@@ -386,7 +375,7 @@ export default function SubscriptionReturn() {
    */
 
   return (
-    <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 text-center">
+    <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
 
       <div className="space-y-4 max-w-sm">
 

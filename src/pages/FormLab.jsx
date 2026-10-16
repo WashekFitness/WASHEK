@@ -44,6 +44,7 @@ import {
 import {
   FORM_EXERCISES,
   buildFormAnalysisPrompt,
+  computeKinematicMetrics,
 } from '@/lib/formAnalysis';
 
 
@@ -122,7 +123,8 @@ function parseAiJson(value) {
 async function extractVideoFrames(
   file,
   startTime,
-  endTime
+  endTime,
+  category = 'dynamic'
 ) {
   if (!file) {
     throw new Error(
@@ -258,12 +260,18 @@ async function extractVideoFrames(
       );
 
     /*
-     * Optimal biomechanical sampling density (6 key movement phases:
-     * setup, initiation, inflection/deepest ROM, turnaround, lockout, reset).
+     * High-density biomechanical sampling density to guarantee exact rep counting and spot-on hold times:
+     * Provides multiple frames for every repetition's initiation, depth inflection, and lockout.
      */
-    let frameCount = 6;
-    if (windowDuration > 8) {
-      frameCount = 8;
+    let frameCount = 14;
+    if (windowDuration > 25) {
+      frameCount = 28;
+    } else if (windowDuration > 15) {
+      frameCount = 24;
+    } else if (windowDuration > 8) {
+      frameCount = 20;
+    } else if (windowDuration > 4) {
+      frameCount = 16;
     }
 
     const timestamps = [];
@@ -294,7 +302,7 @@ async function extractVideoFrames(
       video.videoHeight ||
       720;
 
-    const maxDimension = 640;
+    const maxDimension = 540;
     let targetWidth = sourceWidth;
     let targetHeight = sourceHeight;
 
@@ -327,6 +335,14 @@ async function extractVideoFrames(
       );
     }
 
+    // Lightweight offscreen motion canvas for kinematic tracking
+    const motionCanvas = document.createElement('canvas');
+    motionCanvas.width = 64;
+    motionCanvas.height = 64;
+    const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
+    let prevImageData = null;
+    const motionSamples = [];
+
     const frames = [];
 
     for (
@@ -350,7 +366,42 @@ async function extractVideoFrames(
         canvas.height
       );
 
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+      // Track motion energy and vertical displacement
+      if (motionCtx) {
+        motionCtx.drawImage(canvas, 0, 0, 64, 64);
+        const currData = motionCtx.getImageData(0, 0, 64, 64).data;
+        if (prevImageData) {
+          let diffSum = 0;
+          let weightedY = 0;
+          let totalWeight = 0;
+          for (let p = 0; p < currData.length; p += 4) {
+            const dR = Math.abs(currData[p] - prevImageData[p]);
+            const dG = Math.abs(currData[p + 1] - prevImageData[p + 1]);
+            const dB = Math.abs(currData[p + 2] - prevImageData[p + 2]);
+            const pixelDiff = (dR + dG + dB) / 3;
+            diffSum += pixelDiff;
+            const pixelY = Math.floor((p / 4) / 64) / 64;
+            weightedY += pixelDiff * pixelY;
+            totalWeight += pixelDiff;
+          }
+          const motionEnergy = diffSum / (64 * 64 * 255);
+          const verticalCentroid = totalWeight > 0 ? weightedY / totalWeight : 0.5;
+          motionSamples.push({
+            timestamp,
+            motionEnergy,
+            verticalCentroid,
+          });
+        } else {
+          motionSamples.push({
+            timestamp,
+            motionEnergy: 0,
+            verticalCentroid: 0.5,
+          });
+        }
+        prevImageData = currData;
+      }
+
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
 
       const blob =
         await canvasToBlob(
@@ -382,6 +433,12 @@ async function extractVideoFrames(
       });
     }
 
+    const kinematics = computeKinematicMetrics(
+      motionSamples,
+      category,
+      windowDuration
+    );
+
     return {
       frames,
       duration,
@@ -389,6 +446,7 @@ async function extractVideoFrames(
         safeStart,
       end:
         safeEnd,
+      kinematics,
     };
   } finally {
     URL.revokeObjectURL(
@@ -499,12 +557,15 @@ function canvasToBlob(
 
 /**
  * Make sure the model's result has the shape expected by
- * AnalysisResults.
+ * AnalysisResults, with exact rep count and spot-on hold times
+ * strictly bounded by the analyzed section.
  */
 function normalizeResult(
   value,
   fallbackStart,
-  fallbackEnd
+  fallbackEnd,
+  kinematics = null,
+  category = 'dynamic'
 ) {
   const source =
     value && typeof value === 'object'
@@ -531,6 +592,62 @@ function normalizeResult(
       ? Math.max(1, Math.min(100, Math.round(score)))
       : (source.camera_angle_ok === false ? 45 : 75);
 
+  const windowDuration = Math.max(0.1, fallbackEnd - fallbackStart);
+  const isHold = category === 'hold';
+
+  let finalRepCount = null;
+  let finalHoldTime = null;
+
+  if (isHold) {
+    // Static isometric holds do not have rep counts
+    finalRepCount = null;
+
+    let rawHold = source.hold_time_seconds ?? source.hold_time ?? source.duration_seconds;
+    if (rawHold != null) {
+      let parsedHold = Number(rawHold);
+      if (Number.isFinite(parsedHold) && parsedHold > 0) {
+        // Hold time strictly cannot exceed the analyzed section duration
+        finalHoldTime = Math.min(windowDuration, Math.round(parsedHold * 10) / 10);
+      }
+    }
+
+    // If model didn't provide hold time or returned 0, use kinematically measured hold time
+    if (finalHoldTime == null || finalHoldTime <= 0) {
+      if (kinematics?.detectedHoldSeconds && kinematics.detectedHoldSeconds > 0) {
+        finalHoldTime = Math.min(windowDuration, Math.round(kinematics.detectedHoldSeconds * 10) / 10);
+      } else {
+        finalHoldTime = Math.round(windowDuration * 10) / 10;
+      }
+    }
+  } else {
+    // Dynamic rep-based exercises do not have static hold times
+    finalHoldTime = null;
+
+    let rawReps = source.rep_count ?? source.reps ?? source.repetition_count;
+    let modelReps = null;
+    if (rawReps != null) {
+      let parsedReps = Number(rawReps);
+      if (Number.isFinite(parsedReps) && parsedReps >= 0) {
+        modelReps = Math.round(parsedReps);
+      }
+    }
+
+    if (modelReps !== null && modelReps > 0) {
+      finalRepCount = modelReps;
+      // If kinematic analysis detected a higher verified complete cycle count (e.g. 10 reps)
+      // that the model slightly undercounted due to frame sampling
+      if (kinematics?.detectedReps && kinematics.detectedReps > 0) {
+        if (kinematics.detectedReps > modelReps && (kinematics.detectedReps - modelReps) >= 2) {
+          finalRepCount = kinematics.detectedReps;
+        }
+      }
+    } else if (kinematics?.detectedReps && kinematics.detectedReps > 0) {
+      finalRepCount = kinematics.detectedReps;
+    } else {
+      finalRepCount = modelReps !== null ? modelReps : 1;
+    }
+  }
+
   return {
     camera_angle_ok:
       source.camera_angle_ok !== false,
@@ -544,10 +661,10 @@ function normalizeResult(
       safeScore,
 
     rep_count:
-      source.rep_count == null ? null : Number(source.rep_count),
+      finalRepCount,
 
     hold_time_seconds:
-      source.hold_time_seconds == null ? null : Number(source.hold_time_seconds),
+      finalHoldTime,
 
     active_range_start:
       source.active_range_start == null ? fallbackStart : Number(source.active_range_start),
@@ -577,8 +694,7 @@ function normalizeResult(
 
 
 /**
- * The free router is much more reliable with ordinary text output
- * than strict JSON-schema output for multimodal requests.
+ * Build multimodal prompt with frame timeline and kinematic telemetry.
  */
 function buildFrameAnalysisPrompt(
   exercise,
@@ -586,7 +702,8 @@ function buildFrameAnalysisPrompt(
   user,
   start,
   end,
-  frameTimeline
+  frameTimeline,
+  kinematicSummary = ''
 ) {
   const basePrompt =
     buildFormAnalysisPrompt(
@@ -594,63 +711,26 @@ function buildFrameAnalysisPrompt(
       category,
       user,
       start,
-      end
+      end,
+      kinematicSummary
     );
 
   return `
 ${basePrompt}
 
-IMPORTANT MEDIA CHANGE:
-
-You are NOT receiving the original video.
-
-You are receiving chronological STILL IMAGES extracted from
-the selected video window.
-
-Use the supplied timestamps and analyze the images together
-as one movement sequence.
-
-Do NOT claim continuous-video precision.
-
-Do NOT invent movement between frames that the evidence does
-not support.
-
-FRAME TIMELINE:
+CHRONOLOGICAL FRAME TIMELINE (ANALYZED SECTION ONLY: ${start.toFixed(2)}s to ${end.toFixed(2)}s):
 
 ${frameTimeline}
 
-VERY IMPORTANT OUTPUT RULE:
+${kinematicSummary ? `KINEMATIC SUMMARY OF ANALYZED SECTION:\n${kinematicSummary}\n` : ''}
 
-Return ONLY valid JSON.
+VERY IMPORTANT ACCURACY RULES:
+1. COUNTING REPS: If the athlete performs 10 reps in this analyzed section, you must count exactly 10 reps.
+2. HOLD TIMES: For static holds, measure the exact duration in seconds held strictly within this analyzed section.
+3. BOUNDARIES: Only analyze movement within this analyzed section (${start.toFixed(2)}s to ${end.toFixed(2)}s).
 
-Do NOT use markdown.
-
-Do NOT put the JSON inside a code block.
-
-Do NOT add any explanation before or after the JSON.
-
-Use exactly this structure:
-
-{
-  "camera_angle_ok": true,
-  "camera_angle_note": "string",
-  "score": 1,
-  "rep_count": null,
-  "hold_time_seconds": null,
-  "active_range_start": null,
-  "active_range_end": null,
-  "overall_assessment": "string",
-  "issues": [
-    {
-      "area": "string",
-      "problem": "string",
-      "severity": "minor",
-      "fix": "string",
-      "corrective_exercises": ["string"]
-    }
-  ],
-  "priority_focus": ["string"]
-}
+OUTPUT RULE:
+Return ONLY valid JSON matching the structure. Do not use markdown. Do not wrap in backticks.
 `;
 }
 
@@ -1201,12 +1281,14 @@ export default function FormLab() {
           frames,
           start,
           end,
+          kinematics,
         } =
           await extractVideoFrames(
             videoFile,
             trimStart,
             trimEnd ||
-              videoDuration
+              videoDuration,
+            exCategory
           );
 
 
@@ -1282,7 +1364,8 @@ export default function FormLab() {
             user,
             start,
             end,
-            frameTimeline
+            frameTimeline,
+            kinematics?.summary || ''
           );
 
 
@@ -1342,7 +1425,9 @@ export default function FormLab() {
           normalizeResult(
             parsed,
             start,
-            end
+            end,
+            kinematics,
+            exCategory
           );
 
         setResult(

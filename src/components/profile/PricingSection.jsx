@@ -39,8 +39,9 @@ const plans = [
   {
     name: 'Progress',
     planKey: 'progress',
-    price: '$7.99',
+    price: '$9.99',
     period: '/mo',
+    paymentUrl: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
     icon: Flame,
     color: 'text-accent',
     borderColor: 'border-accent/30',
@@ -59,8 +60,9 @@ const plans = [
   {
     name: 'Performance',
     planKey: 'performance',
-    price: '$14.99',
+    price: '$17.99',
     period: '/mo',
+    paymentUrl: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
     icon: Zap,
     color: 'text-primary',
     borderColor: 'border-primary/40',
@@ -80,8 +82,9 @@ const plans = [
   {
     name: 'Elite',
     planKey: 'elite',
-    price: '$24.99',
+    price: '$34.99',
     period: '/mo',
+    paymentUrl: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
     icon: Crown,
     color: 'text-chart-4',
     borderColor: 'border-chart-4/40',
@@ -91,7 +94,7 @@ const plans = [
       '2,000 Kael AI messages/month (20x Free)',
       'Lightning-fast, masterclass Kael AI — kinetic chain mastery, insider secrets & recovery diagnostics',
       'Everything in Performance',
-      'Enhanced real-time workout adjustments',
+      'Live workout adjustments (real-time coaching while training)',
       'AI calisthenics form analysis with video',
       'AI form scoring, rep/hold counting & corrective drills',
       'Elite tips & insider coaching secrets',
@@ -334,7 +337,7 @@ export default function PricingSection() {
       } =
         await supabase.auth.getUser();
 
-      if (!user) {
+      if (!user && !plan.paymentUrl) {
         throw new Error(
           'Please sign in before upgrading your plan.'
         );
@@ -345,48 +348,80 @@ export default function PricingSection() {
        * checkout. This prevents an already-active plan from
        * being purchased again if the UI was stale.
        */
+      if (user) {
+        const {
+          data: freshProfile,
+          error: freshProfileError,
+        } =
+          await supabase
+            .from('profiles')
+            .select(
+              'subscription_plan, subscription_status'
+            )
+            .eq('id', user.id)
+            .maybeSingle();
 
-      const {
-        data: freshProfile,
-        error: freshProfileError,
-      } =
-        await supabase
-          .from('profiles')
-          .select(
-            'subscription_plan, subscription_status'
-          )
-          .eq('id', user.id)
-          .maybeSingle();
+        if (!freshProfileError && freshProfile) {
+          const freshPlan =
+            normalizePlan(
+              freshProfile.subscription_plan
+            );
 
-      if (freshProfileError) {
-        throw freshProfileError;
+          const freshStatus =
+            String(
+              freshProfile.subscription_status || ''
+            ).toLowerCase();
+
+          if (
+            freshPlan ===
+              plan.planKey &&
+            isActiveStatus(
+              freshStatus
+            )
+          ) {
+            setCurrentPlan(
+              freshPlan
+            );
+
+            setError(
+              `You already have an active ${plan.name} subscription.`
+            );
+
+            return;
+          }
+        }
       }
 
-      const freshPlan =
-        normalizePlan(
-          freshProfile?.subscription_plan
-        );
+      /*
+       * Directly navigate to the designated Stripe Payment URL.
+       * Attach client_reference_id (user ID) and prefilled_email
+       * so Stripe automatically attributes the subscription to their account.
+       */
+      if (plan.paymentUrl) {
+        let destinationUrl = plan.paymentUrl;
+        try {
+          const urlObj = new URL(destinationUrl);
+          if (user?.email) {
+            urlObj.searchParams.set('prefilled_email', user.email);
+          }
+          if (user?.id) {
+            urlObj.searchParams.set('client_reference_id', user.id);
+          }
+          destinationUrl = urlObj.toString();
+        } catch {
+          // Keep raw payment URL on URL parse failure
+        }
 
-      const freshStatus =
-        String(
-          freshProfile?.subscription_status || ''
-        ).toLowerCase();
+        try {
+          if (window.top && window.top !== window) {
+            window.top.location.href = destinationUrl;
+            return;
+          }
+        } catch {
+          // If cross-origin framing forbids top navigation, fall back to window.location
+        }
 
-      if (
-        freshPlan ===
-          plan.planKey &&
-        isActiveStatus(
-          freshStatus
-        )
-      ) {
-        setCurrentPlan(
-          freshPlan
-        );
-
-        setError(
-          `You already have an active ${plan.name} subscription.`
-        );
-
+        window.location.href = destinationUrl;
         return;
       }
 
@@ -760,29 +795,34 @@ export default function PricingSection() {
                 Current Plan
               </Button>
             ) : (
-              <Button
-                className="w-full h-10 font-heading font-semibold"
-                variant="outline"
-                onClick={() =>
-                  handleCheckout(
-                    plan
-                  )
-                }
-                disabled={
-                  !!loadingPlan ||
-                  loadingSubscription
-                }
-              >
-                {loadingPlan ===
-                plan.planKey ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Loading...
-                  </>
-                ) : (
-                  `Get ${plan.name}`
-                )}
-              </Button>
+              <div className="space-y-1.5">
+                <Button
+                  className="w-full h-10 font-heading font-semibold"
+                  variant="outline"
+                  onClick={() =>
+                    handleCheckout(
+                      plan
+                    )
+                  }
+                  disabled={
+                    !!loadingPlan ||
+                    loadingSubscription
+                  }
+                >
+                  {loadingPlan ===
+                  plan.planKey ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Loading...
+                    </>
+                  ) : (
+                    `Get ${plan.name}`
+                  )}
+                </Button>
+                <p className="text-[11px] text-center text-muted-foreground">
+                  7 days free, then {plan.price}/mo · Cancel anytime in 1 tap
+                </p>
+              </div>
             )}
           </Card>
         );

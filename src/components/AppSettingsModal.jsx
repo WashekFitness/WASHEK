@@ -1,5 +1,6 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { createPortal } from 'react-dom';
+import { useNavigate } from 'react-router-dom';
 
 import {
   Settings,
@@ -12,10 +13,15 @@ import {
   LockKeyhole,
   LogOut,
   Trash2,
+  Dumbbell,
+  Sparkles,
+  RefreshCw,
+  ShieldCheck,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { generateNewProgram } from '@/lib/programService';
 
 import {
   useAppSettings,
@@ -30,6 +36,7 @@ import {
 import { cn } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
+import { useAuth } from '@/lib/AuthContext';
 import { toast } from 'sonner';
 
 import {
@@ -463,10 +470,11 @@ export default function AppSettingsModal() {
   } =
     useAppSettings();
 
+  const { logout, user } = useAuth();
+  const navigate = useNavigate();
 
   const [open, setOpen] =
     useState(false);
-
 
   const [local, setLocal] =
     useState(
@@ -478,6 +486,47 @@ export default function AppSettingsModal() {
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [changingPassword, setChangingPassword] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
+  const [loggingOut, setLoggingOut] = useState(false);
+
+  // Training program regeneration state
+  const [confirmRegenerateOpen, setConfirmRegenerateOpen] = useState(false);
+  const [isRegeneratingProgram, setIsRegeneratingProgram] = useState(false);
+  const [selectedTrainingType, setSelectedTrainingType] = useState(null);
+  const [userProfile, setUserProfile] = useState(null);
+
+  useEffect(() => {
+    if (!open) return;
+    let mounted = true;
+    supabaseApi.auth
+      .me()
+      .then((p) => {
+        if (mounted && p) {
+          setUserProfile(p);
+          if (!selectedTrainingType && p.training_type) {
+            setSelectedTrainingType(p.training_type);
+          }
+        }
+      })
+      .catch((err) => {
+        console.debug('[AppSettingsModal] me sync note:', err);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [open]);
+
+  const currentTrainingType =
+    selectedTrainingType ||
+    userProfile?.training_type ||
+    user?.training_type ||
+    user?.user_metadata?.training_type ||
+    'calisthenics';
+
+  const handleProceedToOnboarding = () => {
+    setConfirmRegenerateOpen(false);
+    closeModal();
+    navigate('/onboarding');
+  };
 
 
   const openModal = () => {
@@ -565,18 +614,27 @@ export default function AppSettingsModal() {
   };
 
   const handleLogout = async () => {
+    if (loggingOut) return;
+    setLoggingOut(true);
     try {
-      await supabaseApi.auth.logout();
+      closeModal();
+      await logout();
+      try {
+        await supabaseApi.auth.logout();
+      } catch (err) {
+        // Safe fallback
+      }
+      toast.success('Logged out successfully.');
+      window.location.assign('/login');
     } catch (error) {
       console.error(
         '[SETTINGS] Logout failed:',
         error
       );
-
-      toast.error(
-        error?.message ||
-          'Unable to log out.'
-      );
+      closeModal();
+      window.location.assign('/login');
+    } finally {
+      setLoggingOut(false);
     }
   };
 
@@ -611,13 +669,19 @@ export default function AppSettingsModal() {
         );
       }
 
-      await supabaseApi.auth.logout();
+      closeModal();
+      await logout();
+      try {
+        await supabaseApi.auth.logout();
+      } catch (err) {
+        console.debug('[SETTINGS] Secondary auth cleanup error:', err);
+      }
 
       toast.success(
         'Your account has been permanently deleted.'
       );
 
-      window.location.href = '/login';
+      window.location.assign('/login');
     } catch (error) {
       console.error(
         '[SETTINGS] Account deletion failed:',
@@ -1077,6 +1141,45 @@ export default function AppSettingsModal() {
 
                 </div>
 
+                {/* Training Program */}
+                {/* Training Program */}
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+                    <Dumbbell className="w-3 h-3 text-primary" />
+                    Training Program
+                  </p>
+
+                  <button
+                    type="button"
+                    onClick={() => setConfirmRegenerateOpen(true)}
+                    className="
+                      w-full
+                      h-12
+                      rounded-xl
+                      border
+                      border-border
+                      bg-muted/30
+                      text-sm
+                      font-semibold
+                      hover:border-primary/40
+                      hover:bg-muted
+                      transition-all
+                      pointer-events-auto
+                      touch-manipulation
+                      flex
+                      items-center
+                      justify-center
+                      gap-2
+                    "
+                  >
+                    <RefreshCw className="w-4 h-4 text-primary" />
+                    <span>Generate New Program</span>
+                  </button>
+                  <p className="text-[11px] text-muted-foreground mt-1.5 px-0.5 leading-normal">
+                    Return to onboarding to update your goals and create a new plan. All photos, chats, and logs remain safe.
+                  </p>
+                </div>
+
                 {/* Change Password */}
 
                 <div>
@@ -1123,7 +1226,7 @@ export default function AppSettingsModal() {
                     <button
                       type="button"
                       onClick={handleLogout}
-                      disabled={deletingAccount}
+                      disabled={deletingAccount || loggingOut}
                       className="
                         w-full
                         h-12
@@ -1144,8 +1247,17 @@ export default function AppSettingsModal() {
                         gap-2
                       "
                     >
-                      <LogOut className="w-4 h-4" />
-                      Log Out
+                      {loggingOut ? (
+                        <>
+                          <div className="w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                          <span>Logging out...</span>
+                        </>
+                      ) : (
+                        <>
+                          <LogOut className="w-4 h-4" />
+                          <span>Log Out</span>
+                        </>
+                      )}
                     </button>
 
 
@@ -1353,6 +1465,88 @@ export default function AppSettingsModal() {
         )
       : null;
 
+  const confirmRegenerateModal =
+    confirmRegenerateOpen &&
+    typeof document !== 'undefined'
+      ? createPortal(
+          <div
+            className="fixed inset-0 z-[11000] flex items-center justify-center p-4 bg-black/75 backdrop-blur-md"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Generate New Program Confirmation"
+          >
+            <section className="relative w-full max-w-md max-h-[92vh] overflow-y-auto rounded-3xl border border-border bg-card p-6 shadow-2xl space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="space-y-1">
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-primary/10 text-primary border border-primary/20">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    <span>New Program Onboarding</span>
+                  </div>
+                  <h2 className="font-heading font-bold text-xl text-foreground">
+                    Generate a New Program?
+                  </h2>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setConfirmRegenerateOpen(false)}
+                  aria-label="Close dialog"
+                  className="w-9 h-9 rounded-xl bg-muted hover:bg-muted/80 flex items-center justify-center shrink-0 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <p className="text-sm text-muted-foreground leading-relaxed">
+                This will send you back to onboarding so if your goals change, you can update all your new preferences, experience, and training style just like when you started out.
+              </p>
+
+              {/* Data Safety Card */}
+              <div className="rounded-2xl border border-primary/20 bg-primary/5 p-4 text-xs space-y-2">
+                <p className="font-bold text-primary flex items-center gap-1.5 text-xs">
+                  <ShieldCheck className="w-4 h-4 shrink-0 text-primary" />
+                  Your existing data is completely safe and untouched:
+                </p>
+                <ul className="space-y-1.5 text-muted-foreground list-disc list-inside text-xs leading-relaxed">
+                  <li>
+                    <strong className="text-foreground">Progress photos</strong>, custom labels, and date tags remain exactly where they are
+                  </li>
+                  <li>
+                    <strong className="text-foreground">Coach Kael</strong> chat history and guidance memory stay fully preserved
+                  </li>
+                  <li>
+                    <strong className="text-foreground">Past workout logs</strong> and nutrition tracking remain intact
+                  </li>
+                  <li>
+                    <strong className="text-foreground">Profile &amp; stats</strong> stay as they were before
+                  </li>
+                </ul>
+              </div>
+
+              {/* Action Buttons */}
+              <div className="flex flex-col sm:flex-row gap-2 pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setConfirmRegenerateOpen(false)}
+                  className="w-full sm:w-1/2 h-12 rounded-xl text-xs font-semibold order-2 sm:order-1"
+                >
+                  Keep Current Program
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleProceedToOnboarding}
+                  className="w-full sm:w-1/2 h-12 rounded-xl font-heading font-semibold text-xs shadow-md order-1 sm:order-2"
+                >
+                  <Sparkles className="w-4 h-4 mr-2" />
+                  Continue to Onboarding
+                </Button>
+              </div>
+            </section>
+          </div>,
+          document.body
+        )
+      : null;
+
 
   return (
     <>
@@ -1401,6 +1595,7 @@ export default function AppSettingsModal() {
 
       {modal}
       {changePasswordModal}
+      {confirmRegenerateModal}
 
     </>
   );

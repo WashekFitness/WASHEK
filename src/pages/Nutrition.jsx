@@ -23,7 +23,6 @@ import FoodScanner from '@/components/nutrition/FoodScanner';
 import ManualFoodEntry from '@/components/nutrition/ManualFoodEntry';
 import FoodLog from '@/components/nutrition/FoodLog';
 
-import PullToRefresh from '@/components/layout/PullToRefresh';
 import PageHeader from '@/components/layout/PageHeader';
 
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
@@ -41,7 +40,16 @@ export default function Nutrition() {
   const [
     user,
     setUser,
-  ] = useState(null);
+  ] = useState(() => {
+    try {
+      const raw = localStorage.getItem('washek_user');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const userKey = user?.email || user?.id || 'athlete';
 
   /*
    * Synchronized to the user's specific calendar day and timezone.
@@ -61,14 +69,14 @@ export default function Nutrition() {
           return;
         }
 
-        setUser(
-          currentUser
-        );
+        if (currentUser) {
+          setUser(currentUser);
+        }
       })
       .catch((error) => {
-        console.error(
-          '[Nutrition] Failed to load user:',
-          error
+        console.warn(
+          '[Nutrition] Auth check note:',
+          error?.message || error
         );
       });
 
@@ -119,21 +127,20 @@ export default function Nutrition() {
     queryKey: [
       'nutrition',
       today,
-      user?.email,
+      userKey,
     ],
 
     queryFn: () =>
       supabaseApi.entities.NutritionEntry.filter(
         {
           date: today,
-          created_by: user.email,
+          created_by: userKey,
         },
         '-created_date',
         100
       ),
 
-    enabled:
-      !!user?.email,
+    enabled: true,
   });
 
 
@@ -152,9 +159,12 @@ export default function Nutrition() {
 
             date: today,
 
+            created_by: userKey,
+
             meal_type:
               data.meal_type ||
-              mealType,
+              mealType ||
+              'snack',
           }
         ),
 
@@ -163,7 +173,7 @@ export default function Nutrition() {
           queryKey: [
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ],
         });
 
@@ -171,18 +181,33 @@ export default function Nutrition() {
           queryClient.getQueryData([
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ]);
 
         const optimistic = {
           id:
-            `_opt_${Date.now()}`,
+            `_opt_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
 
           date: today,
 
+          created_by: userKey,
+
           meal_type:
             data.meal_type ||
-            mealType,
+            mealType ||
+            'snack',
+
+          calories:
+            Number(data.calories) || 0,
+
+          protein_g:
+            Number(data.protein_g) || 0,
+
+          carbs_g:
+            Number(data.carbs_g) || 0,
+
+          fat_g:
+            Number(data.fat_g) || 0,
 
           ...data,
         };
@@ -191,7 +216,7 @@ export default function Nutrition() {
           [
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ],
 
           (old) => [
@@ -202,6 +227,7 @@ export default function Nutrition() {
 
         return {
           prev: previous,
+          userKey,
         };
       },
 
@@ -215,7 +241,7 @@ export default function Nutrition() {
             [
               'nutrition',
               today,
-              user?.email,
+              context.userKey || userKey,
             ],
             context.prev
           );
@@ -232,7 +258,25 @@ export default function Nutrition() {
         );
       },
 
-      onSuccess: () => {
+      onSuccess: (savedEntry, _variables, context) => {
+        const key = context?.userKey || userKey;
+        if (savedEntry) {
+          queryClient.setQueryData(
+            [
+              'nutrition',
+              today,
+              key,
+            ],
+            (old) => {
+              const current = old || [];
+              const filtered = current.filter(
+                (item) => !String(item.id).startsWith('_opt_') && item.id !== savedEntry.id
+              );
+              return [...filtered, savedEntry];
+            }
+          );
+        }
+
         queryClient.invalidateQueries({
           queryKey: [
             'nutrition',
@@ -299,14 +343,84 @@ export default function Nutrition() {
           }
         ),
 
-      onSuccess: () => {
-        queryClient.invalidateQueries({
+      onMutate: async ({ id, data }) => {
+        await queryClient.cancelQueries({
           queryKey: [
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ],
         });
+
+        const previous =
+          queryClient.getQueryData([
+            'nutrition',
+            today,
+            userKey,
+          ]);
+
+        queryClient.setQueryData(
+          [
+            'nutrition',
+            today,
+            userKey,
+          ],
+          (old) =>
+            (old || []).map((entry) =>
+              entry.id === id
+                ? {
+                    ...entry,
+                    ...data,
+                    meal_type: data.meal_type || entry.meal_type || mealType,
+                  }
+                : entry
+            )
+        );
+
+        return {
+          prev: previous,
+          userKey,
+        };
+      },
+
+      onError: (error, _variables, context) => {
+        if (context?.prev) {
+          queryClient.setQueryData(
+            [
+              'nutrition',
+              today,
+              context.userKey || userKey,
+            ],
+            context.prev
+          );
+        }
+
+        console.error(
+          '[Nutrition] Failed to update food entry:',
+          error
+        );
+
+        toast.error(
+          error?.message ||
+            'Unable to update food.'
+        );
+      },
+
+      onSuccess: (updatedEntry, _variables, context) => {
+        const key = context?.userKey || userKey;
+        if (updatedEntry) {
+          queryClient.setQueryData(
+            [
+              'nutrition',
+              today,
+              key,
+            ],
+            (old) =>
+              (old || []).map((entry) =>
+                entry.id === updatedEntry.id ? { ...entry, ...updatedEntry } : entry
+              )
+          );
+        }
 
         queryClient.invalidateQueries({
           queryKey: [
@@ -316,18 +430,6 @@ export default function Nutrition() {
 
         toast.success(
           'Food updated!'
-        );
-      },
-
-      onError: (error) => {
-        console.error(
-          '[Nutrition] Failed to update food entry:',
-          error
-        );
-
-        toast.error(
-          error?.message ||
-            'Unable to update food.'
         );
       },
     });
@@ -351,7 +453,7 @@ export default function Nutrition() {
           queryKey: [
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ],
         });
 
@@ -359,14 +461,14 @@ export default function Nutrition() {
           queryClient.getQueryData([
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ]);
 
         queryClient.setQueryData(
           [
             'nutrition',
             today,
-            user?.email,
+            userKey,
           ],
 
           (old) =>
@@ -378,6 +480,7 @@ export default function Nutrition() {
 
         return {
           prev: previous,
+          userKey,
         };
       },
 
@@ -391,7 +494,7 @@ export default function Nutrition() {
             [
               'nutrition',
               today,
-              user?.email,
+              context.userKey || userKey,
             ],
             context.prev
           );
@@ -408,7 +511,21 @@ export default function Nutrition() {
         );
       },
 
-      onSuccess: () => {
+      onSuccess: (_data, id, context) => {
+        const key = context?.userKey || userKey;
+        queryClient.setQueryData(
+          [
+            'nutrition',
+            today,
+            key,
+          ],
+          (old) =>
+            (old || []).filter(
+              (entry) =>
+                entry.id !== id
+            )
+        );
+
         queryClient.invalidateQueries({
           queryKey: [
             'nutrition',
@@ -511,17 +628,7 @@ export default function Nutrition() {
    */
 
   return (
-    <PullToRefresh
-      queryKeys={[
-        [
-          'nutrition',
-          today,
-          user?.email,
-        ],
-      ]}
-    >
-
-      <div className="
+    <div className="
         px-5
         pb-4
       ">
@@ -540,110 +647,95 @@ export default function Nutrition() {
             ==================================================== */}
 
         <div className="
-          flex
-          items-center
-          gap-6
+          w-full
           mb-6
-          p-4
+          p-5
+          sm:p-6
           bg-card
           rounded-2xl
           border
-          border-border
+          border-border/90
+          dark:border-white/[0.08]
+          shadow-[0_4px_24px_rgba(15,23,42,0.06),0_1px_3px_rgba(15,23,42,0.03)]
+          dark:shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05),0_8px_32px_rgba(0,0,0,0.45)]
         ">
 
-          {/* Calorie Ring */}
-
+          {/* Calorie Overview Header */}
           <div className="
-            relative
-            w-24
-            h-24
-            shrink-0
+            flex
+            flex-col
+            sm:flex-row
+            items-start
+            sm:items-center
+            justify-between
+            gap-4
+            pb-5
+            mb-5
+            border-b
+            border-border/80
+            dark:border-white/[0.07]
           ">
+            <div className="flex items-center gap-4">
+              <div className="relative w-16 h-16 shrink-0">
+                <svg
+                  className="w-16 h-16 -rotate-90"
+                  viewBox="0 0 100 100"
+                  aria-hidden="true"
+                >
+                  <circle
+                    cx="50"
+                    cy="50"
+                    r="40"
+                    fill="none"
+                    stroke="hsl(var(--muted))"
+                    strokeWidth="9"
+                  />
+                  <circle
+                    cx="50"
+                    cy="50"
+                    r="40"
+                    fill="none"
+                    stroke="hsl(var(--primary))"
+                    strokeWidth="9"
+                    strokeLinecap="round"
+                    strokeDasharray={`${progress * 2.51} 251`}
+                    className="transition-all duration-700"
+                  />
+                </svg>
 
-            <svg
-              className="
-                w-24
-                h-24
-                -rotate-90
-              "
-              viewBox="0 0 100 100"
-              aria-hidden="true"
-            >
+                <div className="absolute inset-0 flex items-center justify-center">
+                  <Flame className="w-5 h-5 text-primary drop-shadow" />
+                </div>
+              </div>
 
-              <circle
-                cx="50"
-                cy="50"
-                r="42"
-                fill="none"
-                stroke="hsl(var(--muted))"
-                strokeWidth="8"
-              />
-
-
-              <circle
-                cx="50"
-                cy="50"
-                r="42"
-                fill="none"
-                stroke="hsl(var(--primary))"
-                strokeWidth="8"
-                strokeLinecap="round"
-                strokeDasharray={`${progress * 2.64} 264`}
-                className="
-                  transition-all
-                  duration-700
-                "
-              />
-
-            </svg>
-
-
-            <div className="
-              absolute
-              inset-0
-              flex
-              flex-col
-              items-center
-              justify-center
-            ">
-
-              <Flame className="
-                w-4
-                h-4
-                text-primary
-                mb-0.5
-              " />
-
-
-              <p className="
-                font-heading
-                font-bold
-                text-sm
-              ">
-                {Math.round(
-                  totals.calories
-                )}
-              </p>
-
-
-              <p className="
-                text-[9px]
-                text-muted-foreground
-              ">
-                / {calorieGoal}
-              </p>
-
+              <div>
+                <span className="text-[10px] font-bold tracking-widest text-muted-foreground uppercase font-heading">
+                  Daily Energy
+                </span>
+                <div className="flex items-baseline gap-1.5 mt-0.5">
+                  <span className="font-heading font-extrabold text-2xl text-foreground">
+                    {Math.round(totals.calories).toLocaleString()}
+                  </span>
+                  <span className="text-xs text-muted-foreground font-medium">
+                    / {calorieGoal.toLocaleString()} kcal
+                  </span>
+                </div>
+                <p className="text-xs text-primary font-medium mt-0.5">
+                  {Math.max(0, calorieGoal - Math.round(totals.calories)).toLocaleString()} kcal remaining
+                </p>
+              </div>
             </div>
 
+            <div className="flex items-center gap-2 self-end sm:self-center">
+              <span className="text-xs text-muted-foreground font-medium">
+                {Math.round(progress)}% of daily target
+              </span>
+            </div>
           </div>
 
 
-          {/* Macro Bars */}
-
-          <div className="
-            flex-1
-            space-y-2
-          ">
+          {/* Macro Bars - spanning the full width of the box */}
+          <div className="w-full space-y-4">
 
             {[
               {
@@ -651,7 +743,10 @@ export default function Nutrition() {
                 value: totals.protein,
                 goal: goals.protein,
                 icon: Drumstick,
-                color: 'bg-primary',
+                barGradient: 'from-blue-600 via-blue-500 to-sky-400',
+                textColor: 'text-blue-400',
+                badgeBg: 'bg-blue-500/15 border-blue-500/25',
+                glow: 'shadow-[0_0_12px_rgba(59,130,246,0.35)]',
               },
 
               {
@@ -659,7 +754,10 @@ export default function Nutrition() {
                 value: totals.carbs,
                 goal: goals.carbs,
                 icon: Wheat,
-                color: 'bg-accent',
+                barGradient: 'from-emerald-600 via-emerald-500 to-teal-400',
+                textColor: 'text-emerald-400',
+                badgeBg: 'bg-emerald-500/15 border-emerald-500/25',
+                glow: 'shadow-[0_0_12px_rgba(16,185,129,0.35)]',
               },
 
               {
@@ -667,80 +765,121 @@ export default function Nutrition() {
                 value: totals.fat,
                 goal: goals.fat,
                 icon: Droplets,
-                color: 'bg-chart-4',
+                barGradient: 'from-amber-600 via-amber-500 to-orange-400',
+                textColor: 'text-amber-400',
+                badgeBg: 'bg-amber-500/15 border-amber-500/25',
+                glow: 'shadow-[0_0_12px_rgba(245,158,11,0.35)]',
               },
             ].map(
               ({
                 label,
                 value,
                 goal,
-                color,
+                icon: Icon,
+                barGradient,
+                textColor,
+                badgeBg,
+                glow,
               }) => {
-
-                const safeGoal =
-                  Math.max(
-                    Number(goal) || 1,
-                    1
-                  );
-
-                const macroProgress =
-                  Math.min(
-                    (
-                      Number(value) /
-                      safeGoal
-                    ) * 100,
-                    100
-                  );
+                const safeGoal = Math.max(Number(goal) || 1, 1);
+                const roundedVal = Math.round(Number(value) || 0);
+                const macroProgress = Math.min((Number(value) / safeGoal) * 100, 100);
+                const realPercent = Math.round((Number(value) / safeGoal) * 100);
 
                 return (
                   <div
                     key={label}
+                    className="w-full"
                   >
 
                     <div className="
                       flex
                       items-center
                       justify-between
-                      text-xs
-                      mb-0.5
+                      mb-1.5
                     ">
 
-                      <span className="
-                        text-muted-foreground
-                      ">
-                        {label}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <div className={`
+                          w-5
+                          h-5
+                          rounded-md
+                          flex
+                          items-center
+                          justify-center
+                          border
+                          ${badgeBg}
+                        `}>
+                          <Icon className={`w-3 h-3 ${textColor}`} />
+                        </div>
+
+                        <span className="
+                          font-heading
+                          font-semibold
+                          text-sm
+                          text-foreground
+                          tracking-wide
+                        ">
+                          {label}
+                        </span>
+                      </div>
 
 
-                      <span className="
-                        font-medium
-                      ">
-                        {Math.round(
-                          Number(value) || 0
-                        )}g / {goal}g
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs">
+                          <strong className="font-bold text-sm text-foreground">
+                            {roundedVal}g
+                          </strong>
+                          <span className="text-muted-foreground font-normal ml-0.5">
+                            / {goal}g
+                          </span>
+                        </span>
+
+                        <span className={`
+                          text-[10px]
+                          font-bold
+                          px-1.5
+                          py-0.5
+                          rounded-full
+                          border
+                          ${badgeBg}
+                          ${textColor}
+                        `}>
+                          {realPercent}%
+                        </span>
+                      </div>
 
                     </div>
 
 
+                    {/* Full-width Macro Bar */}
                     <div className="
-                      h-1.5
-                      bg-muted
+                      relative
+                      h-3
+                      w-full
+                      bg-slate-100
+                      dark:bg-muted/70
                       rounded-full
                       overflow-hidden
+                      border
+                      border-slate-200/80
+                      dark:border-white/[0.06]
+                      p-0.5
+                      shadow-inner
                     ">
 
                       <div
                         className={`
                           h-full
-                          ${color}
+                          bg-gradient-to-r
+                          ${barGradient}
                           rounded-full
                           transition-all
                           duration-500
+                          ${macroProgress > 0 ? glow : ''}
                         `}
                         style={{
-                          width:
-                            `${macroProgress}%`,
+                          width: `${Math.max(macroProgress, roundedVal > 0 ? 3 : 0)}%`,
                         }}
                       />
 
@@ -820,6 +959,7 @@ export default function Nutrition() {
         ">
 
           <FoodScanner
+            defaultMealType={mealType}
             onFoodDetected={
               (food) =>
                 createMutation.mutate(
@@ -835,6 +975,7 @@ export default function Nutrition() {
 
 
           <ManualFoodEntry
+            defaultMealType={mealType}
             onSubmit={
               (food) =>
                 createMutation.mutate(
@@ -888,7 +1029,5 @@ export default function Nutrition() {
         </div>
 
       </div>
-
-    </PullToRefresh>
   );
 }

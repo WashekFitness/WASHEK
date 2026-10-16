@@ -7,9 +7,10 @@ function Footer() {
       className="
         mt-8
         border-t
-        border-border
+        border-border/80
+        dark:border-white/[0.08]
         pt-6
-        pb-[calc(5.5rem+env(safe-area-inset-bottom))]
+        pb-3
         sm:pb-4
       "
     >
@@ -96,11 +97,10 @@ function Footer() {
             className="
               inline-flex
               min-h-11
-              min-w-24
               items-center
               justify-center
               rounded-lg
-              px-4
+              px-3
               py-2
               text-sm
               font-medium
@@ -112,6 +112,50 @@ function Footer() {
             "
           >
             Contact
+          </Link>
+
+          <Link
+            to="/terms"
+            className="
+              inline-flex
+              min-h-11
+              items-center
+              justify-center
+              rounded-lg
+              px-3
+              py-2
+              text-xs
+              font-medium
+              text-muted-foreground
+              transition-colors
+              hover:bg-muted/50
+              hover:text-foreground
+              active:bg-muted
+            "
+          >
+            Terms
+          </Link>
+
+          <Link
+            to="/privacy"
+            className="
+              inline-flex
+              min-h-11
+              items-center
+              justify-center
+              rounded-lg
+              px-3
+              py-2
+              text-xs
+              font-medium
+              text-muted-foreground
+              transition-colors
+              hover:bg-muted/50
+              hover:text-foreground
+              active:bg-muted
+            "
+          >
+            Privacy
           </Link>
 
         </nav>

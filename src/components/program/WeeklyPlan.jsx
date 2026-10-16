@@ -26,6 +26,7 @@ import {
   Loader2,
   TrendingUp,
   Shield,
+  Lock,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
@@ -770,7 +771,7 @@ export default function WeeklyPlan({
       !program?.id ||
       !currentMicrocycle
     ) {
-      window.alert(
+      toast.error(
         'This workout cannot be edited right now.'
       );
 
@@ -835,7 +836,7 @@ export default function WeeklyPlan({
       cleanExercises.length ===
       0
     ) {
-      window.alert(
+      toast.error(
         'Add at least one named exercise before saving.'
       );
 
@@ -995,7 +996,7 @@ export default function WeeklyPlan({
         error
       );
 
-      window.alert(
+      toast.error(
         error?.message ||
           'Unable to save your workout changes.'
       );
@@ -1313,7 +1314,9 @@ export default function WeeklyPlan({
             </div>
           ) : (
             <p className="text-[11px] text-muted-foreground leading-relaxed">
-              ⚡ This predicted progression adapts continuously as you complete workouts and log post-workout feedback with Kael.
+              {canEditWorkouts
+                ? '⚡ This predicted progression adapts continuously as you complete workouts and log post-workout feedback with Kael.'
+                : '⚡ Custom workout edits and adaptive programming calibrate your 12-week progression on Progress, Performance, and Elite.'}
             </p>
           )}
         </div>
@@ -1451,6 +1454,23 @@ export default function WeeklyPlan({
                           <Edit3 className="w-3.5 h-3.5" />
 
                           Edit Workout
+
+                        </Button>
+                      )}
+
+                    {!isRestDay &&
+                      !canEditWorkouts && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="w-full mt-3 gap-2 text-xs text-muted-foreground hover:text-foreground border border-dashed border-border/60"
+                          onClick={() => navigate('/profile')}
+                        >
+
+                          <Lock className="w-3.5 h-3.5 text-muted-foreground" />
+
+                          Custom Workout Edits (Progress+)
 
                         </Button>
                       )}

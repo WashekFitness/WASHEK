@@ -55,11 +55,34 @@ export default function FoodLog({ entries, onDelete, onEdit }) {
                   <Card key={entry.id} className="p-3 flex items-center justify-between gap-2">
                     <div className="flex-1 min-w-0">
                       <p className="font-medium text-sm truncate">{entry.food_name}</p>
-                      <div className="flex gap-3 text-xs text-muted-foreground mt-0.5 flex-wrap">
+                      <div className="flex items-center gap-2 text-xs text-muted-foreground mt-1 flex-wrap">
                         <span>{entry.calories} kcal</span>
+                        <span className="text-border/80">•</span>
                         <span>P: {entry.protein_g || 0}g</span>
+                        <span className="text-border/80">•</span>
                         <span>C: {entry.carbs_g || 0}g</span>
+                        <span className="text-border/80">•</span>
                         <span>F: {entry.fat_g || 0}g</span>
+                        <span className="text-border/80">•</span>
+                        <select
+                          value={entry.meal_type || 'snack'}
+                          onChange={(e) => {
+                            const nextMeal = e.target.value;
+                            if (nextMeal !== (entry.meal_type || 'snack')) {
+                              onEdit(entry.id, {
+                                ...entry,
+                                meal_type: nextMeal,
+                              });
+                            }
+                          }}
+                          aria-label={`Change meal for ${entry.food_name}`}
+                          className="text-[11px] font-medium text-foreground bg-muted/60 hover:bg-muted dark:bg-muted/40 border border-border/70 rounded px-1.5 py-0.5 cursor-pointer focus:outline-hidden focus:ring-1 focus:ring-primary transition-colors capitalize"
+                        >
+                          <option value="breakfast">🌅 Breakfast</option>
+                          <option value="lunch">☀️ Lunch</option>
+                          <option value="dinner">🌙 Dinner</option>
+                          <option value="snack">🍎 Snack</option>
+                        </select>
                       </div>
                     </div>
                     <div className="flex items-center shrink-0">
@@ -94,6 +117,7 @@ export default function FoodLog({ entries, onDelete, onEdit }) {
         <FoodEditModal
           foods={[editingEntry]}
           imageUrl={editingEntry.image_url}
+          defaultMealType={editingEntry.meal_type || 'snack'}
           title="Edit Logged Food"
           subtitle="Correct anything you want to change"
           onConfirm={async (items) => {

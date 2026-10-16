@@ -231,12 +231,17 @@ export default function WeeklyUpdate({
   const weekEnd =
     previousWeek.end;
 
+  const cacheKey =
+    `kael_weekly_report_${weekStart}_${weekEnd}_${user?.id || 'user'}`;
+
+  const localClaimKey =
+    `kael_weekly_claimed_${weekStart}_${user?.id || 'user'}`;
+
 
   // ============================================================
   // CHECK SERVER-SIDE WEEKLY UPDATE STATUS
   //
-  // This replaces localStorage as the source of truth for
-  // whether the current Monday cycle has already been used.
+  // Respects both Supabase sessions and Firebase/local sessions
   // ============================================================
 
   useEffect(() => {
@@ -254,39 +259,80 @@ export default function WeeklyUpdate({
 
       setCheckingWeeklyUpdate(true);
 
+      // Check local cache first (instant and reliable across all auth providers)
+      const hasLocalReport =
+        typeof localStorage !== 'undefined' &&
+        Boolean(localStorage.getItem(cacheKey));
+      const hasLocalClaim =
+        typeof localStorage !== 'undefined' &&
+        Boolean(localStorage.getItem(localClaimKey));
+
+      if (hasLocalReport || hasLocalClaim) {
+        if (!cancelled) {
+          setWeeklyUpdateAvailable(false);
+          setCheckingWeeklyUpdate(false);
+        }
+        return;
+      }
+
+      // If user has an active Supabase session, check server-side claim status
       try {
-        const { data, error: statusError } =
-          await supabase.rpc(
-            'get_weekly_update_status'
-          );
-
-        if (statusError) {
-          throw statusError;
+        let hasSupabaseSession = false;
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          hasSupabaseSession = Boolean(sessionData?.session?.user);
+        } catch {
+          hasSupabaseSession = false;
         }
 
-        if (cancelled) {
-          return;
+        if (hasSupabaseSession) {
+          const { data, error: statusError } =
+            await supabase.rpc(
+              'get_weekly_update_status'
+            );
+
+          if (!statusError && data) {
+            if (cancelled) {
+              return;
+            }
+
+            const alreadyClaimed =
+              Boolean(
+                data?.already_claimed ?? data?.claimed ?? (data?.available === false)
+              );
+
+            setWeeklyUpdateAvailable(
+              !alreadyClaimed
+            );
+            return;
+          }
+
+          // If unauthenticated or RPC error, log gentle notice instead of fatal error
+          const isAuthError =
+            statusError?.code === 'P0001' ||
+            statusError?.code === '42501' ||
+            statusError?.message?.toLowerCase().includes('not authenticated') ||
+            statusError?.message?.toLowerCase().includes('authentication required');
+
+          if (!isAuthError && statusError) {
+            console.warn(
+              '[KAEL WEEKLY UPDATE] Server status check notice:',
+              statusError?.message || statusError
+            );
+          }
         }
 
-        const alreadyClaimed =
-          Boolean(
-            data?.already_claimed
-          );
-
-        setWeeklyUpdateAvailable(
-          !alreadyClaimed
-        );
+        // When authenticated via Firebase/Google or fallback without Supabase JWT,
+        // availability is determined by whether the cycle has been claimed locally
+        if (!cancelled) {
+          setWeeklyUpdateAvailable(true);
+        }
       } catch (statusError) {
-        console.error(
-          '[KAEL WEEKLY UPDATE] Failed to check server status:',
-          statusError
+        console.warn(
+          '[KAEL WEEKLY UPDATE] Status check note:',
+          statusError?.message || statusError
         );
 
-        /*
-         * Do not lock the feature if the status check itself
-         * fails. The actual claim RPC below remains the
-         * authoritative server-side protection.
-         */
         if (!cancelled) {
           setWeeklyUpdateAvailable(true);
         }
@@ -305,6 +351,8 @@ export default function WeeklyUpdate({
   }, [
     user?.id,
     monday,
+    cacheKey,
+    localClaimKey,
   ]);
 
 
@@ -508,13 +556,8 @@ export default function WeeklyUpdate({
   // ============================================================
   // CACHE
   //
-  // LocalStorage is still used only as a display cache.
-  // It is NO LONGER the usage limit.
+  // LocalStorage is used for cached display report
   // ============================================================
-
-  const cacheKey =
-    `kael_weekly_report_${weekStart}_${weekEnd}_${user?.id || 'user'}`;
-
 
   useEffect(() => {
     const cached =
@@ -1497,38 +1540,58 @@ Never diagnose a medical condition.
         // This happens AFTER Kael successfully produced a valid
         // report. Therefore a failed AI request does not consume
         // the user's weekly update.
-        //
-        // The RPC is the authoritative protection against two
-        // simultaneous successful claims.
         // --------------------------------------------------------
 
-      const {
-        data: claimResult,
-        error: claimError,
-      } = await supabase.rpc(
-        'claim_weekly_update'
-      );
+      try {
+        let hasSupabaseSession = false;
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          hasSupabaseSession = Boolean(sessionData?.session?.user);
+        } catch {
+          hasSupabaseSession = false;
+        }
 
+        if (hasSupabaseSession) {
+          const {
+            data: claimResult,
+            error: claimError,
+          } = await supabase.rpc(
+            'claim_weekly_update'
+          );
 
-      if (claimError) {
-        throw claimError;
+          if (claimError) {
+            const isAuthError =
+              claimError.code === 'P0001' ||
+              claimError.code === '42501' ||
+              claimError.message?.toLowerCase().includes('not authenticated') ||
+              claimError.message?.toLowerCase().includes('authentication required');
+
+            if (!isAuthError) {
+              throw claimError;
+            }
+          } else if (claimResult) {
+            if (claimResult.allowed === false && claimResult.claimed === false) {
+              setWeeklyUpdateAvailable(false);
+
+              throw new Error(
+                'You have already used your Weekly Update for this Monday cycle. Your next Weekly Update will be available next Monday.'
+              );
+            }
+          }
+        }
+      } catch (err) {
+        if (err.message?.includes('already used your Weekly Update')) {
+          throw err;
+        }
+        console.warn('[KAEL WEEKLY UPDATE] Server claim note:', err?.message || err);
       }
 
-
-      if (
-        !claimResult?.allowed
-      ) {
-        setWeeklyUpdateAvailable(false);
-
-        throw new Error(
-          'You have already used your Weekly Update for this Monday cycle. Your next Weekly Update will be available next Monday.'
-        );
+      // Record local claim marker
+      try {
+        localStorage.setItem(localClaimKey, 'true');
+      } catch (_storageErr) {
+        // Storage note
       }
-
-
-      // --------------------------------------------------------
-      // SERVER CLAIM SUCCEEDED
-      // --------------------------------------------------------
 
       setWeeklyUpdateAvailable(false);
 

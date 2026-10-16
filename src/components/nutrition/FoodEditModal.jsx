@@ -26,6 +26,7 @@ export default function FoodEditModal({
   imageUrl,
   onConfirm,
   onCancel,
+  defaultMealType = 'snack',
   title = 'Review Scan',
   subtitle = 'Edit anything the AI got wrong',
 }) {
@@ -37,15 +38,20 @@ export default function FoodEditModal({
     setItems,
   ] = useState(
     (foods || []).map(
-      (food) =>
-        Object.fromEntries(
+      (food) => {
+        const cleaned = Object.fromEntries(
           Object.entries(
             food || {}
           ).filter(
             ([key]) =>
               key !== 'image_url'
           )
-        )
+        );
+        return {
+          ...cleaned,
+          meal_type: food?.meal_type || defaultMealType || 'snack',
+        };
+      }
     )
   );
 
@@ -114,6 +120,10 @@ export default function FoodEditModal({
 
           fat_g:
             0,
+
+          meal_type:
+            defaultMealType ||
+            'snack',
 
           image_url:
             imageUrl,
@@ -580,6 +590,46 @@ export default function FoodEditModal({
 
                       </div>
 
+                      {/* Meal Category */}
+                      <div>
+                        <p className="
+                          text-[11px]
+                          text-muted-foreground
+                          mb-1.5
+                          font-medium
+                        ">
+                          Meal
+                        </p>
+                        <div className="grid grid-cols-4 gap-1 p-1 bg-muted/60 dark:bg-muted/40 rounded-xl border border-border/60">
+                          {[
+                            { value: 'breakfast', label: 'Breakfast', emoji: '🌅' },
+                            { value: 'lunch', label: 'Lunch', emoji: '☀️' },
+                            { value: 'dinner', label: 'Dinner', emoji: '🌙' },
+                            { value: 'snack', label: 'Snack', emoji: '🍎' },
+                          ].map((m) => {
+                            const isSelected = (item.meal_type || defaultMealType || 'snack') === m.value;
+                            return (
+                              <button
+                                key={m.value}
+                                type="button"
+                                onClick={() => update(index, 'meal_type', m.value)}
+                                className={`
+                                  flex flex-col sm:flex-row items-center justify-center gap-1 py-1.5 px-1 rounded-lg text-xs transition-all pointer-events-auto touch-manipulation
+                                  ${
+                                    isSelected
+                                      ? 'bg-primary text-primary-foreground font-semibold shadow-xs'
+                                      : 'text-muted-foreground hover:text-foreground hover:bg-background/60 font-medium'
+                                  }
+                                `}
+                              >
+                                <span className="text-xs">{m.emoji}</span>
+                                <span className="text-[10px] sm:text-xs truncate">{m.label}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+
                     </Card>
 
                   )
@@ -709,6 +759,10 @@ export default function FoodEditModal({
                         validItems.map(
                           (item) => ({
                             ...item,
+                            meal_type:
+                              item.meal_type ||
+                              defaultMealType ||
+                              'snack',
                             calories:
                               Number(item.calories) || 0,
                             protein_g:

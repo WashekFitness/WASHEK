@@ -1,0 +1,92 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User account profile, fitness goals, preferences, and biometrics",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Unique user ID matching auth.uid" },
+        "email": { "type": "string", "description": "User email address" },
+        "first_name": { "type": "string", "description": "First name of the athlete" },
+        "last_name": { "type": "string", "description": "Last name of the athlete" },
+        "avatar_url": { "type": "string", "description": "Profile picture URL or base64 data" },
+        "role": { "type": "string", "description": "User role: member, athlete, coach" },
+        "plan": { "type": "string", "description": "Subscription tier: free, pro, elite" },
+        "current_weight": { "type": "number", "description": "Current body weight" },
+        "goal_weight": { "type": "number", "description": "Target body weight" },
+        "target_calories": { "type": "number", "description": "Daily target calories" },
+        "target_protein": { "type": "number", "description": "Daily target protein in grams" },
+        "target_carbs": { "type": "number", "description": "Daily target carbs in grams" },
+        "target_fat": { "type": "number", "description": "Daily target fat in grams" },
+        "created_at": { "type": "string", "description": "ISO timestamp of account creation" },
+        "updated_at": { "type": "string", "description": "ISO timestamp of last update" }
+      },
+      "required": ["id", "email"]
+    },
+    "WorkoutLog": {
+      "title": "WorkoutLog",
+      "description": "Daily completed or scheduled training sessions",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Workout record ID" },
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "date": { "type": "string", "description": "Date string YYYY-MM-DD" },
+        "title": { "type": "string", "description": "Workout session title" },
+        "category": { "type": "string", "description": "Strength, Hypertrophy, Conditioning" },
+        "duration_minutes": { "type": "number", "description": "Session duration" },
+        "completed": { "type": "boolean", "description": "Completion status" },
+        "exercises": { "type": "string", "description": "JSON serialized exercise list or summaries" },
+        "created_at": { "type": "string", "description": "ISO timestamp" }
+      },
+      "required": ["id", "userId", "date"]
+    },
+    "NutritionLog": {
+      "title": "NutritionLog",
+      "description": "Daily nutrition and macro intake logs",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Nutrition record ID" },
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "date": { "type": "string", "description": "Date string YYYY-MM-DD" },
+        "calories": { "type": "number", "description": "Logged total calories" },
+        "protein": { "type": "number", "description": "Logged total protein grams" },
+        "carbs": { "type": "number", "description": "Logged total carb grams" },
+        "fat": { "type": "number", "description": "Logged total fat grams" },
+        "meals": { "type": "string", "description": "JSON serialized meal details" },
+        "created_at": { "type": "string", "description": "ISO timestamp" }
+      },
+      "required": ["id", "userId", "date"]
+    },
+    "WeightEntry": {
+      "title": "WeightEntry",
+      "description": "Biometric weight log entry for progress tracking",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Entry ID" },
+        "userId": { "type": "string", "description": "Owner user ID" },
+        "date": { "type": "string", "description": "Date string YYYY-MM-DD" },
+        "weight": { "type": "number", "description": "Recorded weight" },
+        "notes": { "type": "string", "description": "Optional notes" }
+      },
+      "required": ["id", "userId", "date", "weight"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "UserProfile",
+      "description": "User profile and settings"
+    },
+    "/users/{userId}/workouts/{workoutId}": {
+      "schema": "WorkoutLog",
+      "description": "Workout history and logged sessions"
+    },
+    "/users/{userId}/nutrition_logs/{logId}": {
+      "schema": "NutritionLog",
+      "description": "Daily nutrition and macro logs"
+    },
+    "/users/{userId}/weight_history/{entryId}": {
+      "schema": "WeightEntry",
+      "description": "Historical weight check-ins"
+    }
+  }
+}

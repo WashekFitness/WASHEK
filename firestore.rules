@@ -1,0 +1,45 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // User profile: only the user themselves can read, create, update, or delete
+    match /users/{userId} {
+      allow read, write: if isOwner(userId);
+
+      // Subcollections: workouts, nutrition_logs, weight_history
+      match /workouts/{workoutId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /nutrition_logs/{logId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /nutrition_entries/{entryId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /progress_photos/{photoId} {
+        allow read, write: if isOwner(userId);
+      }
+
+      match /weight_history/{entryId} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Connection test document
+    match /test/{docId} {
+      allow read: if true;
+      allow write: if false;
+    }
+  }
+}

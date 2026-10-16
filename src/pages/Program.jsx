@@ -1,139 +1,93 @@
 import { useEffect, useState } from 'react';
-
-import {
-  supabaseApi,
-} from '@/lib/supabaseApi';
-
+import { useAuth } from '@/lib/AuthContext';
+import { supabaseApi } from '@/lib/supabaseApi';
 import {
   useQuery,
   useMutation,
   useQueryClient,
 } from '@tanstack/react-query';
-
 import {
   Tabs,
   TabsList,
   TabsTrigger,
   TabsContent,
 } from '@/components/ui/tabs';
-
 import CycleOverview from '@/components/program/CycleOverview';
-
 import WeeklyPlan from '@/components/program/WeeklyPlan';
-
-import PullToRefresh from '@/components/layout/PullToRefresh';
-
 import {
   Dumbbell,
   Play,
   Loader2,
   AlertCircle,
+  Sparkles,
 } from 'lucide-react';
-
-import {
-  Button,
-} from '@/components/ui/button';
-
-import {
-  Link,
-} from 'react-router-dom';
-
-import {
-  toast,
-} from 'sonner';
-
-import {
-  normalizeWorkoutProgram,
-} from '@/lib/expandMicrocycles';
+import { Button } from '@/components/ui/button';
+import { Link } from 'react-router-dom';
+import { toast } from 'sonner';
+import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 
 export default function Program() {
-  const queryClient =
-    useQueryClient();
+  const queryClient = useQueryClient();
+  const { user: authUser, isLoadingAuth } = useAuth();
+  const [user, setUser] = useState(() => authUser);
 
-  const [
-    user,
-    setUser,
-  ] =
-    useState(null);
+  // Sync with AuthContext
+  useEffect(() => {
+    if (authUser) {
+      setUser(authUser);
+    }
+  }, [authUser]);
 
   /*
    * ==========================================================
-   * LOAD CURRENT USER
+   * LOAD CURRENT USER PROFILE
    * ==========================================================
    */
-
   useEffect(() => {
     let mounted = true;
 
     supabaseApi.auth
       .me()
-      .then(
-        currentUser => {
-          if (
-            mounted
-          ) {
-            setUser(
-              currentUser
-            );
-          }
+      .then(currentUser => {
+        if (mounted && currentUser) {
+          setUser(currentUser);
         }
-      )
-      .catch(
-        error => {
-          console.error(
-            '[Program] Failed to load user:',
-            error
-          );
-        }
-      );
+      })
+      .catch(error => {
+        console.debug('[Program] User sync note:', error?.message || error);
+      });
 
     return () => {
-      mounted =
-        false;
+      mounted = false;
     };
   }, []);
+
+  const effectiveUser = user || authUser;
 
   /*
    * ==========================================================
    * LOAD ACTIVE PROGRAM
    * ==========================================================
    */
-
   const {
     data: programs = [],
     isLoading,
     isError,
     error,
-  } =
-    useQuery({
-      queryKey: [
-        'programs',
-        user?.id,
-      ],
-
-      queryFn:
-        () =>
-          supabaseApi.entities.WorkoutProgram.filter(
-            {
-              status:
-                'active',
-            },
-            '-created_at',
-            10
-          ),
-
-      enabled:
-        !!user?.id,
-
-      staleTime:
-        0,
-
-      refetchOnMount:
-        'always',
-
-      refetchOnWindowFocus:
-        true,
-    });
+    refetch,
+  } = useQuery({
+    queryKey: ['programs', effectiveUser?.id],
+    queryFn: () =>
+      supabaseApi.entities.WorkoutProgram.filter(
+        { status: 'active' },
+        '-created_at',
+        10
+      ),
+    enabled: !!effectiveUser?.id,
+    staleTime: 0,
+    refetchOnMount: 'always',
+    refetchOnWindowFocus: true,
+  });
 
   /*
    * ==========================================================
@@ -200,13 +154,9 @@ export default function Program() {
    * INITIAL LOADING
    * ==========================================================
    */
-
-  if (
-    !user ||
-    isLoading
-  ) {
+  if ((isLoading && !programs.length) || (isLoadingAuth && !effectiveUser)) {
     return (
-      <div className="flex items-center justify-center min-h-screen">
+      <div className="flex items-center justify-center min-h-[70vh]">
         <Loader2 className="w-8 h-8 animate-spin text-primary" />
       </div>
     );
@@ -217,40 +167,39 @@ export default function Program() {
    * LOAD ERROR
    * ==========================================================
    */
-
-  if (
-    isError
-  ) {
+  if (isError && !program) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen px-6 text-center">
-
+      <div className="flex flex-col items-center justify-center min-h-[70vh] px-6 text-center">
         <AlertCircle className="w-14 h-14 text-destructive mb-4" />
 
         <h2 className="font-heading text-xl font-bold mb-2">
           Program couldn't be loaded
         </h2>
 
-        <p className="text-sm text-muted-foreground max-w-sm mb-5">
+        <p className="text-sm text-muted-foreground max-w-sm mb-6">
           {error?.message ||
             'There was a problem loading your workout program.'}
         </p>
 
-        <Button
-          type="button"
-          onClick={() =>
-            queryClient.invalidateQueries(
-              {
-                queryKey: [
-                  'programs',
-                  user.id,
-                ],
-              }
-            )
-          }
-        >
-          Try Again
-        </Button>
+        <div className="flex flex-col sm:flex-row items-center gap-3 w-full max-w-xs">
+          <Button
+            type="button"
+            className="w-full h-11 rounded-xl"
+            onClick={() => refetch()}
+          >
+            Try Again
+          </Button>
 
+          <Link to="/onboarding" className="w-full">
+            <Button
+              type="button"
+              variant="outline"
+              className="w-full h-11 rounded-xl"
+            >
+              Build New Program
+            </Button>
+          </Link>
+        </div>
       </div>
     );
   }
@@ -260,23 +209,27 @@ export default function Program() {
    * NO PROGRAM
    * ==========================================================
    */
-
-  if (
-    !program
-  ) {
+  if (!program) {
     return (
-      <div className="flex flex-col items-center justify-center min-h-screen px-6 text-center">
+      <div className="flex flex-col items-center justify-center min-h-[70vh] px-6 text-center">
+        <div className="w-16 h-16 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mb-5 shadow-lg shadow-primary/10">
+          <Dumbbell className="w-8 h-8 text-primary" />
+        </div>
 
-        <Dumbbell className="w-16 h-16 text-muted-foreground mb-4" />
-
-        <h2 className="font-heading text-xl font-bold mb-2">
+        <h2 className="font-heading text-2xl font-bold mb-2">
           No Program Yet
         </h2>
 
-        <p className="text-muted-foreground max-w-sm">
-          Complete the onboarding to generate your personalized program.
+        <p className="text-sm text-muted-foreground max-w-sm mb-6">
+          Set up your personalized 12-week periodized program tailored to your goals, equipment, and experience.
         </p>
 
+        <Link to="/onboarding">
+          <Button className="h-12 px-7 rounded-xl font-heading font-semibold text-sm bg-gradient-to-r from-primary to-blue-600 shadow-xl shadow-primary/25 hover:opacity-95 transition-all">
+            <Sparkles className="w-4 h-4 mr-2" />
+            Build My 12-Week Program
+          </Button>
+        </Link>
       </div>
     );
   }
@@ -286,22 +239,8 @@ export default function Program() {
    * PROGRAM
    * ==========================================================
    */
-
   return (
-    <PullToRefresh
-      queryKeys={[
-        [
-          'programs',
-          user.id,
-        ],
-        [
-          'logs',
-          user.id,
-        ],
-      ]}
-    >
-
-      <div className="px-5 pb-4">
+    <div className="px-5 pb-4">
 
         {/* -------------------------------------------------- */}
         {/* HEADER */}
@@ -507,7 +446,5 @@ export default function Program() {
         </Tabs>
 
       </div>
-
-    </PullToRefresh>
   );
 }

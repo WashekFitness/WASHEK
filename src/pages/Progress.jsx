@@ -78,33 +78,44 @@ export default function Progress() {
     queryFn: () => supabaseApi.auth.me(),
   });
 
-  const email = user?.email;
-  const plan = user?.subscription_plan || 'free';
+  const storedUser = (() => {
+    try {
+      const raw = localStorage.getItem('washek_user');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  const effectiveUser = user || storedUser;
+  const email = effectiveUser?.email;
+  const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
+  const plan = effectiveUser?.subscription_plan || 'free';
   const hasWorkoutAnalytics = canAccess(
     plan,
     'workout_analytics'
   );
 
   const { data: logs = [] } = useQuery({
-    queryKey: ['progress-workout-logs', email],
+    queryKey: ['progress-workout-logs', userKey],
     queryFn: () =>
       supabaseApi.entities.WorkoutLog.filter(
-        { created_by: email },
+        { created_by: userKey },
         '-date',
         500
       ),
-    enabled: !!email,
+    enabled: true,
   });
 
   const { data: nutrition = [] } = useQuery({
-    queryKey: ['progress-nutrition', email],
+    queryKey: ['progress-nutrition', userKey],
     queryFn: () =>
       supabaseApi.entities.NutritionEntry.filter(
-        { created_by: email },
+        { created_by: userKey },
         '-date',
         500
       ),
-    enabled: !!email,
+    enabled: true,
   });
 
   const todayKey = toLocalDateKey();
@@ -341,7 +352,7 @@ export default function Progress() {
 
       <div className="mb-5" />
 
-      <div className="grid grid-cols-3 gap-3 mb-6">
+      <div className="grid grid-cols-3 gap-2.5 sm:gap-3 mb-6">
         {statCards.map(
           ({
             label,
@@ -351,15 +362,17 @@ export default function Progress() {
           }) => (
             <Card
               key={label}
-              className="p-3 text-center"
+              className="p-3 sm:p-4 text-center hover:border-primary/40 transition-all flex flex-col items-center justify-center"
             >
-              <Icon
-                className={`w-5 h-5 ${color} mx-auto mb-1`}
-              />
-              <p className="font-heading font-bold text-lg">
+              <div className="w-8 h-8 rounded-xl bg-slate-100/90 dark:bg-background/60 border border-slate-200/80 dark:border-white/[0.04] flex items-center justify-center mb-1.5 shadow-xs">
+                <Icon
+                  className={`w-4 h-4 ${color}`}
+                />
+              </div>
+              <p className="font-heading font-bold text-base sm:text-lg leading-tight">
                 {value}
               </p>
-              <p className="text-[10px] text-muted-foreground">
+              <p className="text-[10px] text-muted-foreground mt-0.5 uppercase tracking-wider font-semibold">
                 {label}
               </p>
             </Card>

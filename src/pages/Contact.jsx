@@ -129,29 +129,11 @@ export default function Contact() {
 
 
       try {
-        /*
-         * IMPORTANT:
-         *
-         * send-contact-email expects:
-         *   name
-         *   email
-         *   message
-         *
-         * Do NOT send:
-         *   to
-         *   subject
-         *   body
-         *
-         * The Edge Function supplies the destination and
-         * subject itself.
-         */
-
         await supabaseApi.email.send({
           name,
           email,
           message,
         });
-
 
         setForm({
           name: '',
@@ -159,13 +141,12 @@ export default function Contact() {
           message: '',
         });
 
-
         toast({
           title:
             'Message sent',
 
           description:
-            'Thanks for reaching out — Adrian will get back to you soon.',
+            'Thank you for reaching out — we will get back to you as soon as possible.',
         });
 
       } catch (

@@ -5,7 +5,24 @@ import { GoogleGenAI } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
-const PORT = 3000;
+// Parse CLI flags and environment variables for port and host
+const args = process.argv.slice(2);
+function parseArg(flag: string): string | null {
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === flag && args[i + 1] && !args[i + 1].startsWith('-')) {
+      return args[i + 1];
+    }
+    if (args[i].startsWith(flag + '=')) {
+      return args[i].slice(flag.length + 1);
+    }
+  }
+  return null;
+}
+
+const cliPort = parseArg('--port') || parseArg('-p');
+const cliHost = parseArg('--host') || parseArg('-h');
+const PORT = parseInt(cliPort || process.env.PORT || '3000', 10);
+const HOST = cliHost || process.env.HOST || '0.0.0.0';
 
 // Body parsers with generous limits for media & base64 frames
 app.use(express.json({ limit: '50mb' }));
@@ -25,6 +42,9 @@ const SUPABASE_ANON_KEY =
     : process.env.VITE_SUPABASE_ANON_KEY && !process.env.VITE_SUPABASE_ANON_KEY.includes('YOUR_')
       ? process.env.VITE_SUPABASE_ANON_KEY
       : 'sb_publishable_hR5RWMT6qfPKbONf3G783A_Log5r61I';
+
+// Supabase client instance for storage & server-side operations
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // Lazy initialization of the Google Gemini AI client
 let aiClient: GoogleGenAI | null = null;
@@ -75,10 +95,10 @@ app.get('/api/health', (req, res) => {
 });
 
 const SYSTEM_INSTRUCTIONS: Record<string, string> = {
-  kael: 'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. You are direct, scientifically grounded, encouraging, and focused on progressive overload, proper biomechanics, recovery, and nutrition. Provide concise, actionable, and motivational guidance.',
+  kael: 'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. You are direct, scientifically grounded, encouraging, and focused on progressive overload, proper form, recovery, and nutrition. Always communicate in simple, everyday language that any beginner can easily understand, without confusing textbook jargon. Use intuitive real-world analogies when helpful to make concepts click, but never talk down to the athlete or sound like you are explaining things to a baby. Maintain a mature, supportive, and practical coaching presence.',
   structure: 'You are an elite strength & conditioning program architect for WASHEK. Design workout structures and weekly splits tailored to the athlete goals. Return a single, strictly valid JSON object matching the requested schema.',
   microcycle: 'You are an elite strength & conditioning program architect for WASHEK. Build comprehensive, progressive workout programming for the microcycle with days, exercise sequences, sets, reps, rest intervals, notes, and activation cues. Return a single valid JSON object with the "microcycle" key adhering to the requested schema.',
-  form_analysis: 'You are an expert biomechanist and strength coach for WASHEK Form Lab. Analyze the user exercise execution from the provided images or video frames. Evaluate posture, joint angles, movement path, tempo, and stability. Be accurate, objective, and fair: reward clean, safe mechanics with solid, encouraging scores (80-95), and only deduct points when there is genuine, observable form breakdown or safety risk. Do not be overly harsh or dock points without visible technique errors. Return a valid JSON analysis.',
+  form_analysis: 'You are an expert biomechanist and strength coach for WASHEK Form Lab. Analyze the user exercise execution from the provided images or video frames. CRITICAL ACCURACY MANDATE: For rep-based exercises, accurately count every completed repetition ONLY WITHIN the analyzed section (if the athlete does 10 reps, count exactly 10). For static holds, measure the exact hold time spot-on in seconds strictly within the analyzed section. Evaluate posture, joint angles, movement path, tempo, and stability. Be accurate, objective, and fair: reward clean, safe mechanics with solid scores (80-95), and only deduct points when there is genuine, observable form breakdown or safety risk. Do not be overly harsh or dock points without visible technique errors. Return a valid JSON analysis.',
   food_scan: 'You are a sports nutritionist and dietitian for WASHEK. Analyze the food photo or ingredients. Identify the foods, estimate portion sizes, and calculate accurate macronutrients (calories, protein, carbohydrates, fat). Return a valid JSON object.',
   food_barcode: 'You are a sports nutritionist for WASHEK. Identify the product from the barcode information and estimate accurate nutritional values and serving sizes in a valid JSON object.',
   progress_photo: 'You are a physique assessment specialist for WASHEK. Objectively assess the progress photo for body composition, estimated body fat percentage range, visible muscle definition, posture, and symmetry in a valid JSON object.',
@@ -222,134 +242,196 @@ app.post('/api/ai-generate', async (req, res) => {
         }
       };
 
-      if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return res.status(401).json({
-          success: false,
-          error: 'Authentication is required to chat with Coach Kael.',
-          error_code: 'UNAUTHENTICATED',
-          type: 'kael',
-        });
-      }
-
-      const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-      const supabaseUser = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-        global: {
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-        },
-        auth: {
-          persistSession: false,
-          autoRefreshToken: false,
-        },
-      });
-
-      // Verify authentic session with Supabase using token
-      const { data: userData, error: userError } = await supabaseUser.auth.getUser(token);
-      if (userError || !userData?.user) {
-        return res.status(401).json({
-          success: false,
-          error: 'Your session is invalid or expired. Please sign in again.',
-          error_code: 'UNAUTHENTICATED',
-          type: 'kael',
-        });
-      }
-
-      const userId = userData.user.id;
-
-      // Authoritatively resolve user's profile and subscription plan
-      const { data: profileRow } = await supabaseUser
-        .from('profiles')
-        .select('subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
-        .eq('id', userId)
-        .maybeSingle();
-
-      const effectiveTz = clientTimezone || profileRow?.timezone || 'UTC';
-      const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-
-      const PLAN_LIMITS: Record<string, number> = {
-        free: 100,
-        progress: 300,
-        performance: 800,
-        elite: 2000,
-      };
-
-      const rawPlan = String(profileRow?.subscription_plan || effectivePlan || 'free').toLowerCase();
-      const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
-      effectivePlan = resolvedPlan;
-      const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
-
-      // Check current usage BEFORE generating response via get_kael_usage RPC
-      let currentUsage: { used: number; limit: number; remaining: number; monthKey: string; plan: string } | null = null;
-      try {
-        let { data: rpcUsage, error: rpcErr } = await supabaseUser.rpc('get_kael_usage');
-        if (rpcErr && rpcErr.code === 'PGRST202') {
-          const fallbackRes = await supabaseUser.rpc('get_kael_usage', {
-            p_timezone: effectiveTz,
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        try {
+          const supabaseUser = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+            global: {
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            },
+            auth: {
+              persistSession: false,
+              autoRefreshToken: false,
+            },
           });
-          if (!fallbackRes.error) {
-            rpcUsage = fallbackRes.data;
-            rpcErr = null;
+
+          // Verify authentic session with Supabase using token
+          const { data: userData, error: userError } = await supabaseUser.auth.getUser(token);
+          if (!userError && userData?.user) {
+            const userId = userData.user.id;
+
+            // Authoritatively resolve user's profile and subscription plan
+            const { data: profileRow } = await supabaseUser
+              .from('profiles')
+              .select('subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+              .eq('id', userId)
+              .maybeSingle();
+
+            const effectiveTz = clientTimezone || profileRow?.timezone || 'UTC';
+            const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+
+            const PLAN_LIMITS: Record<string, number> = {
+              free: 100,
+              progress: 300,
+              performance: 800,
+              elite: 2000,
+            };
+
+            const rawPlan = String(profileRow?.subscription_plan || effectivePlan || 'free').toLowerCase();
+            const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
+            effectivePlan = resolvedPlan;
+            const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
+
+            // Check current usage BEFORE generating response via get_kael_usage RPC
+            let currentUsage: { used: number; limit: number; remaining: number; monthKey: string; plan: string } | null = null;
+            try {
+              let { data: rpcUsage, error: rpcErr } = await supabaseUser.rpc('get_kael_usage');
+              if (rpcErr && rpcErr.code === 'PGRST202') {
+                const fallbackRes = await supabaseUser.rpc('get_kael_usage', {
+                  p_timezone: effectiveTz,
+                });
+                if (!fallbackRes.error) {
+                  rpcUsage = fallbackRes.data;
+                  rpcErr = null;
+                }
+              }
+              if (!rpcErr && rpcUsage && typeof rpcUsage.used === 'number') {
+                currentUsage = {
+                  used: rpcUsage.used,
+                  limit: rpcUsage.limit || usageLimit,
+                  remaining:
+                    typeof rpcUsage.remaining === 'number'
+                      ? rpcUsage.remaining
+                      : Math.max(0, (rpcUsage.limit || usageLimit) - rpcUsage.used),
+                  monthKey: rpcUsage.monthKey || currentMonthKey,
+                  plan: rpcUsage.plan || resolvedPlan,
+                };
+              }
+            } catch (err) {
+              console.warn('[server.ts] get_kael_usage error:', err);
+            }
+
+            // Profile table fallback calculation
+            if (!currentUsage) {
+              const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
+              const count = isCurrentMonth ? Number(profileRow?.kael_msg_count || 0) : 0;
+              currentUsage = {
+                used: count,
+                limit: usageLimit,
+                remaining: Math.max(0, usageLimit - count),
+                monthKey: currentMonthKey,
+                plan: resolvedPlan,
+              };
+            }
+
+            // STRICT BACKEND ENFORCEMENT: If limit reached (0 remaining), reject immediately without calling Gemini
+            if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+              return res.status(429).json({
+                success: false,
+                error: 'You have reached your monthly message limit for Coach Kael.',
+                error_code: 'KAEL_LIMIT_REACHED',
+                quota: {
+                  allowed: false,
+                  used: currentUsage.used,
+                  limit: currentUsage.limit,
+                  remaining: 0,
+                  monthKey: currentUsage.monthKey,
+                  plan: currentUsage.plan,
+                  timezone: effectiveTz,
+                },
+                type: 'kael',
+              });
+            }
+
+            // Store verified user context for atomic deduction once Kael actually answers
+            kaelUserSession = {
+              client: supabaseUser,
+              id: userId,
+              effectiveTz,
+              usageLimit,
+              resolvedPlan,
+              currentMonthKey,
+              currentUsage,
+            };
+          }
+        } catch (authErr) {
+          console.warn('[server.ts] Auth verification note, using free baseline:', authErr);
+        }
+      }
+
+      // Fallback session handling when token is absent or invalid (e.g. preview mode or local user)
+      if (!kaelUserSession) {
+        const fallbackUserId = req.body?.user_id || null;
+        const effectiveTz = clientTimezone || 'UTC';
+        const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+        const PLAN_LIMITS: Record<string, number> = {
+          free: 100,
+          progress: 300,
+          performance: 800,
+          elite: 2000,
+        };
+
+        let profileRow: any = null;
+        if (fallbackUserId) {
+          try {
+            const { data } = await supabase
+              .from('profiles')
+              .select('subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+              .eq('id', fallbackUserId)
+              .maybeSingle();
+            profileRow = data;
+          } catch (profileErr) {
+            console.warn('[server.ts] Fallback profile lookup note:', profileErr);
           }
         }
-        if (!rpcErr && rpcUsage && typeof rpcUsage.used === 'number') {
-          currentUsage = {
-            used: rpcUsage.used,
-            limit: rpcUsage.limit || usageLimit,
-            remaining:
-              typeof rpcUsage.remaining === 'number'
-                ? rpcUsage.remaining
-                : Math.max(0, (rpcUsage.limit || usageLimit) - rpcUsage.used),
-            monthKey: rpcUsage.monthKey || currentMonthKey,
-            plan: rpcUsage.plan || resolvedPlan,
-          };
-        }
-      } catch (err) {
-        console.warn('[server.ts] get_kael_usage error:', err);
-      }
 
-      // Profile table fallback calculation
-      if (!currentUsage) {
+        const rawPlan = String(profileRow?.subscription_plan || req.body?.plan || effectivePlan || 'free').toLowerCase();
+        const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
+        effectivePlan = resolvedPlan;
+        const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
+
         const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
-        const count = isCurrentMonth ? Number(profileRow?.kael_msg_count || 0) : 0;
-        currentUsage = {
+        const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
+        const count = isCurrentMonth ? Number(profileRow?.kael_msg_count ?? clientUsed) : clientUsed;
+
+        const currentUsage = {
           used: count,
           limit: usageLimit,
           remaining: Math.max(0, usageLimit - count),
           monthKey: currentMonthKey,
           plan: resolvedPlan,
         };
-      }
 
-      // STRICT BACKEND ENFORCEMENT: If limit reached (0 remaining), reject immediately without calling Gemini
-      if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
-        return res.status(429).json({
-          success: false,
-          error: 'You have reached your monthly message limit for Coach Kael.',
-          error_code: 'KAEL_LIMIT_REACHED',
-          quota: {
-            allowed: false,
-            used: currentUsage.used,
-            limit: currentUsage.limit,
-            remaining: 0,
-            monthKey: currentUsage.monthKey,
-            plan: currentUsage.plan,
-            timezone: effectiveTz,
-          },
-          type: 'kael',
-        });
-      }
+        if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+          return res.status(429).json({
+            success: false,
+            error: 'You have reached your monthly message limit for Coach Kael.',
+            error_code: 'KAEL_LIMIT_REACHED',
+            quota: {
+              allowed: false,
+              used: currentUsage.used,
+              limit: currentUsage.limit,
+              remaining: 0,
+              monthKey: currentUsage.monthKey,
+              plan: currentUsage.plan,
+              timezone: effectiveTz,
+            },
+            type: 'kael',
+          });
+        }
 
-      // Store verified user context for atomic deduction once Kael actually answers
-      kaelUserSession = {
-        client: supabaseUser,
-        id: userId,
-        effectiveTz,
-        usageLimit,
-        resolvedPlan,
-        currentMonthKey,
-        currentUsage,
-      };
+        kaelUserSession = {
+          client: supabase,
+          id: fallbackUserId || 'guest',
+          effectiveTz,
+          usageLimit,
+          resolvedPlan,
+          currentMonthKey,
+          currentUsage,
+        };
+      }
     }
 
     const isJsonExpected =
@@ -368,30 +450,31 @@ app.post('/api/ai-generate', async (req, res) => {
     if (type === 'kael') {
       const kaelBaseMandate =
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
-        'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ';
+        'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
+        'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ';
 
       if (effectivePlan === 'elite') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Detail the full kinetic chain, joint angles, torque, and neuromuscular mechanics. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant.';
+          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
         config.temperature = 0.25;
         config.maxOutputTokens = 3500;
       } else if (effectivePlan === 'performance') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence), neuromuscular activation cues, exercise synergy, and fueling/recovery timing.';
+          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
         config.temperature = 0.3;
         config.maxOutputTokens = 2500;
       } else if (effectivePlan === 'progress') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the biomechanical "why" behind the movement and outline clear actionable progression steps.';
+          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
         config.temperature = 0.35;
         config.maxOutputTokens = 1800;
       } else {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: FREE. Deliver 100% scientifically accurate, direct, and concise coaching answers (~40–80 words). Provide the exact recommendation and key execution cue without filler or fluff.';
+          'TIER: FREE. Deliver 100% scientifically accurate, direct, and concise coaching answers (~40–80 words). Provide the exact recommendation and key execution cue in plain, everyday language without confusing jargon, fluff, or filler.';
         config.temperature = 0.4;
         config.maxOutputTokens = 900;
       }
@@ -489,10 +572,16 @@ app.post('/api/ai-generate', async (req, res) => {
         if (effectiveTz) {
           updatePayload.timezone = effectiveTz;
         }
-        await client
-          .from('profiles')
-          .update(updatePayload)
-          .eq('id', userId);
+        if (userId && userId !== 'guest') {
+          try {
+            await client
+              .from('profiles')
+              .update(updatePayload)
+              .eq('id', userId);
+          } catch (dbErr) {
+            console.warn('[server.ts] Profile update fallback note:', dbErr);
+          }
+        }
 
         claimResult = {
           allowed: true,
@@ -515,6 +604,38 @@ app.post('/api/ai-generate', async (req, res) => {
       }
 
       kaelQuota = claimResult;
+    }
+
+    if (!kaelQuota && isKael) {
+      const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
+      const newCount = clientUsed + 1;
+      const PLAN_LIMITS: Record<string, number> = {
+        free: 100,
+        progress: 300,
+        performance: 800,
+        elite: 2000,
+      };
+      const resolvedPlan = PLAN_LIMITS[effectivePlan] ? effectivePlan : 'free';
+      const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
+      const clientTz = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || 'UTC';
+      let monthKey = new Date().toISOString().slice(0, 7);
+      try {
+        monthKey = new Intl.DateTimeFormat('en-CA', {
+          timeZone: clientTz,
+          year: 'numeric',
+          month: '2-digit',
+        }).format(new Date()).slice(0, 7);
+      } catch {}
+
+      kaelQuota = {
+        allowed: true,
+        used: newCount,
+        limit: usageLimit,
+        remaining: Math.max(0, usageLimit - newCount),
+        monthKey,
+        plan: resolvedPlan,
+        timezone: clientTz,
+      };
     }
 
     let result: any = outputText;
@@ -551,28 +672,143 @@ app.post('/api/ai-generate', async (req, res) => {
   }
 });
 
+app.post('/api/send-contact-email', async (req, res) => {
+  try {
+    const { name, email, message, subject, body } = req.body || {};
+    const cleanName = typeof name === 'string' ? name.trim() : '';
+    const cleanEmail = typeof email === 'string' ? email.trim() : '';
+    const cleanMessage =
+      typeof message === 'string' && message.trim()
+        ? message.trim()
+        : typeof body === 'string' && body.trim()
+          ? body.trim()
+          : '';
+    const cleanSubject =
+      typeof subject === 'string' && subject.trim()
+        ? subject.trim()
+        : cleanName
+          ? `WASHEK Contact Message from ${cleanName}`
+          : 'WASHEK Contact Message';
+
+    if (!cleanMessage) {
+      return res.status(400).json({
+        success: false,
+        error: 'Message content is required.',
+      });
+    }
+
+    const resendApiKey = process.env.RESEND_API_KEY;
+    if (resendApiKey && !resendApiKey.includes('YOUR_')) {
+      const emailPayload: Record<string, unknown> = {
+        from: process.env.CONTACT_FROM_EMAIL || 'WASHEK <onboarding@resend.dev>',
+        to: [process.env.CONTACT_TO_EMAIL || 'washekfitness@gmail.com'],
+        subject: cleanSubject,
+        text: cleanMessage,
+        html: `
+          <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111;">
+            <h2 style="color: #0f172a; margin-bottom: 12px;">WASHEK Contact Message</h2>
+            ${cleanName ? `<p><strong>Name:</strong> ${cleanName}</p>` : ''}
+            ${cleanEmail ? `<p><strong>Email:</strong> ${cleanEmail}</p>` : ''}
+            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;" />
+            <p style="white-space: pre-wrap;">${cleanMessage}</p>
+          </div>
+        `,
+      };
+
+      if (cleanEmail) {
+        emailPayload.reply_to = cleanEmail;
+      }
+
+      const emailRes = await fetch('https://api.resend.com/emails', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${resendApiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(emailPayload),
+      });
+
+      const result = await emailRes.json().catch(() => ({}));
+      if (emailRes.ok) {
+        return res.json({
+          success: true,
+          id: result?.id || null,
+        });
+      }
+    }
+
+    // Persist to Supabase contact_messages table via server client
+    try {
+      await supabase.from('contact_messages').insert({
+        name: cleanName || 'Guest User',
+        email: cleanEmail || 'no-email@washek.fitness',
+        message: cleanMessage,
+      });
+    } catch (dbErr) {
+      console.warn('[server.ts] Failed to persist to contact_messages:', dbErr);
+    }
+
+    return res.json({
+      success: true,
+      message: 'Message received and stored.',
+    });
+  } catch (err: any) {
+    console.error('[server.ts /api/send-contact-email error]', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Failed to process contact email.',
+    });
+  }
+});
+
 // ------------------------------------------------------------
 // SERVER LIFECYCLE & VITE MIDDLEWARE
 // ------------------------------------------------------------
 
 async function startServer() {
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
+  try {
+    if (process.env.NODE_ENV !== 'production') {
+      const vite = await createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: false,
+        },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    } else {
+      const distPath = path.join(process.cwd(), 'dist');
+      app.use(express.static(distPath));
+      app.get('*all', (req, res) => {
+        res.sendFile(path.join(distPath, 'index.html'));
+      });
+    }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`WASHEK server running on http://0.0.0.0:${PORT} with Google Gemini backend`);
-  });
+    const server = app.listen(PORT, HOST, () => {
+      console.log(`WASHEK server running on http://${HOST}:${PORT} with Google Gemini backend`);
+    });
+
+    server.on('error', (err: any) => {
+      if (err.code === 'EADDRINUSE') {
+        console.error(`[server.ts] Port ${PORT} is already in use.`);
+        process.exit(1);
+      } else {
+        console.error('[server.ts] Server error:', err);
+        process.exit(1);
+      }
+    });
+
+    const shutdown = () => {
+      server.close(() => {
+        process.exit(0);
+      });
+    };
+    process.on('SIGTERM', shutdown);
+    process.on('SIGINT', shutdown);
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
 }
 
 startServer();

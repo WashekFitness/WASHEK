@@ -429,16 +429,38 @@ function getSubscriptionPlan(
    * Price ID fallback.
    */
 
-  const priceId =
+  const priceItem =
     subscription
       .items
       .data[0]
-      ?.price
-      ?.id;
+      ?.price;
 
-  return getPlanFromPriceId(
-    priceId
-  );
+  const priceId =
+    priceItem?.id;
+
+  const planFromId =
+    getPlanFromPriceId(
+      priceId
+    );
+
+  if (planFromId) {
+    return planFromId;
+  }
+
+  /*
+   * Amount-based fallback for newly configured prices:
+   * Progress: $9.99 (999 cents)
+   * Performance: $17.99 (1799 cents)
+   * Elite: $34.99 (3499 cents)
+   */
+  const unitAmount =
+    priceItem?.unit_amount;
+
+  if (unitAmount === 999) return 'progress';
+  if (unitAmount === 1799) return 'performance';
+  if (unitAmount === 3499) return 'elite';
+
+  return null;
 }
 
 /*
@@ -889,22 +911,43 @@ async function handleCheckoutCompleted(
     );
 
   const sessionUserId =
-    getMetadataUserId(
-      session.metadata
-    );
+    (typeof session.client_reference_id === 'string' && session.client_reference_id.trim())
+      ? session.client_reference_id.trim()
+      : getMetadataUserId(
+          session.metadata
+        );
 
   const subscriptionUserId =
     getSubscriptionUserId(
       newSubscription
     );
 
-  const userId =
+  let userId =
     subscriptionUserId ||
     sessionUserId;
 
   if (!userId) {
+    const customerEmail =
+      session.customer_details?.email ||
+      (typeof session.customer_email === 'string' ? session.customer_email : null);
+
+    if (customerEmail) {
+      const { data: profileByEmail } =
+        await supabase
+          .from('profiles')
+          .select('id')
+          .ilike('email', customerEmail.trim())
+          .maybeSingle();
+
+      if (profileByEmail?.id) {
+        userId = profileByEmail.id;
+      }
+    }
+  }
+
+  if (!userId) {
     throw new Error(
-      `New subscription ${subscriptionId} is missing metadata.user_id`
+      `New subscription ${subscriptionId} is missing metadata.user_id or client_reference_id`
     );
   }
 

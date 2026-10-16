@@ -20,6 +20,7 @@ import {
 } from 'framer-motion';
 
 import Footer from '@/components/layout/Footer';
+import PullToRefresh from '@/components/layout/PullToRefresh';
 
 
 const navItems = [
@@ -67,16 +68,17 @@ function NavItem({
           flex
           items-center
           gap-3
-          px-4
-          py-3
+          px-3.5
+          py-2.5
           rounded-xl
           transition-all
+          duration-150
           pointer-events-auto
           touch-manipulation
         `,
         isActive
-          ? 'text-primary bg-primary/10'
-          : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+          ? 'text-primary bg-primary/10 dark:bg-primary/15 border border-primary/30 shadow-[0_0_18px_rgba(37,99,235,0.14)] font-semibold'
+          : 'text-slate-600 dark:text-muted-foreground hover:text-slate-900 dark:hover:text-foreground hover:bg-slate-100/80 dark:hover:bg-white/[0.05] border border-transparent'
       )}
       aria-current={
         isActive
@@ -84,16 +86,19 @@ function NavItem({
           : undefined
       }
     >
+      {isActive && (
+        <span className="absolute left-0 top-2 bottom-2 w-1 bg-gradient-to-b from-primary to-blue-400 rounded-r-full shadow-[0_0_8px_rgba(37,99,235,0.6)]" />
+      )}
       <Icon
         className="w-5 h-5 shrink-0"
         strokeWidth={
           isActive
             ? 2.5
-            : 1.5
+            : 1.75
         }
       />
 
-      <span className="font-medium text-sm hidden md:block">
+      <span className="text-sm font-heading hidden md:block">
         {label}
       </span>
     </Link>
@@ -160,14 +165,19 @@ export default function AppLayout() {
           left-0
           h-full
           z-40
-          bg-card
+          bg-card/90
+          dark:bg-card/75
+          backdrop-blur-2xl
           border-r
-          border-border
+          border-slate-200/80
+          dark:border-white/[0.08]
           w-16
           md:w-56
           py-6
           overflow-y-auto
           pointer-events-auto
+          shadow-[4px_0_24px_rgba(15,23,42,0.02)]
+          dark:shadow-[4px_0_30px_rgba(0,0,0,0.4)]
         "
         style={{
           paddingTop:
@@ -177,29 +187,34 @@ export default function AppLayout() {
 
         {/* Branding */}
 
-        <div className="px-4 mb-8 flex items-center gap-2.5">
+        <div className="px-4 mb-8 flex items-center gap-3">
 
-          <img
-            src="/washek-fitness-logo.jpg"
-            alt="WASHEK"
-            className="
-              w-8
-              h-8
-              rounded-xl
-              object-contain
-              shrink-0
-            "
-          />
+          <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-transparent border border-primary/20 shrink-0 shadow-sm shadow-primary/10">
+            <img
+              src="/washek-fitness-logo.jpg"
+              alt="WASHEK"
+              className="
+                w-7
+                h-7
+                rounded-[10px]
+                object-contain
+                shrink-0
+              "
+            />
+          </div>
 
-          <span className="
-            font-heading
-            font-bold
-            text-sm
-            hidden
-            md:block
-          ">
-            WASHEK
-          </span>
+          <div className="hidden md:flex items-center">
+            <span className="
+              font-heading
+              font-bold
+              text-base
+              tracking-wider
+              text-foreground
+              leading-none
+            ">
+              WASHEK
+            </span>
+          </div>
 
         </div>
 
@@ -277,8 +292,8 @@ export default function AppLayout() {
             `,
 
             isKael
-              ? 'pb-0'
-              : 'pb-safe sm:pb-6'
+              ? 'pt-0 pb-0'
+              : 'pt-safe pb-safe sm:pt-6 sm:pb-6'
           )}
         >
 
@@ -314,7 +329,9 @@ export default function AppLayout() {
                 pointer-events-auto
               "
             >
-              <Outlet />
+              <PullToRefresh>
+                <Outlet />
+              </PullToRefresh>
             </motion.div>
 
           </AnimatePresence>
@@ -344,9 +361,12 @@ export default function AppLayout() {
           right-0
           z-50
           bg-card/95
-          backdrop-blur-xl
+          backdrop-blur-2xl
           border-t
-          border-border
+          border-border/90
+          dark:border-white/[0.08]
+          shadow-[0_-4px_24px_rgba(15,23,42,0.08)]
+          dark:shadow-[0_-8px_32px_rgba(0,0,0,0.55)]
           pointer-events-auto
         "
         style={{
@@ -447,10 +467,11 @@ export default function AppLayout() {
                         p-1.5
                         rounded-xl
                         transition-all
+                        duration-200
                       `,
-
-                      isActive &&
-                        'bg-primary/15'
+                      isActive
+                        ? 'bg-gradient-to-br from-primary/25 to-primary/10 text-primary border border-primary/30 shadow-[0_0_14px_rgba(37,99,235,0.35)] scale-105'
+                        : 'text-slate-500 dark:text-muted-foreground'
                     )}
                   >
 
@@ -462,18 +483,17 @@ export default function AppLayout() {
                       strokeWidth={
                         isActive
                           ? 2.5
-                          : 1.5
+                          : 1.75
                       }
                     />
 
                   </div>
 
 
-                  <span className="
-                    text-[10px]
-                    font-medium
-                    whitespace-nowrap
-                  ">
+                  <span className={cn(
+                    "text-[10px] whitespace-nowrap transition-colors",
+                    isActive ? "font-heading font-bold text-primary tracking-tight" : "font-heading font-medium text-slate-500 dark:text-muted-foreground"
+                  )}>
                     {
                       shortLabel ||
                       label

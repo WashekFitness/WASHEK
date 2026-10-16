@@ -1,8 +1,9 @@
 import { useRef, useState, useEffect } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { queryClientInstance } from '@/lib/query-client';
 
-const THRESHOLD = 72;
+const THRESHOLD = 65;
 const ACTIVATION_DISTANCE = 8;
 
 function isInteractiveTarget(target) {
@@ -29,6 +30,7 @@ function isInteractiveTarget(target) {
 
 export default function PullToRefresh({
   children,
+  onRefresh,
 }) {
   const [pullY, setPullY] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
@@ -41,316 +43,189 @@ export default function PullToRefresh({
   const wrapperRef = useRef(null);
 
   useEffect(() => {
-    /*
-     * Find the app's existing scroll container.
-     * We do not create another scroll container.
-     */
-    let scroller =
-      wrapperRef.current?.parentElement;
+    // Locate the nearest scrolling parent container
+    let scroller = wrapperRef.current?.parentElement;
 
-    while (scroller) {
-      const style =
-        getComputedStyle(scroller);
-
+    while (scroller && scroller !== document.body) {
+      const style = getComputedStyle(scroller);
       if (
         style.overflowY === 'auto' ||
         style.overflowY === 'scroll'
       ) {
         break;
       }
-
-      scroller =
-        scroller.parentElement;
+      scroller = scroller.parentElement;
     }
 
     if (!scroller) {
-      scroller =
-        document.documentElement;
+      scroller = document.documentElement;
     }
 
-    const onTouchStart = (e) => {
-      if (
-        refreshingRef.current ||
-        !e.touches?.length
-      ) {
-        return;
+    const checkInnerScroll = (target) => {
+      let cur = target;
+      while (cur && cur !== scroller && cur !== document.body) {
+        if (cur.scrollHeight > cur.clientHeight && cur.scrollTop > 0) {
+          return true;
+        }
+        cur = cur.parentElement;
       }
+      return false;
+    };
 
-      /*
-       * Never hijack a tap that starts on a button,
-       * link, tab, input, etc.
-       */
-      interactiveTouchRef.current =
-        isInteractiveTarget(e.target);
+    const handleStart = (clientY, target) => {
+      if (refreshingRef.current) return;
 
-      pullingRef.current = false;
-      pullYRef.current = 0;
-      setPullY(0);
-
-      if (
-        interactiveTouchRef.current
-      ) {
+      if (isInteractiveTarget(target) || checkInnerScroll(target)) {
+        interactiveTouchRef.current = true;
         startY.current = null;
         return;
       }
 
-      /*
-       * Pull-to-refresh only begins when the page
-       * is already at the very top.
-       */
-      if (
-        scroller.scrollTop === 0
-      ) {
-        startY.current =
-          e.touches[0].clientY;
+      interactiveTouchRef.current = false;
+      pullingRef.current = false;
+      pullYRef.current = 0;
+      setPullY(0);
+
+      // Only begin if scroll container is at the very top
+      if (scroller.scrollTop <= 2) {
+        startY.current = clientY;
       } else {
         startY.current = null;
       }
     };
 
-    const onTouchMove = (e) => {
+    const handleMove = (clientY, e) => {
       if (
         startY.current === null ||
         interactiveTouchRef.current ||
-        refreshingRef.current ||
-        !e.touches?.length
-      ) {
-        return;
-      }
-
-      const delta =
-        e.touches[0].clientY -
-        startY.current;
-
-      /*
-       * Only respond to a downward pull.
-       */
-      if (
-        delta <= 0 ||
-        scroller.scrollTop !== 0
-      ) {
-        return;
-      }
-
-      /*
-       * Don't hijack a normal tap.
-       */
-      if (
-        !pullingRef.current &&
-        delta < ACTIVATION_DISTANCE
-      ) {
-        return;
-      }
-
-      pullingRef.current = true;
-
-      /*
-       * Once the gesture is clearly a pull,
-       * stop the browser from scrolling the page.
-       */
-      e.preventDefault();
-
-      const next =
-        Math.min(
-          delta * 0.5,
-          THRESHOLD + 20
-        );
-
-      pullYRef.current =
-        next;
-
-      setPullY(next);
-    };
-
-    const onTouchEnd = () => {
-      if (
         refreshingRef.current
       ) {
         return;
       }
 
-      /*
-       * Normal taps are completely ignored.
-       */
-      if (
-        interactiveTouchRef.current
-      ) {
-        interactiveTouchRef.current =
-          false;
+      const delta = clientY - startY.current;
 
-        pullingRef.current =
-          false;
-
-        startY.current =
-          null;
-
-        pullYRef.current =
-          0;
-
-        setPullY(0);
-
+      if (delta <= 0 || scroller.scrollTop > 2) {
         return;
       }
 
-      /*
-       * A successful pull now performs an ACTUAL
-       * browser page reload.
-       */
-      if (
-        pullingRef.current &&
-        pullYRef.current >= THRESHOLD
-      ) {
-        refreshingRef.current =
-          true;
+      if (!pullingRef.current && delta < ACTIVATION_DISTANCE) {
+        return;
+      }
 
+      pullingRef.current = true;
+      if (e?.cancelable) {
+        e.preventDefault();
+      }
+
+      const next = Math.min(delta * 0.45, THRESHOLD + 28);
+      pullYRef.current = next;
+      setPullY(next);
+    };
+
+    const handleEnd = async () => {
+      if (refreshingRef.current) return;
+
+      if (interactiveTouchRef.current) {
+        interactiveTouchRef.current = false;
+        pullingRef.current = false;
+        startY.current = null;
+        pullYRef.current = 0;
+        setPullY(0);
+        return;
+      }
+
+      if (pullingRef.current && pullYRef.current >= THRESHOLD) {
+        refreshingRef.current = true;
         setRefreshing(true);
-
-        pullYRef.current =
-          0;
-
+        pullYRef.current = 0;
         setPullY(0);
 
-        /*
-         * Give React one frame to render the spinner
-         * before reloading the document.
-         */
-        window.requestAnimationFrame(() => {
+        try {
+          if (typeof onRefresh === 'function') {
+            await onRefresh();
+          } else {
+            try {
+              await queryClientInstance.invalidateQueries();
+            } catch (err) {
+              console.debug('[PullToRefresh] Query invalidation note:', err);
+            }
+            window.location.reload();
+          }
+        } catch (err) {
+          console.debug('[PullToRefresh] Refresh handler note:', err);
           window.location.reload();
-        });
-
+        } finally {
+          setTimeout(() => {
+            refreshingRef.current = false;
+            setRefreshing(false);
+          }, 600);
+        }
         return;
       }
 
-      /*
-       * Pull wasn't far enough.
-       */
-      pullYRef.current =
-        0;
-
+      pullYRef.current = 0;
       setPullY(0);
-
-      pullingRef.current =
-        false;
-
-      interactiveTouchRef.current =
-        false;
-
-      startY.current =
-        null;
+      pullingRef.current = false;
+      interactiveTouchRef.current = false;
+      startY.current = null;
     };
 
-    const onTouchCancel = () => {
-      startY.current =
-        null;
-
-      pullYRef.current =
-        0;
-
-      pullingRef.current =
-        false;
-
-      interactiveTouchRef.current =
-        false;
-
-      setPullY(0);
+    // Touch event listeners
+    const onTouchStart = (e) => {
+      if (!e.touches?.length) return;
+      handleStart(e.touches[0].clientY, e.target);
     };
 
-    scroller.addEventListener(
-      'touchstart',
-      onTouchStart,
-      { passive: true }
-    );
+    const onTouchMove = (e) => {
+      if (!e.touches?.length) return;
+      handleMove(e.touches[0].clientY, e);
+    };
 
-    scroller.addEventListener(
-      'touchmove',
-      onTouchMove,
-      { passive: false }
-    );
+    const onTouchEnd = () => handleEnd();
+    const onTouchCancel = () => handleEnd();
 
-    scroller.addEventListener(
-      'touchend',
-      onTouchEnd
-    );
-
-    scroller.addEventListener(
-      'touchcancel',
-      onTouchCancel
-    );
+    scroller.addEventListener('touchstart', onTouchStart, { passive: true });
+    scroller.addEventListener('touchmove', onTouchMove, { passive: false });
+    scroller.addEventListener('touchend', onTouchEnd);
+    scroller.addEventListener('touchcancel', onTouchCancel);
 
     return () => {
-      scroller.removeEventListener(
-        'touchstart',
-        onTouchStart
-      );
-
-      scroller.removeEventListener(
-        'touchmove',
-        onTouchMove
-      );
-
-      scroller.removeEventListener(
-        'touchend',
-        onTouchEnd
-      );
-
-      scroller.removeEventListener(
-        'touchcancel',
-        onTouchCancel
-      );
+      scroller.removeEventListener('touchstart', onTouchStart);
+      scroller.removeEventListener('touchmove', onTouchMove);
+      scroller.removeEventListener('touchend', onTouchEnd);
+      scroller.removeEventListener('touchcancel', onTouchCancel);
     };
-  }, []);
+  }, [onRefresh]);
 
-  const progress =
-    Math.min(
-      pullY / THRESHOLD,
-      1
-    );
+  const progress = Math.min(pullY / THRESHOLD, 1);
 
   return (
-    <div ref={wrapperRef}>
-
+    <div ref={wrapperRef} className="relative w-full">
       <div
-        className="
-          flex
-          items-center
-          justify-center
-          overflow-hidden
-          transition-all
-          duration-200
-        "
+        className="flex items-center justify-center overflow-hidden transition-all duration-200 pointer-events-none select-none z-50"
         style={{
-          height:
-            refreshing
-              ? 48
-              : pullY > 0
-                ? pullY
-                : 0,
+          height: refreshing ? 52 : pullY > 0 ? pullY : 0,
         }}
       >
-
-        <RefreshCw
-          className={cn(
-            'w-5 h-5 text-primary transition-all',
-            refreshing &&
-              'animate-spin'
-          )}
-          style={{
-            opacity:
-              refreshing
-                ? 1
-                : progress,
-
-            transform:
-              `rotate(${
-                progress * 180
-              }deg)`,
-          }}
-        />
-
+        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-card/90 backdrop-blur-md border border-border shadow-md">
+          <RefreshCw
+            className={cn(
+              'w-4 h-4 text-primary transition-transform duration-100',
+              refreshing && 'animate-spin'
+            )}
+            style={{
+              opacity: refreshing ? 1 : Math.max(0.3, progress),
+              transform: refreshing ? undefined : `rotate(${progress * 240}deg)`,
+            }}
+          />
+          <span className="text-xs font-semibold text-foreground tracking-wide">
+            {refreshing ? 'Refreshing…' : progress >= 1 ? 'Release to refresh' : 'Pull to refresh'}
+          </span>
+        </div>
       </div>
 
       {children}
-
     </div>
   );
 }

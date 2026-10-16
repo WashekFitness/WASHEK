@@ -1,6 +1,7 @@
 import {
   useState,
   useEffect,
+  useRef,
 } from 'react';
 
 import {
@@ -26,12 +27,15 @@ import {
 
 import {
   User,
+  Camera,
+  Trash2,
   Dumbbell,
   Target,
-  RefreshCw,
   Zap,
+  Move,
 } from 'lucide-react';
 
+import AvatarAdjustModal from '@/components/profile/AvatarAdjustModal';
 import AppSettingsModal from '@/components/AppSettingsModal';
 
 import ExpandableText from '@/components/ExpandableText';
@@ -39,6 +43,10 @@ import ExpandableText from '@/components/ExpandableText';
 import PricingSection from '@/components/profile/PricingSection';
 
 import QuickAccess from '@/components/layout/QuickAccess';
+
+import { firebaseApi } from '@/lib/firebaseApi';
+import { useAuth } from '@/lib/AuthContext';
+import { isLogo, cleanseAvatarUrl } from '@/lib/avatarUtils';
 
 import {
   supabaseApi,
@@ -63,14 +71,179 @@ import {
 export default function Profile() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const { user: authUser, setUser: setAuthUser } = useAuth();
 
-  const [user, setUser] =
-    useState(null);
+  const [user, setUser] = useState(() => authUser);
 
-  const { timeZone } = useMidnightSync(user);
+  useEffect(() => {
+    if (authUser) {
+      setUser(authUser);
+    }
+  }, [authUser]);
 
-  const [regenerating, setRegenerating] =
-    useState(false);
+  const fileInputRef = useRef(null);
+
+  // Filter out any app logo from avatar URL so only custom photos are loaded
+  const [avatarUrl, setAvatarUrl] = useState(() => {
+    try {
+      if (localStorage.getItem('washek_avatar_explicitly_removed') === 'true') {
+        return null;
+      }
+      const stored = localStorage.getItem('washek_custom_avatar');
+      if (stored && !isLogo(stored)) {
+        return stored;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  });
+
+  // Modal state for fine-grained image cropping, framing & positioning
+  const [adjustModalOpen, setAdjustModalOpen] = useState(false);
+  const [imageToAdjust, setImageToAdjust] = useState(null);
+
+  const { timeZone } = useMidnightSync(user || authUser);
+
+  useEffect(() => {
+    if (user?.id || user?.email) {
+      const userKey = user.id || user.email;
+      const isExplicitlyRemoved = localStorage.getItem('washek_avatar_explicitly_removed') === 'true';
+
+      const candidate =
+        localStorage.getItem(`washek_custom_avatar_${userKey}`) ||
+        localStorage.getItem('washek_custom_avatar') ||
+        (!isExplicitlyRemoved ? (user.avatar_url || user.photo_url) : null);
+
+      // Guarantee that if the user does not have a custom picture, the logo is NEVER filled in!
+      if (candidate && !isLogo(candidate)) {
+        setAvatarUrl(candidate);
+      } else {
+        // If candidate was a logo, cleanse it immediately across all storage layers so it never returns!
+        if (candidate && isLogo(candidate)) {
+          try {
+            localStorage.removeItem(`washek_custom_avatar_${userKey}`);
+            localStorage.removeItem('washek_custom_avatar');
+            const stored = localStorage.getItem('washek_user');
+            if (stored) {
+              const parsed = JSON.parse(stored);
+              parsed.avatar_url = null;
+              parsed.photo_url = null;
+              localStorage.setItem('washek_user', JSON.stringify(parsed));
+            }
+          } catch (_err) {
+            // Ignore storage cleanup error
+          }
+          firebaseApi.firestore.saveAvatar(null).catch(() => {});
+          if (user?.id) {
+            supabase.from('profiles').update({ avatar_url: null, photo_url: null }).eq('id', user.id).then(() => {}).catch(() => {});
+          }
+        }
+        setAvatarUrl(null);
+      }
+    }
+  }, [user]);
+
+  const handleImageUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!file.type.startsWith('image/')) {
+      toast.error('Please upload an image file (PNG, JPG, WEBP).');
+      return;
+    }
+
+    if (file.size > 15 * 1024 * 1024) {
+      toast.error('Image is too large. Please select an image under 15MB.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const rawDataUrl = event.target.result;
+      // Open adjuster modal so user can adjust what part of the picture shows
+      setImageToAdjust(rawDataUrl);
+      setAdjustModalOpen(true);
+    };
+    reader.onerror = () => {
+      toast.error('Could not load image file.');
+    };
+    reader.readAsDataURL(file);
+    e.target.value = '';
+  };
+
+  const handleSaveAdjustedAvatar = (croppedDataUrl) => {
+    const userKey = user?.id || user?.email || 'default';
+    try {
+      localStorage.removeItem('washek_avatar_explicitly_removed');
+      localStorage.setItem(`washek_custom_avatar_${userKey}`, croppedDataUrl);
+      localStorage.setItem('washek_custom_avatar', croppedDataUrl);
+      const stored = localStorage.getItem('washek_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        parsed.avatar_url = croppedDataUrl;
+        parsed.photo_url = croppedDataUrl;
+        localStorage.setItem('washek_user', JSON.stringify(parsed));
+      }
+    } catch (storageErr) {
+      console.warn('LocalStorage error storing avatar:', storageErr);
+    }
+
+    // Sync with Firestore & Supabase
+    firebaseApi.firestore.saveAvatar(croppedDataUrl).catch((err) => {
+      console.warn('[Firebase] Avatar cloud sync note:', err);
+    });
+    if (user?.id) {
+      supabase.from('profiles').update({ avatar_url: croppedDataUrl, photo_url: croppedDataUrl }).eq('id', user.id).then(() => {}).catch(() => {});
+    }
+
+    // Update in-memory user states
+    setUser((prev) => (prev ? { ...prev, avatar_url: croppedDataUrl, photo_url: croppedDataUrl } : prev));
+    if (setAuthUser) {
+      setAuthUser((prev) => (prev ? { ...prev, avatar_url: croppedDataUrl, photo_url: croppedDataUrl } : prev));
+    }
+
+    setAvatarUrl(croppedDataUrl);
+    setAdjustModalOpen(false);
+    setImageToAdjust(null);
+    window.dispatchEvent(new CustomEvent('washek_avatar_changed', { detail: { avatarUrl: croppedDataUrl } }));
+    toast.success('Profile picture saved successfully!');
+  };
+
+  const handleRemoveAvatar = (e) => {
+    e?.stopPropagation();
+    const userKey = user?.id || user?.email || 'default';
+    try {
+      localStorage.setItem('washek_avatar_explicitly_removed', 'true');
+      localStorage.removeItem(`washek_custom_avatar_${userKey}`);
+      localStorage.removeItem('washek_custom_avatar');
+      const stored = localStorage.getItem('washek_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        parsed.avatar_url = null;
+        parsed.photo_url = null;
+        localStorage.setItem('washek_user', JSON.stringify(parsed));
+      }
+    } catch (err) {
+      console.warn('LocalStorage remove error:', err);
+    }
+
+    // Cloud removals
+    firebaseApi.firestore.saveAvatar(null).catch(() => {});
+    if (user?.id) {
+      supabase.from('profiles').update({ avatar_url: null, photo_url: null }).eq('id', user.id).then(() => {}).catch(() => {});
+    }
+
+    // Update local and auth states
+    setUser((prev) => (prev ? { ...prev, avatar_url: null, photo_url: null } : prev));
+    if (setAuthUser) {
+      setAuthUser((prev) => (prev ? { ...prev, avatar_url: null, photo_url: null } : prev));
+    }
+
+    setAvatarUrl(null);
+    window.dispatchEvent(new CustomEvent('washek_avatar_changed', { detail: { avatarUrl: null } }));
+    toast.success('Custom picture removed. Default avatar restored.');
+  };
 
 
   useEffect(() => {
@@ -79,17 +252,25 @@ export default function Profile() {
     supabaseApi.auth
       .me()
       .then((currentUser) => {
-        if (active) {
+        if (active && currentUser) {
+          if (isLogo(currentUser.avatar_url) || isLogo(currentUser.photo_url)) {
+            currentUser.avatar_url = null;
+            currentUser.photo_url = null;
+          }
+          if (localStorage.getItem('washek_avatar_explicitly_removed') === 'true') {
+            const userKey = currentUser.id || currentUser.email;
+            const hasNew = localStorage.getItem(`washek_custom_avatar_${userKey}`) || localStorage.getItem('washek_custom_avatar');
+            if (!hasNew) {
+              currentUser.avatar_url = null;
+              currentUser.photo_url = null;
+            }
+          }
           setUser(currentUser);
         }
       })
       .catch((error) => {
-        console.error(
-          '[PROFILE] Failed to load profile:',
-          error
-        );
-
-        if (active) {
+        console.debug('[PROFILE] Notice checking profile:', error?.message || error);
+        if (authUser && active) {
           toast.error(
             error?.message ||
               'Unable to load your profile.'
@@ -100,7 +281,7 @@ export default function Profile() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [authUser]);
 
 
   const {
@@ -219,44 +400,6 @@ export default function Profile() {
   };
 
 
-  const handleRegenerate = async () => {
-    if (
-      !user?.fitness_level ||
-      !user?.primary_goal
-    ) {
-      navigate('/onboarding');
-      return;
-    }
-
-    setRegenerating(true);
-
-    try {
-      if (activeProgram) {
-        await supabaseApi.entities.WorkoutProgram.update(
-          activeProgram.id,
-          {
-            status: 'completed',
-          }
-        );
-      }
-
-      navigate('/onboarding');
-    } catch (error) {
-      console.error(
-        '[PROFILE] Regeneration failed:',
-        error
-      );
-
-      toast.error(
-        error?.message ||
-          'Unable to start a new program.'
-      );
-    } finally {
-      setRegenerating(false);
-    }
-  };
-
-
 
   if (!user) {
     return (
@@ -353,21 +496,134 @@ export default function Profile() {
           gap-4
         ">
 
-          <div className="
-            w-16
-            h-16
-            rounded-2xl
-            bg-primary/15
-            flex
-            items-center
-            justify-center
-            shrink-0
-          ">
-            <User className="
-              w-8
-              h-8
-              text-primary
-            " />
+          {/* Custom Picture or Default Avatar Box */}
+          <div className="relative shrink-0">
+            <input
+              type="file"
+              ref={fileInputRef}
+              onChange={handleImageUpload}
+              accept="image/*"
+              className="hidden"
+              id="avatar-image-upload"
+            />
+
+            <button
+              type="button"
+              onClick={() => {
+                if (avatarUrl) {
+                  setImageToAdjust(avatarUrl);
+                  setAdjustModalOpen(true);
+                } else {
+                  fileInputRef.current?.click();
+                }
+              }}
+              className="
+                group
+                relative
+                block
+                p-0.5
+                rounded-2xl
+                bg-gradient-to-br
+                from-primary/40
+                via-primary/15
+                to-transparent
+                border
+                border-primary/30
+                shrink-0
+                shadow-sm
+                shadow-primary/20
+                hover:border-primary/60
+                transition-all
+                cursor-pointer
+                focus:outline-none
+                focus:ring-2
+                focus:ring-primary/40
+                text-left
+              "
+              title={avatarUrl ? "Click to adjust framing or reposition picture" : "Click to upload a custom profile picture"}
+              aria-label={avatarUrl ? "Adjust profile picture framing" : "Upload custom profile picture"}
+            >
+              <div className="w-14 h-14 rounded-[14px] bg-card/90 flex items-center justify-center overflow-hidden relative">
+                {avatarUrl ? (
+                  <img
+                    src={avatarUrl}
+                    alt={user.full_name || 'Profile'}
+                    className="w-full h-full object-cover rounded-[14px]"
+                  />
+                ) : (
+                  <User className="
+                    w-7
+                    h-7
+                    text-primary
+                  " />
+                )}
+
+                {/* Subtle hover overlay */}
+                <div className="
+                  absolute
+                  inset-0
+                  bg-black/55
+                  opacity-0
+                  group-hover:opacity-100
+                  transition-opacity
+                  flex
+                  flex-col
+                  items-center
+                  justify-center
+                  rounded-[14px]
+                ">
+                  {avatarUrl ? (
+                    <>
+                      <Move className="w-4 h-4 text-white drop-shadow" />
+                      <span className="text-[9px] font-semibold text-white/90 leading-tight mt-0.5">
+                        Adjust
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <Camera className="w-4 h-4 text-white drop-shadow" />
+                      <span className="text-[9px] font-semibold text-white/90 leading-tight mt-0.5">
+                        Upload
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
+            </button>
+
+            {/* Camera corner badge - click to upload/change */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                fileInputRef.current?.click();
+              }}
+              className="
+                absolute
+                -bottom-1
+                -right-1
+                w-5
+                h-5
+                rounded-full
+                bg-primary
+                text-primary-foreground
+                flex
+                items-center
+                justify-center
+                shadow-md
+                border-2
+                border-background
+                hover:scale-110
+                active:scale-95
+                transition-transform
+                cursor-pointer
+                z-10
+              "
+              title={avatarUrl ? "Choose a different picture file" : "Upload picture"}
+              aria-label={avatarUrl ? "Choose different picture" : "Upload picture"}
+            >
+              <Camera className="w-2.5 h-2.5" />
+            </button>
           </div>
 
 
@@ -395,16 +651,115 @@ export default function Profile() {
             </p>
 
 
-            <Badge
-              className={`
-                mt-1
-                border-0
-                text-xs
-                ${planColors[plan] || planColors.free}
-              `}
-            >
-              {planLabels[plan] || 'Free'} Plan
-            </Badge>
+            <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+              <Badge
+                className={`
+                  border-0
+                  text-xs
+                  ${planColors[plan] || planColors.free}
+                `}
+              >
+                {planLabels[plan] || 'Free'} Plan
+              </Badge>
+
+              {avatarUrl ? (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setImageToAdjust(avatarUrl);
+                      setAdjustModalOpen(true);
+                    }}
+                    className="
+                      inline-flex
+                      items-center
+                      gap-1
+                      text-[11px]
+                      font-medium
+                      text-primary
+                      hover:text-primary/80
+                      transition-colors
+                      px-2
+                      py-0.5
+                      rounded-md
+                      hover:bg-primary/10
+                    "
+                    title="Adjust framing, zoom, or reposition what part shows"
+                  >
+                    <Move className="w-3 h-3" />
+                    Adjust crop
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    className="
+                      inline-flex
+                      items-center
+                      gap-1
+                      text-[11px]
+                      font-medium
+                      text-muted-foreground
+                      hover:text-foreground
+                      transition-colors
+                      px-2
+                      py-0.5
+                      rounded-md
+                      hover:bg-muted/60
+                    "
+                    title="Select a different photo file"
+                  >
+                    <Camera className="w-3 h-3" />
+                    Change
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleRemoveAvatar}
+                    className="
+                      inline-flex
+                      items-center
+                      gap-1
+                      text-[11px]
+                      font-medium
+                      text-muted-foreground
+                      hover:text-destructive
+                      transition-colors
+                      px-2
+                      py-0.5
+                      rounded-md
+                      hover:bg-destructive/10
+                    "
+                    title="Remove custom picture and revert to default avatar"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    Remove
+                  </button>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  className="
+                    inline-flex
+                    items-center
+                    gap-1
+                    text-[11px]
+                    font-medium
+                    text-primary
+                    hover:text-primary/80
+                    transition-colors
+                    px-2
+                    py-0.5
+                    rounded-md
+                    hover:bg-primary/10
+                  "
+                >
+                  <Camera className="w-3 h-3" />
+                  Upload picture
+                </button>
+              )}
+            </div>
 
           </div>
 
@@ -458,8 +813,8 @@ export default function Profile() {
 
             <div className="
               w-full
-              h-1.5
-              bg-muted
+              h-2
+              bg-muted/80
               rounded-full
               overflow-hidden
             ">
@@ -472,7 +827,7 @@ export default function Profile() {
                   ${
                     stats.remaining === 0
                       ? 'bg-destructive'
-                      : 'bg-primary'
+                      : 'bg-gradient-to-r from-primary to-accent'
                   }
                 `}
                 style={{
@@ -748,52 +1103,6 @@ export default function Profile() {
 
 
       {/* ====================================================
-          ACTIONS
-          ==================================================== */}
-
-      <div className="
-        relative
-        z-0
-        space-y-2
-      ">
-
-        <Button
-          type="button"
-          variant="outline"
-          className="
-            w-full
-            h-12
-            justify-start
-          "
-          onClick={
-            handleRegenerate
-          }
-          disabled={
-            regenerating
-          }
-        >
-
-          <RefreshCw
-            className={`
-              w-4
-              h-4
-              mr-3
-              ${
-                regenerating
-                  ? 'animate-spin'
-                  : ''
-              }
-            `}
-          />
-
-          Generate New Program
-
-        </Button>
-
-      </div>
-
-
-      {/* ====================================================
           PRICING
           ==================================================== */}
 
@@ -804,6 +1113,20 @@ export default function Profile() {
       ">
         <PricingSection />
       </div>
+
+      {/* ====================================================
+          AVATAR FRAMING & POSITION ADJUSTMENT MODAL
+          ==================================================== */}
+      <AvatarAdjustModal
+        isOpen={adjustModalOpen}
+        onClose={() => {
+          setAdjustModalOpen(false);
+          setImageToAdjust(null);
+        }}
+        imageSrc={imageToAdjust}
+        onSave={handleSaveAdjustedAvatar}
+        onSelectNewImage={(newUrl) => setImageToAdjust(newUrl)}
+      />
 
     </div>
   );

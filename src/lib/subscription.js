@@ -17,6 +17,15 @@ export const PLAN_HIERARCHY = [
   'elite',
 ];
 
+/**
+ * Stripe Payment Link URLs for direct plan upgrades.
+ */
+export const PLAN_PAYMENT_URLS = {
+  progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
+  performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
+  elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
+};
+
 
 /**
  * Monthly Kael message allowances.
@@ -129,6 +138,13 @@ export const FEATURE_PLANS = {
    * Save progress photos.
    */
   progress_photos:
+    'progress',
+
+  /**
+   * Adaptive programming — Kael learns from your workout edits
+   * and post-workout check-ins to calibrate progression.
+   */
+  adaptive_programming:
     'progress',
 
   /**

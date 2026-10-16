@@ -9,7 +9,7 @@ import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Sparkles, Dumbbe
 import { COUNTRIES, LANGUAGES, getCountryDefaults } from '@/lib/countries';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { supabase } from '@/lib/supabase';
-import { supabaseApi } from '@/lib/supabaseApi';
+import { supabaseApi, ensureValidUuid } from '@/lib/supabaseApi';
 import { cn } from '@/lib/utils';
 import TrainingTypeSelect from '@/components/onboarding/TrainingTypeSelect';
 import { CALISTHENICS_GOALS, WEIGHT_GOALS, buildWeekPrompt } from '@/lib/trainingTypes';
@@ -224,6 +224,40 @@ export default function Onboarding() {
     return () => window.removeEventListener('popstate', handler);
   }, [step]);
 
+  // Preload existing user profile data so returning athletes never lose their name or stats
+  useEffect(() => {
+    supabaseApi.auth.me().then((p) => {
+      if (!p) return;
+      if (p.first_name) setFirstName(p.first_name);
+      if (p.last_name) setLastName(p.last_name);
+      if (p.country) setCountry(p.country);
+      if (p.language) setLanguage(p.language);
+      if (p.unit) setUnit(p.unit);
+      if (p.training_type) setTrainingType(p.training_type);
+      if (p.fitness_level) setLevel(p.fitness_level);
+      if (p.primary_goal) setGoalDescription(p.primary_goal);
+      if (p.age) setAge(String(p.age));
+      if (p.weight_lbs) {
+        const stored = p.unit === 'metric' ? Math.round(p.weight_lbs * 0.453592) : Math.round(p.weight_lbs);
+        setWeightLbs(String(stored));
+      }
+      if (p.height_inches) {
+        setHeightFt(String(Math.floor(p.height_inches / 12)));
+        setHeightIn(String(p.height_inches % 12));
+      } else if (p.height_cm) {
+        setHeightFt(String(p.height_cm));
+      }
+      if (p.gender) setGender(p.gender);
+      if (Array.isArray(p.fitness_goals) && p.fitness_goals.length > 0) setFitnessGoals(p.fitness_goals);
+      if (Array.isArray(p.weight_goals) && p.weight_goals.length > 0) setWeightGoals(p.weight_goals);
+      if (p.current_skills) setCurrentSkills(p.current_skills);
+      if (p.available_equipment) setEquipment(p.available_equipment);
+      if (p.training_requirements) setRequirements(p.training_requirements);
+    }).catch((err) => {
+      console.debug('[Onboarding] Profile preload note:', err);
+    });
+  }, []);
+
   const handleGenerate = async () => {
     if (loading || generationStartedRef.current) return;
 
@@ -239,18 +273,45 @@ export default function Onboarding() {
     });
 
     try {
-      const { data: authData, error: authError } =
-        await supabase.auth.getUser();
+      let user = null;
+      try {
+        const { data: authData } = await supabase.auth.getUser();
+        if (authData?.user) {
+          user = authData.user;
+        }
+      } catch (err) {
+        console.debug('[ONBOARDING] getUser note:', err);
+      }
 
-      if (authError) throw authError;
+      if (!user?.id) {
+        try {
+          const profileUser = await supabaseApi.auth.me();
+          if (profileUser) {
+            user = profileUser;
+          }
+        } catch (err) {
+          console.debug('[ONBOARDING] me note:', err);
+        }
+      }
 
-      const user = authData?.user;
+      if (!user?.id) {
+        try {
+          const cached = localStorage.getItem('washek_user');
+          if (cached) {
+            user = JSON.parse(cached);
+          }
+        } catch (err) {
+          console.debug('[ONBOARDING] localStorage note:', err);
+        }
+      }
 
-      if (!user) {
+      if (!user?.id) {
         throw new Error(
           'No authenticated user found. Please sign in again.'
         );
       }
+
+      const validUserId = ensureValidUuid(user.id || user.uid);
 
       const parsedAge = Number.parseInt(age, 10);
       const enteredWeight = Number.parseFloat(weightLbs);
@@ -265,10 +326,22 @@ export default function Onboarding() {
           : enteredWeight
         : null;
 
+      let existingProfile = null;
+      try {
+        const { data: ep } = await supabase
+          .from('profiles')
+          .select('*')
+          .eq('id', validUserId)
+          .maybeSingle();
+        existingProfile = ep;
+      } catch (epErr) {
+        console.debug('[Onboarding] Existing profile fetch note:', epErr);
+      }
+
       const profileData = {
-        id: user.id,
-        first_name: firstName.trim(),
-        last_name: lastName.trim(),
+        id: validUserId,
+        first_name: firstName.trim() || existingProfile?.first_name || '',
+        last_name: lastName.trim() || existingProfile?.last_name || '',
         training_type: trainingType,
         fitness_level: level || 'intermediate',
         primary_goal:
@@ -562,7 +635,7 @@ export default function Onboarding() {
       setLoadingPhase('Finalizing your schedule…');
 
       const programPayload = {
-        user_id: user.id,
+        user_id: validUserId,
         program_name:
           `${firstName.trim() || 'Athlete'}'s ${
             trainingType === 'weights'
@@ -593,16 +666,23 @@ export default function Onboarding() {
         status: 'active',
       };
 
-      const {
-        data: savedProgram,
-        error: programError,
-      } = await supabase
-        .from('workout_programs')
-        .insert(programPayload)
-        .select()
-        .single();
+      let savedProgram = null;
+      try {
+        savedProgram = await supabaseApi.entities.WorkoutProgram.create(programPayload);
+      } catch (entityErr) {
+        console.warn('[ONBOARDING] entity create fallback:', entityErr);
+        const {
+          data,
+          error: programError,
+        } = await supabase
+          .from('workout_programs')
+          .insert(programPayload)
+          .select()
+          .single();
 
-      if (programError) throw programError;
+        if (programError) throw programError;
+        savedProgram = data;
+      }
 
       if (!savedProgram) {
         throw new Error(

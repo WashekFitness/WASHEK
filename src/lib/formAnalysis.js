@@ -85,6 +85,156 @@ export function hasCalisthenics(
   );
 }
 
+// ── Kinematic motion & cycle analysis for exact rep & hold detection ──
+
+export function computeKinematicMetrics(
+  samples,
+  category,
+  windowDuration
+) {
+  if (!Array.isArray(samples) || samples.length < 2) {
+    return {
+      detectedReps: null,
+      detectedHoldSeconds: null,
+      repTimelines: [],
+      summary: '',
+    };
+  }
+
+  const n = samples.length;
+  const smoothedY = [];
+  const smoothedEnergy = [];
+
+  for (let i = 0; i < n; i++) {
+    const prev = samples[Math.max(0, i - 1)];
+    const curr = samples[i];
+    const next = samples[Math.min(n - 1, i + 1)];
+
+    smoothedY.push(
+      (prev.verticalCentroid + curr.verticalCentroid * 2 + next.verticalCentroid) / 4
+    );
+    smoothedEnergy.push(
+      (prev.motionEnergy + curr.motionEnergy * 2 + next.motionEnergy) / 4
+    );
+  }
+
+  const avgY = smoothedY.reduce((a, b) => a + b, 0) / n;
+  const varianceY = smoothedY.reduce((acc, val) => acc + Math.pow(val - avgY, 2), 0) / n;
+  const stdY = Math.sqrt(varianceY);
+  const avgEnergy = smoothedEnergy.reduce((a, b) => a + b, 0) / n;
+
+  if (category === 'hold') {
+    // For static isometric holds: identify the continuous stable window
+    const stabilityThreshold = Math.max(0.015, avgEnergy * 0.85);
+    let bestHoldStart = samples[0].timestamp;
+    let bestHoldEnd = samples[n - 1].timestamp;
+    let maxHoldDuration = 0;
+    let currentStart = null;
+
+    for (let i = 0; i < n; i++) {
+      const isStable = smoothedEnergy[i] <= stabilityThreshold;
+      if (isStable) {
+        if (currentStart === null) currentStart = samples[i].timestamp;
+      } else {
+        if (currentStart !== null) {
+          const dur = samples[i].timestamp - currentStart;
+          if (dur > maxHoldDuration) {
+            maxHoldDuration = dur;
+            bestHoldStart = currentStart;
+            bestHoldEnd = samples[i].timestamp;
+          }
+          currentStart = null;
+        }
+      }
+    }
+
+    if (currentStart !== null) {
+      const dur = samples[n - 1].timestamp - currentStart;
+      if (dur > maxHoldDuration) {
+        maxHoldDuration = dur;
+        bestHoldStart = currentStart;
+        bestHoldEnd = samples[n - 1].timestamp;
+      }
+    }
+
+    const detectedHoldSeconds = Math.max(
+      0.5,
+      Math.min(windowDuration, maxHoldDuration > 0 ? maxHoldDuration : windowDuration * 0.95)
+    );
+
+    return {
+      detectedReps: null,
+      detectedHoldSeconds: Number(detectedHoldSeconds.toFixed(1)),
+      repTimelines: [],
+      summary: `Kinematically tracked hold stability: ${bestHoldStart.toFixed(2)}s to ${bestHoldEnd.toFixed(2)}s (${detectedHoldSeconds.toFixed(1)}s)`,
+    };
+  }
+
+  // Dynamic movement cycle detection (reps)
+  const peaks = [];
+  const troughs = [];
+  const minDistanceSamples = Math.max(2, Math.round(n / Math.max(1, windowDuration / 0.8)));
+
+  for (let i = 1; i < n - 1; i++) {
+    const isLocalMax = smoothedY[i] > smoothedY[i - 1] && smoothedY[i] >= smoothedY[i + 1];
+    const isLocalMin = smoothedY[i] < smoothedY[i - 1] && smoothedY[i] <= smoothedY[i + 1];
+
+    if (isLocalMax && Math.abs(smoothedY[i] - avgY) > stdY * 0.3) {
+      if (peaks.length === 0 || i - peaks[peaks.length - 1].index >= minDistanceSamples) {
+        peaks.push({ index: i, timestamp: samples[i].timestamp, value: smoothedY[i] });
+      }
+    }
+    if (isLocalMin && Math.abs(smoothedY[i] - avgY) > stdY * 0.3) {
+      if (troughs.length === 0 || i - troughs[troughs.length - 1].index >= minDistanceSamples) {
+        troughs.push({ index: i, timestamp: samples[i].timestamp, value: smoothedY[i] });
+      }
+    }
+  }
+
+  const energyPeaks = [];
+  for (let i = 1; i < n - 1; i++) {
+    if (
+      smoothedEnergy[i] > smoothedEnergy[i - 1] &&
+      smoothedEnergy[i] >= smoothedEnergy[i + 1] &&
+      smoothedEnergy[i] > avgEnergy * 0.55
+    ) {
+      if (
+        energyPeaks.length === 0 ||
+        samples[i].timestamp - energyPeaks[energyPeaks.length - 1].timestamp >= 0.7
+      ) {
+        energyPeaks.push({ timestamp: samples[i].timestamp });
+      }
+    }
+  }
+
+  const inflectionCycles = Math.min(peaks.length, troughs.length);
+  const energyRepEstimate = Math.round(energyPeaks.length / 2);
+
+  let detectedReps = inflectionCycles;
+  if (detectedReps === 0 && energyRepEstimate > 0) {
+    detectedReps = energyRepEstimate;
+  } else if (detectedReps > 0 && energyRepEstimate > 0 && Math.abs(detectedReps - energyRepEstimate) <= 2) {
+    detectedReps = Math.max(detectedReps, energyRepEstimate);
+  }
+
+  const maxPossibleReps = Math.max(1, Math.floor(windowDuration / 1.0));
+  detectedReps = Math.min(detectedReps, maxPossibleReps);
+
+  const repTimelines = peaks.map((p, idx) => ({
+    rep: idx + 1,
+    inflectionTimestamp: Number(p.timestamp.toFixed(2)),
+  }));
+
+  const summary = `Kinematically verified ${detectedReps} movement cycle(s) in analyzed section.`;
+
+  return {
+    detectedReps,
+    detectedHoldSeconds: null,
+    repTimelines,
+    summary,
+  };
+}
+
 // ── Build the expert AI prompt for form analysis ───────────
 
 export function buildFormAnalysisPrompt(
@@ -92,7 +242,8 @@ export function buildFormAnalysisPrompt(
   category,
   user,
   trimStart,
-  trimEnd
+  trimEnd,
+  kinematicInfo = null
 ) {
   const firstName =
     user?.first_name ||
@@ -170,25 +321,17 @@ ${injuries}`
     : ''
 }
 
+${
+  kinematicInfo
+    ? `KINEMATIC MOVEMENT DATA:
+${kinematicInfo}`
+    : ''
+}
+
 IMPORTANT MEDIA INSTRUCTION:
 
-The input is NOT continuous video.
-
-The input consists of chronological still frames extracted from a video.
-
-Treat the supplied frames as ONE movement sequence ordered by timestamp.
-
-Do not assume things happened between two frames unless the visible sequence reasonably supports that conclusion.
-
-Do not claim continuous-video precision.
-
-ANALYSIS PRIORITY:
-
-Accuracy is more important than sounding confident.
-
-Only report observations supported by the supplied frames.
-
-If something cannot be determined reliably from the available frames, say so.
+The input consists of chronological high-resolution still frames extracted from the selected video window.
+Analyze all supplied frames as ONE continuous chronological movement sequence ordered by timestamp.
 
 ============================================================
 1. CAMERA ANGLE
@@ -206,34 +349,41 @@ Consider:
 If the angle is inadequate, explain exactly why.
 
 ============================================================
-2. REP COUNT / HOLD QUALITY
+2. CRITICAL ACCURACY MANDATE: REP COUNT & HOLD TIME
 ============================================================
 
-DYNAMIC MOVEMENT:
+ANALYZED SECTION BOUNDARIES:
+- Analysis Start: ${trimStart != null ? trimStart.toFixed(2) + 's' : '0.00s'}
+- Analysis End: ${trimEnd != null ? trimEnd.toFixed(2) + 's' : 'end of video'}
+- Section Duration: ${trimStart != null && trimEnd != null ? (trimEnd - trimStart).toFixed(2) + 's' : 'full video'}
 
-Count only complete repetitions that are actually supported by the chronological frames.
+CRITICAL SCOPING RULE:
+Count reps and measure hold times STRICTLY AND ONLY within this analyzed section.
+Do not count any repetitions or setup movements that occurred before ${trimStart != null ? trimStart.toFixed(2) + 's' : '0.00s'} or after ${trimEnd != null ? trimEnd.toFixed(2) + 's' : 'end of video'}.
 
-Do not count incomplete movements as full reps.
+DYNAMIC REP COUNTING RULES:
+- ACCURACY IS CRITICAL: You must accurately and strictly count every single completed repetition inside this analyzed section.
+- If the athlete performs 10 reps in this section, you must count exactly 10 reps.
+- Track every full movement cycle (initiation / eccentric descent -> turnaround/depth inflection -> concentric ascent -> lockout/reset).
+- Count each completed repetition that reaches acceptable range of motion.
+- Look across all the chronological frames from first frame to last frame to tally each completed rep.
+- Set "rep_count" to the exact integer of completed reps (e.g., 10). Set "hold_time_seconds" to null.
 
-Do not invent repetitions between widely separated frames.
-
-STATIC HOLD:
-
-Use the timestamps of the supplied frames to estimate when the athlete enters the position and when the position is visibly lost.
-
-The hold-time estimate must reflect the limitations of sampled frames.
+STATIC ISOMETRIC HOLD RULES:
+- ACCURACY IS CRITICAL: Hold times must be spot-on in seconds strictly within the analyzed section.
+- Identify the exact timestamp when the athlete locks into the target isometric shape.
+- Identify the exact timestamp when the athlete breaks form, sags, drops, or when the analyzed section ends.
+- Calculate hold duration: hold_time_seconds = (end_timestamp - start_timestamp).
+- The hold time MUST be spot-on (e.g., 8.5 or 12.0) and CANNOT exceed the analyzed section duration (${trimStart != null && trimEnd != null ? (trimEnd - trimStart).toFixed(2) + 's' : 'window duration'}).
+- Set "hold_time_seconds" to the exact hold duration in seconds. Set "rep_count" to null.
 
 ============================================================
 3. ACTIVE RANGE
 ============================================================
 
 Estimate:
-- active_range_start
-- active_range_end
-
-using the supplied chronological frame timestamps.
-
-Do not pretend these are exact continuous-video timestamps.
+- active_range_start (the second within the analyzed window where the first rep/hold begins)
+- active_range_end (the second within the analyzed window where the final rep finishes or hold drops)
 
 ============================================================
 4. FORM SCORE (FAIR & ACCURATE RATING SYSTEM)

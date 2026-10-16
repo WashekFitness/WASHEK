@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap');
 
 @tailwind base;
 @tailwind components;
@@ -6,322 +6,327 @@
 
 
 /* =========================================================
-   WASHEK THEME
+   WASHEK LUXURY ATHLETIC THEME ($50-$100+ Tier)
    ========================================================= */
 
 @layer base {
 
   :root {
     --font-heading:
-      'Space Grotesk',
+      'Outfit',
+      'Plus Jakarta Sans',
       sans-serif;
 
     --font-body:
-      'Inter',
+      'Plus Jakarta Sans',
       sans-serif;
 
-    /* Dark default */
+    --font-mono:
+      'JetBrains Mono',
+      monospace;
+
+    /* Dark default: Obsidian Glass & Electric Cobalt */
 
     --background:
-      220 20% 4%;
+      222 28% 5.5%;
 
     --foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --card:
-      220 18% 7%;
+      222 24% 8.5%;
 
     --card-foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --popover:
-      220 18% 7%;
+      222 24% 8.5%;
 
     --popover-foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --primary:
-      210 100% 56%;
+      217 100% 56%;
 
     --primary-foreground:
       0 0% 100%;
 
     --secondary:
-      220 15% 13%;
+      222 20% 13%;
 
     --secondary-foreground:
-      210 20% 85%;
+      210 25% 92%;
 
     --muted:
-      220 15% 11%;
+      222 22% 11%;
 
     --muted-foreground:
-      220 10% 50%;
+      217 15% 62%;
 
     --accent:
-      160 84% 45%;
+      158 86% 46%;
 
     --accent-foreground:
       0 0% 100%;
 
     --destructive:
-      0 72% 55%;
+      0 76% 56%;
 
     --destructive-foreground:
       0 0% 98%;
 
     --border:
-      220 15% 15%;
+      222 18% 15.5%;
 
     --input:
-      220 15% 15%;
+      222 18% 15.5%;
 
     --ring:
-      210 100% 56%;
+      217 100% 56%;
 
     --chart-1:
-      210 100% 56%;
+      217 100% 56%;
 
     --chart-2:
-      160 84% 45%;
+      158 86% 46%;
 
     --chart-3:
-      280 70% 60%;
+      280 75% 62%;
 
     --chart-4:
-      35 92% 60%;
+      38 95% 58%;
 
     --chart-5:
-      0 72% 55%;
+      0 76% 56%;
 
     --radius:
-      0.75rem;
+      0.875rem;
 
     --sidebar-background:
-      220 18% 7%;
+      222 24% 7.5%;
 
     --sidebar-foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --sidebar-primary:
-      210 100% 56%;
+      217 100% 56%;
 
     --sidebar-primary-foreground:
       0 0% 100%;
 
     --sidebar-accent:
-      220 15% 13%;
+      222 20% 13%;
 
     --sidebar-accent-foreground:
-      210 20% 85%;
+      210 25% 92%;
 
     --sidebar-border:
-      220 15% 15%;
+      222 18% 15.5%;
 
     --sidebar-ring:
-      210 100% 56%;
+      217 100% 56%;
   }
 
 
-  /* Explicit dark mode */
+  /* Explicit dark mode: Ultra-Deep Obsidian & Laser Micro-Highlights */
 
   html.dark {
     --background:
-      220 20% 4%;
+      222 28% 5.5%;
 
     --foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --card:
-      220 18% 7%;
+      222 24% 8.5%;
 
     --card-foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --popover:
-      220 18% 7%;
+      222 24% 8.5%;
 
     --popover-foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --primary:
-      210 100% 56%;
+      217 100% 56%;
 
     --primary-foreground:
       0 0% 100%;
 
     --secondary:
-      220 15% 13%;
+      222 20% 13%;
 
     --secondary-foreground:
-      210 20% 85%;
+      210 25% 92%;
 
     --muted:
-      220 15% 11%;
+      222 22% 11%;
 
     --muted-foreground:
-      220 10% 50%;
+      217 15% 62%;
 
     --accent:
-      160 84% 45%;
+      158 86% 46%;
 
     --accent-foreground:
       0 0% 100%;
 
     --destructive:
-      0 72% 55%;
+      0 76% 56%;
 
     --destructive-foreground:
       0 0% 98%;
 
     --border:
-      220 15% 15%;
+      222 18% 15.5%;
 
     --input:
-      220 15% 15%;
+      222 18% 15.5%;
 
     --ring:
-      210 100% 56%;
+      217 100% 56%;
 
     --chart-1:
-      210 100% 56%;
+      217 100% 56%;
 
     --chart-2:
-      160 84% 45%;
+      158 86% 46%;
 
     --chart-3:
-      280 70% 60%;
+      280 75% 62%;
 
     --chart-4:
-      35 92% 60%;
+      38 95% 58%;
 
     --chart-5:
-      0 72% 55%;
+      0 76% 56%;
 
     --sidebar-background:
-      220 18% 7%;
+      222 24% 7.5%;
 
     --sidebar-foreground:
-      210 20% 95%;
+      210 30% 98%;
 
     --sidebar-primary:
-      210 100% 56%;
+      217 100% 56%;
 
     --sidebar-primary-foreground:
       0 0% 100%;
 
     --sidebar-accent:
-      220 15% 13%;
+      222 20% 13%;
 
     --sidebar-accent-foreground:
-      210 20% 85%;
+      210 25% 92%;
 
     --sidebar-border:
-      220 15% 15%;
+      222 18% 15.5%;
 
     --sidebar-ring:
-      210 100% 56%;
+      217 100% 56%;
   }
 
 
-  /* Explicit light mode */
+  /* Explicit light mode: Apple Health / Equinox Pristine Swiss Editorial */
 
   html.light {
     --background:
-      0 0% 97%;
+      210 33% 98%;
 
     --foreground:
-      220 20% 8%;
+      222 47% 11%;
 
     --card:
       0 0% 100%;
 
     --card-foreground:
-      220 20% 8%;
+      222 47% 11%;
 
     --popover:
       0 0% 100%;
 
     --popover-foreground:
-      220 20% 8%;
+      222 47% 11%;
 
     --primary:
-      210 100% 50%;
+      221 83% 53%;
 
     --primary-foreground:
       0 0% 100%;
 
     --secondary:
-      220 15% 92%;
+      210 40% 96%;
 
     --secondary-foreground:
-      220 20% 20%;
+      222 40% 16%;
 
     --muted:
-      220 15% 93%;
+      210 36% 95%;
 
     --muted-foreground:
-      220 10% 45%;
+      215 18% 44%;
 
     --accent:
-      160 84% 38%;
+      158 82% 38%;
 
     --accent-foreground:
       0 0% 100%;
 
     --destructive:
-      0 72% 50%;
+      0 78% 52%;
 
     --destructive-foreground:
       0 0% 98%;
 
     --border:
-      220 15% 86%;
+      214 32% 90%;
 
     --input:
-      220 15% 86%;
+      214 32% 90%;
 
     --ring:
-      210 100% 50%;
+      221 83% 53%;
 
     --chart-1:
-      210 100% 50%;
+      221 83% 53%;
 
     --chart-2:
-      160 84% 38%;
+      158 82% 38%;
 
     --chart-3:
-      280 70% 55%;
+      270 70% 55%;
 
     --chart-4:
-      35 92% 55%;
+      35 95% 46%;
 
     --chart-5:
-      0 72% 50%;
+      0 78% 52%;
 
     --sidebar-background:
       0 0% 100%;
 
     --sidebar-foreground:
-      220 20% 8%;
+      222 47% 11%;
 
     --sidebar-primary:
-      210 100% 50%;
+      221 83% 53%;
 
     --sidebar-primary-foreground:
       0 0% 100%;
 
     --sidebar-accent:
-      220 15% 92%;
+      210 36% 95%;
 
     --sidebar-accent-foreground:
-      220 20% 20%;
+      222 47% 11%;
 
     --sidebar-border:
-      220 15% 86%;
+      214 32% 90%;
 
     --sidebar-ring:
-      210 100% 50%;
+      221 83% 53%;
   }
 
 
@@ -403,6 +408,27 @@
 
     font-family:
       var(--font-body);
+
+    -webkit-font-smoothing:
+      antialiased;
+
+    -moz-osx-font-smoothing:
+      grayscale;
+
+    background-color: hsl(var(--background));
+    background-image:
+      radial-gradient(ellipse 100% 50% at 50% -15%, hsl(217 100% 56% / 0.12), transparent 65%),
+      radial-gradient(ellipse 70% 40% at 100% 100%, hsl(158 86% 46% / 0.045), transparent 50%),
+      radial-gradient(ellipse 60% 35% at 0% 50%, hsl(217 100% 56% / 0.035), transparent 45%);
+    background-attachment: fixed;
+  }
+
+  html.light body {
+    background-color: hsl(var(--background));
+    background-image:
+      radial-gradient(ellipse 90% 45% at 50% -10%, hsl(221 83% 53% / 0.05), transparent 60%),
+      radial-gradient(ellipse 60% 35% at 100% 100%, hsl(158 82% 38% / 0.025), transparent 45%);
+    background-attachment: fixed;
   }
 
 
@@ -452,34 +478,75 @@
    SAFE AREA
    ========================================================= */
 
-.safe-top {
-  padding-top:
-    max(
-      2.75rem,
-      env(safe-area-inset-top)
-    );
+:root {
+  --safe-area-inset-top: env(safe-area-inset-top, 0px);
+  --safe-area-inset-bottom: env(safe-area-inset-bottom, 0px);
 }
 
-
-.safe-bottom {
-  padding-bottom:
+.safe-top,
+.pt-safe {
+  padding-top:
     max(
-      5.75rem,
+      0.75rem,
       calc(
-        env(safe-area-inset-bottom) +
-        4.75rem
+        env(safe-area-inset-top, 0px) +
+        0.5rem
       )
     );
 }
 
+.safe-top-compact {
+  padding-top:
+    max(
+      0.625rem,
+      calc(
+        env(safe-area-inset-top, 0px) +
+        0.375rem
+      )
+    );
+}
 
+.safe-sheet-header {
+  padding-top:
+    max(
+      1rem,
+      calc(
+        env(safe-area-inset-top, 0px) +
+        0.75rem
+      )
+    );
+}
+
+.safe-sheet-close {
+  top:
+    max(
+      1rem,
+      calc(
+        env(safe-area-inset-top, 0px) +
+        0.75rem
+      )
+    );
+}
+
+.pt-safe-dropdown {
+  padding-top:
+    max(
+      2.5rem,
+      calc(
+        env(safe-area-inset-top, 0px) +
+        1rem
+      )
+    );
+}
+
+.safe-bottom,
 .pb-safe {
   padding-bottom:
     max(
-      5.75rem,
+      4.25rem,
       calc(
-        env(safe-area-inset-bottom) +
-        4.75rem
+        env(safe-area-inset-bottom, 0px) +
+        4.25rem
       )
     );
 }
@@ -508,52 +575,200 @@
 
 
   /*
-   * A little top clearance, but not so much that it
-   * steals unnecessary vertical space from the page.
+   * Leveled top clearance:
+   * Clears the phone notch, Dynamic Island, and status bar icons
+   * so all buttons/headers are reachable and clickable.
    */
 
-  .safe-top {
+  .safe-top,
+  .pt-safe {
     padding-top:
       max(
-        2.75rem,
+        0.875rem,
         calc(
-          env(safe-area-inset-top) +
+          env(safe-area-inset-top, 0px) +
+          0.625rem
+        )
+      );
+  }
+
+  .safe-top-compact {
+    padding-top:
+      max(
+        0.625rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          0.375rem
+        )
+      );
+  }
+
+  .safe-sheet-header {
+    padding-top:
+      max(
+        1.25rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
           0.75rem
         )
       );
   }
 
+  .safe-sheet-close {
+    top:
+      max(
+        1.25rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          0.75rem
+        )
+      );
+  }
 
   /*
-   * Main content gets enough room above the fixed
-   * bottom navigation.
+   * Kael Conversation Selection / Dropdown Container
+   * When active on mobile, add dedicated top clearance so it does not
+   * collide with the status bar, notch, camera cutout, or Dynamic Island.
+   */
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active,
+  .kael-conversation-dropdown-container[data-state='open'],
+  .pt-safe-dropdown {
+    padding-top:
+      max(
+        2.75rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          1.25rem
+        )
+      ) !important;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active .safe-sheet-header,
+  .kael-conversation-dropdown-container[data-state='open'] .safe-sheet-header {
+    padding-top:
+      0.75rem !important;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active .safe-sheet-close,
+  .kael-conversation-dropdown-container[data-state='open'] .safe-sheet-close {
+    top:
+      max(
+        3.25rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          1.75rem
+        )
+      ) !important;
+  }
+
+
+  /*
+   * Leveled bottom clearance:
+   * Clean clearance above fixed mobile bottom navigation
+   * without creating an excessive blank void when scrolled down.
    */
 
   .safe-bottom,
   .pb-safe {
     padding-bottom:
-      max(
-        6rem,
-        calc(
-          env(safe-area-inset-bottom) +
-          5rem
-        )
+      calc(
+        env(safe-area-inset-bottom, 0px) +
+        4.25rem
       );
   }
 
 
   /*
-   * Footer gets its own clearance as well.
-   * This ensures About and Contact are always reachable.
+   * Footer sits naturally at the bottom without double-padding.
    */
 
   footer {
     padding-bottom:
+      0.5rem !important;
+  }
+}
+
+
+/* =========================================================
+   STANDALONE APP MODE (iOS PWA / Android Installed Web App)
+   ========================================================= */
+
+@media (display-mode: standalone) {
+  /*
+   * When installed / run as an app, ensure status bar clearance
+   * so content never runs into the top notch/clock/battery.
+   */
+  .safe-top,
+  .pt-safe {
+    padding-top:
       max(
-        6rem,
+        2.75rem,
         calc(
-          env(safe-area-inset-bottom) +
-          5rem
+          env(safe-area-inset-top, 0px) +
+          0.625rem
+        )
+      );
+  }
+
+  .safe-top-compact {
+    padding-top:
+      max(
+        2.5rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          0.375rem
+        )
+      );
+  }
+
+  .safe-sheet-header {
+    padding-top:
+      max(
+        3rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          0.75rem
+        )
+      );
+  }
+
+  .safe-sheet-close {
+    top:
+      max(
+        3rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          0.75rem
+        )
+      );
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active,
+  .kael-conversation-dropdown-container[data-state='open'] {
+    padding-top:
+      max(
+        3.25rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          1.5rem
+        )
+      ) !important;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active .safe-sheet-header,
+  .kael-conversation-dropdown-container[data-state='open'] .safe-sheet-header {
+    padding-top:
+      0.75rem !important;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active .safe-sheet-close,
+  .kael-conversation-dropdown-container[data-state='open'] .safe-sheet-close {
+    top:
+      max(
+        3.75rem,
+        calc(
+          env(safe-area-inset-top, 0px) +
+          2rem
         )
       ) !important;
   }
@@ -566,6 +781,46 @@
 
 @media (min-width: 640px) {
 
+  .safe-top,
+  .pt-safe {
+    padding-top:
+      1.5rem;
+  }
+
+  .safe-top-compact {
+    padding-top:
+      0.625rem;
+  }
+
+  .safe-sheet-header {
+    padding-top:
+      1rem;
+  }
+
+  .safe-sheet-close {
+    top:
+      1rem;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active,
+  .kael-conversation-dropdown-container[data-state='open'],
+  .pt-safe-dropdown {
+    padding-top:
+      0 !important;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active .safe-sheet-header,
+  .kael-conversation-dropdown-container[data-state='open'] .safe-sheet-header {
+    padding-top:
+      1rem !important;
+  }
+
+  .kael-conversation-dropdown-container.kael-conversation-dropdown-active .safe-sheet-close,
+  .kael-conversation-dropdown-container[data-state='open'] .safe-sheet-close {
+    top:
+      1rem !important;
+  }
+
   .safe-bottom,
   .pb-safe {
     padding-bottom:
@@ -574,7 +829,7 @@
 
   footer {
     padding-bottom:
-      1rem;
+      1rem !important;
   }
 }
 
@@ -607,4 +862,56 @@ a {
     transition-duration:
       0.01ms !important;
   }
+}
+
+/* =========================================================
+   CUSTOM LUXURY SCROLLBAR
+   ========================================================= */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: hsl(var(--border) / 0.8);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: hsl(var(--muted-foreground) / 0.5);
+}
+
+/* =========================================================
+   ATHLETIC SURFACE POLISH
+   ========================================================= */
+
+.glass-card {
+  background: hsl(var(--card) / 0.95);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid hsl(var(--border) / 0.9);
+  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.05);
+}
+
+html.dark .glass-card {
+  background: hsl(var(--card) / 0.85);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.05), 0 8px 32px rgba(0, 0, 0, 0.35);
+}
+
+.glow-blue {
+  box-shadow: 0 0 25px -4px rgba(37, 99, 235, 0.25);
+}
+
+.glow-orange {
+  box-shadow: 0 0 25px -4px rgba(245, 158, 11, 0.25);
+}
+
+.glow-mint {
+  box-shadow: 0 0 25px -4px rgba(16, 185, 129, 0.25);
 }

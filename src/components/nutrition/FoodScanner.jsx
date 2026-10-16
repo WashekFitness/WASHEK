@@ -607,6 +607,7 @@ ${buildMemoryContext()}
 export default function FoodScanner({
   onFoodDetected,
   userPlan = 'free',
+  defaultMealType = 'snack',
 }) {
   const [
     scanning,
@@ -874,7 +875,10 @@ export default function FoodScanner({
 
         setPendingFoods(
           {
-            foods,
+            foods: foods.map((f) => ({
+              ...f,
+              meal_type: f.meal_type || defaultMealType || 'snack',
+            })),
 
             imageUrl,
           }
@@ -1036,7 +1040,10 @@ export default function FoodScanner({
 
         setPendingFoods(
           {
-            foods,
+            foods: foods.map((f) => ({
+              ...f,
+              meal_type: f.meal_type || defaultMealType || 'snack',
+            })),
 
             imageUrl,
           }
@@ -1191,6 +1198,10 @@ export default function FoodScanner({
 
         imageUrl={
           pendingFoods.imageUrl
+        }
+
+        defaultMealType={
+          defaultMealType
         }
 
         onConfirm={

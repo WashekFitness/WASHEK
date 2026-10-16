@@ -31,14 +31,14 @@ export function Toaster() {
             title,
             description,
             action,
+            onOpenChange,
+            duration,
             ...props
           } = toast;
 
           return (
             <Toast
-              key={
-                id
-              }
+              key={id}
               {...props}
             >
 
@@ -46,17 +46,13 @@ export function Toaster() {
 
                 {title && (
                   <ToastTitle>
-                    {
-                      title
-                    }
+                    {title}
                   </ToastTitle>
                 )}
 
                 {description && (
                   <ToastDescription>
-                    {
-                      description
-                    }
+                    {description}
                   </ToastDescription>
                 )}
 
@@ -70,6 +66,9 @@ export function Toaster() {
                 onClick={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  if (typeof onOpenChange === 'function') {
+                    onOpenChange(false);
+                  }
                   dismiss(id);
                 }}
               />

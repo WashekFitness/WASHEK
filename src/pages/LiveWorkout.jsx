@@ -30,6 +30,8 @@ import { cn } from '@/lib/utils';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { toast } from 'sonner';
 import { getLocalDateKey } from '@/lib/dateUtils';
+import { triggerHaptic } from '@/lib/haptics';
+import { playRestCompleteCue } from '@/lib/audioCue';
 
 // ─── Timer ─────────────────────────────────────────────
 function useTimer() {
@@ -75,6 +77,12 @@ function RestTimer({ seconds: restSecs, onDone }) {
       if (remaining <= 0) {
         clearInterval(interval);
         setLeft(0);
+        try {
+          playRestCompleteCue();
+          triggerHaptic('success');
+        } catch (_cueErr) {
+          // Audio cue note
+        }
         onDoneRef.current();
       } else {
         setLeft(remaining);
@@ -723,6 +731,7 @@ function PostWorkoutCheckin({
   log,
   onSave,
   canAdjust,
+  canAdapt,
   program,
   onProgramUpdated,
 }) {
@@ -746,7 +755,7 @@ function PostWorkoutCheckin({
         )
         .join('\n');
 
-      if (program) {
+      if (program && canAdapt) {
         const currentWeek = program.current_week || 1;
 
         const nextMicrocycle =
@@ -915,7 +924,7 @@ Respond in JSON:
           hybrid: 'hybrid training',
         }[trainingType];
 
-        const prompt = `You are Kael, a real-talk ${typeLabel} coach. Based on this post-workout check-in, give a SHORT (2-3 sentence) human response and a concrete note on how to adjust the next workout. Sound like a person, not a bot.
+        const prompt = `You are Kael, a real-talk ${typeLabel} coach. Based on this post-workout check-in, give a SHORT (2-3 sentence) human response and a concrete note on how to adjust the next workout. Sound like a person, not a bot. Explain things in simple, everyday words that any beginner can easily understand without confusing jargon. If an analogy helps, use it, but never talk down to the athlete or sound childish.
 
 Check-in: "${checkin}"
 
@@ -1050,7 +1059,9 @@ export default function LiveWorkout() {
     useState({});
 
   useEffect(() => {
-    supabaseApi.auth.me().then(setUser);
+    supabaseApi.auth.me().then((u) => {
+      if (u) setUser(u);
+    }).catch(() => {});
   }, []);
 
   // iOS back gesture: when workout is done, back navigates
@@ -1240,7 +1251,17 @@ export default function LiveWorkout() {
     'live_workout_adjustments'
   );
 
+  const canAdapt = canAccess(
+    user?.subscription_plan,
+    'adaptive_programming'
+  );
+
   const applyLiveAdjustment = adjusted => {
+    if (!canAdjust) {
+      toast.error('Real-time live adjustments are an Elite feature.');
+      return;
+    }
+
     setLiveExercises(prev =>
       prev.map((ex, index) =>
         index === exIndex
@@ -1276,6 +1297,7 @@ export default function LiveWorkout() {
 
   const markSet = () => {
     if (!exercise) return;
+    triggerHaptic('success');
 
     const key = `${exIndex}-${setIndex}`;
 
@@ -1308,6 +1330,7 @@ export default function LiveWorkout() {
   };
 
   const finishWorkout = () => {
+    triggerHaptic('heavy');
     setRunning(false);
     setWorkoutDone(true);
 
@@ -1471,6 +1494,7 @@ export default function LiveWorkout() {
                 <PostWorkoutCheckin
                   log={savedLog}
                   canAdjust={canAdjust}
+                  canAdapt={canAdapt}
                   program={program}
                   onProgramUpdated={() =>
                     queryClient.invalidateQueries({

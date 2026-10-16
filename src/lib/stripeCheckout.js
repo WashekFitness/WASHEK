@@ -3,6 +3,12 @@ import { supabase } from '@/lib/supabase';
 const CHECKOUT_FUNCTION =
   'create-checkout-session';
 
+export const PLAN_PAYMENT_URLS = {
+  progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
+  performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
+  elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
+};
+
 const VALID_PLANS = [
   'progress',
   'performance',
@@ -80,7 +86,10 @@ export async function createStripeCheckout(
       {
         body: {
           plan,
-          app_url: 'https://washek.ai.studio',
+          app_url:
+            typeof window !== 'undefined' && window.location.origin
+              ? window.location.origin
+              : 'https://washek.ai.studio',
         },
       }
     );

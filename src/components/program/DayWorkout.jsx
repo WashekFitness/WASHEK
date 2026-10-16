@@ -4,14 +4,21 @@ import { Button } from '@/components/ui/button';
 import { ArrowLeft, Check, Timer, MessageSquare, Zap, TrendingUp, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { getLocalDateKey } from '@/lib/dateUtils';
+import { triggerHaptic } from '@/lib/haptics';
 
 export default function DayWorkout({ day, weekNumber, onBack, onComplete }) {
   const [completedSets, setCompletedSets] = useState({});
   const [startTime] = useState(Date.now());
 
   const toggleSet = (exIdx, setIdx) => {
+    const key = `${exIdx}-${setIdx}`;
+    const willBeCompleted = !completedSets[key];
+    if (willBeCompleted) {
+      triggerHaptic('success');
+    } else {
+      triggerHaptic('selection');
+    }
     setCompletedSets(prev => {
-      const key = `${exIdx}-${setIdx}`;
       const next = { ...prev };
       next[key] = !next[key];
       return next;
@@ -25,6 +32,7 @@ export default function DayWorkout({ day, weekNumber, onBack, onComplete }) {
   const allComplete = day.exercises?.every((ex, i) => isExerciseComplete(i, ex.sets));
 
   const handleFinish = () => {
+    triggerHaptic('heavy');
     const duration = Math.round((Date.now() - startTime) / 60000);
     onComplete({
       date: getLocalDateKey(),
