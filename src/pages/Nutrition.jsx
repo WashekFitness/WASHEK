@@ -18,10 +18,10 @@ import { toast } from 'sonner';
 
 import { supabaseApi } from '@/lib/supabaseApi';
 
-import MobileSelect from '@/components/ui/MobileSelect';
 import FoodScanner from '@/components/nutrition/FoodScanner';
 import ManualFoodEntry from '@/components/nutrition/ManualFoodEntry';
 import FoodLog from '@/components/nutrition/FoodLog';
+import SavedMealsManager from '@/components/nutrition/SavedMealsManager';
 
 import PageHeader from '@/components/layout/PageHeader';
 
@@ -86,33 +86,79 @@ export default function Nutrition() {
   }, []);
 
 
+function getSmartDefaultMeal() {
+  try {
+    const saved = localStorage.getItem('washek_active_meal');
+    if (saved && ['breakfast', 'lunch', 'dinner', 'snack'].includes(saved)) {
+      return saved;
+    }
+  } catch (_e) {
+    // LocalStorage unavailable
+  }
+  const hour = new Date().getHours();
+  if (hour >= 4 && hour < 11) return 'breakfast';
+  if (hour >= 11 && hour < 15) return 'lunch';
+  if (hour >= 15 && hour < 18) return 'snack';
+  if (hour >= 18 && hour < 22) return 'dinner';
+  return 'snack';
+}
+
   const [
     searchParams,
-    setSearchParams,
   ] = useSearchParams();
 
+  const [activeTab, setActiveTab] = useState(() => {
+    try {
+      const url = new URL(window.location.href);
+      const tabParam = url.searchParams.get('tab') || url.searchParams.get('view');
+      return tabParam === 'saved' ? 'saved' : 'log';
+    } catch {
+      return 'log';
+    }
+  });
 
-  const mealType =
-    searchParams.get('meal') ||
-    'snack';
+  const [mealType, setMealTypeState] = useState(() => {
+    const param = searchParams.get('meal');
+    if (param && ['breakfast', 'lunch', 'dinner', 'snack'].includes(param.toLowerCase())) {
+      return param.toLowerCase();
+    }
+    return getSmartDefaultMeal();
+  });
 
+  const setMealType = (value) => {
+    const normalized = String(value || 'breakfast').toLowerCase();
+    setMealTypeState(normalized);
+    try {
+      localStorage.setItem('washek_active_meal', normalized);
+    } catch (_e) {
+      // LocalStorage write ignored
+    }
+    // Update URL silently without triggering React Router route re-mounts or scroll jumps
+    try {
+      const url = new URL(window.location.href);
+      if (url.searchParams.get('meal') !== normalized) {
+        url.searchParams.set('meal', normalized);
+        window.history.replaceState(window.history.state, '', url.pathname + url.search);
+      }
+    } catch (_e) {
+      // Ignore
+    }
+  };
 
-  const setMealType =
-    (value) => {
-      const next =
-        new URLSearchParams(
-          searchParams
-        );
-
-      next.set(
-        'meal',
-        value
-      );
-
-      setSearchParams(
-        next
-      );
-    };
+  const handleTabChange = (tab) => {
+    setActiveTab(tab);
+    try {
+      const url = new URL(window.location.href);
+      if (tab === 'saved') {
+        url.searchParams.set('tab', 'saved');
+      } else {
+        url.searchParams.delete('tab');
+      }
+      window.history.replaceState(window.history.state, '', url.pathname + url.search);
+    } catch (_e) {
+      // Ignore
+    }
+  };
 
 
   /*
@@ -143,6 +189,52 @@ export default function Nutrition() {
     enabled: true,
   });
 
+  /*
+   * ============================================================
+   * SAVED MEALS & SNACKS LIBRARY
+   * ============================================================
+   */
+  const { data: savedMeals = [] } = useQuery({
+    queryKey: ['saved_meals', userKey],
+    queryFn: async () => {
+      try {
+        const results = await supabaseApi.entities.SavedMeal.filter(
+          { created_by: userKey },
+          '-created_at',
+          200
+        );
+        return results || [];
+      } catch (err) {
+        console.warn('[Nutrition] Fetch saved meals note:', err);
+        const list = await supabaseApi.entities.SavedMeal.list('-created_at', 200);
+        return list || [];
+      }
+    },
+  });
+
+  const saveToMealsMutation = useMutation({
+    mutationFn: (mealData) =>
+      supabaseApi.entities.SavedMeal.create({
+        ...mealData,
+        created_by: userKey,
+      }),
+    onSuccess: (saved) => {
+      queryClient.setQueryData(['saved_meals', userKey], (old = []) => [
+        saved,
+        ...old.filter((m) => m.id !== saved.id),
+      ]);
+      queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
+      toast.success(`Saved "${saved.name || saved.food_name || 'meal'}" to your Saved Meals!`);
+    },
+    onError: (err) => {
+      console.error('[Nutrition] Save to meals failed:', err);
+      toast.error(err?.message || 'Failed to save to meals library.');
+    },
+  });
+
+  const handleSaveToMeals = (mealData) => {
+    saveToMealsMutation.mutate(mealData);
+  };
 
   /*
    * ============================================================
@@ -164,7 +256,7 @@ export default function Nutrition() {
             meal_type:
               data.meal_type ||
               mealType ||
-              'snack',
+              'breakfast',
           }
         ),
 
@@ -195,7 +287,7 @@ export default function Nutrition() {
           meal_type:
             data.meal_type ||
             mealType ||
-            'snack',
+            'breakfast',
 
           calories:
             Number(data.calories) || 0,
@@ -303,45 +395,19 @@ export default function Nutrition() {
       mutationFn: ({
         id,
         data,
-      }) =>
-        supabaseApi.entities.NutritionEntry.update(
-          id,
-          {
-            food_name:
-              data.food_name,
+      }) => {
+        const payload = {};
+        if (data.food_name !== undefined) payload.food_name = data.food_name;
+        if (data.serving_size !== undefined) payload.serving_size = data.serving_size;
+        if (data.calories !== undefined) payload.calories = Number(data.calories) || 0;
+        if (data.protein_g !== undefined) payload.protein_g = Number(data.protein_g) || 0;
+        if (data.carbs_g !== undefined) payload.carbs_g = Number(data.carbs_g) || 0;
+        if (data.fat_g !== undefined) payload.fat_g = Number(data.fat_g) || 0;
+        if (data.meal_type !== undefined) payload.meal_type = data.meal_type;
+        if (data.image_url !== undefined) payload.image_url = data.image_url;
 
-            serving_size:
-              data.serving_size,
-
-            calories:
-              Number(
-                data.calories
-              ) || 0,
-
-            protein_g:
-              Number(
-                data.protein_g
-              ) || 0,
-
-            carbs_g:
-              Number(
-                data.carbs_g
-              ) || 0,
-
-            fat_g:
-              Number(
-                data.fat_g
-              ) || 0,
-
-            meal_type:
-              data.meal_type ||
-              mealType,
-
-            image_url:
-              data.image_url ||
-              null,
-          }
-        ),
+        return supabaseApi.entities.NutritionEntry.update(id, payload);
+      },
 
       onMutate: async ({ id, data }) => {
         await queryClient.cancelQueries({
@@ -371,7 +437,7 @@ export default function Nutrition() {
                 ? {
                     ...entry,
                     ...data,
-                    meal_type: data.meal_type || entry.meal_type || mealType,
+                    meal_type: data.meal_type !== undefined ? data.meal_type : entry.meal_type,
                   }
                 : entry
             )
@@ -639,7 +705,66 @@ export default function Nutrition() {
         />
 
 
-        <div className="mb-5" />
+        {/* ====================================================
+            SUBPAGE NAVIGATION TABS
+            ==================================================== */}
+        <div className="flex items-center gap-1.5 my-4 p-1 bg-muted/60 dark:bg-muted/30 rounded-2xl border border-border/80 dark:border-white/[0.08] shadow-2xs">
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              handleTabChange('log');
+            }}
+            className={`
+              flex-1 flex items-center justify-center py-2.5 px-3 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer touch-manipulation select-none text-center
+              ${
+                activeTab === 'log'
+                  ? 'bg-card text-foreground shadow-xs border border-border/80 dark:border-white/10'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted/40'
+              }
+            `}
+          >
+            <span>Daily Log</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={(e) => {
+              e.preventDefault();
+              handleTabChange('saved');
+            }}
+            className={`
+              flex-1 flex items-center justify-center gap-1.5 py-2.5 px-3 rounded-xl text-xs sm:text-sm font-semibold transition-all cursor-pointer touch-manipulation select-none text-center
+              ${
+                activeTab === 'saved'
+                  ? 'bg-card text-foreground shadow-xs border border-border/80 dark:border-white/10'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted/40'
+              }
+            `}
+          >
+            <span>Saved Meals & Snacks</span>
+            {savedMeals.length > 0 && (
+              <span className="px-1.5 py-0.5 rounded-full text-[10px] sm:text-xs bg-amber-500/15 border border-amber-500/25 text-amber-600 dark:text-amber-400 font-bold leading-none">
+                {savedMeals.length}
+              </span>
+            )}
+          </button>
+        </div>
+
+        {activeTab === 'saved' ? (
+          <div className="pt-1">
+            <SavedMealsManager
+              userKey={userKey}
+              activeMealType={mealType}
+              onLogMeal={(food) => {
+                createMutation.mutate(food);
+                handleTabChange('log');
+              }}
+              isModal={false}
+            />
+          </div>
+        ) : (
+          <>
 
 
         {/* ====================================================
@@ -896,57 +1021,57 @@ export default function Nutrition() {
 
 
         {/* ====================================================
-            MEAL TYPE
+            MEAL TYPE SELECTOR TABS
             ==================================================== */}
 
-        <div className="
-          flex
-          items-center
-          gap-3
-          mb-4
-        ">
+        <div className="mb-5">
+          <div className="flex items-center justify-between mb-2 px-1">
+            <span className="text-xs font-bold uppercase tracking-wider text-muted-foreground font-heading">
+              Select Meal
+            </span>
+            <span className="text-xs text-primary font-semibold capitalize flex items-center gap-1.5">
+              <span className="text-muted-foreground font-normal">Active:</span>
+              <span className="px-2.5 py-0.5 rounded-full bg-primary/10 border border-primary/20 text-primary font-bold">
+                {mealType === 'breakfast' && '🌅 Breakfast'}
+                {mealType === 'lunch' && '☀️ Lunch'}
+                {mealType === 'dinner' && '🌙 Dinner'}
+                {mealType === 'snack' && '🍎 Snack'}
+              </span>
+            </span>
+          </div>
 
-          <p className="
-            text-sm
-            font-medium
-          ">
-            Add to:
-          </p>
-
-
-          <MobileSelect
-            value={mealType}
-            onValueChange={
-              setMealType
-            }
-            placeholder="Meal"
-            triggerClassName="
-              w-32
-              h-9
-            "
-            options={[
-              {
-                value: 'breakfast',
-                label: 'Breakfast',
-              },
-
-              {
-                value: 'lunch',
-                label: 'Lunch',
-              },
-
-              {
-                value: 'dinner',
-                label: 'Dinner',
-              },
-
-              {
-                value: 'snack',
-                label: 'Snack',
-              },
-            ]}
-          />
-
+          <div className="grid grid-cols-4 gap-1.5 p-1.5 bg-card border border-border/80 dark:border-white/[0.08] rounded-2xl shadow-xs">
+            {[
+              { value: 'breakfast', label: 'Breakfast', emoji: '🌅' },
+              { value: 'lunch', label: 'Lunch', emoji: '☀️' },
+              { value: 'dinner', label: 'Dinner', emoji: '🌙' },
+              { value: 'snack', label: 'Snack', emoji: '🍎' },
+            ].map((m) => {
+              const active = mealType === m.value;
+              return (
+                <button
+                  key={m.value}
+                  type="button"
+                  onClick={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setMealType(m.value);
+                  }}
+                  className={`
+                    flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-1.5 py-2.5 px-1 sm:px-2 rounded-xl text-xs font-semibold transition-all touch-manipulation cursor-pointer select-none
+                    ${
+                      active
+                        ? 'bg-primary text-primary-foreground shadow-sm shadow-primary/25 scale-[1.02]'
+                        : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                    }
+                  `}
+                >
+                  <span className="text-base sm:text-sm">{m.emoji}</span>
+                  <span className="text-[11px] sm:text-xs truncate">{m.label}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
 
 
@@ -957,7 +1082,6 @@ export default function Nutrition() {
         <div className="
           space-y-4
         ">
-
           <FoodScanner
             defaultMealType={mealType}
             onFoodDetected={
@@ -966,7 +1090,7 @@ export default function Nutrition() {
                   food
                 )
             }
-
+            onSaveToMeals={handleSaveToMeals}
             userPlan={
               user?.subscription_plan ||
               'free'
@@ -982,6 +1106,7 @@ export default function Nutrition() {
                   food
                 )
             }
+            onSaveToMeals={handleSaveToMeals}
           />
 
 
@@ -1022,11 +1147,15 @@ export default function Nutrition() {
                     data,
                   })
               }
+
+              onSaveToMeals={handleSaveToMeals}
             />
 
           </div>
 
         </div>
+          </>
+        )}
 
       </div>
   );

@@ -21,6 +21,7 @@ import {
 
 import Footer from '@/components/layout/Footer';
 import PullToRefresh from '@/components/layout/PullToRefresh';
+import MobileHeader from '@/components/layout/MobileHeader';
 
 
 const navItems = [
@@ -123,10 +124,7 @@ export default function AppLayout() {
       top: 0,
       behavior: 'auto',
     });
-  }, [
-    location.pathname,
-    location.search,
-  ]);
+  }, [location.pathname]);
 
 
   if (
@@ -254,6 +252,13 @@ export default function AppLayout() {
 
 
       {/* =====================================================
+          MOBILE HEADER (Clock & Notch Safe Shield)
+          ===================================================== */}
+
+      {!isKael && <MobileHeader scrollRef={scrollRef} />}
+
+
+      {/* =====================================================
           SCROLLING CONTENT AREA
           ===================================================== */}
 
@@ -293,7 +298,7 @@ export default function AppLayout() {
 
             isKael
               ? 'pt-0 pb-0'
-              : 'pt-safe pb-safe sm:pt-6 sm:pb-6'
+              : 'pt-[calc(env(safe-area-inset-top,0px)+4.25rem)] pb-safe sm:pt-6 sm:pb-6'
           )}
         >
 

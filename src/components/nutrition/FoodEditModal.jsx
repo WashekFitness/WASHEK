@@ -26,12 +26,14 @@ export default function FoodEditModal({
   imageUrl,
   onConfirm,
   onCancel,
-  defaultMealType = 'snack',
+  onSaveToMeals,
+  defaultMealType = 'breakfast',
   title = 'Review Scan',
   subtitle = 'Edit anything the AI got wrong',
 }) {
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState('');
+  const [saveToMeals, setSaveToMeals] = useState(false);
 
   const [
     items,
@@ -49,12 +51,25 @@ export default function FoodEditModal({
         );
         return {
           ...cleaned,
-          meal_type: food?.meal_type || defaultMealType || 'snack',
+          meal_type: food?.meal_type || defaultMealType || 'breakfast',
         };
       }
     )
   );
 
+  const [selectedMeal, setSelectedMeal] = useState(
+    foods?.[0]?.meal_type || defaultMealType || 'breakfast'
+  );
+
+  const applyMealToAll = (meal) => {
+    setSelectedMeal(meal);
+    setItems((previous) =>
+      previous.map((item) => ({
+        ...item,
+        meal_type: meal,
+      }))
+    );
+  };
 
   const update = (
     index,
@@ -300,6 +315,49 @@ export default function FoodEditModal({
                   space-y-4
                 "
               >
+
+                {/* Active Meal Selector for this scan/entry */}
+                <div className="p-3 bg-muted/40 dark:bg-muted/20 rounded-2xl border border-border/70 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-foreground font-heading">
+                      Meal Category
+                    </span>
+                    <span className="text-[11px] text-primary font-semibold capitalize">
+                      {selectedMeal}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-4 gap-1 p-1 bg-background/80 dark:bg-card rounded-xl border border-border/60">
+                    {[
+                      { value: 'breakfast', label: 'Breakfast', emoji: '🌅' },
+                      { value: 'lunch', label: 'Lunch', emoji: '☀️' },
+                      { value: 'dinner', label: 'Dinner', emoji: '🌙' },
+                      { value: 'snack', label: 'Snack', emoji: '🍎' },
+                    ].map((m) => {
+                      const isSelected = selectedMeal === m.value;
+                      return (
+                        <button
+                          key={m.value}
+                          type="button"
+                          onClick={(e) => {
+                            e.preventDefault();
+                            applyMealToAll(m.value);
+                          }}
+                          className={`
+                            flex items-center justify-center gap-1.5 py-2 px-1 rounded-lg text-xs font-semibold transition-all pointer-events-auto touch-manipulation cursor-pointer
+                            ${
+                              isSelected
+                                ? 'bg-primary text-primary-foreground shadow-xs'
+                                : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+                            }
+                          `}
+                        >
+                          <span>{m.emoji}</span>
+                          <span className="hidden sm:inline">{m.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
 
                 {items.map(
                   (
@@ -607,12 +665,15 @@ export default function FoodEditModal({
                             { value: 'dinner', label: 'Dinner', emoji: '🌙' },
                             { value: 'snack', label: 'Snack', emoji: '🍎' },
                           ].map((m) => {
-                            const isSelected = (item.meal_type || defaultMealType || 'snack') === m.value;
+                            const isSelected = (item.meal_type || selectedMeal || defaultMealType || 'breakfast') === m.value;
                             return (
                               <button
                                 key={m.value}
                                 type="button"
-                                onClick={() => update(index, 'meal_type', m.value)}
+                                onClick={(e) => {
+                                  e.preventDefault();
+                                  update(index, 'meal_type', m.value);
+                                }}
                                 className={`
                                   flex flex-col sm:flex-row items-center justify-center gap-1 py-1.5 px-1 rounded-lg text-xs transition-all pointer-events-auto touch-manipulation
                                   ${
@@ -748,6 +809,21 @@ export default function FoodEditModal({
                   </p>
                 )}
 
+                {onSaveToMeals && (
+                  <label className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/40 hover:bg-muted/60 border border-border/70 cursor-pointer transition-colors text-xs select-none mb-3">
+                    <input
+                      type="checkbox"
+                      checked={saveToMeals}
+                      onChange={(e) => setSaveToMeals(e.target.checked)}
+                      className="rounded border-border text-primary focus:ring-primary w-4 h-4 accent-primary shrink-0"
+                    />
+                    <span className="font-semibold text-foreground flex items-center gap-1.5">
+                      <span>⭐</span>
+                      <span>Save to My Meals for quick 1-tap logging later</span>
+                    </span>
+                  </label>
+                )}
+
                 <Button
                   type="button"
                   onClick={async () => {
@@ -761,8 +837,9 @@ export default function FoodEditModal({
                             ...item,
                             meal_type:
                               item.meal_type ||
+                              selectedMeal ||
                               defaultMealType ||
-                              'snack',
+                              'breakfast',
                             calories:
                               Number(item.calories) || 0,
                             protein_g:
@@ -775,6 +852,43 @@ export default function FoodEditModal({
                         );
 
                       await onConfirm(normalizedItems);
+
+                      if (saveToMeals && onSaveToMeals) {
+                        try {
+                          if (normalizedItems.length === 1) {
+                            const item = normalizedItems[0];
+                            onSaveToMeals({
+                              name: item.food_name,
+                              food_name: item.food_name,
+                              meal_type: item.meal_type || selectedMeal || 'breakfast',
+                              serving_size: item.serving_size || '1 serving',
+                              calories: item.calories,
+                              protein_g: item.protein_g,
+                              carbs_g: item.carbs_g,
+                              fat_g: item.fat_g,
+                            });
+                          } else if (normalizedItems.length > 1) {
+                            const cals = normalizedItems.reduce((s, i) => s + (Number(i.calories) || 0), 0);
+                            const p = normalizedItems.reduce((s, i) => s + (Number(i.protein_g) || 0), 0);
+                            const c = normalizedItems.reduce((s, i) => s + (Number(i.carbs_g) || 0), 0);
+                            const f = normalizedItems.reduce((s, i) => s + (Number(i.fat_g) || 0), 0);
+                            const mealName = normalizedItems.map((i) => i.food_name).join(' + ');
+                            onSaveToMeals({
+                              name: mealName.slice(0, 60),
+                              food_name: mealName.slice(0, 60),
+                              meal_type: selectedMeal || defaultMealType || 'lunch',
+                              serving_size: `${normalizedItems.length} items`,
+                              calories: cals,
+                              protein_g: Number(p.toFixed(1)),
+                              carbs_g: Number(c.toFixed(1)),
+                              fat_g: Number(f.toFixed(1)),
+                              items: normalizedItems,
+                            });
+                          }
+                        } catch (saveErr) {
+                          console.warn('[FoodEditModal] onSaveToMeals note:', saveErr);
+                        }
+                      }
                     } catch (error) {
                       console.error('[FoodEditModal] Save failed:', error);
                       setSaveError(error?.message || 'Could not save this food. Please try again.');

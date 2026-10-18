@@ -17,8 +17,8 @@ import {
 export default function About() {
   return (
     <div className="relative z-0 px-4 sm:px-6 pb-12 max-w-3xl mx-auto">
-      {/* Top Navigation */}
-      <div className="relative z-30 flex items-center justify-between gap-3 mb-8 pt-4 pointer-events-auto">
+      {/* Top Navigation (Desktop) */}
+      <div className="relative z-30 hidden sm:flex items-center justify-between gap-3 mb-8 pt-4 pointer-events-auto">
         <div className="flex items-center gap-3">
           <Link
             to="/"

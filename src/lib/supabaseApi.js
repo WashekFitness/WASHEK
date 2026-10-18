@@ -366,6 +366,7 @@ function getLocalEntityRecords(table, userId) {
   const keys = [
     getEntityStorageKey(table, userId),
     getEntityStorageKey(table, 'guest'),
+    getEntityStorageKey(table, 'athlete'),
     `washek_entity_${table}_all`,
   ];
 
@@ -458,11 +459,13 @@ async function syncToFirestore(table, record, action = 'set') {
     if (!fbUser || !firebaseDb) return;
     const subCol = table === 'nutrition_entries'
       ? 'nutrition_entries'
-      : (table === 'workout_logs'
-        ? 'workouts'
-        : (table === 'progress_photos'
-          ? 'progress_photos'
-          : (table === 'weight_history' ? 'weight_history' : null)));
+      : (table === 'saved_meals'
+        ? 'saved_meals'
+        : (table === 'workout_logs'
+          ? 'workouts'
+          : (table === 'progress_photos'
+            ? 'progress_photos'
+            : (table === 'weight_history' ? 'weight_history' : null))));
     if (!subCol) return;
     const ref = firestoreDoc(firebaseDb, 'users', fbUser.uid, subCol, record.id);
     if (action === 'delete') {
@@ -481,9 +484,11 @@ async function fetchFromFirestore(table) {
     if (!fbUser || !firebaseDb) return [];
     const subCol = table === 'nutrition_entries'
       ? 'nutrition_entries'
-      : (table === 'workout_logs'
-        ? 'workouts'
-        : (table === 'progress_photos' ? 'progress_photos' : null));
+      : (table === 'saved_meals'
+        ? 'saved_meals'
+        : (table === 'workout_logs'
+          ? 'workouts'
+          : (table === 'progress_photos' ? 'progress_photos' : null)));
     if (!subCol) return [];
     const colRef = firestoreCollection(firebaseDb, 'users', fbUser.uid, subCol);
     const snap = await firestoreGetDocs(colRef);
@@ -558,6 +563,22 @@ const KNOWN_TABLE_COLUMNS = {
     'carbs_g',
     'fat_g',
     'created_at',
+  ]),
+  saved_meals: new Set([
+    'id',
+    'user_id',
+    'created_by',
+    'name',
+    'meal_type',
+    'calories',
+    'protein_g',
+    'carbs_g',
+    'fat_g',
+    'serving_size',
+    'items',
+    'notes',
+    'created_at',
+    'updated_at',
   ]),
   movement_baselines: new Set([
     'id',
@@ -771,19 +792,26 @@ function entity(table) {
         if (item?.id) map.set(item.id, item);
       });
       firestoreRecords.forEach((item) => {
-        if (item?.id) map.set(item.id, { ...(map.get(item.id) || {}), ...item });
+        if (item?.id) {
+          const existing = map.get(item.id);
+          if (!existing || (item.updated_at && (!existing.updated_at || item.updated_at >= existing.updated_at))) {
+            map.set(item.id, { ...(existing || {}), ...item });
+          }
+        }
       });
       localFiltered.forEach((item) => {
         if (item?.id) {
-          const prev = map.get(item.id) || {};
-          map.set(item.id, {
-            ...prev,
-            ...item,
-            weight_lbs: item.weight_lbs !== undefined && item.weight_lbs !== null ? item.weight_lbs : prev.weight_lbs,
-            label: item.label !== undefined ? item.label : prev.label,
-            custom_label: item.custom_label !== undefined ? item.custom_label : prev.custom_label,
-            tags: Array.isArray(item.tags) && item.tags.length > 0 ? item.tags : prev.tags,
-          });
+          const existing = map.get(item.id);
+          if (!existing || !item.updated_at || !existing.updated_at || item.updated_at >= existing.updated_at) {
+            map.set(item.id, {
+              ...(existing || {}),
+              ...item,
+              weight_lbs: item.weight_lbs !== undefined && item.weight_lbs !== null ? item.weight_lbs : (existing?.weight_lbs ?? item.weight_lbs),
+              label: item.label !== undefined ? item.label : (existing?.label ?? item.label),
+              custom_label: item.custom_label !== undefined ? item.custom_label : (existing?.custom_label ?? item.custom_label),
+              tags: Array.isArray(item.tags) && item.tags.length > 0 ? item.tags : (existing?.tags ?? item.tags),
+            });
+          }
         }
       });
 
@@ -844,11 +872,22 @@ function entity(table) {
         row.food_name = payload.food_name || 'Food item';
       }
 
+      if (table === 'saved_meals') {
+        row.name = payload.name || payload.food_name || 'My Saved Meal';
+        row.calories = Number(payload.calories) || 0;
+        row.protein_g = Number(payload.protein_g) || 0;
+        row.carbs_g = Number(payload.carbs_g) || 0;
+        row.fat_g = Number(payload.fat_g) || 0;
+        row.meal_type = payload.meal_type || 'snack';
+        row.serving_size = payload.serving_size || '1 serving';
+        row.items = Array.isArray(payload.items) ? payload.items : [];
+      }
+
       // 1. Immediately persist in local storage cache
       saveLocalEntityRecord(table, validUserId, row);
 
-      // 2. Persist to Firestore
-      syncToFirestore(table, row, 'set');
+      // 2. Persist to Firestore (await to ensure consistency)
+      await syncToFirestore(table, row, 'set');
 
       // 3. Attempt Supabase insert with schema-safe columns
       try {
@@ -883,9 +922,17 @@ function entity(table) {
       const localRecords = getLocalEntityRecords(table, validUserId);
       const existing = localRecords.find((item) => item?.id === id);
 
+      // Strip undefined values so they don't overwrite existing fields
+      const cleanPayload = {};
+      for (const [key, val] of Object.entries(payload || {})) {
+        if (val !== undefined) {
+          cleanPayload[key] = val;
+        }
+      }
+
       const row = {
         ...(existing || {}),
-        ...payload,
+        ...cleanPayload,
         id,
         updated_at: new Date().toISOString(),
       };
@@ -897,24 +944,41 @@ function entity(table) {
       }
 
       if (table === 'nutrition_entries') {
-        if (payload.calories !== undefined) row.calories = Number(payload.calories) || 0;
-        if (payload.protein_g !== undefined) row.protein_g = Number(payload.protein_g) || 0;
-        if (payload.carbs_g !== undefined) row.carbs_g = Number(payload.carbs_g) || 0;
-        if (payload.fat_g !== undefined) row.fat_g = Number(payload.fat_g) || 0;
+        if (cleanPayload.meal_type !== undefined && cleanPayload.meal_type) {
+          row.meal_type = String(cleanPayload.meal_type).toLowerCase().trim();
+        }
+        if (cleanPayload.food_name !== undefined && cleanPayload.food_name) {
+          row.food_name = cleanPayload.food_name;
+        }
+        if (cleanPayload.calories !== undefined) row.calories = Number(cleanPayload.calories) || 0;
+        if (cleanPayload.protein_g !== undefined) row.protein_g = Number(cleanPayload.protein_g) || 0;
+        if (cleanPayload.carbs_g !== undefined) row.carbs_g = Number(cleanPayload.carbs_g) || 0;
+        if (cleanPayload.fat_g !== undefined) row.fat_g = Number(cleanPayload.fat_g) || 0;
+      }
+
+      if (table === 'saved_meals') {
+        if (cleanPayload.name !== undefined && cleanPayload.name) row.name = cleanPayload.name;
+        if (cleanPayload.meal_type !== undefined && cleanPayload.meal_type) row.meal_type = String(cleanPayload.meal_type).toLowerCase().trim();
+        if (cleanPayload.serving_size !== undefined) row.serving_size = cleanPayload.serving_size;
+        if (cleanPayload.calories !== undefined) row.calories = Number(cleanPayload.calories) || 0;
+        if (cleanPayload.protein_g !== undefined) row.protein_g = Number(cleanPayload.protein_g) || 0;
+        if (cleanPayload.carbs_g !== undefined) row.carbs_g = Number(cleanPayload.carbs_g) || 0;
+        if (cleanPayload.fat_g !== undefined) row.fat_g = Number(cleanPayload.fat_g) || 0;
+        if (Array.isArray(cleanPayload.items)) row.items = cleanPayload.items;
       }
 
       // 1. Immediately update in local storage across all keys
       saveLocalEntityRecord(table, validUserId, row);
 
-      // 2. Update in Firestore with merge
-      syncToFirestore(table, row, 'set');
+      // 2. Update in Firestore with merge (awaited so immediate invalidations read the fresh state)
+      await syncToFirestore(table, row, 'set');
 
       // 3. Attempt Supabase update with schema-safe columns
       try {
-        const cleanPayload = sanitizeForSupabase(table, row);
-        delete cleanPayload.id;
+        const cleanForDb = sanitizeForSupabase(table, row);
+        delete cleanForDb.id;
 
-        let q = supabase.from(table).update(cleanPayload).eq('id', id);
+        let q = supabase.from(table).update(cleanForDb).eq('id', id);
         const { data, error } = await q.select().maybeSingle();
         if (!error && data) {
           const merged = { ...row, ...data };
@@ -933,8 +997,9 @@ function entity(table) {
 
     async delete(id) {
       let validUserId = null;
+      let user = null;
       try {
-        const user = await requireUser();
+        user = await requireUser();
         validUserId = ensureValidUuid(user?.id);
       } catch (_authErr) {
         // Fallback
@@ -944,7 +1009,7 @@ function entity(table) {
       removeLocalEntityRecord(table, validUserId, id);
 
       // 2. Remove from Firestore
-      syncToFirestore(table, { id }, 'delete');
+      await syncToFirestore(table, { id }, 'delete');
 
       // 3. Attempt Supabase delete
       try {
@@ -1469,6 +1534,7 @@ export const supabaseApi = {
     WorkoutProgram: entity('workout_programs'),
     WorkoutLog: entity('workout_logs'),
     NutritionEntry: entity('nutrition_entries'),
+    SavedMeal: entity('saved_meals'),
     ProgressPhoto: entity('progress_photos'),
     MovementBaseline: entity('movement_baselines'),
     FormAnalysis: entity('form_analyses'),

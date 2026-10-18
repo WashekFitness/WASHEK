@@ -463,7 +463,7 @@ function CountryDropdown({
 }
 
 
-export default function AppSettingsModal() {
+export default function AppSettingsModal({ triggerClassName, iconClassName } = {}) {
   const {
     settings,
     updateSettings,
@@ -1559,36 +1559,34 @@ export default function AppSettingsModal() {
           openModal
         }
         aria-label="App Settings"
-        className="
-          relative
-          z-[110]
-          flex
-          items-center
-          justify-center
-          w-11
-          h-11
-          min-w-11
-          min-h-11
-          rounded-xl
-          bg-card
-          border
-          border-border
-          shadow-lg
-          hover:bg-muted
-          active:bg-muted
-          transition-all
-          pointer-events-auto
-          touch-manipulation
-          shrink-0
-        "
+        className={cn(
+          `
+            relative
+            z-[110]
+            flex
+            items-center
+            justify-center
+            w-11
+            h-11
+            min-w-11
+            min-h-11
+            rounded-xl
+            bg-card
+            border
+            border-border
+            shadow-lg
+            hover:bg-muted
+            active:bg-muted
+            transition-all
+            pointer-events-auto
+            touch-manipulation
+            shrink-0
+          `,
+          triggerClassName
+        )}
       >
 
-        <Settings className="
-          w-5
-          h-5
-          text-muted-foreground
-          pointer-events-none
-        " />
+        <Settings className={cn("w-5 h-5 text-muted-foreground pointer-events-none", iconClassName)} />
 
       </button>
 

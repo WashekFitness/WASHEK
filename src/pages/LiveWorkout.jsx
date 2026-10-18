@@ -1392,64 +1392,90 @@ export default function LiveWorkout() {
     );
   }
 
+  const handleScrollToTop = (e) => {
+    e?.stopPropagation?.();
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    }
+  };
+
   return (
     <div className="flex flex-col min-h-screen bg-background">
-      {/* Header */}
-      <div className="px-5 safe-top pb-3 border-b border-border bg-card/50 backdrop-blur-sm flex-shrink-0 flex items-center gap-3">
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() =>
-            navigate('/program')
-          }
-        >
-          <ChevronLeft className="w-5 h-5" />
-        </Button>
-
-        <div className="flex-1">
-          <h1 className="font-heading font-bold text-xl">
-            Live Workout
-          </h1>
-
-          <p className="text-xs text-muted-foreground">
-            Week {currentWeekNum} ·{' '}
-            {program.program_name}
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2 bg-card border border-border px-3 py-1.5 rounded-full">
-          <Timer className="w-3.5 h-3.5 text-primary" />
-
-          <span className="font-heading font-bold text-sm tabular-nums">
-            {fmt(seconds)}
-          </span>
-        </div>
-      </div>
-
       <Tabs
         defaultValue="workout"
         className="flex-1 flex flex-col"
       >
-        <TabsList className="mx-5 mt-3 bg-muted/50 flex-shrink-0">
-          <TabsTrigger
-            value="workout"
-            className="flex-1 font-heading"
-          >
-            Workout
-          </TabsTrigger>
+        {/* Sticky Pinned Header Section - Stays at top when you scroll on mobile & desktop */}
+        <div
+          onClick={handleScrollToTop}
+          className="sticky top-0 z-40 bg-background/90 dark:bg-card/90 backdrop-blur-2xl border-b border-border/80 shadow-[0_2px_12px_rgba(0,0,0,0.05)] dark:shadow-[0_4px_20px_rgba(0,0,0,0.35)] select-none pointer-events-auto cursor-pointer transition-colors"
+          title="Tap to scroll to top"
+        >
+          {/* Main Header Bar */}
+          <div className="px-4 sm:px-5 safe-top pb-2.5 flex items-center gap-3">
+            <Button
+              variant="ghost"
+              size="icon"
+              onClick={(e) => {
+                e.stopPropagation();
+                navigate('/program');
+              }}
+              aria-label="Back to program"
+              className="w-9 h-9 rounded-xl hover:bg-muted active:scale-95 transition-all shrink-0 cursor-pointer"
+            >
+              <ChevronLeft className="w-5 h-5 pointer-events-none" />
+            </Button>
 
-          <TabsTrigger
-            value="baseline"
-            className="flex-1 font-heading"
+            <div className="flex-1 min-w-0">
+              <h1 className="font-heading font-bold text-lg sm:text-xl truncate leading-tight">
+                Live Workout
+              </h1>
+
+              <p className="text-xs text-muted-foreground truncate leading-tight mt-0.5">
+                Week {currentWeekNum} ·{' '}
+                {program.program_name}
+              </p>
+            </div>
+
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className="flex items-center gap-2 bg-card border border-border px-3 py-1.5 rounded-full shadow-2xs shrink-0"
+            >
+              <Timer className="w-3.5 h-3.5 text-primary" />
+
+              <span className="font-heading font-bold text-sm tabular-nums">
+                {fmt(seconds)}
+              </span>
+            </div>
+          </div>
+
+          {/* Workout / My Maxes Tabs Bar */}
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="px-4 sm:px-5 pb-2.5 pt-0.5"
           >
-            My Maxes
-          </TabsTrigger>
-        </TabsList>
+            <TabsList className="w-full bg-muted/60 dark:bg-muted/40">
+              <TabsTrigger
+                value="workout"
+                className="flex-1 font-heading text-xs sm:text-sm font-semibold"
+              >
+                Workout
+              </TabsTrigger>
+
+              <TabsTrigger
+                value="baseline"
+                className="flex-1 font-heading text-xs sm:text-sm font-semibold"
+              >
+                My Maxes
+              </TabsTrigger>
+            </TabsList>
+          </div>
+        </div>
 
         {/* ── WORKOUT TAB ── */}
         <TabsContent
           value="workout"
-          className="flex-1 px-5 py-4 space-y-4 overflow-y-auto safe-bottom"
+          className="flex-1 px-4 sm:px-5 py-4 space-y-4 safe-bottom m-0"
         >
           {/* Day selector */}
           <div className="flex gap-2 overflow-x-auto pb-1">
@@ -1865,7 +1891,7 @@ export default function LiveWorkout() {
         {/* ── BASELINE TAB ── */}
         <TabsContent
           value="baseline"
-          className="flex-1 px-5 py-4 overflow-y-auto safe-bottom"
+          className="flex-1 px-4 sm:px-5 py-4 safe-bottom m-0"
         >
           <h2 className="font-heading font-bold text-lg mb-1">
             My Current Maxes

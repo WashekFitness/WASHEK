@@ -5,8 +5,10 @@ import { Label } from '@/components/ui/label';
 import { Card } from '@/components/ui/card';
 import { Plus } from 'lucide-react';
 
-export default function ManualFoodEntry({ onSubmit, defaultMealType = 'snack' }) {
+export default function ManualFoodEntry({ onSubmit, onSaveToMeals, defaultMealType = 'breakfast' }) {
   const [open, setOpen] = useState(false);
+  const [userSelectedMeal, setUserSelectedMeal] = useState(false);
+  const [saveToMeals, setSaveToMeals] = useState(false);
   const [data, setData] = useState({
     food_name: '',
     calories: '',
@@ -14,26 +16,45 @@ export default function ManualFoodEntry({ onSubmit, defaultMealType = 'snack' })
     carbs_g: '',
     fat_g: '',
     serving_size: '',
-    meal_type: defaultMealType || 'snack',
+    meal_type: defaultMealType || 'breakfast',
   });
 
   useEffect(() => {
-    setData((d) => ({
-      ...d,
-      meal_type: d.food_name ? d.meal_type : (defaultMealType || 'snack'),
-    }));
-  }, [defaultMealType]);
+    if (!userSelectedMeal && defaultMealType) {
+      setData((d) => ({
+        ...d,
+        meal_type: defaultMealType,
+      }));
+    }
+  }, [defaultMealType, userSelectedMeal]);
 
   const handleSubmit = () => {
     if (!data.food_name || !data.calories) return;
-    onSubmit({
+    const finalMeal = data.meal_type || defaultMealType || 'breakfast';
+    const entryPayload = {
       ...data,
-      meal_type: data.meal_type || defaultMealType || 'snack',
+      meal_type: finalMeal,
       calories: Number(data.calories),
       protein_g: Number(data.protein_g) || 0,
       carbs_g: Number(data.carbs_g) || 0,
       fat_g: Number(data.fat_g) || 0,
-    });
+    };
+
+    onSubmit(entryPayload);
+
+    if (saveToMeals && onSaveToMeals) {
+      onSaveToMeals({
+        name: data.food_name.trim(),
+        food_name: data.food_name.trim(),
+        meal_type: finalMeal,
+        serving_size: data.serving_size.trim() || '1 serving',
+        calories: Number(data.calories),
+        protein_g: Number(data.protein_g) || 0,
+        carbs_g: Number(data.carbs_g) || 0,
+        fat_g: Number(data.fat_g) || 0,
+      });
+    }
+
     setData({
       food_name: '',
       calories: '',
@@ -41,8 +62,10 @@ export default function ManualFoodEntry({ onSubmit, defaultMealType = 'snack' })
       carbs_g: '',
       fat_g: '',
       serving_size: '',
-      meal_type: defaultMealType || 'snack',
+      meal_type: defaultMealType || 'breakfast',
     });
+    setSaveToMeals(false);
+    setUserSelectedMeal(false);
     setOpen(false);
   };
 
@@ -95,7 +118,10 @@ export default function ManualFoodEntry({ onSubmit, defaultMealType = 'snack' })
                 <button
                   key={m.value}
                   type="button"
-                  onClick={() => setData((d) => ({ ...d, meal_type: m.value }))}
+                  onClick={() => {
+                    setUserSelectedMeal(true);
+                    setData((d) => ({ ...d, meal_type: m.value }));
+                  }}
                   className={`
                     flex flex-col sm:flex-row items-center justify-center gap-1 py-1.5 px-1 rounded-lg text-xs transition-all pointer-events-auto touch-manipulation
                     ${
@@ -112,6 +138,23 @@ export default function ManualFoodEntry({ onSubmit, defaultMealType = 'snack' })
             })}
           </div>
         </div>
+
+        {onSaveToMeals && (
+          <div className="col-span-2 pt-1">
+            <label className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/40 hover:bg-muted/60 border border-border/70 cursor-pointer transition-colors text-xs select-none">
+              <input
+                type="checkbox"
+                checked={saveToMeals}
+                onChange={(e) => setSaveToMeals(e.target.checked)}
+                className="rounded border-border text-primary focus:ring-primary w-4 h-4 accent-primary shrink-0"
+              />
+              <span className="font-semibold text-foreground flex items-center gap-1.5">
+                <span>⭐</span>
+                <span>Save to My Meals for quick 1-tap logging later</span>
+              </span>
+            </label>
+          </div>
+        )}
       </div>
       <div className="flex gap-2">
         <Button variant="outline" className="flex-1 h-12" onClick={() => setOpen(false)}>Cancel</Button>

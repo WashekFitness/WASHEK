@@ -606,8 +606,9 @@ ${buildMemoryContext()}
 
 export default function FoodScanner({
   onFoodDetected,
+  onSaveToMeals,
   userPlan = 'free',
-  defaultMealType = 'snack',
+  defaultMealType = 'breakfast',
 }) {
   const [
     scanning,
@@ -877,7 +878,7 @@ export default function FoodScanner({
           {
             foods: foods.map((f) => ({
               ...f,
-              meal_type: f.meal_type || defaultMealType || 'snack',
+              meal_type: f.meal_type || defaultMealType || 'breakfast',
             })),
 
             imageUrl,
@@ -1042,7 +1043,7 @@ export default function FoodScanner({
           {
             foods: foods.map((f) => ({
               ...f,
-              meal_type: f.meal_type || defaultMealType || 'snack',
+              meal_type: f.meal_type || defaultMealType || 'breakfast',
             })),
 
             imageUrl,
@@ -1204,6 +1205,10 @@ export default function FoodScanner({
           defaultMealType
         }
 
+        onSaveToMeals={
+          onSaveToMeals
+        }
+
         onConfirm={
           handleConfirm
         }
@@ -1312,6 +1317,15 @@ export default function FoodScanner({
         }
       />
 
+
+      <div className="flex items-center justify-between px-1 mb-1">
+        <span className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground font-heading">
+          Scanner
+        </span>
+        <span className="text-xs text-primary font-medium flex items-center gap-1 capitalize">
+          Adding to <strong className="font-bold">{defaultMealType}</strong>
+        </span>
+      </div>
 
       <div className="grid grid-cols-2 gap-3">
 
