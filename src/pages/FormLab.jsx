@@ -924,10 +924,36 @@ export default function FormLab() {
     []
   );
 
+  useEffect(() => {
+    const handleSubUpdated = (e) => {
+      const p = e.detail?.plan;
+      if (p) {
+        setUser((prev) => (prev ? { ...prev, subscription_plan: p } : prev));
+      }
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+  }, []);
 
-  const plan =
-    user?.subscription_plan ||
-    'free';
+  const plan = (() => {
+    if (user?.subscription_plan && user.subscription_plan !== 'free') {
+      return user.subscription_plan.toLowerCase().trim();
+    }
+    try {
+      const storedPlan = localStorage.getItem('washek_subscription_plan');
+      if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
+      const storedUser = localStorage.getItem('washek_user');
+      if (storedUser) {
+        const parsed = JSON.parse(storedUser);
+        if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
+          return parsed.subscription_plan.toLowerCase().trim();
+        }
+      }
+    } catch (_err) {
+      // ignore
+    }
+    return 'free';
+  })();
 
   const isElite =
     plan ===

@@ -330,9 +330,69 @@ export default function Profile() {
   const activeProgram =
     programs[0];
 
-  const plan =
-    user?.subscription_plan ||
-    'free';
+  // Resolve plan with local storage and cloud overrides to ensure immediate reflection
+  const plan = (() => {
+    const status = String(
+      user?.subscription_status ||
+      (() => {
+        try {
+          return localStorage.getItem('washek_subscription_status') || '';
+        } catch {
+          return '';
+        }
+      })()
+    ).toLowerCase().trim();
+
+    if (status === 'canceled' || status === 'cancelled' || status === 'inactive') {
+      return 'free';
+    }
+
+    const fromUser = user?.subscription_plan;
+    if (fromUser && fromUser !== 'free') return fromUser.toLowerCase().trim();
+    try {
+      const storedPlan = localStorage.getItem('washek_subscription_plan');
+      if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
+      const storedUser = localStorage.getItem('washek_user');
+      if (storedUser) {
+        const parsed = JSON.parse(storedUser);
+        if (parsed?.subscription_status === 'canceled' || parsed?.subscription_status === 'cancelled') return 'free';
+        if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
+          return parsed.subscription_plan.toLowerCase().trim();
+        }
+      }
+    } catch (_err) {
+      // ignore
+    }
+    return 'free';
+  })();
+
+  // Listen for real-time subscription plan upgrades / cancellations
+  useEffect(() => {
+    const handleSubUpdated = (e) => {
+      const newPlan = e.detail?.plan;
+      const newStatus = e.detail?.status || (newPlan === 'free' ? 'canceled' : 'active');
+      if (newPlan) {
+        setUser((prev) => prev ? {
+          ...prev,
+          subscription_plan: newPlan,
+          subscription_status: newStatus,
+          tier: newPlan,
+          plan: newPlan,
+        } : prev);
+        if (setAuthUser) {
+          setAuthUser((prev) => prev ? {
+            ...prev,
+            subscription_plan: newPlan,
+            subscription_status: newStatus,
+            tier: newPlan,
+            plan: newPlan,
+          } : prev);
+        }
+      }
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+  }, [setAuthUser]);
 
   // Live server-authoritative Kael monthly quota stats
   const {
@@ -1111,7 +1171,17 @@ export default function Profile() {
         z-0
         pt-2
       ">
-        <PricingSection />
+        <PricingSection
+          onPlanChange={(newPlan) => {
+            setUser((prev) => (prev ? {
+              ...prev,
+              subscription_plan: newPlan,
+              subscription_status: newPlan === 'free' ? 'canceled' : (prev.subscription_status || 'active'),
+              tier: newPlan,
+              plan: newPlan,
+            } : prev));
+          }}
+        />
       </div>
 
       {/* ====================================================

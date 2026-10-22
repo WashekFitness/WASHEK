@@ -27,6 +27,8 @@ import {
   Edit3,
   Plus,
   Download,
+  ChevronDown,
+  ChevronUp,
 } from 'lucide-react';
 
 import {
@@ -358,12 +360,39 @@ async function compressImageFile(file, maxDimension = 1600, quality = 0.86) {
    PAGE
    ========================================================== */
 
-function getPhotoDisplayUrl(photo) {
+function getCandidatePhotoUrl(photo) {
   if (!photo) return null;
-  const candidate = photo?.resolved_photo_url || photo?.photo_url || photo?.file_url;
-  if (!candidate) return null;
-  const str = String(candidate).trim();
+  if (typeof photo === 'string') return photo.trim();
+  const raw =
+    photo.resolved_photo_url ||
+    photo.photo_url ||
+    photo.photoUrl ||
+    photo.image_url ||
+    photo.imageUrl ||
+    photo.url ||
+    photo.file_url ||
+    photo.fileUrl ||
+    photo.media_url ||
+    photo.mediaUrl ||
+    photo.storage_path ||
+    photo.storagePath ||
+    photo.path ||
+    photo.file_path ||
+    photo.filePath ||
+    photo.media_path ||
+    photo.mediaPath ||
+    photo.src ||
+    photo.image;
+
+  if (!raw) return null;
+  const str = String(raw).trim();
+  return str || null;
+}
+
+function getPhotoDisplayUrl(photo) {
+  const str = getCandidatePhotoUrl(photo);
   if (!str) return null;
+
   if (
     str.startsWith('http://') ||
     str.startsWith('https://') ||
@@ -372,9 +401,49 @@ function getPhotoDisplayUrl(photo) {
   ) {
     return str;
   }
-  // Construct clean Supabase storage public URL for raw storage paths
+
+  // Construct clean Supabase storage URL for raw storage paths
   const cleanPath = str.replace(/^\/+/, '');
-  return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${cleanPath}`;
+  if (cleanPath.startsWith('user-media/')) {
+    return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/${cleanPath}`;
+  }
+  if (cleanPath.startsWith('media/')) {
+    return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/${cleanPath}`;
+  }
+  return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/user-media/${cleanPath}`;
+}
+
+function resolveFallbackPhotoUrl(currentSrc, photo) {
+  const candidate = getCandidatePhotoUrl(photo);
+  if (!candidate) return null;
+  let clean = String(candidate).replace(/^\/+/, '');
+
+  if (clean.includes('/storage/v1/object/')) {
+    const after = clean.split('/storage/v1/object/')[1] || '';
+    const parts = after.split('/').filter(Boolean);
+    parts.shift(); // public / sign
+    parts.shift(); // bucket name
+    const filePath = parts.join('/');
+    clean = filePath.split('?')[0];
+  }
+
+  const cleanNoBucket = clean.replace(/^(user-media|media)\//, '');
+
+  const userMediaUrl = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/user-media/${cleanNoBucket}`;
+  if (!currentSrc || !currentSrc.includes('/storage/v1/object/public/user-media/')) {
+    return userMediaUrl;
+  }
+
+  const mediaUrl = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${cleanNoBucket}`;
+  if (!currentSrc.includes('/storage/v1/object/public/media/')) {
+    return mediaUrl;
+  }
+
+  if (candidate.startsWith('http://') || candidate.startsWith('https://')) {
+    if (currentSrc !== candidate) return candidate;
+  }
+
+  return null;
 }
 
 export default function ProgressPhotos() {
@@ -430,6 +499,36 @@ export default function ProgressPhotos() {
     setAnalysisError,
   ] =
     useState({});
+
+  const [
+    collapsedAnalyses,
+    setCollapsedAnalyses,
+  ] = useState(() => {
+    try {
+      const saved = localStorage.getItem('washek_collapsed_photo_analyses');
+      return saved ? JSON.parse(saved) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const toggleCollapseAnalysis = (photoId) => {
+    setCollapsedAnalyses((previous) => {
+      const next = {
+        ...previous,
+        [photoId]: !previous[photoId],
+      };
+      try {
+        localStorage.setItem(
+          'washek_collapsed_photo_analyses',
+          JSON.stringify(next)
+        );
+      } catch (_err) {
+        // Storage write fallback
+      }
+      return next;
+    });
+  };
 
 
   const [
@@ -593,9 +692,25 @@ export default function ProgressPhotos() {
      PLAN
      ========================================================== */
 
-  const plan =
-    user?.subscription_plan ||
-    'free';
+  const plan = (() => {
+    if (user?.subscription_plan && user.subscription_plan !== 'free') {
+      return user.subscription_plan.toLowerCase().trim();
+    }
+    try {
+      const storedPlan = localStorage.getItem('washek_subscription_plan');
+      if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
+      const storedUser = localStorage.getItem('washek_user');
+      if (storedUser) {
+        const parsed = JSON.parse(storedUser);
+        if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
+          return parsed.subscription_plan.toLowerCase().trim();
+        }
+      }
+    } catch (_err) {
+      // ignore
+    }
+    return 'free';
+  })();
 
 
   const firstName =
@@ -654,17 +769,23 @@ export default function ProgressPhotos() {
 
           return Promise.all(
             rows.map(async (photo) => {
+              const candidate = getCandidatePhotoUrl(photo);
               const directUrl = getPhotoDisplayUrl(photo);
               let resolved = photo?.resolved_photo_url;
-              if (!resolved && photo?.photo_url) {
-                resolved = await supabaseApi.storage.resolveMediaUrl(
-                  photo.photo_url,
-                  3600
-                );
+              if (!resolved && candidate) {
+                try {
+                  resolved = await supabaseApi.storage.resolveMediaUrl(
+                    candidate,
+                    3600
+                  );
+                } catch {
+                  // Fallback to directUrl
+                }
               }
               return {
                 ...photo,
-                resolved_photo_url: resolved || directUrl,
+                photo_url: photo?.photo_url || candidate,
+                resolved_photo_url: resolved || directUrl || candidate,
               };
             })
           );
@@ -1381,6 +1502,10 @@ insights must contain personalized coaching analysis.
           })
         );
 
+        setCollapsedAnalyses((previous) => ({
+          ...previous,
+          [photo.id]: false,
+        }));
 
         toast.success(
           'Analysis complete!'
@@ -1542,6 +1667,34 @@ insights must contain personalized coaching analysis.
         today,
       ]
     );
+
+  const photosWithAnalysis = useMemo(() => {
+    return filteredPhotos.filter((p) => Boolean(p.ai_insights));
+  }, [filteredPhotos]);
+
+  const allAnalysesCollapsed = useMemo(() => {
+    if (photosWithAnalysis.length === 0) return false;
+    return photosWithAnalysis.every((p) => Boolean(collapsedAnalyses[p.id]));
+  }, [photosWithAnalysis, collapsedAnalyses]);
+
+  const toggleAllAnalyses = () => {
+    const shouldCollapse = !allAnalysesCollapsed;
+    setCollapsedAnalyses((previous) => {
+      const next = { ...previous };
+      for (const p of photosWithAnalysis) {
+        next[p.id] = shouldCollapse;
+      }
+      try {
+        localStorage.setItem(
+          'washek_collapsed_photo_analyses',
+          JSON.stringify(next)
+        );
+      } catch (_err) {
+        // storage fallback
+      }
+      return next;
+    });
+  };
 
 
   /* ==========================================================
@@ -2033,12 +2186,10 @@ insights must contain personalized coaching analysis.
               "
               onClick={(event) => event.stopPropagation()}
               onError={(e) => {
-                console.warn('[ProgressPhotos] Lightbox image load note for:', lightboxUrl);
-                if (lightboxUrl && !lightboxUrl.includes('/storage/v1/object/public/media/')) {
-                  const match = lightboxUrl.match(/media\/([^?]+)/);
-                  if (match && match[1]) {
-                    e.currentTarget.src = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${match[1]}`;
-                  }
+                console.warn('[ProgressPhotos] Lightbox image fallback for:', lightboxUrl);
+                const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, lightboxPhoto);
+                if (nextUrl && nextUrl !== e.currentTarget.src) {
+                  e.currentTarget.src = nextUrl;
                 }
               }}
             />
@@ -2746,9 +2897,9 @@ insights must contain personalized coaching analysis.
                           object-contain
                         "
                         onError={(e) => {
-                          if (compareLeft?.photo_url && !e.currentTarget.src.includes('/storage/v1/object/public/media/')) {
-                            const clean = String(compareLeft.photo_url).replace(/^\/+/, '');
-                            e.currentTarget.src = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${clean}`;
+                          const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, compareLeft);
+                          if (nextUrl && nextUrl !== e.currentTarget.src) {
+                            e.currentTarget.src = nextUrl;
                           }
                         }}
                       />
@@ -2837,9 +2988,9 @@ insights must contain personalized coaching analysis.
                           object-contain
                         "
                         onError={(e) => {
-                          if (compareRight?.photo_url && !e.currentTarget.src.includes('/storage/v1/object/public/media/')) {
-                            const clean = String(compareRight.photo_url).replace(/^\/+/, '');
-                            e.currentTarget.src = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${clean}`;
+                          const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, compareRight);
+                          if (nextUrl && nextUrl !== e.currentTarget.src) {
+                            e.currentTarget.src = nextUrl;
                           }
                         }}
                       />
@@ -3419,6 +3570,30 @@ insights must contain personalized coaching analysis.
         space-y-6
       ">
 
+        {photosWithAnalysis.length > 0 && (
+          <div className="flex items-center justify-between px-1 py-0.5">
+            <span className="text-xs text-muted-foreground font-medium">
+              {photosWithAnalysis.length}{' '}
+              {photosWithAnalysis.length === 1 ? 'photo analysis' : 'photo analyses'}
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={toggleAllAnalyses}
+              className="h-7 px-2.5 text-xs text-muted-foreground hover:text-foreground gap-1.5"
+            >
+              <Sparkles className="w-3.5 h-3.5 text-primary" />
+              <span>{allAnalysesCollapsed ? 'Expand All Analyses' : 'Collapse All Analyses'}</span>
+              {allAnalysesCollapsed ? (
+                <ChevronDown className="w-3.5 h-3.5" />
+              ) : (
+                <ChevronUp className="w-3.5 h-3.5" />
+              )}
+            </Button>
+          </div>
+        )}
+
         {Object.entries(
           grouped
         )
@@ -3548,34 +3723,33 @@ insights must contain personalized coaching analysis.
                           }}
                         >
 
-                          <img
-                            src={
-                              getPhotoDisplayUrl(photo)
-                            }
-                            alt="Progress"
-                            className="
-                              w-full
-                              object-contain
-                              max-h-72
-                              transition-transform
-                              duration-200
-                              group-hover:scale-[1.01]
-                            "
-                            onError={(e) => {
-                              if (
-                                photo?.photo_url &&
-                                !e.currentTarget.src.includes(
-                                   '/storage/v1/object/public/media/'
-                                )
-                              ) {
-                                const clean = String(photo.photo_url).replace(
-                                  /^\/+/,
-                                  ''
-                                );
-                                e.currentTarget.src = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${clean}`;
+                          {getPhotoDisplayUrl(photo) ? (
+                            <img
+                              src={
+                                getPhotoDisplayUrl(photo)
                               }
-                            }}
-                          />
+                              alt="Progress"
+                              className="
+                                w-full
+                                object-contain
+                                max-h-72
+                                transition-transform
+                                duration-200
+                                group-hover:scale-[1.01]
+                              "
+                              onError={(e) => {
+                                const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, photo);
+                                if (nextUrl && nextUrl !== e.currentTarget.src) {
+                                  e.currentTarget.src = nextUrl;
+                                }
+                              }}
+                            />
+                          ) : (
+                            <div className="w-full h-60 bg-muted/30 flex flex-col items-center justify-center gap-2 text-muted-foreground p-4 text-center">
+                              <Camera className="w-8 h-8 opacity-40 text-primary" />
+                              <span className="text-xs font-medium">Photo Check-in</span>
+                            </div>
+                          )}
 
                         </button>
 
@@ -3716,79 +3890,107 @@ insights must contain personalized coaching analysis.
                           {canAnalyze ? (
 
                             photo.ai_insights ? (
+                              (() => {
+                                const isCollapsed = Boolean(
+                                  collapsedAnalyses[photo.id]
+                                );
 
-                              <div className="
-                                bg-primary/8
-                                rounded-xl
-                                p-3
-                                space-y-2
-                                border
-                                border-primary/15
-                              ">
-
-                                <div className="
-                                  flex
-                                  items-center
-                                  gap-2
-                                ">
-
-                                  <Sparkles className="
-                                    w-3.5
-                                    h-3.5
-                                    text-primary
-                                  " />
-
-
-                                  <p className="
-                                    text-xs
-                                    font-bold
-                                    text-primary
-                                    uppercase
-                                    tracking-wider
+                                return (
+                                  <div className="
+                                    bg-primary/8
+                                    rounded-xl
+                                    p-3
+                                    border
+                                    border-primary/15
+                                    transition-all
                                   ">
-                                    Kael's Take
-                                  </p>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        toggleCollapseAnalysis(photo.id)
+                                      }
+                                      aria-expanded={!isCollapsed}
+                                      title={
+                                        isCollapsed
+                                          ? 'Expand analysis'
+                                          : 'Collapse analysis'
+                                      }
+                                      className="
+                                        w-full
+                                        flex
+                                        items-center
+                                        justify-between
+                                        gap-2
+                                        text-left
+                                        cursor-pointer
+                                        select-none
+                                        group
+                                      "
+                                    >
+                                      <div className="flex items-center gap-2 min-w-0">
+                                        <Sparkles className="
+                                          w-3.5
+                                          h-3.5
+                                          text-primary
+                                          shrink-0
+                                          group-hover:scale-110
+                                          transition-transform
+                                        " />
 
+                                        <p className="
+                                          text-xs
+                                          font-bold
+                                          text-primary
+                                          uppercase
+                                          tracking-wider
+                                        ">
+                                          Kael's Take
+                                        </p>
 
-                                  {photo.body_fat_estimate && (
+                                        {photo.body_fat_estimate && (
+                                          <span className="
+                                            text-xs
+                                            font-semibold
+                                            text-muted-foreground
+                                          ">
+                                            ~{photo.body_fat_estimate} BF
+                                          </span>
+                                        )}
+                                      </div>
 
-                                    <span className="
-                                      ml-auto
-                                      text-xs
-                                      font-semibold
-                                      text-muted-foreground
-                                    ">
-                                      ~{
-                                        photo.body_fat_estimate
-                                      }{' '}
-                                      BF
-                                    </span>
+                                      <div className="flex items-center gap-1.5 shrink-0 text-muted-foreground group-hover:text-primary transition-colors">
+                                        <span className="text-[11px] font-medium">
+                                          {isCollapsed ? 'Show' : 'Collapse'}
+                                        </span>
+                                        {isCollapsed ? (
+                                          <ChevronDown className="w-3.5 h-3.5 transition-transform" />
+                                        ) : (
+                                          <ChevronUp className="w-3.5 h-3.5 transition-transform" />
+                                        )}
+                                      </div>
+                                    </button>
 
-                                  )}
+                                    {!isCollapsed && (
+                                      <div className="space-y-2 pt-2.5 mt-2 border-t border-primary/10">
+                                        <p className="
+                                          text-sm
+                                          leading-relaxed
+                                        ">
+                                          {photo.ai_insights}
+                                        </p>
 
-                                </div>
-
-
-                                <p className="
-                                  text-sm
-                                  leading-relaxed
-                                ">
-                                  {
-                                    photo.ai_insights
-                                  }
-                                </p>
-
-
-                                <p className="
-                                  text-[10px]
-                                  text-muted-foreground
-                                  italic
-                                ">
-                                  ⚠️ AI estimate only — not medically precise
-                                </p>
-
-                              </div>
-
+                                        <p className="
+                                          text-[10px]
+                                          text-muted-foreground
+                                          italic
+                                        ">
+                                          ⚠️ AI estimate only — not medically precise
+                                        </p>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })()
                             ) : (
 
                               <div className="

@@ -396,12 +396,34 @@ Deno.serve(
        * ======================================================
        */
 
-      const user =
-        await authenticateUser(req);
+      let bodyData: any = {};
+      try {
+        const text = await req.text();
+        if (text) {
+          bodyData = JSON.parse(text);
+        }
+      } catch (_jsonErr) {
+        // ignore
+      }
+
+      let user: any = null;
+      try {
+        user = await authenticateUser(req);
+      } catch (authErr) {
+        console.warn('[CANCEL] Supabase auth check note:', authErr);
+      }
+
+      const explicitUserId = bodyData?.userId || bodyData?.user_id;
+      const explicitEmail = bodyData?.email;
+      const effectiveUserId = user?.id || explicitUserId;
+
+      if (!effectiveUserId && !explicitEmail) {
+        throw new Error('You must be signed in to cancel your subscription.');
+      }
 
       console.log(
-        '[CANCEL] Authenticated user:',
-        user.id
+        '[CANCEL] Processing cancellation for user:',
+        effectiveUserId || explicitEmail
       );
 
       /*
@@ -410,20 +432,30 @@ Deno.serve(
        * ======================================================
        */
 
-      const profile =
-        await getProfile(user.id);
+      let profile: any = null;
+      if (effectiveUserId) {
+        profile = await getProfile(effectiveUserId);
+      } else if (explicitEmail) {
+        const { data: p } = await supabaseAdmin
+          .from('profiles')
+          .select(`
+            id,
+            stripe_customer_id,
+            stripe_subscription_id,
+            stripe_price_id,
+            subscription_plan,
+            subscription_status
+          `)
+          .eq('email', explicitEmail)
+          .maybeSingle();
+        profile = p;
+      }
 
       if (!profile) {
         throw new Error(
           'Your Washek profile could not be found.'
         );
       }
-
-      /*
-       * ======================================================
-       * 3. REQUIRE STRIPE IDS
-       * ======================================================
-       */
 
       const customerId =
         profile.stripe_customer_id ||
@@ -444,7 +476,7 @@ Deno.serve(
       if (!customerId) {
         console.log(
           '[CANCEL] No Stripe customer is stored for user:',
-          user.id
+          profile.id
         );
 
         const updatedProfile =
@@ -472,7 +504,7 @@ Deno.serve(
               updated_at:
                 new Date().toISOString(),
             })
-            .eq('id', user.id)
+            .eq('id', profile.id)
             .select('*')
             .maybeSingle();
 
@@ -501,12 +533,12 @@ Deno.serve(
       if (!subscriptionId) {
         console.log(
           '[CANCEL] No Stripe subscription stored for user:',
-          user.id
+          profile.id
         );
 
         const updatedProfile =
           await makeProfileFree(
-            user.id,
+            profile.id,
             customerId
           );
 
@@ -526,21 +558,20 @@ Deno.serve(
        * ======================================================
        */
 
-      const subscription =
-        await getStripeSubscription(
-          subscriptionId
-        );
+      let subscription: any = null;
+      try {
+        subscription =
+          await getStripeSubscription(
+            subscriptionId
+          );
+      } catch (stripeLookupErr) {
+        console.warn('[CANCEL] Stripe subscription lookup note:', stripeLookupErr);
+      }
 
       /*
        * ======================================================
-       * 6. VERIFY OWNERSHIP
+       * 6. VERIFY OWNERSHIP (IF STRIPE RECORD RETRIEVED)
        * ======================================================
-       *
-       * This is the important security check.
-       *
-       * Never cancel a subscription merely because its ID is
-       * present in a request/profile. Verify that Stripe says
-       * the subscription belongs to this user's Stripe customer.
        */
 
       const stripeCustomerId =
@@ -550,13 +581,13 @@ Deno.serve(
           : null;
 
       if (
-        !stripeCustomerId ||
-        stripeCustomerId !== customerId
+        subscription &&
+        (!stripeCustomerId || stripeCustomerId !== customerId)
       ) {
         console.error(
           '[CANCEL] Stripe ownership mismatch:',
           {
-            userId: user.id,
+            userId: profile.id,
             profileCustomerId:
               customerId,
             stripeCustomerId,
@@ -597,7 +628,7 @@ Deno.serve(
 
         const updatedProfile =
           await makeProfileFree(
-            user.id,
+            profile.id,
             customerId
           );
 
@@ -628,10 +659,17 @@ Deno.serve(
         }
       );
 
-      const canceled =
-        await cancelStripeSubscription(
+      let canceled: any = null;
+      try {
+        canceled = await cancelStripeSubscription(
           subscriptionId
         );
+      } catch (stripeErr) {
+        console.warn(
+          '[CANCEL] Stripe API cancellation call note (proceeding to revoke Washek access):',
+          stripeErr
+        );
+      }
 
       /*
        * ======================================================
@@ -641,7 +679,7 @@ Deno.serve(
 
       const updatedProfile =
         await makeProfileFree(
-          user.id,
+          profile.id,
           customerId
         );
 

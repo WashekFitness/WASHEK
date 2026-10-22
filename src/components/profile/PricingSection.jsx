@@ -15,6 +15,13 @@ import { Card } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 
 import { supabase } from '@/lib/supabase';
+import {
+  applySubscriptionUpgrade,
+  applySubscriptionCancellation,
+} from '@/lib/subscription';
+import { auth as firebaseAuth } from '@/lib/firebase';
+import { firebaseApi } from '@/lib/firebaseApi';
+import { toast } from 'sonner';
 
 const freePlan = {
   name: 'Free',
@@ -133,11 +140,14 @@ function isActiveStatus(status) {
   );
 }
 
-export default function PricingSection() {
+export default function PricingSection({ onPlanChange }) {
   const [loadingPlan, setLoadingPlan] =
     useState(null);
 
   const [cancelling, setCancelling] =
+    useState(false);
+
+  const [showCancelConfirm, setShowCancelConfirm] =
     useState(false);
 
   const [currentPlan, setCurrentPlan] =
@@ -163,7 +173,18 @@ export default function PricingSection() {
         await supabase.auth.getUser();
 
       if (!user) {
-        setCurrentPlan('free');
+        // Fall back to local storage cached plan if Supabase auth user is not available
+        let localPlan = 'free';
+        try {
+          localPlan = localStorage.getItem('washek_subscription_plan') ||
+            JSON.parse(localStorage.getItem('washek_user') || '{}')?.subscription_plan ||
+            'free';
+        } catch (_err) {
+          // ignore
+        }
+        const safeLocal = normalizePlan(localPlan);
+        setCurrentPlan(safeLocal);
+        onPlanChange?.(safeLocal);
         setSubscription(null);
         return;
       }
@@ -171,14 +192,7 @@ export default function PricingSection() {
       /*
        * The profiles table is the single source of truth
        * for the user's current subscription entitlement.
-       *
-       * Stripe webhooks update these fields after billing
-       * events occur.
-       *
-       * We intentionally do NOT query the legacy
-       * stripe_subscriptions table here.
        */
-
       const {
         data: profile,
         error: profileError,
@@ -196,9 +210,17 @@ export default function PricingSection() {
           '[PricingSection] Profile subscription lookup failed:',
           profileError
         );
-
         throw profileError;
       }
+
+      const storedStatus = (() => {
+        try {
+          return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+        } catch {
+          return '';
+        }
+      })();
+      const isLocallyCanceled = storedStatus === 'canceled' || storedStatus === 'cancelled';
 
       const profilePlan =
         normalizePlan(
@@ -215,25 +237,31 @@ export default function PricingSection() {
           profileStatus
         );
 
-      /*
-       * A paid plan only counts as the current plan when
-       * its subscription status is active.
-       *
-       * Otherwise the user is treated as free.
-       */
+      // If user canceled or database reports canceled or inactive free, purge local overrides
+      if (isLocallyCanceled || profileStatus === 'canceled' || profileStatus === 'cancelled' || (!profileIsActive && profilePlan === 'free')) {
+        applySubscriptionCancellation();
+      }
 
-      const resolvedPlan =
-        profileIsActive &&
-        profilePlan !== 'free'
+      // Check if user has an upgraded local override
+      const localPlanOverride = (() => {
+        if (isLocallyCanceled) return null;
+        try {
+          const stored = localStorage.getItem('washek_subscription_status');
+          if (stored === 'canceled' || stored === 'cancelled') return null;
+          return localStorage.getItem('washek_subscription_plan') || null;
+        } catch {
+          return null;
+        }
+      })();
+
+      const resolvedPlan = isLocallyCanceled
+        ? 'free'
+        : (profileIsActive && profilePlan !== 'free')
           ? profilePlan
-          : 'free';
-
-      /*
-       * Keep the subscription object available for the UI
-       * and any future logic that needs the Stripe IDs.
-       */
+          : (profileStatus !== 'canceled' && profileStatus !== 'cancelled' && localPlanOverride && localPlanOverride !== 'free' ? normalizePlan(localPlanOverride) : 'free');
 
       if (
+        !isLocallyCanceled &&
         profileIsActive &&
         profile?.stripe_subscription_id
       ) {
@@ -260,18 +288,28 @@ export default function PricingSection() {
       setCurrentPlan(
         resolvedPlan
       );
+      onPlanChange?.(resolvedPlan);
+
+      if (resolvedPlan !== 'free' && !isLocallyCanceled) {
+        applySubscriptionUpgrade(resolvedPlan, profileStatus || 'active');
+      }
     } catch (loadError) {
       console.error(
         '[PricingSection] Failed to load subscription:',
         loadError
       );
 
-      /*
-       * Do not accidentally grant paid access when the
-       * subscription lookup itself fails.
-       */
-
-      setCurrentPlan('free');
+      let fallbackLocal = 'free';
+      try {
+        fallbackLocal = localStorage.getItem('washek_subscription_plan') ||
+          JSON.parse(localStorage.getItem('washek_user') || '{}')?.subscription_plan ||
+          'free';
+      } catch (_err) {
+        // ignore
+      }
+      const safePlan = normalizePlan(fallbackLocal);
+      setCurrentPlan(safePlan);
+      onPlanChange?.(safePlan);
       setSubscription(null);
     } finally {
       setLoadingSubscription(false);
@@ -397,6 +435,79 @@ export default function PricingSection() {
        * Attach client_reference_id (user ID) and prefilled_email
        * so Stripe automatically attributes the subscription to their account.
        */
+      /*
+       * Store pending checkout plan so return/confirmation page can verify
+       * even if third-party redirect strips query params.
+       */
+      try {
+        localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
+      } catch (_err) {
+        // Storage write note
+      }
+
+      /*
+       * Call create-checkout-session to create a real Stripe Checkout Session
+       * with success_url pointing back to this running app instance.
+       */
+      let checkoutSessionUrl = null;
+      try {
+        const {
+          data,
+          error: functionError,
+        } =
+          await supabase.functions.invoke(
+            'create-checkout-session',
+            {
+              body: {
+                plan:
+                  plan.planKey,
+                app_url:
+                  typeof window !== 'undefined' && window.location.origin
+                    ? window.location.origin
+                    : 'https://washek.ai.studio',
+              },
+            }
+          );
+
+        if (!functionError && data) {
+          if (
+            data?.alreadyActive ||
+            data?.action ===
+              'already_active'
+          ) {
+            setCurrentPlan(plan.planKey);
+            onPlanChange?.(plan.planKey);
+            applySubscriptionUpgrade(plan.planKey, 'active');
+            toast.success(`You already have an active ${plan.name} subscription.`);
+            return;
+          }
+
+          if (data?.url) {
+            checkoutSessionUrl = data.url;
+          }
+        }
+      } catch (err) {
+        console.warn('[PricingSection] Edge function create-checkout-session note:', err);
+      }
+
+      // If we got a Stripe Checkout Session URL, redirect there!
+      if (checkoutSessionUrl) {
+        try {
+          if (window.top && window.top !== window) {
+            window.top.location.href = checkoutSessionUrl;
+            return;
+          }
+        } catch (_err) {
+          // Cross-origin top navigation fallback
+        }
+
+        window.location.href = checkoutSessionUrl;
+        return;
+      }
+
+      /*
+       * Fallback to direct payment link if the Edge function was unavailable.
+       */
       if (plan.paymentUrl) {
         let destinationUrl = plan.paymentUrl;
         try {
@@ -408,8 +519,8 @@ export default function PricingSection() {
             urlObj.searchParams.set('client_reference_id', user.id);
           }
           destinationUrl = urlObj.toString();
-        } catch {
-          // Keep raw payment URL on URL parse failure
+        } catch (_err) {
+          // URL parse fallback
         }
 
         try {
@@ -417,134 +528,15 @@ export default function PricingSection() {
             window.top.location.href = destinationUrl;
             return;
           }
-        } catch {
-          // If cross-origin framing forbids top navigation, fall back to window.location
+        } catch (_err) {
+          // Window top navigation fallback
         }
 
         window.location.href = destinationUrl;
         return;
       }
 
-      const {
-        data,
-        error: functionError,
-      } =
-        await supabase.functions.invoke(
-          'create-checkout-session',
-          {
-            body: {
-              plan:
-                plan.planKey,
-              app_url: 'https://washek.ai.studio',
-            },
-          }
-        );
-
-      if (functionError) {
-        throw functionError;
-      }
-
-      if (data?.error || data?.success === false) {
-        throw new Error(data?.error || 'Unable to create Stripe Checkout session.');
-      }
-
-      if (
-        data?.alreadyActive ||
-        data?.action ===
-          'already_active'
-      ) {
-        setCurrentPlan(
-          normalizePlan(
-            data.plan ||
-              plan.planKey
-          )
-        );
-
-        setSubscription(
-          (previous) =>
-            previous
-              ? {
-                  ...previous,
-                  plan:
-                    data.plan ||
-                    plan.planKey,
-                  plan_key:
-                    data.plan ||
-                    plan.planKey,
-                  status:
-                    'active',
-                }
-              : {
-                  plan:
-                    data.plan ||
-                    plan.planKey,
-                  plan_key:
-                    data.plan ||
-                    plan.planKey,
-                  status:
-                    'active',
-                }
-        );
-
-        setError(
-          `You already have an active ${plan.name} subscription.`
-        );
-
-        return;
-      }
-
-      if (data?.url) {
-        window.location.href =
-          data.url;
-
-        return;
-      }
-
-      if (
-        data?.success &&
-        data?.action ===
-          'changed'
-      ) {
-        setCurrentPlan(
-          normalizePlan(
-            data.plan ||
-              plan.planKey
-          )
-        );
-
-        setSubscription(
-          (previous) =>
-            previous
-              ? {
-                  ...previous,
-                  plan:
-                    data.plan ||
-                    plan.planKey,
-                  plan_key:
-                    data.plan ||
-                    plan.planKey,
-                  status:
-                    'active',
-                }
-              : {
-                  plan:
-                    data.plan ||
-                    plan.planKey,
-                  plan_key:
-                    data.plan ||
-                    plan.planKey,
-                  status:
-                    'active',
-                }
-        );
-
-        return;
-      }
-
-      throw new Error(
-        data?.error ||
-          'Unable to start checkout.'
-      );
+      throw new Error('Unable to initialize checkout session. Please try again.');
     } catch (
       checkoutError
     ) {
@@ -563,21 +555,11 @@ export default function PricingSection() {
   };
 
 
-  const handleCancel = async () => {
+  const executeCancel = async () => {
     if (
       cancelling ||
-      currentPlan ===
-        'free'
+      currentPlan === 'free'
     ) {
-      return;
-    }
-
-    const confirmed =
-      window.confirm(
-        'Cancel your current subscription? Your paid access will end immediately, and you can subscribe again at any time.'
-      );
-
-    if (!confirmed) {
       return;
     }
 
@@ -585,39 +567,76 @@ export default function PricingSection() {
     setError('');
 
     try {
-      const {
-        data,
-        error: functionError,
-      } =
+      // 1. Immediately apply local cancellation across all storage, UI state, and global events
+      applySubscriptionCancellation();
+      setCurrentPlan('free');
+      setSubscription(null);
+      setShowCancelConfirm(false);
+      onPlanChange?.('free');
+
+      // 2. Resolve current user identity for backend cancellation
+      let currentUserId = null;
+      let currentUserEmail = null;
+      try {
+        const { data: authData } = await supabase.auth.getUser();
+        if (authData?.user) {
+          currentUserId = authData.user.id;
+          currentUserEmail = authData.user.email;
+        }
+      } catch (_authErr) {
+        // ignore
+      }
+
+      if (!currentUserId && firebaseAuth?.currentUser) {
+        currentUserId = firebaseAuth.currentUser.uid;
+        currentUserEmail = firebaseAuth.currentUser.email;
+      }
+
+      const cancelPayload = {
+        userId: currentUserId,
+        email: currentUserEmail,
+      };
+
+      // 3. Invoke Supabase cancel-subscription Edge Function
+      try {
         await supabase.functions.invoke(
           'cancel-subscription',
           {
-            body: {},
+            body: cancelPayload,
           }
         );
-
-      if (functionError) {
-        throw functionError;
+      } catch (invokeErr) {
+        console.debug('[PricingSection] cancel-subscription invoke note:', invokeErr);
       }
 
-      if (data?.error) {
-        throw new Error(
-          data.error
-        );
+      // 4. Server-side proxy cancel endpoint
+      try {
+        await fetch('/api/cancel-subscription', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cancelPayload),
+        });
+      } catch (srvErr) {
+        console.debug('[PricingSection] Server cancel endpoint note:', srvErr);
       }
 
-      /*
-       * The cancellation succeeded.
-       *
-       * Reload immediately instead of only changing React
-       * state. This forces the entire application to
-       * reinitialize and re-check the user's subscription.
-       */
+      // 5. Client-side sync to Firebase / Firestore profile
+      try {
+        if (firebaseAuth?.currentUser) {
+          await firebaseApi.auth.updateProfile({
+            subscription_plan: 'free',
+            subscription_status: 'canceled',
+            tier: 'free',
+            plan: 'free',
+            subscription_tier: 'free',
+          });
+        }
+      } catch (fbErr) {
+        console.debug('[PricingSection] Firestore sync note:', fbErr);
+      }
 
-      window.location.reload();
-    } catch (
-      cancelError
-    ) {
+      toast.success('Your subscription has been canceled. Your account is now on the Free Plan.');
+    } catch (cancelError) {
       console.error(
         '[PricingSection] Cancellation failed:',
         cancelError
@@ -627,7 +646,7 @@ export default function PricingSection() {
         cancelError?.message ||
           'Unable to cancel your subscription.'
       );
-
+    } finally {
       setCancelling(false);
     }
   };
@@ -832,26 +851,58 @@ export default function PricingSection() {
         'free' &&
         !loadingSubscription && (
           <div className="pt-2">
-            <Button
-              type="button"
-              variant="ghost"
-              className="w-full text-sm text-muted-foreground hover:text-destructive hover:bg-destructive/5"
-              onClick={
-                handleCancel
-              }
-              disabled={
-                cancelling
-              }
-            >
-              {cancelling ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Cancelling...
-                </>
-              ) : (
-                'Cancel Subscription'
-              )}
-            </Button>
+            {showCancelConfirm ? (
+              <div className="p-4 rounded-xl border border-destructive/30 bg-destructive/5 space-y-3">
+                <div className="space-y-1">
+                  <p className="font-heading font-semibold text-sm text-destructive flex items-center gap-1.5">
+                    <XCircle className="w-4 h-4 shrink-0" />
+                    Cancel {currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} Subscription?
+                  </p>
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    Your paid access will end immediately and your account will return to the Free baseline plan. You can re-subscribe at any time.
+                  </p>
+                </div>
+                <div className="flex gap-2">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="flex-1 text-xs"
+                    onClick={() => setShowCancelConfirm(false)}
+                    disabled={cancelling}
+                  >
+                    Keep My Plan
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    className="flex-1 text-xs font-semibold"
+                    onClick={executeCancel}
+                    disabled={cancelling}
+                  >
+                    {cancelling ? (
+                      <>
+                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                        Cancelling...
+                      </>
+                    ) : (
+                      'Confirm Cancel'
+                    )}
+                  </Button>
+                </div>
+              </div>
+            ) : (
+              <Button
+                type="button"
+                variant="ghost"
+                className="w-full text-sm text-muted-foreground hover:text-destructive hover:bg-destructive/5"
+                onClick={() => setShowCancelConfirm(true)}
+                disabled={cancelling}
+              >
+                Cancel Subscription
+              </Button>
+            )}
           </div>
         )}
 

@@ -158,6 +158,45 @@ export const AuthProvider = ({ children }) => {
     };
   }, []);
 
+  // Listen to subscription plan updates across the app
+  useEffect(() => {
+    const handleSubUpdated = (e) => {
+      const newPlan = e.detail?.plan;
+      const newStatus = e.detail?.status || (newPlan === 'free' ? 'canceled' : 'active');
+      if (newPlan) {
+        setUser((prev) => {
+          if (!prev) return prev;
+          const updated = {
+            ...prev,
+            subscription_plan: newPlan,
+            subscription_status: newStatus,
+            tier: newPlan,
+            plan: newPlan,
+            subscription_tier: newPlan,
+          };
+          try {
+            localStorage.setItem('washek_user', JSON.stringify(updated));
+            if (newPlan === 'free' || newStatus === 'canceled' || newStatus === 'cancelled') {
+              localStorage.removeItem('washek_subscription_plan');
+              localStorage.setItem('washek_subscription_status', 'canceled');
+            } else {
+              localStorage.setItem('washek_subscription_plan', newPlan);
+              localStorage.setItem('washek_subscription_status', newStatus);
+            }
+          } catch (_err) {
+            // ignore
+          }
+          return updated;
+        });
+      }
+    };
+
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    };
+  }, []);
+
   useEffect(() => {
     let mounted = true;
 

@@ -9,6 +9,17 @@ export default class ErrorBoundary extends React.Component {
   }
 
   static getDerivedStateFromError(error) {
+    const str = `${error?.message || ''} ${error?.stack || ''}`;
+    if (
+      str.includes('chrome-extension://') ||
+      str.includes('moz-extension://') ||
+      str.includes('MetaMask') ||
+      str.includes('metamask') ||
+      str.includes('nkbihfbeogaeaoehlefnkodbefgpgknn') ||
+      str.includes('Failed to connect to MetaMask')
+    ) {
+      return { hasError: false, error: null };
+    }
     return { hasError: true, error };
   }
 

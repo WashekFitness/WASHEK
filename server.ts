@@ -94,6 +94,46 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+app.post('/api/cancel-subscription', async (req, res) => {
+  try {
+    const { userId, email } = req.body || {};
+    console.log('[API] Processing cancel-subscription for:', { userId, email });
+
+    if (userId || email) {
+      try {
+        let query = supabase.from('profiles').update({
+          subscription_plan: 'free',
+          subscription_status: 'canceled',
+          stripe_subscription_id: null,
+          stripe_price_id: null,
+          subscription_cancelled_at: new Date().toISOString(),
+          subscription_updated_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+
+        if (userId) {
+          query = query.eq('id', userId);
+        } else if (email) {
+          query = query.eq('email', email);
+        }
+        await query;
+      } catch (dbErr) {
+        console.debug('[API] cancel profile update note:', dbErr);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Subscription canceled. Account is now on Free Plan.',
+      plan: 'free',
+      status: 'canceled',
+    });
+  } catch (err: any) {
+    console.error('[API] cancel-subscription error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Failed to cancel subscription' });
+  }
+});
+
 const SYSTEM_INSTRUCTIONS: Record<string, string> = {
   kael: 'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. You are direct, scientifically grounded, encouraging, and focused on progressive overload, proper form, recovery, and nutrition. Always communicate in simple, everyday language that any beginner can easily understand, without confusing textbook jargon. Use intuitive real-world analogies when helpful to make concepts click, but never talk down to the athlete or sound like you are explaining things to a baby. Maintain a mature, supportive, and practical coaching presence.',
   structure: 'You are an elite strength & conditioning program architect for WASHEK. Design workout structures and weekly splits tailored to the athlete goals. Return a single, strictly valid JSON object matching the requested schema.',

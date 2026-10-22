@@ -1062,6 +1062,13 @@ export default function LiveWorkout() {
     supabaseApi.auth.me().then((u) => {
       if (u) setUser(u);
     }).catch(() => {});
+
+    const handleSubUpdated = (e) => {
+      const p = e.detail?.plan;
+      if (p) setUser((prev) => (prev ? { ...prev, subscription_plan: p } : { subscription_plan: p }));
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
   }, []);
 
   // iOS back gesture: when workout is done, back navigates

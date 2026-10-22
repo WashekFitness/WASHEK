@@ -19,6 +19,7 @@ import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 import PageNotFound from '@/lib/PageNotFound';
 import ErrorBoundary from '@/components/ErrorBoundary';
+import OfflineIndicator from '@/components/pwa/OfflineIndicator';
 
 import Dashboard from '@/pages/Dashboard';
 import Onboarding from '@/pages/Onboarding';
@@ -95,6 +96,7 @@ function AuthenticatedApp() {
     location.pathname !== '/login' &&
     location.pathname !== '/reset-password' &&
     location.pathname !== '/subscription-return' &&
+    location.pathname !== '/subscription/return' &&
     location.pathname !== '/terms' &&
     location.pathname !== '/privacy'
   ) {
@@ -110,6 +112,7 @@ function AuthenticatedApp() {
 
   return (
     <>
+      <OfflineIndicator />
       {isAuthenticated && <GlobalMidnightWatcher />}
       {isAuthenticated && <ProgramWeekBootstrap />}
 
@@ -125,6 +128,10 @@ function AuthenticatedApp() {
 
             <Route
               path="/subscription-return"
+              element={<SubscriptionReturn />}
+            />
+            <Route
+              path="/subscription/return"
               element={<SubscriptionReturn />}
             />
 

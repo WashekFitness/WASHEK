@@ -561,6 +561,15 @@ export default function WeeklyPlan({
   }, []);
 
   useEffect(() => {
+    const handleSubUpdated = (e) => {
+      const p = e.detail?.plan;
+      if (p) setUserPlan(p);
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+  }, []);
+
+  useEffect(() => {
     if (
       allWeeks.some(
         (microcycle) =>

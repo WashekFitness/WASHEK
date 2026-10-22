@@ -22,6 +22,7 @@ import {
 import Footer from '@/components/layout/Footer';
 import PullToRefresh from '@/components/layout/PullToRefresh';
 import MobileHeader from '@/components/layout/MobileHeader';
+import PWAInstallButton from '@/components/pwa/PWAInstallButton';
 
 
 const navItems = [
@@ -247,6 +248,10 @@ export default function AppLayout() {
           )}
 
         </nav>
+
+        <div className="px-2 pt-4 mt-auto border-t border-border/50 hidden md:block">
+          <PWAInstallButton className="w-full flex items-center justify-center gap-2 rounded-xl bg-primary/10 hover:bg-primary/20 text-primary border border-primary/25 px-3 py-2 text-xs font-semibold transition-all active:scale-95" />
+        </div>
 
       </aside>
 

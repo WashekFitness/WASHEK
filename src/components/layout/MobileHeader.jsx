@@ -4,6 +4,7 @@ import {
 } from 'lucide-react';
 import { useAuth } from '@/lib/AuthContext';
 import AppSettingsModal from '@/components/AppSettingsModal';
+import PWAInstallButton from '@/components/pwa/PWAInstallButton';
 
 const ROOT_PATHS = ['/', '/program', '/nutrition', '/profile', '/kael'];
 
@@ -108,8 +109,12 @@ export default function MobileHeader({ scrollRef }) {
           </button>
         </div>
 
-        {/* Right Side: Quick Settings */}
+        {/* Right Side: Quick Settings & Install */}
         <div className="flex items-center gap-1.5 shrink-0">
+          <PWAInstallButton
+            compact
+            className="flex items-center gap-1.5 rounded-xl bg-primary/15 hover:bg-primary/25 text-primary border border-primary/25 px-2.5 py-1.5 text-xs font-semibold transition-all active:scale-95"
+          />
           <AppSettingsModal
             triggerClassName="w-9 h-9 min-w-9 min-h-9 rounded-xl bg-muted/60 dark:bg-card/40 border-border/70 hover:bg-muted text-muted-foreground hover:text-foreground shadow-none"
             iconClassName="w-4 h-4"

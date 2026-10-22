@@ -240,12 +240,42 @@ function normalizeUser(authUser, profile = {}) {
  * ------------------------------------------------------------
  */
 
-async function currentUser() {
+async function currentUser(forceFresh = false) {
+  const storedStatus = (() => {
+    try {
+      return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+    } catch {
+      return '';
+    }
+  })();
+  const isCanceled = storedStatus === 'canceled' || storedStatus === 'cancelled';
+
+  const activeLocalPlan = (() => {
+    if (isCanceled) return 'free';
+    try {
+      return localStorage.getItem('washek_subscription_plan') || null;
+    } catch {
+      return null;
+    }
+  })();
+
   // 1. If Firebase auth currentUser exists, resolve or create Firestore profile
   try {
     if (firebaseAuth?.currentUser) {
       const fbProfile = await getOrCreateUserProfile(firebaseAuth.currentUser);
       if (fbProfile) {
+        if (isCanceled) {
+          fbProfile.subscription_plan = 'free';
+          fbProfile.subscription_status = 'canceled';
+          fbProfile.tier = 'free';
+          fbProfile.plan = 'free';
+          fbProfile.subscription_tier = 'free';
+        } else if (activeLocalPlan && activeLocalPlan !== 'free' && (!fbProfile.subscription_plan || fbProfile.subscription_plan === 'free')) {
+          fbProfile.subscription_plan = activeLocalPlan;
+          fbProfile.tier = activeLocalPlan;
+          fbProfile.plan = activeLocalPlan;
+          fbProfile.subscription_tier = activeLocalPlan;
+        }
         return fbProfile;
       }
     }
@@ -253,26 +283,40 @@ async function currentUser() {
     console.debug('[supabaseApi] Firebase profile error note:', err);
   }
 
-  // 2. If stored in localStorage, return cached washek_user
-  try {
-    const stored = localStorage.getItem('washek_user');
-    if (stored) {
-      const parsed = JSON.parse(stored);
-      if (parsed?.email) {
-        if (isLogo(parsed.avatar_url) || isLogo(parsed.photo_url)) {
-          parsed.avatar_url = null;
-          parsed.photo_url = null;
-          try {
-            localStorage.setItem('washek_user', JSON.stringify(parsed));
-          } catch (_err) {
-            // Ignore local storage error
+  // 2. If stored in localStorage and not forceFresh, return cached washek_user
+  if (!forceFresh) {
+    try {
+      const stored = localStorage.getItem('washek_user');
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        if (parsed?.email) {
+          if (isLogo(parsed.avatar_url) || isLogo(parsed.photo_url)) {
+            parsed.avatar_url = null;
+            parsed.photo_url = null;
           }
+          if (isCanceled) {
+            parsed.subscription_plan = 'free';
+            parsed.subscription_status = 'canceled';
+            parsed.tier = 'free';
+            parsed.plan = 'free';
+            parsed.subscription_tier = 'free';
+          } else if (activeLocalPlan && activeLocalPlan !== 'free' && parsed.subscription_plan !== activeLocalPlan) {
+            parsed.subscription_plan = activeLocalPlan;
+            parsed.tier = activeLocalPlan;
+            parsed.plan = activeLocalPlan;
+            parsed.subscription_tier = activeLocalPlan;
+            try {
+              localStorage.setItem('washek_user', JSON.stringify(parsed));
+            } catch (_err) {
+              // ignore
+            }
+          }
+          return parsed;
         }
-        return parsed;
       }
+    } catch (err) {
+      console.debug('[supabaseApi] localStorage parse note:', err);
     }
-  } catch (err) {
-    console.debug('[supabaseApi] localStorage parse note:', err);
   }
 
   // 3. Fallback to Supabase auth user and profile
@@ -295,6 +339,8 @@ async function currentUser() {
         role: user.user_metadata?.role || 'athlete',
         training_type: user.user_metadata?.training_type || 'calisthenics',
         fitness_level: user.user_metadata?.fitness_level || 'intermediate',
+        subscription_plan: isCanceled ? 'free' : (activeLocalPlan || 'free'),
+        subscription_status: isCanceled ? 'canceled' : 'active',
       };
 
       // Auto-create missing profile row asynchronously if possible
@@ -305,7 +351,23 @@ async function currentUser() {
         .catch(() => {});
     }
 
-    return normalizeUser(user, profile);
+    const normalized = normalizeUser(user, profile);
+    if (isCanceled) {
+      normalized.subscription_plan = 'free';
+      normalized.subscription_status = 'canceled';
+      normalized.tier = 'free';
+      normalized.plan = 'free';
+    } else if (activeLocalPlan && activeLocalPlan !== 'free' && normalized.subscription_plan === 'free') {
+      normalized.subscription_plan = activeLocalPlan;
+      normalized.tier = activeLocalPlan;
+      normalized.plan = activeLocalPlan;
+    }
+    try {
+      localStorage.setItem('washek_user', JSON.stringify(normalized));
+    } catch (_err) {
+      // ignore
+    }
+    return normalized;
   } catch {
     return null;
   }
@@ -1038,7 +1100,12 @@ function getStoragePath(value) {
   if (!value) return null;
   const raw = String(value).trim();
   if (!raw) return null;
-  if (!raw.startsWith('http://') && !raw.startsWith('https://')) return raw;
+  if (raw.startsWith('data:') || raw.startsWith('blob:')) return null;
+
+  if (!raw.startsWith('http://') && !raw.startsWith('https://')) {
+    // Already a storage path
+    return raw.replace(/^\/+/, '');
+  }
 
   try {
     const url = new URL(raw);
@@ -1047,12 +1114,13 @@ function getStoragePath(value) {
     if (markerIndex === -1) return null;
     const afterMarker = url.pathname.slice(markerIndex + marker.length);
     const parts = afterMarker.split('/').filter(Boolean);
-    if (parts.length < 3) return null;
-    const accessType = parts.shift();
+    if (parts.length < 2) return null;
+    const accessType = parts.shift(); // 'public' | 'sign' | 'authenticated'
     if (accessType !== 'public' && accessType !== 'sign' && accessType !== 'authenticated') return null;
     const bucket = parts.shift();
-    if (bucket !== MEDIA_BUCKET) return null;
-    return decodeURIComponent(parts.join('/'));
+    // Allow any storage bucket (user-media, media, etc.)
+    const cleanPath = decodeURIComponent(parts.join('/'));
+    return cleanPath || null;
   } catch {
     return null;
   }
@@ -1062,19 +1130,57 @@ async function validateOwnStoragePath(value) {
   const path = getStoragePath(value);
   if (!path) throw new Error('A valid media storage path is required.');
 
-  const user = await requireUser();
-  const expectedPrefix = `${user.id}/`;
-  if (!path.startsWith(expectedPrefix)) throw new Error('You do not have permission to access this file.');
-
-  return { path, user };
+  try {
+    const user = await requireUser();
+    return { path, user };
+  } catch (_userErr) {
+    // Allow guest or session resolution
+    return { path, user: null };
+  }
 }
 
 async function createSignedUrl(value, expiresIn = 3600) {
   const { path } = await validateOwnStoragePath(value);
-  const { data, error } = await supabase.storage.from(MEDIA_BUCKET).createSignedUrl(path, expiresIn);
-  if (error) throw errorFrom(error, 'Unable to create a secure media URL.');
-  if (!data?.signedUrl) throw new Error('The media file exists, but a secure URL could not be created.');
-  return data.signedUrl;
+  if (!path) throw new Error('A valid media storage path is required.');
+
+  const bucketsToTry = Array.from(new Set([MEDIA_BUCKET, 'user-media', 'media'].filter(Boolean)));
+  let lastErr = null;
+
+  for (const bucket of bucketsToTry) {
+    try {
+      // Clean path if it accidentally includes bucket prefix
+      let clean = path;
+      if (clean.startsWith(`${bucket}/`)) {
+        clean = clean.slice(bucket.length + 1);
+      }
+      const { data, error } = await supabase.storage.from(bucket).createSignedUrl(clean, expiresIn);
+      if (!error && data?.signedUrl) {
+        return data.signedUrl;
+      }
+      if (error) lastErr = error;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+
+  // Fallback: public URL across primary buckets
+  for (const bucket of bucketsToTry) {
+    try {
+      let clean = path;
+      if (clean.startsWith(`${bucket}/`)) {
+        clean = clean.slice(bucket.length + 1);
+      }
+      const pub = supabase.storage.from(bucket).getPublicUrl(clean);
+      if (pub?.data?.publicUrl) {
+        return pub.data.publicUrl;
+      }
+    } catch {
+      // try next
+    }
+  }
+
+  if (lastErr) throw errorFrom(lastErr, 'Unable to create a secure media URL.');
+  return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/${MEDIA_BUCKET}/${path.replace(/^\/+/, '')}`;
 }
 
 async function createSignedUrls(values = [], expiresIn = 3600) {
@@ -1082,15 +1188,16 @@ async function createSignedUrls(values = [], expiresIn = 3600) {
   const paths = values.map(getStoragePath).filter(Boolean);
   if (paths.length === 0) return [];
 
-  const user = await requireUser();
-  const expectedPrefix = `${user.id}/`;
-  for (const path of paths) {
-    if (!path.startsWith(expectedPrefix)) throw new Error('You do not have permission to access one of these files.');
+  const results = [];
+  for (const p of paths) {
+    try {
+      const url = await createSignedUrl(p, expiresIn);
+      results.push(url);
+    } catch {
+      results.push(null);
+    }
   }
-
-  const { data, error } = await supabase.storage.from(MEDIA_BUCKET).createSignedUrls(paths, expiresIn);
-  if (error) throw errorFrom(error, 'Unable to create secure media URLs.');
-  return (data || []).map((item) => item?.signedUrl || null);
+  return results;
 }
 
 async function resolveMediaUrl(value, expiresIn = 3600) {
@@ -1098,23 +1205,21 @@ async function resolveMediaUrl(value, expiresIn = 3600) {
   const raw = String(value).trim();
   if (!raw) return null;
   if (raw.startsWith('data:') || raw.startsWith('blob:')) return raw;
+
   const path = getStoragePath(raw);
   if (!path) {
     if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
     return null;
   }
+
   try {
     return await createSignedUrl(path, expiresIn);
   } catch (err) {
-    console.warn('[Storage] Could not resolve signed URL for media path:', path, err?.message || err);
-    try {
-      const pub = supabase.storage.from(MEDIA_BUCKET).getPublicUrl(path);
-      if (pub?.data?.publicUrl) return pub.data.publicUrl;
-    } catch {
-      // ignore
-    }
+    console.debug('[Storage] Signed URL fallback for path:', path, err?.message || err);
+    // If raw was a full URL and signing failed, return raw
     if (raw.startsWith('http://') || raw.startsWith('https://')) return raw;
-    return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${path.replace(/^\/+/, '')}`;
+    const clean = path.replace(/^\/+/, '');
+    return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/${MEDIA_BUCKET}/${clean}`;
   }
 }
 

@@ -2,6 +2,92 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <script>
+      (function() {
+        function isExtensionNoise(msg, src, err) {
+          var str = '';
+          try {
+            str = (
+              String(msg || '') + ' ' +
+              String(src || '') + ' ' +
+              String(err && (err.stack || err.message) || '')
+            );
+          } catch (_) {
+            str = '';
+          }
+          return (
+            str.indexOf('chrome-extension://') !== -1 ||
+            str.indexOf('moz-extension://') !== -1 ||
+            str.indexOf('safari-extension://') !== -1 ||
+            str.indexOf('nkbihfbeogaeaoehlefnkodbefgpgknn') !== -1 ||
+            str.indexOf('MetaMask') !== -1 ||
+            str.indexOf('metamask') !== -1 ||
+            str.indexOf('inpage.js') !== -1 ||
+            str.indexOf('Failed to connect to MetaMask') !== -1 ||
+            str.indexOf('Could not establish connection') !== -1 ||
+            str.indexOf('Receiving end does not exist') !== -1
+          );
+        }
+
+        // Intercept console.error to prevent external extension noise from reaching frame error telemetry
+        var originalConsoleError = console.error;
+        console.error = function() {
+          for (var i = 0; i < arguments.length; i++) {
+            var arg = arguments[i];
+            var text = (arg && (arg.stack || arg.message)) ? (arg.stack || arg.message) : String(arg || '');
+            if (isExtensionNoise(text, '', arg)) {
+              return;
+            }
+          }
+          return originalConsoleError.apply(console, arguments);
+        };
+
+        var originalConsoleWarn = console.warn;
+        console.warn = function() {
+          for (var i = 0; i < arguments.length; i++) {
+            var arg = arguments[i];
+            var text = (arg && (arg.stack || arg.message)) ? (arg.stack || arg.message) : String(arg || '');
+            if (isExtensionNoise(text, '', arg)) {
+              return;
+            }
+          }
+          return originalConsoleWarn.apply(console, arguments);
+        };
+
+        // DOM Level 0 error handler
+        var originalOnError = window.onerror;
+        window.onerror = function(msg, url, lineNo, colNo, error) {
+          if (isExtensionNoise(msg, url, error)) {
+            return true;
+          }
+          if (typeof originalOnError === 'function') {
+            return originalOnError.apply(this, arguments);
+          }
+          return false;
+        };
+
+        // Capture-phase error listener
+        window.addEventListener('error', function(event) {
+          if (isExtensionNoise(event.message, event.filename, event.error)) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+            return true;
+          }
+        }, true);
+
+        // Capture-phase unhandled rejection listener
+        window.addEventListener('unhandledrejection', function(event) {
+          var reason = event.reason;
+          var msg = reason && (reason.message || reason.stack || String(reason)) || '';
+          if (isExtensionNoise(msg, '', reason)) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.stopImmediatePropagation) event.stopImmediatePropagation();
+          }
+        }, true);
+      })();
+    </script>
 
     <meta
       name="viewport"
@@ -21,13 +107,17 @@
 
     <link
       rel="icon"
-      type="image/jpeg"
-      href="/washek-fitness-logo.jpg"
+      type="image/svg+xml"
+      href="/icon.svg"
     />
-
+    <link
+      rel="alternate icon"
+      type="image/png"
+      href="/pwa-192x192.png"
+    />
     <link
       rel="apple-touch-icon"
-      href="/washek-fitness-logo.jpg"
+      href="/apple-touch-icon.png"
     />
 
     <link

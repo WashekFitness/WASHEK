@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#05070b" />
+      <stop offset="100%" stop-color="#0b1329" />
+    </linearGradient>
+    <linearGradient id="circleGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#2563eb" />
+      <stop offset="100%" stop-color="#1d4ed8" />
+    </linearGradient>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="8" result="blur" />
+      <feComposite in="SourceGraphic" in2="blur" operator="over" />
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="112" fill="url(#bgGrad)" />
+
+  <!-- Outer Ring with Soft Glow -->
+  <circle cx="256" cy="256" r="200" fill="url(#circleGrad)" stroke="#3b82f6" stroke-width="6" filter="url(#glow)" opacity="0.95" />
+
+  <!-- Pull-Up Bar -->
+  <rect x="110" y="140" width="292" height="14" rx="7" fill="#ffffff" />
+  <circle cx="110" cy="147" r="10" fill="#93c5fd" />
+  <circle cx="402" cy="147" r="10" fill="#93c5fd" />
+
+  <!-- Athlete Head -->
+  <circle cx="256" cy="200" r="26" fill="#ffffff" />
+
+  <!-- Traps, Shoulders & Arms to Bar -->
+  <path d="M 230 220 C 210 200 170 170 156 148 C 152 144 160 142 168 144 C 184 160 216 195 236 215 Z" fill="#ffffff" />
+  <path d="M 282 220 C 302 200 342 170 356 148 C 360 144 352 142 344 144 C 328 160 296 195 276 215 Z" fill="#ffffff" />
+
+  <!-- Broad V-Taper Back / Lats -->
+  <path d="M 230 220 Q 256 226 282 220 Q 306 250 280 320 Q 256 340 232 320 Q 206 250 230 220 Z" fill="#ffffff" />
+
+  <!-- Lower Body / Legs in Athletic Form -->
+  <path d="M 242 320 L 236 385 C 235 395 240 405 246 410 C 250 405 252 395 251 385 L 253 325 Z" fill="#ffffff" />
+  <path d="M 270 320 L 276 385 C 277 395 272 405 266 410 C 262 405 260 395 261 385 L 259 325 Z" fill="#ffffff" />
+</svg>
