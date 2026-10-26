@@ -12,6 +12,7 @@ const defaultSettings = {
   language: 'English',
   unit: 'imperial',
   theme: 'dark',
+  manualRestDays: {},
 };
 
 function normalizeTheme(value) {
@@ -40,7 +41,7 @@ function applyTheme(theme) {
   // Also update browser UI color where supported.
   const themeColor =
     normalizedTheme === 'light'
-      ? '#f7f7f8'
+      ? '#d9e2ef'
       : '#05070b';
 
   let meta = document.querySelector(
@@ -231,11 +232,37 @@ export function AppSettingsProvider({ children }) {
     });
   };
 
+  const toggleManualRestDay = (dateKey) => {
+    if (!dateKey) return;
+    setSettings((previous) => {
+      const currentMap = previous?.manualRestDays || {};
+      const nextMap = { ...currentMap };
+      if (nextMap[dateKey]) {
+        delete nextMap[dateKey];
+      } else {
+        nextMap[dateKey] = true;
+      }
+      const next = {
+        ...previous,
+        manualRestDays: nextMap,
+      };
+      saveSettings(next);
+      return next;
+    });
+  };
+
+  const isRestDayMarked = (dateKey) => {
+    if (!dateKey) return false;
+    return Boolean(settings?.manualRestDays?.[dateKey]);
+  };
+
   return (
     <AppSettingsContext.Provider
       value={{
         settings,
         updateSettings,
+        toggleManualRestDay,
+        isRestDayMarked,
       }}
     >
       {children}

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 
 import {
   Check,
@@ -30,8 +30,8 @@ const freePlan = {
   period: '/forever',
   icon: ShieldCheck,
   color: 'text-muted-foreground',
-  borderColor: 'border-border/60',
-  bgColor: 'bg-muted/10',
+  borderColor: 'border-slate-300 dark:border-border/60',
+  bgColor: 'bg-slate-100/70 dark:bg-muted/10',
   badge: null,
   features: [
     '100 Kael AI messages/month',
@@ -50,9 +50,9 @@ const plans = [
     period: '/mo',
     paymentUrl: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
     icon: Flame,
-    color: 'text-accent',
-    borderColor: 'border-accent/30',
-    bgColor: 'bg-accent/5',
+    color: 'text-emerald-600 dark:text-accent',
+    borderColor: 'border-emerald-500/45 dark:border-accent/30',
+    bgColor: 'bg-emerald-500/[0.08] dark:bg-accent/5',
     badge: null,
     features: [
       '300 Kael AI messages/month (3x Free)',
@@ -71,9 +71,9 @@ const plans = [
     period: '/mo',
     paymentUrl: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
     icon: Zap,
-    color: 'text-primary',
-    borderColor: 'border-primary/40',
-    bgColor: 'bg-primary/5',
+    color: 'text-blue-600 dark:text-primary',
+    borderColor: 'border-blue-500/50 dark:border-primary/40',
+    bgColor: 'bg-blue-500/[0.08] dark:bg-primary/5',
     badge: 'Most Popular',
     features: [
       '800 Kael AI messages/month (8x Free)',
@@ -93,9 +93,9 @@ const plans = [
     period: '/mo',
     paymentUrl: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
     icon: Crown,
-    color: 'text-chart-4',
-    borderColor: 'border-chart-4/40',
-    bgColor: 'bg-chart-4/5',
+    color: 'text-amber-600 dark:text-chart-4',
+    borderColor: 'border-amber-500/50 dark:border-chart-4/40',
+    bgColor: 'bg-amber-500/[0.08] dark:bg-chart-4/5',
     badge: 'Best',
     features: [
       '2,000 Kael AI messages/month (20x Free)',
@@ -141,6 +141,11 @@ function isActiveStatus(status) {
 }
 
 export default function PricingSection({ onPlanChange }) {
+  const onPlanChangeRef = useRef(onPlanChange);
+  useEffect(() => {
+    onPlanChangeRef.current = onPlanChange;
+  }, [onPlanChange]);
+
   const [loadingPlan, setLoadingPlan] =
     useState(null);
 
@@ -161,6 +166,8 @@ export default function PricingSection({ onPlanChange }) {
 
   const [loadingSubscription, setLoadingSubscription] =
     useState(true);
+
+  const isLaunchingRef = useRef(false);
 
 
   const loadSubscription = async () => {
@@ -183,8 +190,12 @@ export default function PricingSection({ onPlanChange }) {
           // ignore
         }
         const safeLocal = normalizePlan(localPlan);
-        setCurrentPlan(safeLocal);
-        onPlanChange?.(safeLocal);
+        setCurrentPlan((prev) => {
+          if (prev !== safeLocal) {
+            onPlanChangeRef.current?.(safeLocal);
+          }
+          return safeLocal;
+        });
         setSubscription(null);
         return;
       }
@@ -237,8 +248,8 @@ export default function PricingSection({ onPlanChange }) {
           profileStatus
         );
 
-      // If user canceled or database reports canceled or inactive free, purge local overrides
-      if (isLocallyCanceled || profileStatus === 'canceled' || profileStatus === 'cancelled' || (!profileIsActive && profilePlan === 'free')) {
+      // Only purge local overrides if the user or profile explicitly recorded a cancellation
+      if (isLocallyCanceled || profileStatus === 'canceled' || profileStatus === 'cancelled') {
         applySubscriptionCancellation();
       }
 
@@ -258,7 +269,7 @@ export default function PricingSection({ onPlanChange }) {
         ? 'free'
         : (profileIsActive && profilePlan !== 'free')
           ? profilePlan
-          : (profileStatus !== 'canceled' && profileStatus !== 'cancelled' && localPlanOverride && localPlanOverride !== 'free' ? normalizePlan(localPlanOverride) : 'free');
+          : (profileStatus !== 'canceled' && profileStatus !== 'cancelled' && localPlanOverride && localPlanOverride !== 'free' ? normalizePlan(localPlanOverride) : profilePlan || 'free');
 
       if (
         !isLocallyCanceled &&
@@ -285,10 +296,12 @@ export default function PricingSection({ onPlanChange }) {
         setSubscription(null);
       }
 
-      setCurrentPlan(
-        resolvedPlan
-      );
-      onPlanChange?.(resolvedPlan);
+      setCurrentPlan((prev) => {
+        if (prev !== resolvedPlan) {
+          onPlanChangeRef.current?.(resolvedPlan);
+        }
+        return resolvedPlan;
+      });
 
       if (resolvedPlan !== 'free' && !isLocallyCanceled) {
         applySubscriptionUpgrade(resolvedPlan, profileStatus || 'active');
@@ -308,8 +321,12 @@ export default function PricingSection({ onPlanChange }) {
         // ignore
       }
       const safePlan = normalizePlan(fallbackLocal);
-      setCurrentPlan(safePlan);
-      onPlanChange?.(safePlan);
+      setCurrentPlan((prev) => {
+        if (prev !== safePlan) {
+          onPlanChangeRef.current?.(safePlan);
+        }
+        return safePlan;
+      });
       setSubscription(null);
     } finally {
       setLoadingSubscription(false);
@@ -320,13 +337,31 @@ export default function PricingSection({ onPlanChange }) {
   useEffect(() => {
     let active = true;
 
-    const run = async () => {
+    // Purge any legacy pending checkout flags
+    try {
+      localStorage.removeItem('washek_pending_checkout_plan');
+      sessionStorage.removeItem('washek_pending_checkout_plan');
+    } catch (_err) {
+      // ignore
+    }
+
+    if (active) {
+      loadSubscription();
+    }
+
+    const handleFocus = () => {
       if (active) {
-        await loadSubscription();
+        loadSubscription();
       }
     };
 
-    run();
+    window.addEventListener('focus', handleFocus);
+    const handleVisChange = () => {
+      if (document.visibilityState === 'visible' && active) {
+        handleFocus();
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisChange);
 
     const {
       data: authListener,
@@ -339,218 +374,116 @@ export default function PricingSection({ onPlanChange }) {
 
     return () => {
       active = false;
-
+      window.removeEventListener('focus', handleFocus);
+      document.removeEventListener('visibilitychange', handleVisChange);
       authListener?.subscription?.unsubscribe();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
 
   const handleCheckout = async (plan) => {
     if (
       !plan?.planKey ||
-      loadingPlan
+      loadingPlan ||
+      isLaunchingRef.current
     ) {
       return;
     }
 
-    if (
-      currentPlan ===
-      plan.planKey
-    ) {
-      setError(
-        `You already have an active ${plan.name} subscription.`
-      );
-
+    if (currentPlan === plan.planKey) {
+      setError(`You already have an active ${plan.name} subscription.`);
+      toast.info(`You already have an active ${plan.name} subscription.`);
       return;
     }
 
+    // Immediately lock all checkout buttons to strictly prevent double payments
+    isLaunchingRef.current = true;
+    setLoadingPlan(plan.planKey);
     setError('');
-    setLoadingPlan(
-      plan.planKey
-    );
 
     try {
       const {
         data: { user },
-      } =
-        await supabase.auth.getUser();
+      } = await supabase.auth.getUser();
 
       if (!user && !plan.paymentUrl) {
-        throw new Error(
-          'Please sign in before upgrading your plan.'
-        );
+        throw new Error('Please sign in before upgrading your plan.');
       }
 
       /*
-       * Re-check the profile immediately before starting
-       * checkout. This prevents an already-active plan from
-       * being purchased again if the UI was stale.
+       * Check the profile immediately before starting checkout to ensure
+       * an already-active plan cannot be purchased again.
        */
       if (user) {
-        const {
-          data: freshProfile,
-          error: freshProfileError,
-        } =
-          await supabase
-            .from('profiles')
-            .select(
-              'subscription_plan, subscription_status'
-            )
-            .eq('id', user.id)
-            .maybeSingle();
+        const { data: freshProfile } = await supabase
+          .from('profiles')
+          .select('subscription_plan, subscription_status')
+          .eq('id', user.id)
+          .maybeSingle();
 
-        if (!freshProfileError && freshProfile) {
-          const freshPlan =
-            normalizePlan(
-              freshProfile.subscription_plan
-            );
-
-          const freshStatus =
-            String(
-              freshProfile.subscription_status || ''
-            ).toLowerCase();
-
-          if (
-            freshPlan ===
-              plan.planKey &&
-            isActiveStatus(
-              freshStatus
-            )
-          ) {
-            setCurrentPlan(
-              freshPlan
-            );
-
-            setError(
-              `You already have an active ${plan.name} subscription.`
-            );
-
+        if (freshProfile) {
+          const freshPlan = normalizePlan(freshProfile.subscription_plan);
+          const freshStatus = String(freshProfile.subscription_status || '').toLowerCase();
+          if (freshPlan === plan.planKey && isActiveStatus(freshStatus)) {
+            setCurrentPlan(freshPlan);
+            setError(`You already have an active ${plan.name} subscription.`);
+            setLoadingPlan(null);
+            isLaunchingRef.current = false;
             return;
           }
         }
       }
+
 
       /*
        * Directly navigate to the designated Stripe Payment URL.
        * Attach client_reference_id (user ID) and prefilled_email
-       * so Stripe automatically attributes the subscription to their account.
+       * so Stripe automatically creates and attributes the customer.
        */
-      /*
-       * Store pending checkout plan so return/confirmation page can verify
-       * even if third-party redirect strips query params.
-       */
+      let destinationUrl = plan.paymentUrl;
+      if (!destinationUrl) {
+        throw new Error('Stripe payment URL is unavailable for this plan.');
+      }
+
       try {
-        localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
+        const urlObj = new URL(destinationUrl);
+        if (user?.email) {
+          urlObj.searchParams.set('prefilled_email', user.email);
+        }
+        if (user?.id) {
+          urlObj.searchParams.set('client_reference_id', user.id);
+        }
+        destinationUrl = urlObj.toString();
       } catch (_err) {
-        // Storage write note
+        // URL parse fallback
       }
 
       /*
-       * Call create-checkout-session to create a real Stripe Checkout Session
-       * with success_url pointing back to this running app instance.
+       * Perform reliable redirection out of iframe to the Stripe checkout page.
        */
-      let checkoutSessionUrl = null;
+      let redirected = false;
       try {
-        const {
-          data,
-          error: functionError,
-        } =
-          await supabase.functions.invoke(
-            'create-checkout-session',
-            {
-              body: {
-                plan:
-                  plan.planKey,
-                app_url:
-                  typeof window !== 'undefined' && window.location.origin
-                    ? window.location.origin
-                    : 'https://washek.ai.studio',
-              },
-            }
-          );
-
-        if (!functionError && data) {
-          if (
-            data?.alreadyActive ||
-            data?.action ===
-              'already_active'
-          ) {
-            setCurrentPlan(plan.planKey);
-            onPlanChange?.(plan.planKey);
-            applySubscriptionUpgrade(plan.planKey, 'active');
-            toast.success(`You already have an active ${plan.name} subscription.`);
-            return;
-          }
-
-          if (data?.url) {
-            checkoutSessionUrl = data.url;
-          }
+        if (window.top && window.top !== window) {
+          window.top.location.href = destinationUrl;
+          redirected = true;
         }
-      } catch (err) {
-        console.warn('[PricingSection] Edge function create-checkout-session note:', err);
+      } catch (_err) {
+        redirected = false;
       }
 
-      // If we got a Stripe Checkout Session URL, redirect there!
-      if (checkoutSessionUrl) {
-        try {
-          if (window.top && window.top !== window) {
-            window.top.location.href = checkoutSessionUrl;
-            return;
-          }
-        } catch (_err) {
-          // Cross-origin top navigation fallback
+      if (!redirected) {
+        const stripeWin = window.open(destinationUrl, '_blank', 'noopener,noreferrer');
+        if (!stripeWin || stripeWin.closed || typeof stripeWin.closed === 'undefined') {
+          window.location.assign(destinationUrl);
         }
-
-        window.location.href = checkoutSessionUrl;
-        return;
       }
-
-      /*
-       * Fallback to direct payment link if the Edge function was unavailable.
-       */
-      if (plan.paymentUrl) {
-        let destinationUrl = plan.paymentUrl;
-        try {
-          const urlObj = new URL(destinationUrl);
-          if (user?.email) {
-            urlObj.searchParams.set('prefilled_email', user.email);
-          }
-          if (user?.id) {
-            urlObj.searchParams.set('client_reference_id', user.id);
-          }
-          destinationUrl = urlObj.toString();
-        } catch (_err) {
-          // URL parse fallback
-        }
-
-        try {
-          if (window.top && window.top !== window) {
-            window.top.location.href = destinationUrl;
-            return;
-          }
-        } catch (_err) {
-          // Window top navigation fallback
-        }
-
-        window.location.href = destinationUrl;
-        return;
-      }
-
-      throw new Error('Unable to initialize checkout session. Please try again.');
-    } catch (
-      checkoutError
-    ) {
-      console.error(
-        '[PricingSection] Checkout failed:',
-        checkoutError
-      );
-
-      setError(
-        checkoutError?.message ||
-          'Unable to start checkout.'
-      );
-    } finally {
+    } catch (checkoutError) {
+      console.error('[PricingSection] Stripe redirect failed:', checkoutError);
+      setError(checkoutError?.message || 'Unable to start checkout.');
+      toast.error(checkoutError?.message || 'Unable to start checkout.');
       setLoadingPlan(null);
+      isLaunchingRef.current = false;
     }
   };
 
@@ -663,6 +596,7 @@ export default function PricingSection({ onPlanChange }) {
           </span>
         </div>
       )}
+
 
       {/* =========================================================
           SECTION HEADER
@@ -816,7 +750,7 @@ export default function PricingSection({ onPlanChange }) {
             ) : (
               <div className="space-y-1.5">
                 <Button
-                  className="w-full h-10 font-heading font-semibold"
+                  className="w-full h-10 font-heading font-semibold transition-all"
                   variant="outline"
                   onClick={() =>
                     handleCheckout(
@@ -832,7 +766,7 @@ export default function PricingSection({ onPlanChange }) {
                   plan.planKey ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Loading...
+                      Redirecting to Stripe…
                     </>
                   ) : (
                     `Get ${plan.name}`

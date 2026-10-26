@@ -25,6 +25,7 @@ import { Button } from '@/components/ui/button';
 import { Link } from 'react-router-dom';
 import { toast } from 'sonner';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
+import { getCachedProgramsList, setCachedProgramsList } from '@/lib/cacheStore';
 
 export default function Program() {
   const queryClient = useQueryClient();
@@ -63,10 +64,12 @@ export default function Program() {
   }, []);
 
   const effectiveUser = user || authUser;
+  const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
 
   /*
    * ==========================================================
    * LOAD ACTIVE PROGRAM
+   * Immediately hydrates from synchronous local cacheStore.
    * ==========================================================
    */
   const {
@@ -76,17 +79,21 @@ export default function Program() {
     error,
     refetch,
   } = useQuery({
-    queryKey: ['programs', effectiveUser?.id],
-    queryFn: () =>
-      supabaseApi.entities.WorkoutProgram.filter(
+    queryKey: ['programs', userKey],
+    queryFn: async () => {
+      const res = await supabaseApi.entities.WorkoutProgram.filter(
         { status: 'active' },
         '-created_at',
         10
-      ),
-    enabled: !!effectiveUser?.id,
-    staleTime: 0,
-    refetchOnMount: 'always',
-    refetchOnWindowFocus: true,
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedProgramsList(res, userKey);
+      }
+      return res;
+    },
+    initialData: () => getCachedProgramsList(userKey),
+    staleTime: 5 * 60 * 1000,
+    enabled: true,
   });
 
   /*

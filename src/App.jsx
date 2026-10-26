@@ -87,7 +87,7 @@ function AuthenticatedApp() {
   const { isLoadingAuth, isAuthenticated } = useAuth();
   const location = useLocation();
 
-  if (isLoadingAuth) {
+  if (isLoadingAuth && !isAuthenticated) {
     return <PageLoader />;
   }
 

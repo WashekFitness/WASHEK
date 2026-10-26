@@ -8,6 +8,10 @@ import {
 } from '@/lib/periodizationEngine';
 import { sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
 import { buildWeekPrompt } from '@/lib/trainingTypes';
+import {
+  checkProgramGenerationLock,
+  recordProgramGenerated,
+} from '@/lib/programCooldown';
 
 /**
  * Generates a fresh 12-week workout program for the user.
@@ -67,6 +71,27 @@ export async function generateNewProgram(options = {}) {
   }
 
   const validUserId = ensureValidUuid(user.id || user.uid);
+
+  // 1.5. Enforce 7-day cooldown (1 workout generated per week) to prevent spamming
+  try {
+    const { data: latestPrograms } = await supabase
+      .from('workout_programs')
+      .select('id, created_at')
+      .order('created_at', { ascending: false })
+      .limit(1);
+
+    const lock = checkProgramGenerationLock(latestPrograms?.[0]?.created_at);
+    if (lock.isLocked) {
+      throw new Error(
+        `Workout program generation is locked. You can generate a new program in ${lock.remainingDays} day${lock.remainingDays === 1 ? '' : 's'}.`
+      );
+    }
+  } catch (lockErr) {
+    if (lockErr.message?.includes('generation is locked')) {
+      throw lockErr;
+    }
+    console.debug('[ProgramService] Cooldown check note:', lockErr);
+  }
 
   // 2. Resolve profile settings and preferences
   let profile = null;
@@ -363,6 +388,9 @@ export async function generateNewProgram(options = {}) {
   if (!savedProgram) {
     throw new Error('Your 12-week program was built but could not be saved.');
   }
+
+  // Stamp 7-day cooldown immediately
+  recordProgramGenerated();
 
   // 8. If training type was changed by user, update profile training_type without wiping other fields
   if (trainingTypeOverride && trainingTypeOverride !== profile?.training_type) {

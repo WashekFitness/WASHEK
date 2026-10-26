@@ -2,6 +2,7 @@ import {
   useState,
   useEffect,
   useRef,
+  useCallback,
 } from 'react';
 
 import {
@@ -77,9 +78,14 @@ export default function Profile() {
 
   useEffect(() => {
     if (authUser) {
-      setUser(authUser);
+      setUser((prev) => {
+        if (prev?.id === authUser.id && prev?.subscription_plan === authUser.subscription_plan && prev?.avatar_url === authUser.avatar_url) {
+          return prev;
+        }
+        return authUser;
+      });
     }
-  }, [authUser]);
+  }, [authUser?.id, authUser?.subscription_plan, authUser?.avatar_url]);
 
   const fileInputRef = useRef(null);
 
@@ -104,6 +110,8 @@ export default function Profile() {
   const [imageToAdjust, setImageToAdjust] = useState(null);
 
   const { timeZone } = useMidnightSync(user || authUser);
+
+  const avatarKey = `${user?.id || user?.email || 'default'}_${user?.avatar_url || ''}_${user?.photo_url || ''}`;
 
   useEffect(() => {
     if (user?.id || user?.email) {
@@ -142,7 +150,7 @@ export default function Profile() {
         setAvatarUrl(null);
       }
     }
-  }, [user]);
+  }, [avatarKey]);
 
   const handleImageUpload = (e) => {
     const file = e.target.files?.[0];
@@ -265,23 +273,28 @@ export default function Profile() {
               currentUser.photo_url = null;
             }
           }
-          setUser(currentUser);
+          setUser((prev) => {
+            if (
+              prev &&
+              prev.id === currentUser.id &&
+              prev.avatar_url === currentUser.avatar_url &&
+              prev.subscription_plan === currentUser.subscription_plan &&
+              prev.full_name === currentUser.full_name
+            ) {
+              return prev;
+            }
+            return currentUser;
+          });
         }
       })
       .catch((error) => {
         console.debug('[PROFILE] Notice checking profile:', error?.message || error);
-        if (authUser && active) {
-          toast.error(
-            error?.message ||
-              'Unable to load your profile.'
-          );
-        }
       });
 
     return () => {
       active = false;
     };
-  }, [authUser]);
+  }, [authUser?.id]);
 
 
   const {
@@ -393,6 +406,19 @@ export default function Profile() {
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
     return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
   }, [setAuthUser]);
+
+  const handlePlanChange = useCallback((newPlan) => {
+    setUser((prev) => {
+      if (!prev || prev.subscription_plan === newPlan) return prev;
+      return {
+        ...prev,
+        subscription_plan: newPlan,
+        subscription_status: newPlan === 'free' ? 'canceled' : (prev.subscription_status || 'active'),
+        tier: newPlan,
+        plan: newPlan,
+      };
+    });
+  }, []);
 
   // Live server-authoritative Kael monthly quota stats
   const {
@@ -1171,17 +1197,7 @@ export default function Profile() {
         z-0
         pt-2
       ">
-        <PricingSection
-          onPlanChange={(newPlan) => {
-            setUser((prev) => (prev ? {
-              ...prev,
-              subscription_plan: newPlan,
-              subscription_status: newPlan === 'free' ? 'canceled' : (prev.subscription_status || 'active'),
-              tier: newPlan,
-              plan: newPlan,
-            } : prev));
-          }}
-        />
+        <PricingSection onPlanChange={handlePlanChange} />
       </div>
 
       {/* ====================================================

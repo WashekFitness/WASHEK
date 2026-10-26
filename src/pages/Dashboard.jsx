@@ -15,6 +15,14 @@ import QuickAccess from '@/components/layout/QuickAccess';
 
 import { useMidnightSync } from '@/hooks/useMidnightSync';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
+import {
+  getCachedProgramsList,
+  setCachedProgramsList,
+  getCachedLogs,
+  setCachedLogs,
+  getCachedNutrition,
+  setCachedNutrition,
+} from '@/lib/cacheStore';
 
 export default function Dashboard() {
   const navigate = useNavigate();
@@ -62,50 +70,72 @@ export default function Dashboard() {
     };
   }, [authUser, navigate]);
 
+  const effectiveUser = user || authUser;
+  const userKey =
+    effectiveUser?.email ||
+    effectiveUser?.id ||
+    'athlete';
+
   /*
    * Active workout program.
+   * Hydrates immediately with initialData from synchronous cacheStore.
    */
   const {
     data: programs = [],
+    isLoading: isLoadingPrograms,
   } = useQuery({
     queryKey: [
       'programs',
-      user?.id || user?.email,
+      userKey,
     ],
 
-    queryFn: () =>
-      supabaseApi.entities.WorkoutProgram.filter(
+    queryFn: async () => {
+      const res = await supabaseApi.entities.WorkoutProgram.filter(
         {
           status: 'active',
         },
         '-created_at',
         5
-      ),
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedProgramsList(res, userKey);
+      }
+      return res;
+    },
 
-    enabled: !!(user?.id || user?.email),
+    initialData: () => getCachedProgramsList(userKey),
+    staleTime: 5 * 60 * 1000,
+    enabled: true,
   });
 
   /*
    * Workout logs.
+   * Hydrates immediately with initialData from synchronous cacheStore.
    */
   const {
     data: logs = [],
   } = useQuery({
     queryKey: [
       'logs',
-      user?.email,
+      userKey,
     ],
 
-    queryFn: () =>
-      supabaseApi.entities.WorkoutLog.filter(
-        {
-          created_by: user.email,
-        },
+    queryFn: async () => {
+      const emailFilter = effectiveUser?.email;
+      const res = await supabaseApi.entities.WorkoutLog.filter(
+        emailFilter ? { created_by: emailFilter } : { created_by: userKey },
         '-date',
         30
-      ),
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedLogs(res, userKey);
+      }
+      return res;
+    },
 
-    enabled: !!user?.email,
+    initialData: () => getCachedLogs(userKey),
+    staleTime: 5 * 60 * 1000,
+    enabled: true,
   });
 
   /*
@@ -113,17 +143,7 @@ export default function Dashboard() {
    *
    * Fetch nutrition entries for the current user and use the same
    * local-date definition as the Nutrition page.
-   *
-   * We intentionally request today's entries directly instead of
-   * fetching a broad list and then relying on UTC date conversion.
    */
-  const userKey =
-    user?.email ||
-    authUser?.email ||
-    user?.id ||
-    authUser?.id ||
-    'athlete';
-
   const {
     data: nutrition = [],
   } = useQuery({
@@ -133,16 +153,23 @@ export default function Dashboard() {
       userKey,
     ],
 
-    queryFn: () =>
-      supabaseApi.entities.NutritionEntry.filter(
+    queryFn: async () => {
+      const res = await supabaseApi.entities.NutritionEntry.filter(
         {
           date: today,
           created_by: userKey,
         },
         '-created_date',
         100
-      ),
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedNutrition(res, userKey);
+      }
+      return res;
+    },
 
+    initialData: () => getCachedNutrition(userKey),
+    staleTime: 5 * 60 * 1000,
     enabled: true,
   });
 
@@ -154,19 +181,19 @@ export default function Dashboard() {
   } = useQuery({
     queryKey: [
       'progress-photos',
-      user?.email,
+      effectiveUser?.email || userKey,
     ],
 
     queryFn: () =>
       supabaseApi.entities.ProgressPhoto.filter(
         {
-          created_by: user.email,
+          created_by: effectiveUser?.email || userKey,
         },
         '-date',
         20
       ),
 
-    enabled: !!user?.email,
+    enabled: !!(effectiveUser?.email || userKey),
   });
 
   const activeProgram =
@@ -243,6 +270,7 @@ export default function Dashboard() {
             logs={logs}
             user={user}
             timeZone={timeZone}
+            program={activeProgram}
           />
 
 
@@ -250,6 +278,7 @@ export default function Dashboard() {
             program={activeProgram}
             user={user}
             timeZone={timeZone}
+            isLoading={isLoadingPrograms && !activeProgram}
           />
 
 

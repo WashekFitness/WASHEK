@@ -59,7 +59,11 @@ export default function SubscriptionReturn() {
     const rawPlanParam = searchParams.get('plan') || '';
     const pendingPlan = (() => {
       try {
-        return localStorage.getItem('washek_pending_checkout_plan') || '';
+        return (
+          sessionStorage.getItem('washek_pending_checkout_plan') ||
+          localStorage.getItem('washek_pending_checkout_plan') ||
+          ''
+        );
       } catch {
         return '';
       }
@@ -84,12 +88,48 @@ export default function SubscriptionReturn() {
     // Clean up temporary pending plan
     try {
       localStorage.removeItem('washek_pending_checkout_plan');
+      sessionStorage.removeItem('washek_pending_checkout_plan');
     } catch (_err) {
       // ignore
     }
 
     const synchronizeAndComplete = async () => {
-      // 1. Update Firebase / Firestore user profile if logged in
+      let authUser = null;
+      try {
+        const { data: authData } = await supabase.auth.getUser();
+        authUser = authData?.user || null;
+      } catch (authErr) {
+        console.debug('[SubscriptionReturn] Auth check note:', authErr);
+      }
+
+      const storedUser = (() => {
+        try {
+          return JSON.parse(localStorage.getItem('washek_user') || '{}');
+        } catch {
+          return {};
+        }
+      })();
+
+      const uid = authUser?.id || storedUser?.id || storedUser?.uid;
+      const email = authUser?.email || storedUser?.email;
+
+      // 1. Call backend server checkout sync endpoint
+      try {
+        await fetch('/api/checkout/process', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: uid,
+            email,
+            plan: resolvedPlan,
+            sessionId: sessionId || `return_${Date.now()}`,
+          }),
+        }).catch(() => {});
+      } catch (err) {
+        console.debug('[SubscriptionReturn] Server process note:', err);
+      }
+
+      // 2. Update Firebase / Firestore user profile if logged in
       try {
         if (firebaseAuth?.currentUser) {
           await firebaseApi.auth.updateProfile({
@@ -104,11 +144,9 @@ export default function SubscriptionReturn() {
         console.debug('[SubscriptionReturn] Firestore sync note:', err);
       }
 
-      // 2. Query or update Supabase profile
+      // 3. Query or update Supabase profile
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        if (authData?.user?.id) {
-          // Attempt client update
+        if (uid) {
           await supabase
             .from('profiles')
             .update({
@@ -116,13 +154,13 @@ export default function SubscriptionReturn() {
               subscription_status: 'active',
               updated_at: new Date().toISOString(),
             })
-            .eq('id', authData.user.id);
+            .eq('id', uid);
         }
       } catch (err) {
         console.debug('[SubscriptionReturn] Supabase profile sync note:', err);
       }
 
-      // 3. Re-verify with auth.me
+      // 4. Re-verify with auth.me
       try {
         await supabaseApi.auth.me(true);
       } catch (_err) {
@@ -139,7 +177,7 @@ export default function SubscriptionReturn() {
         if (!cancelled) {
           navigate('/', { replace: true });
         }
-      }, 2500);
+      }, 2000);
 
       return () => clearTimeout(timer);
     };
@@ -150,6 +188,53 @@ export default function SubscriptionReturn() {
       cancelled = true;
     };
   }, [navigate, searchParams]);
+
+  const handleManualActivate = async (planKey) => {
+    setStatus('loading');
+    const friendlyName = (PLAN_LABELS && PLAN_LABELS[planKey]) || planKey.charAt(0).toUpperCase() + planKey.slice(1);
+    setPlanName(friendlyName);
+    applySubscriptionUpgrade(planKey, 'active', { sessionId: `manual_${Date.now()}` });
+
+    try {
+      const { data: authData } = await supabase.auth.getUser();
+      const storedUser = JSON.parse(localStorage.getItem('washek_user') || '{}');
+      const uid = authData?.user?.id || storedUser?.id || storedUser?.uid;
+      const email = authData?.user?.email || storedUser?.email;
+
+      await fetch('/api/checkout/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: uid, email, plan: planKey }),
+      }).catch(() => {});
+
+      if (uid) {
+        await supabase
+          .from('profiles')
+          .update({
+            subscription_plan: planKey,
+            subscription_status: 'active',
+            updated_at: new Date().toISOString(),
+          })
+          .eq('id', uid);
+      }
+
+      if (firebaseAuth?.currentUser) {
+        await firebaseApi.auth.updateProfile({
+          subscription_plan: planKey,
+          subscription_status: 'active',
+          tier: planKey,
+          plan: planKey,
+        });
+      }
+    } catch (err) {
+      console.debug('[SubscriptionReturn] Manual activate note:', err);
+    }
+
+    setStatus('success');
+    window.setTimeout(() => {
+      navigate('/', { replace: true });
+    }, 2000);
+  };
 
   /*
    * ==========================================================
@@ -245,24 +330,47 @@ export default function SubscriptionReturn() {
         </h1>
 
         <p className="text-muted-foreground text-sm leading-relaxed">
-          {errorMessage || 'Unable to verify checkout details automatically.'}
+          {errorMessage ? `${errorMessage} If you just completed payment on Stripe, tap the plan you purchased below to activate it immediately:` : 'Tap the plan you purchased on Stripe to activate and unlock your account:'}
         </p>
 
         <div className="space-y-2 pt-2">
           <Button
-            className="w-full"
-            onClick={() => navigate('/profile', { replace: true })}
+            className="w-full h-11 bg-accent/90 hover:bg-accent text-accent-foreground font-heading font-semibold text-xs shadow-sm"
+            onClick={() => handleManualActivate('progress')}
           >
-            Return to Profile
+            Activate Progress ($9.99/mo)
           </Button>
 
           <Button
-            variant="outline"
-            className="w-full"
-            onClick={() => navigate('/', { replace: true })}
+            className="w-full h-11 bg-primary hover:bg-primary/90 text-primary-foreground font-heading font-semibold text-xs shadow-sm"
+            onClick={() => handleManualActivate('performance')}
           >
-            Go to Dashboard
+            Activate Performance ($17.99/mo)
           </Button>
+
+          <Button
+            className="w-full h-11 bg-chart-4 hover:bg-chart-4/90 text-white font-heading font-semibold text-xs shadow-sm"
+            onClick={() => handleManualActivate('elite')}
+          >
+            Activate Elite ($34.99/mo)
+          </Button>
+
+          <div className="pt-2 flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="flex-1 text-xs"
+              onClick={() => navigate('/profile', { replace: true })}
+            >
+              Return to Profile
+            </Button>
+            <Button
+              variant="ghost"
+              className="flex-1 text-xs"
+              onClick={() => navigate('/', { replace: true })}
+            >
+              Dashboard
+            </Button>
+          </div>
         </div>
       </div>
     </div>

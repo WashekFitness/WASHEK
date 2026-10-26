@@ -229,104 +229,104 @@
   }
 
 
-  /* Explicit light mode: Apple Health / Equinox Pristine Swiss Editorial */
+  /* Explicit light mode: Athletic Luxury with Colored Light Base */
 
   html.light {
     --background:
-      210 33% 98%;
+      218 38% 91.5%;
 
     --foreground:
-      222 47% 11%;
+      222 52% 11%;
 
     --card:
-      0 0% 100%;
+      218 42% 96.8%;
 
     --card-foreground:
-      222 47% 11%;
+      222 52% 11%;
 
     --popover:
-      0 0% 100%;
+      218 42% 96.8%;
 
     --popover-foreground:
-      222 47% 11%;
+      222 52% 11%;
 
     --primary:
-      221 83% 53%;
+      221 92% 52%;
 
     --primary-foreground:
       0 0% 100%;
 
     --secondary:
-      210 40% 96%;
+      218 36% 87%;
 
     --secondary-foreground:
-      222 40% 16%;
+      222 55% 15%;
 
     --muted:
-      210 36% 95%;
+      218 32% 87%;
 
     --muted-foreground:
-      215 18% 44%;
+      219 28% 38%;
 
     --accent:
-      158 82% 38%;
+      158 86% 36%;
 
     --accent-foreground:
       0 0% 100%;
 
     --destructive:
-      0 78% 52%;
+      0 82% 52%;
 
     --destructive-foreground:
       0 0% 98%;
 
     --border:
-      214 32% 90%;
+      218 32% 81%;
 
     --input:
-      214 32% 90%;
+      218 32% 81%;
 
     --ring:
-      221 83% 53%;
+      221 92% 52%;
 
     --chart-1:
-      221 83% 53%;
+      221 92% 52%;
 
     --chart-2:
-      158 82% 38%;
+      158 86% 36%;
 
     --chart-3:
-      270 70% 55%;
+      270 75% 55%;
 
     --chart-4:
-      35 95% 46%;
+      35 96% 46%;
 
     --chart-5:
-      0 78% 52%;
+      0 82% 52%;
 
     --sidebar-background:
-      0 0% 100%;
+      218 40% 94%;
 
     --sidebar-foreground:
-      222 47% 11%;
+      222 52% 11%;
 
     --sidebar-primary:
-      221 83% 53%;
+      221 92% 52%;
 
     --sidebar-primary-foreground:
       0 0% 100%;
 
     --sidebar-accent:
-      210 36% 95%;
+      218 34% 88%;
 
     --sidebar-accent-foreground:
-      222 47% 11%;
+      222 52% 11%;
 
     --sidebar-border:
-      214 32% 90%;
+      218 32% 81%;
 
     --sidebar-ring:
-      221 83% 53%;
+      221 92% 52%;
   }
 
 
@@ -426,9 +426,39 @@
   html.light body {
     background-color: hsl(var(--background));
     background-image:
-      radial-gradient(ellipse 90% 45% at 50% -10%, hsl(221 83% 53% / 0.05), transparent 60%),
-      radial-gradient(ellipse 60% 35% at 100% 100%, hsl(158 82% 38% / 0.025), transparent 45%);
+      radial-gradient(ellipse 120% 65% at 50% -12%, hsl(221 92% 56% / 0.22), transparent 70%),
+      radial-gradient(ellipse 95% 55% at 98% 18%, hsl(158 86% 40% / 0.16), transparent 60%),
+      radial-gradient(ellipse 90% 60% at 2% 65%, hsl(221 88% 54% / 0.15), transparent 55%),
+      radial-gradient(ellipse 80% 50% at 85% 85%, hsl(268 85% 62% / 0.11), transparent 50%),
+      radial-gradient(ellipse 70% 45% at 20% 95%, hsl(38 95% 54% / 0.11), transparent 48%);
     background-attachment: fixed;
+  }
+
+  html.light .bg-card {
+    background-image: linear-gradient(180deg, hsl(0 0% 100% / 0.96) 0%, hsl(218 45% 96.5% / 0.96) 100%);
+    border-color: hsl(218 36% 82% / 0.9);
+    box-shadow:
+      0 8px 30px -6px rgba(30, 58, 138, 0.10),
+      0 2px 6px -1px rgba(15, 23, 42, 0.05),
+      inset 0 1px 0 rgba(255, 255, 255, 0.95);
+  }
+
+  html.light aside {
+    background: linear-gradient(180deg, hsl(218 42% 96%) 0%, hsl(218 38% 92.5%) 100%);
+    border-right-color: hsl(218 34% 81%);
+    box-shadow: 4px 0 24px rgba(30, 58, 138, 0.06);
+  }
+
+  html.light nav.fixed.bottom-0 {
+    background: hsl(0 0% 100% / 0.92);
+    border-top-color: hsl(218 34% 81%);
+    box-shadow: 0 -8px 32px rgba(30, 58, 138, 0.10);
+  }
+
+  html.light header.fixed.top-0 {
+    background: hsl(0 0% 100% / 0.92);
+    border-bottom-color: hsl(218 34% 81%);
+    box-shadow: 0 4px 20px rgba(30, 58, 138, 0.07);
   }
 
 

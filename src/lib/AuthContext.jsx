@@ -41,11 +41,33 @@ export const AuthProvider = ({ children }) => {
       return false;
     }
   });
-  const [isLoadingAuth, setIsLoadingAuth] = useState(true);
+  const [isLoadingAuth, setIsLoadingAuth] = useState(() => {
+    try {
+      return !localStorage.getItem('washek_user');
+    } catch {
+      return true;
+    }
+  });
   const [isLoadingPublicSettings] = useState(false);
   const [authError, setAuthError] = useState(null);
-  const [authChecked, setAuthChecked] = useState(false);
+  const [authChecked, setAuthChecked] = useState(() => {
+    try {
+      return !!localStorage.getItem('washek_user');
+    } catch {
+      return false;
+    }
+  });
   const [appPublicSettings] = useState(null);
+
+  // Safety timeout: Never let auth loading block the app for more than 800ms
+  useEffect(() => {
+    const safetyTimer = setTimeout(() => {
+      setIsLoadingAuth(false);
+      setAuthChecked(true);
+    }, 800);
+
+    return () => clearTimeout(safetyTimer);
+  }, []);
 
   // Load user from Supabase session if Firebase user is not active
   const loadFallbackSupabaseUser = useCallback(async () => {
@@ -281,6 +303,40 @@ export const AuthProvider = ({ children }) => {
       supaListener?.subscription?.unsubscribe?.();
     };
   }, [loadFallbackSupabaseUser]);
+
+  // Instantly reflect subscription updates into current user state
+  useEffect(() => {
+    const handleSubUpdate = (e) => {
+      const plan = e.detail?.plan || e.detail?.subscription_plan;
+      const status = e.detail?.status || e.detail?.subscription_status || 'active';
+      if (plan) {
+        setUser((prev) => {
+          if (!prev) return prev;
+          const updated = {
+            ...prev,
+            subscription_plan: plan,
+            subscription_status: status,
+            tier: plan,
+            plan: plan,
+            subscription_tier: plan,
+          };
+          try {
+            localStorage.setItem('washek_user', JSON.stringify(updated));
+          } catch (storageErr) {
+            console.debug('[AUTH] Storage write note:', storageErr);
+          }
+          return updated;
+        });
+      }
+    };
+
+    window.addEventListener('washek_subscription_updated', handleSubUpdate);
+    window.addEventListener('washek_user_changed', handleSubUpdate);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdate);
+      window.removeEventListener('washek_user_changed', handleSubUpdate);
+    };
+  }, []);
 
   const signInWithGoogle = useCallback(async () => {
     setIsLoadingAuth(true);

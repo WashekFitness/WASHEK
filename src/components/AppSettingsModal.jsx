@@ -11,17 +11,25 @@ import {
   Languages,
   Ruler,
   LockKeyhole,
+  Lock,
   LogOut,
   Trash2,
   Dumbbell,
   Sparkles,
   RefreshCw,
   ShieldCheck,
+  HeartPulse,
 } from 'lucide-react';
 
+import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
 import { generateNewProgram } from '@/lib/programService';
+import { useProgramCooldown } from '@/lib/programCooldown';
+import { isActualRestDay } from '@/lib/streakUtils';
+import { getLocalDateKey, getUserTimeZone, getDayOfWeekName } from '@/lib/dateUtils';
+import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 
 import {
   useAppSettings,
@@ -467,11 +475,34 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
   const {
     settings,
     updateSettings,
-  } =
-    useAppSettings();
+    toggleManualRestDay,
+    isRestDayMarked,
+  } = useAppSettings();
 
   const { logout, user } = useAuth();
   const navigate = useNavigate();
+  const { isLocked: isProgramLocked, remainingDays: programRemainingDays } = useProgramCooldown(user);
+
+  const userKey = user?.id || user?.uid || user?.email;
+  const { data: programs = [] } = useQuery({
+    queryKey: ['settings-active-program', userKey],
+    queryFn: () =>
+      supabaseApi.entities.WorkoutProgram.filter(
+        { status: 'active' },
+        '-created_at',
+        1
+      ),
+    enabled: Boolean(userKey),
+  });
+  const activeProgram = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
+
+  const effectiveTz = getUserTimeZone(user);
+  const todayKey = getLocalDateKey(new Date(), effectiveTz);
+  const todayDayName = getDayOfWeekName(new Date(), effectiveTz);
+  const todayIsActualRestDay = isActualRestDay(todayKey, activeProgram, user, effectiveTz);
+  const isTodayMarkedRest = isRestDayMarked
+    ? isRestDayMarked(todayKey)
+    : Boolean(settings?.manualRestDays?.[todayKey]);
 
   const [open, setOpen] =
     useState(false);
@@ -1151,18 +1182,24 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
 
                   <button
                     type="button"
-                    onClick={() => setConfirmRegenerateOpen(true)}
-                    className="
+                    disabled={isProgramLocked}
+                    onClick={() => {
+                      if (isProgramLocked) {
+                        toast.error(
+                          `Program generation is locked. You can generate a new program in ${programRemainingDays} day${programRemainingDays === 1 ? '' : 's'}.`
+                        );
+                        return;
+                      }
+                      setConfirmRegenerateOpen(true);
+                    }}
+                    className={cn(
+                      `
                       w-full
                       h-12
                       rounded-xl
                       border
-                      border-border
-                      bg-muted/30
                       text-sm
                       font-semibold
-                      hover:border-primary/40
-                      hover:bg-muted
                       transition-all
                       pointer-events-auto
                       touch-manipulation
@@ -1170,13 +1207,91 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                       items-center
                       justify-center
                       gap-2
-                    "
+                      `,
+                      isProgramLocked
+                        ? 'border-border/60 bg-muted/20 text-muted-foreground/60 cursor-not-allowed opacity-60'
+                        : 'border-border bg-muted/30 hover:border-primary/40 hover:bg-muted text-foreground'
+                    )}
                   >
-                    <RefreshCw className="w-4 h-4 text-primary" />
-                    <span>Generate New Program</span>
+                    {isProgramLocked ? (
+                      <Lock className="w-4 h-4 text-muted-foreground/70" />
+                    ) : (
+                      <RefreshCw className="w-4 h-4 text-primary" />
+                    )}
+                    <span>
+                      {isProgramLocked
+                        ? `Generate New Program (Locked · ${programRemainingDays}d)`
+                        : 'Generate New Program'}
+                    </span>
                   </button>
                   <p className="text-[11px] text-muted-foreground mt-1.5 px-0.5 leading-normal">
-                    Return to onboarding to update your goals and create a new plan. All photos, chats, and logs remain safe.
+                    {isProgramLocked
+                      ? `Locked for 7 days to preserve your periodized training progression. Available in ${programRemainingDays} day${programRemainingDays === 1 ? '' : 's'}.`
+                      : 'Return to onboarding to update your goals and create a new plan. All photos, chats, and logs remain safe.'}
+                  </p>
+                </div>
+
+                {/* Rest Day & Recovery */}
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+                    <Moon className="w-3.5 h-3.5 text-primary" />
+                    Rest Day &amp; Recovery
+                  </p>
+
+                  <div className="p-3.5 rounded-2xl border border-border bg-muted/20 space-y-2">
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm font-semibold text-foreground">
+                            Mark Today as Rest Day
+                          </p>
+                          <span
+                            className={cn(
+                              "text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider",
+                              todayIsActualRestDay
+                                ? isTodayMarkedRest
+                                  ? "bg-emerald-500/15 text-emerald-500 border border-emerald-500/30"
+                                  : "bg-primary/10 text-primary border border-primary/20"
+                                : "bg-muted text-muted-foreground border border-border"
+                            )}
+                          >
+                            {todayIsActualRestDay
+                              ? isTodayMarkedRest
+                                ? 'Active Rest Day'
+                                : 'Scheduled Rest'
+                              : 'Workout Day'}
+                          </span>
+                        </div>
+                        <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
+                          {todayIsActualRestDay
+                            ? isTodayMarkedRest
+                              ? `Today (${todayDayName}) is marked as a Rest Day. Shown on your dashboard and streak is protected.`
+                              : `Today (${todayDayName}) is a scheduled rest day. Toggle on to show it on your dashboard and ensure your streak is preserved.`
+                            : `Only works for actual rest days. Today (${todayDayName}) is a scheduled workout session.`}
+                        </p>
+                      </div>
+
+                      <Switch
+                        id="toggle-rest-day"
+                        checked={isTodayMarkedRest}
+                        disabled={!todayIsActualRestDay}
+                        onCheckedChange={(checked) => {
+                          if (!todayIsActualRestDay) {
+                            toast.error("Rest day marking only works for actual rest days.");
+                            return;
+                          }
+                          toggleManualRestDay(todayKey);
+                          if (checked) {
+                            toast.success("Today marked as a Rest Day. Your streak is protected.");
+                          } else {
+                            toast.info("Rest day marker removed.");
+                          }
+                        }}
+                      />
+                    </div>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-1.5 px-0.5 leading-normal">
+                    Manually marking a rest day prevents accidental streak resets while leaving your workout program untouched.
                   </p>
                 </div>
 

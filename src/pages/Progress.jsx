@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import {
   BarChart,
@@ -23,6 +23,20 @@ import { Card } from '@/components/ui/card';
 import PageHeader from '@/components/layout/PageHeader';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { canAccess } from '@/lib/subscription';
+import { calcStreak } from '@/lib/streakUtils';
+import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
+import { useAppSettings } from '@/lib/AppSettingsContext';
+import {
+  getCachedLogs,
+  setCachedLogs,
+  getCachedProgramsList,
+  setCachedProgramsList,
+  getCachedNutrition,
+  setCachedNutrition,
+  getCachedStreak,
+  setCachedStreak,
+  setCachedLastWorkout,
+} from '@/lib/cacheStore';
 
 function pad(value) {
   return String(value).padStart(2, '0');
@@ -98,25 +112,63 @@ export default function Progress() {
 
   const { data: logs = [] } = useQuery({
     queryKey: ['progress-workout-logs', userKey],
-    queryFn: () =>
-      supabaseApi.entities.WorkoutLog.filter(
+    queryFn: async () => {
+      const res = await supabaseApi.entities.WorkoutLog.filter(
         { created_by: userKey },
         '-date',
         500
-      ),
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedLogs(res, userKey);
+        if (res[0]) {
+          setCachedLastWorkout(res[0], userKey);
+        }
+      }
+      return res;
+    },
+    initialData: () => getCachedLogs(userKey),
+    staleTime: 5 * 60 * 1000,
     enabled: true,
   });
 
   const { data: nutrition = [] } = useQuery({
     queryKey: ['progress-nutrition', userKey],
-    queryFn: () =>
-      supabaseApi.entities.NutritionEntry.filter(
+    queryFn: async () => {
+      const res = await supabaseApi.entities.NutritionEntry.filter(
         { created_by: userKey },
         '-date',
         500
-      ),
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedNutrition(res, userKey);
+      }
+      return res;
+    },
+    initialData: () => getCachedNutrition(userKey),
+    staleTime: 5 * 60 * 1000,
     enabled: true,
   });
+
+  const { data: programs = [] } = useQuery({
+    queryKey: ['progress-programs', userKey],
+    queryFn: async () => {
+      const res = await supabaseApi.entities.WorkoutProgram.filter(
+        { status: 'active' },
+        '-created_at',
+        1
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedProgramsList(res, userKey);
+      }
+      return res;
+    },
+    initialData: () => getCachedProgramsList(userKey),
+    staleTime: 5 * 60 * 1000,
+    enabled: true,
+  });
+
+  const { settings } = useAppSettings() || {};
+  const activeProgram = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
 
   const todayKey = toLocalDateKey();
 
@@ -135,18 +187,16 @@ export default function Progress() {
         .filter(Boolean)
     );
 
-    let streak = 0;
-    let checkDate = todayKey;
+    const calculatedStreak = calcStreak(logs, {
+      user: effectiveUser,
+      program: activeProgram,
+      manualRestDays: settings?.manualRestDays,
+    });
 
-    // A streak can start yesterday if the user has not worked out yet today.
-    if (!workoutDays.has(checkDate)) {
-      checkDate = addDays(checkDate, -1);
-    }
-
-    while (workoutDays.has(checkDate)) {
-      streak += 1;
-      checkDate = addDays(checkDate, -1);
-    }
+    const cachedStreak = getCachedStreak(userKey);
+    const streak = (Array.isArray(logs) && logs.length > 0)
+      ? calculatedStreak
+      : (cachedStreak || calculatedStreak);
 
     return {
       totalWorkouts,
@@ -154,7 +204,14 @@ export default function Progress() {
       streak,
       workoutDays: workoutDays.size,
     };
-  }, [logs, todayKey]);
+  }, [logs, effectiveUser, activeProgram, settings?.manualRestDays, userKey]);
+
+  // Persist positive streak to cache outside of render
+  useEffect(() => {
+    if (stats.streak > 0) {
+      setCachedStreak(stats.streak, userKey);
+    }
+  }, [stats.streak, userKey]);
 
   const weeklyData = useMemo(() => {
     const currentWeekStart = startOfWeek();

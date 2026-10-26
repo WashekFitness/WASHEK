@@ -67,22 +67,87 @@ function getGeminiClient(): GoogleGenAI {
 // API ROUTES & REDIRECTS
 // ------------------------------------------------------------
 
-// Guarantee that returns from Stripe Checkout redirect to washek.ai.studio
-app.use((req, res, next) => {
-  const host = (req.headers.host || req.hostname || '').toLowerCase();
-  if (!host.includes('washek.ai.studio')) {
-    const isSubscriptionReturn = req.path.startsWith('/subscription-return');
-    const hasStripeQuery = req.query && (req.query.session_id || req.query.plan);
-    const referer = String(req.headers.referer || req.headers.referrer || '');
-    const isStripeReferer = referer.includes('stripe.com');
+// ------------------------------------------------------------
+// CHECKOUT & SUBSCRIPTION APIS
+// ------------------------------------------------------------
 
-    if (isSubscriptionReturn || hasStripeQuery || (req.path.startsWith('/profile') && isStripeReferer)) {
-      const originalUrl = req.originalUrl || req.url;
-      console.log(`[Stripe Redirect] Forwarding from ${host} to https://washek.ai.studio${originalUrl}`);
-      return res.redirect(302, `https://washek.ai.studio${originalUrl}`);
+app.post('/api/checkout/process', async (req, res) => {
+  try {
+    const { userId, email, plan, paymentMethod, sessionId } = req.body || {};
+    const validPlans = ['progress', 'performance', 'elite'];
+    const cleanPlan = String(plan || '').toLowerCase().trim();
+
+    if (!validPlans.includes(cleanPlan)) {
+      return res.status(400).json({ success: false, error: 'Invalid subscription plan.' });
     }
+
+    console.log('[API] Processing checkout for:', { userId, email, plan: cleanPlan, paymentMethod });
+
+    // Update Supabase profiles table
+    if (userId || email) {
+      try {
+        let query = supabase.from('profiles').update({
+          subscription_plan: cleanPlan,
+          subscription_status: 'active',
+          subscription_tier: cleanPlan,
+          stripe_price_id: cleanPlan === 'progress' ? 'price_1TTYrbRuQpZftYKRoSyLbQ0c' : cleanPlan === 'performance' ? 'price_1TTYs8RuQpZftYKR8ZzpNg7x' : 'price_1TTYsWRuQpZftYKRKIm8V10E',
+          stripe_subscription_id: sessionId || `sub_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+          subscription_updated_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        });
+
+        if (userId) {
+          query = query.eq('id', userId);
+        } else if (email) {
+          query = query.eq('email', email);
+        }
+        const { error: dbError } = await query;
+        if (dbError) {
+          console.debug('[API] checkout profile update note:', dbError.message);
+        }
+      } catch (dbErr: any) {
+        console.debug('[API] checkout db error note:', dbErr?.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Successfully upgraded to ${cleanPlan.charAt(0).toUpperCase() + cleanPlan.slice(1)} plan!`,
+      plan: cleanPlan,
+      status: 'active',
+    });
+  } catch (err: any) {
+    console.error('[API] checkout error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Failed to process payment' });
   }
-  next();
+});
+
+app.post('/api/create-checkout-session', async (req, res) => {
+  try {
+    const { plan } = req.body || {};
+    const validPlans: Record<string, string> = {
+      progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
+      performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
+      elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
+    };
+
+    const cleanPlan = String(plan || '').toLowerCase().trim();
+    const fallbackUrl = validPlans[cleanPlan];
+
+    if (!fallbackUrl) {
+      return res.status(400).json({ success: false, error: 'Invalid plan' });
+    }
+
+    res.json({
+      success: true,
+      action: 'checkout',
+      url: fallbackUrl,
+      plan: cleanPlan,
+    });
+  } catch (err: any) {
+    console.error('[API] create-checkout-session error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Failed to create checkout' });
+  }
 });
 
 app.get('/api/health', (req, res) => {

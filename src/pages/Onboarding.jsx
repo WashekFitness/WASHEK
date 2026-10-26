@@ -5,9 +5,10 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Sparkles, Dumbbell, Scale, Heart, Wind, PersonStanding, Globe, Loader2 } from 'lucide-react';
+import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Sparkles, Dumbbell, Scale, Heart, Wind, PersonStanding, Globe, Loader2, Lock } from 'lucide-react';
 import { COUNTRIES, LANGUAGES, getCountryDefaults } from '@/lib/countries';
 import { useAppSettings } from '@/lib/AppSettingsContext';
+import { useAuth } from '@/lib/AuthContext';
 import { supabase } from '@/lib/supabase';
 import { supabaseApi, ensureValidUuid } from '@/lib/supabaseApi';
 import { cn } from '@/lib/utils';
@@ -15,6 +16,7 @@ import TrainingTypeSelect from '@/components/onboarding/TrainingTypeSelect';
 import { CALISTHENICS_GOALS, WEIGHT_GOALS, buildWeekPrompt } from '@/lib/trainingTypes';
 import { build12WeekMicrocycles, buildSingleWeekMicrocycle, buildScientificBaselineWeekOne, WEEK_CONFIGS } from '@/lib/periodizationEngine';
 import { sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
+import { useProgramCooldown, recordProgramGenerated } from '@/lib/programCooldown';
 import { toast } from 'sonner';
 
 const levels = [
@@ -153,6 +155,8 @@ function CountrySelect({ value, onChange }) {
 export default function Onboarding() {
   const navigate = useNavigate();
   const { updateSettings } = useAppSettings();
+  const { user } = useAuth();
+  const { isLocked: isProgramLocked, remainingDays: programRemainingDays } = useProgramCooldown(user);
 
   const [step, setStep] = useState(0);
   const [firstName, setFirstName] = useState('');
@@ -260,6 +264,13 @@ export default function Onboarding() {
 
   const handleGenerate = async () => {
     if (loading || generationStartedRef.current) return;
+
+    if (isProgramLocked) {
+      toast.error(
+        `Workout program generation is locked. You can generate a new program in ${programRemainingDays} day${programRemainingDays === 1 ? '' : 's'}.`
+      );
+      return;
+    }
 
     generationStartedRef.current = true;
     setLoading(true);
@@ -690,6 +701,7 @@ export default function Onboarding() {
         );
       }
 
+      recordProgramGenerated();
       await queryClientInstance.invalidateQueries();
 
       // ALL 15 STEPS COMPLETE -> 100%
@@ -1607,11 +1619,19 @@ export default function Onboarding() {
 
               <Button
                 size="lg"
-                className="relative overflow-hidden flex-1 h-14 text-base sm:text-lg font-heading font-semibold transition-all"
-                disabled={!step4Valid || loading}
+                className={cn(
+                  "relative overflow-hidden flex-1 h-14 text-base sm:text-lg font-heading font-semibold transition-all",
+                  isProgramLocked && "cursor-not-allowed opacity-60"
+                )}
+                disabled={!step4Valid || loading || isProgramLocked}
                 onClick={handleGenerate}
               >
-                {loading ? (
+                {isProgramLocked ? (
+                  <div className="flex items-center justify-center gap-2 text-muted-foreground">
+                    <Lock className="w-5 h-5 text-muted-foreground" />
+                    <span>Build My Program (Locked · {programRemainingDays}d)</span>
+                  </div>
+                ) : loading ? (
                   <>
                     {/* Visual progress fill directly inside the button */}
                     <div

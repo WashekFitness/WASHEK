@@ -19,6 +19,11 @@ import {
 } from './firebase';
 import { ensureValidUuid } from './supabaseApi';
 import { isLogo } from './avatarUtils';
+import {
+  getCachedLogs,
+  setCachedLogs,
+  setCachedLastWorkout,
+} from './cacheStore';
 
 /**
  * Normalizes a Firebase User + Firestore doc into a consistent athlete profile
@@ -81,9 +86,11 @@ export function normalizeFirebaseUser(firebaseUser, firestoreData = {}) {
     avatar_url: avatarUrl,
     photo_url: avatarUrl,
     role: firestoreData.role || 'athlete',
-    plan: firestoreData.plan || 'pro',
-    tier: firestoreData.tier || 'pro',
-    subscription_tier: firestoreData.subscription_tier || 'pro',
+    subscription_plan: firestoreData.subscription_plan || firestoreData.plan || firestoreData.tier || 'free',
+    subscription_status: firestoreData.subscription_status || 'active',
+    plan: firestoreData.subscription_plan || firestoreData.plan || 'free',
+    tier: firestoreData.subscription_plan || firestoreData.tier || 'free',
+    subscription_tier: firestoreData.subscription_plan || firestoreData.subscription_tier || 'free',
     target_calories: firestoreData.target_calories || 2600,
     target_protein: firestoreData.target_protein || 190,
     target_carbs: firestoreData.target_carbs || 260,
@@ -275,10 +282,11 @@ export const firebaseApi = {
     },
 
     /**
-     * Save workout log to Firestore
+     * Save workout log to Firestore and local storage caching layer immediately
      */
     saveWorkoutLog: async (workout) => {
       const currentUser = auth.currentUser;
+      const userKey = currentUser?.uid || currentUser?.email || 'athlete';
       if (!currentUser) return workout;
 
       const workoutId = workout.id || `workout_${Date.now()}`;
@@ -290,20 +298,44 @@ export const firebaseApi = {
         updated_at: new Date().toISOString(),
       };
 
+      // Save to local storage caching layer immediately
+      setCachedLastWorkout(dataToSave, userKey);
+      const existingLogs = getCachedLogs(userKey);
+      const updatedLogs = [dataToSave, ...existingLogs.filter((l) => l.id !== workoutId)];
+      setCachedLogs(updatedLogs, userKey);
+
       await setDoc(workoutRef, dataToSave, { merge: true });
       return dataToSave;
     },
 
     /**
-     * Get workout logs for current user
+     * Get workout logs for current user (hydrates from local storage cache immediately while fetching from Firestore)
      */
     getWorkoutLogs: async () => {
       const currentUser = auth.currentUser;
-      if (!currentUser) return [];
+      const userKey = currentUser?.uid || currentUser?.email || 'athlete';
+      const cached = getCachedLogs(userKey);
 
-      const colRef = collection(db, 'users', currentUser.uid, 'workouts');
-      const snap = await getDocs(query(colRef));
-      return snap.docs.map((d) => d.data());
+      if (!currentUser) return cached;
+
+      try {
+        const colRef = collection(db, 'users', currentUser.uid, 'workouts');
+        const snap = await getDocs(query(colRef));
+        const logs = snap.docs.map((d) => d.data());
+        if (logs.length > 0) {
+          logs.sort((a, b) =>
+            String(b.date || b.created_at || '').localeCompare(String(a.date || a.created_at || ''))
+          );
+          setCachedLogs(logs, userKey);
+          if (logs[0]) {
+            setCachedLastWorkout(logs[0], userKey);
+          }
+        }
+        return logs.length > 0 ? logs : cached;
+      } catch (err) {
+        console.debug('[Firestore] getWorkoutLogs fetch note:', err);
+        return cached;
+      }
     },
 
     /**

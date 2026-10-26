@@ -16,6 +16,10 @@
             str = '';
           }
           return (
+            str.indexOf('WebSocket closed without opened') !== -1 ||
+            str.indexOf('[vite]') !== -1 && str.indexOf('WebSocket') !== -1 ||
+            str.indexOf('@vite/client') !== -1 && str.indexOf('WebSocket') !== -1 ||
+            str.indexOf('WebSocket') !== -1 && str.indexOf('ais-dev-') !== -1 ||
             str.indexOf('chrome-extension://') !== -1 ||
             str.indexOf('moz-extension://') !== -1 ||
             str.indexOf('safari-extension://') !== -1 ||

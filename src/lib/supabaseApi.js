@@ -11,6 +11,7 @@ import {
 } from '@/lib/firebase';
 import { getOrCreateUserProfile } from '@/lib/firebaseApi';
 import { isLogo } from '@/lib/avatarUtils';
+import { setCachedLogs, setCachedLastWorkout } from '@/lib/cacheStore';
 
 const MEDIA_BUCKET =
   import.meta.env.VITE_SUPABASE_MEDIA_BUCKET ||
@@ -534,6 +535,10 @@ async function syncToFirestore(table, record, action = 'set') {
       await firestoreDeleteDoc(ref);
     } else {
       await firestoreSetDoc(ref, record, { merge: true });
+      if (table === 'workout_logs') {
+        setCachedLastWorkout(record, fbUser.uid);
+        if (fbUser.email) setCachedLastWorkout(record, fbUser.email);
+      }
     }
   } catch (err) {
     console.debug(`[Firestore] ${table} ${action} note:`, err?.message || err);
@@ -554,7 +559,22 @@ async function fetchFromFirestore(table) {
     if (!subCol) return [];
     const colRef = firestoreCollection(firebaseDb, 'users', fbUser.uid, subCol);
     const snap = await firestoreGetDocs(colRef);
-    return snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const records = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+
+    // Cache fetched workouts to local storage immediately
+    if (table === 'workout_logs' && records.length > 0) {
+      records.sort((a, b) =>
+        String(b.date || b.created_at || '').localeCompare(String(a.date || a.created_at || ''))
+      );
+      setCachedLogs(records, fbUser.uid);
+      if (fbUser.email) setCachedLogs(records, fbUser.email);
+      if (records[0]) {
+        setCachedLastWorkout(records[0], fbUser.uid);
+        if (fbUser.email) setCachedLastWorkout(records[0], fbUser.email);
+      }
+    }
+
+    return records;
   } catch (err) {
     console.debug(`[Firestore] fetch ${table} note:`, err?.message || err);
     return [];

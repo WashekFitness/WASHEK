@@ -1,35 +1,10 @@
+import { useEffect } from 'react';
 import { Card } from '@/components/ui/card';
 import { Flame } from 'lucide-react';
-import {
-  getLocalDateKey,
-  getPreviousLocalDateKey,
-  getUserTimeZone,
-} from '@/lib/dateUtils';
-
-function daysDifference(dateKeyA, dateKeyB) {
-  const [yA, mA, dA] = String(dateKeyA).split('-').map(Number);
-  const [yB, mB, dB] = String(dateKeyB).split('-').map(Number);
-  const utcA = Date.UTC(yA, mA - 1, dA);
-  const utcB = Date.UTC(yB, mB - 1, dB);
-  return Math.round((utcA - utcB) / 86400000);
-}
-
-function calcStreak(logs, timeZone) {
-  if (!logs || logs.length === 0) return 0;
-  const dates = [...new Set(logs.map(l => l.date).filter(Boolean))].sort((a, b) => b.localeCompare(a));
-  const today = getLocalDateKey(new Date(), timeZone);
-  const yesterday = getPreviousLocalDateKey(new Date(), timeZone);
-
-  if (dates[0] !== today && dates[0] !== yesterday) return 0;
-
-  let streak = 1;
-  for (let i = 1; i < dates.length; i++) {
-    const diff = daysDifference(dates[i - 1], dates[i]);
-    if (diff === 1) streak++;
-    else break;
-  }
-  return streak;
-}
+import { getUserTimeZone } from '@/lib/dateUtils';
+import { calcStreak } from '@/lib/streakUtils';
+import { useAppSettings } from '@/lib/AppSettingsContext';
+import { getCachedStreak, setCachedStreak } from '@/lib/cacheStore';
 
 const encouragements = [
   "You're just getting warmed up. 🔥",
@@ -42,9 +17,30 @@ const encouragements = [
   "That momentum is yours. Don't let it drop.",
 ];
 
-export default function StreakCard({ logs, user, timeZone }) {
+export default function StreakCard({ logs, user, timeZone, program }) {
+  const { settings } = useAppSettings() || {};
   const effectiveTz = timeZone || getUserTimeZone(user);
-  const streak = calcStreak(logs, effectiveTz);
+  const userKey = user?.email || user?.id || 'athlete';
+
+  const calculatedStreak = calcStreak(logs, {
+    user,
+    timeZone: effectiveTz,
+    program,
+    manualRestDays: settings?.manualRestDays,
+  });
+
+  // Display cached streak immediately from local storage while fresh data is being fetched from Firestore
+  const cachedStreak = getCachedStreak(userKey);
+  const streak = (Array.isArray(logs) && logs.length > 0)
+    ? calculatedStreak
+    : (cachedStreak || calculatedStreak);
+
+  useEffect(() => {
+    if (calculatedStreak > 0) {
+      setCachedStreak(calculatedStreak, userKey);
+    }
+  }, [calculatedStreak, userKey]);
+
   const msg = encouragements[streak % encouragements.length];
 
   if (streak === 0) return null;

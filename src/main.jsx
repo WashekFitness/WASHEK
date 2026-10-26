@@ -15,6 +15,10 @@ if (typeof window !== 'undefined') {
       str = '';
     }
     return (
+      str.includes('WebSocket closed without opened') ||
+      (str.includes('[vite]') && str.includes('WebSocket')) ||
+      (str.includes('@vite/client') && str.includes('WebSocket')) ||
+      (str.includes('WebSocket') && str.includes('ais-dev-')) ||
       str.includes('chrome-extension://') ||
       str.includes('moz-extension://') ||
       str.includes('safari-extension://') ||

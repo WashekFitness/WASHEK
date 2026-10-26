@@ -33,26 +33,70 @@ import { getLocalDateKey } from '@/lib/dateUtils';
 import { triggerHaptic } from '@/lib/haptics';
 import { playRestCompleteCue } from '@/lib/audioCue';
 
-// ─── Timer ─────────────────────────────────────────────
+// ─── Timer (Wall-clock powered to count accurately in background) ───
 function useTimer() {
   const [seconds, setSeconds] = useState(0);
   const [running, setRunning] = useState(false);
-  const ref = useRef(null);
+  const startTimeRef = useRef(null);
+  const accumulatedMsRef = useRef(0);
+  const intervalRef = useRef(null);
+
+  // Synchronize elapsed seconds with true wall-clock time
+  const syncElapsed = () => {
+    let totalMs = accumulatedMsRef.current;
+    if (startTimeRef.current !== null) {
+      totalMs += (Date.now() - startTimeRef.current);
+    }
+    const totalSecs = Math.max(0, Math.floor(totalMs / 1000));
+    setSeconds(totalSecs);
+    return totalSecs;
+  };
 
   useEffect(() => {
     if (running) {
-      ref.current = setInterval(() => setSeconds(s => s + 1), 1000);
-    } else {
-      clearInterval(ref.current);
-    }
+      if (startTimeRef.current === null) {
+        startTimeRef.current = Date.now();
+      }
+      syncElapsed();
 
-    return () => clearInterval(ref.current);
+      // Frequent interval while app is in foreground
+      intervalRef.current = setInterval(syncElapsed, 500);
+
+      // Instantly sync when returning from another app or unlocking phone
+      const handleActive = () => {
+        syncElapsed();
+      };
+
+      document.addEventListener('visibilitychange', handleActive);
+      window.addEventListener('focus', handleActive);
+      window.addEventListener('pageshow', handleActive);
+
+      return () => {
+        clearInterval(intervalRef.current);
+        document.removeEventListener('visibilitychange', handleActive);
+        window.removeEventListener('focus', handleActive);
+        window.removeEventListener('pageshow', handleActive);
+      };
+    } else {
+      if (startTimeRef.current !== null) {
+        accumulatedMsRef.current += (Date.now() - startTimeRef.current);
+        startTimeRef.current = null;
+      }
+      clearInterval(intervalRef.current);
+      syncElapsed();
+    }
   }, [running]);
+
+  const reset = () => {
+    startTimeRef.current = null;
+    accumulatedMsRef.current = 0;
+    setSeconds(0);
+  };
 
   const fmt = (s) =>
     `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
 
-  return { seconds, running, setRunning, fmt };
+  return { seconds, running, setRunning, reset, fmt };
 }
 
 function RestTimer({ seconds: restSecs, onDone }) {
@@ -1027,6 +1071,7 @@ export default function LiveWorkout() {
     seconds,
     running,
     setRunning,
+    reset: resetTimer,
     fmt,
   } = useTimer();
 
@@ -1602,6 +1647,7 @@ export default function LiveWorkout() {
               <Button
                 className="w-full h-12 font-heading font-semibold mt-3"
                 onClick={() => {
+                  resetTimer();
                   setStarted(true);
                   setRunning(true);
                 }}
