@@ -1,9 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabaseApi } from '@/lib/supabaseApi';
+import { useAuth } from '@/lib/AuthContext';
 import { canAccess } from '@/lib/subscription';
 import { applyPostWorkoutAdaptation } from '@/lib/periodizationEngine';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
+import { getCachedActiveProgram, getCachedProgramsList, setCachedProgramsList } from '@/lib/cacheStore';
+import DynamicWarmupModal from '@/components/workout/DynamicWarmupModal';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
@@ -25,6 +28,7 @@ import {
   RotateCcw,
   Lock,
   MessageSquare,
+  Flame,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppSettings } from '@/lib/AppSettingsContext';
@@ -1075,7 +1079,21 @@ export default function LiveWorkout() {
     fmt,
   } = useTimer();
 
-  const [user, setUser] = useState(null);
+  const { user: authUser } = useAuth() || {};
+  const [user, setUser] = useState(() => {
+    try {
+      const stored = localStorage.getItem('washek_user');
+      return stored ? JSON.parse(stored) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const effectiveUser = user || authUser;
+  const userKey = effectiveUser?.id || effectiveUser?.email || 'guest';
+
+  const [showWarmupModal, setShowWarmupModal] = useState(false);
+  const [warmupCompleted, setWarmupCompleted] = useState(false);
 
   const [dayIndex, setDayIndex] = useState(0);
   const [exIndex, setExIndex] = useState(0);
@@ -1142,13 +1160,31 @@ export default function LiveWorkout() {
   }, [workoutDone, navigate]);
 
   const { data: programs = [] } = useQuery({
-    queryKey: ['programs'],
-    queryFn: () =>
-      supabaseApi.entities.WorkoutProgram.filter(
+    queryKey: ['programs', userKey],
+    queryFn: async () => {
+      // 1. Try active programs
+      let res = await supabaseApi.entities.WorkoutProgram.filter(
         { status: 'active' },
-        '-created_date',
-        1
-      ),
+        '-created_at',
+        5
+      );
+      // 2. Resilient fallback if status is missing or different
+      if (!Array.isArray(res) || res.length === 0) {
+        res = await supabaseApi.entities.WorkoutProgram.filter(
+          {},
+          '-created_at',
+          5
+        );
+      }
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedProgramsList(res, userKey);
+        return res;
+      }
+      const cached = getCachedProgramsList(userKey);
+      return cached.length ? cached : [];
+    },
+    initialData: () => getCachedProgramsList(userKey),
+    staleTime: 5 * 60 * 1000,
   });
 
   const logMutation = useMutation({
@@ -1237,7 +1273,13 @@ export default function LiveWorkout() {
       }),
   });
 
-  const program = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
+  const activeProgram =
+    programs.find((p) => p.status === 'active') ||
+    programs[0] ||
+    getCachedActiveProgram(userKey) ||
+    null;
+
+  const program = activeProgram ? normalizeWorkoutProgram(activeProgram) : null;
 
   const currentWeekNum =
     program?.current_week || 1;
@@ -1644,16 +1686,35 @@ export default function LiveWorkout() {
                 </div>
               )}
 
-              <Button
-                className="w-full h-12 font-heading font-semibold mt-3"
-                onClick={() => {
-                  resetTimer();
-                  setStarted(true);
-                  setRunning(true);
-                }}
-              >
-                Start Workout
-              </Button>
+              <div className="space-y-2.5 mt-4">
+                {warmupCompleted ? (
+                  <div className="flex items-center justify-center gap-2 py-2 px-3 rounded-xl bg-primary/10 border border-primary/20 text-xs font-semibold text-primary">
+                    <CheckCircle2 className="w-4 h-4 text-primary" />
+                    <span>Dynamic Warmup Completed · Joints Primed</span>
+                  </div>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setShowWarmupModal(true)}
+                    className="w-full h-11 border-primary/40 bg-primary/5 hover:bg-primary/10 text-primary font-heading font-semibold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all shadow-xs"
+                  >
+                    <Flame className="w-4 h-4 text-primary animate-pulse" />
+                    <span>Dynamic Warmup (3–5 min) · Injury Prevention</span>
+                  </Button>
+                )}
+
+                <Button
+                  className="w-full h-12 font-heading font-semibold"
+                  onClick={() => {
+                    resetTimer();
+                    setStarted(true);
+                    setRunning(true);
+                  }}
+                >
+                  Start Workout
+                </Button>
+              </div>
             </Card>
           )}
 
@@ -1957,6 +2018,21 @@ export default function LiveWorkout() {
           />
         </TabsContent>
       </Tabs>
+
+      {/* Dynamic Warmup Routine Generator (Optional injury prevention step) */}
+      <DynamicWarmupModal
+        isOpen={showWarmupModal}
+        onClose={() => setShowWarmupModal(false)}
+        dayName={day?.day_name || 'Workout'}
+        workoutType={day?.workout_type || program?.training_type || 'Strength'}
+        exercises={exercises}
+        onStartWorkout={() => {
+          setWarmupCompleted(true);
+          resetTimer();
+          setStarted(true);
+          setRunning(true);
+        }}
+      />
     </div>
   );
 }

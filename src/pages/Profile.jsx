@@ -343,20 +343,21 @@ export default function Profile() {
   const activeProgram =
     programs[0];
 
+  // Resolve subscription status
+  const currentSubStatus = String(
+    user?.subscription_status ||
+    (() => {
+      try {
+        return localStorage.getItem('washek_subscription_status') || '';
+      } catch {
+        return '';
+      }
+    })()
+  ).toLowerCase().trim();
+
   // Resolve plan with local storage and cloud overrides to ensure immediate reflection
   const plan = (() => {
-    const status = String(
-      user?.subscription_status ||
-      (() => {
-        try {
-          return localStorage.getItem('washek_subscription_status') || '';
-        } catch {
-          return '';
-        }
-      })()
-    ).toLowerCase().trim();
-
-    if (status === 'canceled' || status === 'cancelled' || status === 'inactive') {
+    if (currentSubStatus === 'canceled' || currentSubStatus === 'cancelled' || currentSubStatus === 'inactive') {
       return 'free';
     }
 

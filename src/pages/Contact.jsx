@@ -7,6 +7,7 @@ import {
   ArrowLeft,
   Mail,
   Send,
+  CheckCircle2,
 } from 'lucide-react';
 
 import {
@@ -49,6 +50,11 @@ export default function Contact() {
   const [
     submitting,
     setSubmitting,
+  ] = useState(false);
+
+  const [
+    sentSuccess,
+    setSentSuccess,
   ] = useState(false);
 
 
@@ -140,6 +146,8 @@ export default function Contact() {
           email: '',
           message: '',
         });
+
+        setSentSuccess(true);
 
         toast({
           title:
@@ -561,6 +569,16 @@ export default function Contact() {
             )}
 
           </Button>
+
+          {sentSuccess && (
+            <div className="p-3.5 rounded-xl border border-emerald-500/30 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 flex items-start gap-2.5 text-xs animate-in fade-in slide-in-from-bottom-2">
+              <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5" />
+              <div>
+                <p className="font-semibold text-sm">Message sent</p>
+                <p className="mt-0.5 text-muted-foreground">Thank you for reaching out — we will get back to you as soon as possible.</p>
+              </div>
+            </div>
+          )}
 
         </form>
 

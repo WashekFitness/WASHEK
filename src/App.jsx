@@ -63,6 +63,9 @@ const Progress = lazyWithRetry(() => import('@/pages/Progress'));
 const Kael = lazyWithRetry(() => import('@/pages/Kael'));
 const ProgressPhotos = lazyWithRetry(() => import('@/pages/ProgressPhotos'));
 const FormLab = lazyWithRetry(() => import('@/pages/FormLab'));
+const MuscleHeatmapPage = lazyWithRetry(
+  () => import('@/pages/MuscleHeatmapPage')
+);
 const ProgramDay = lazyWithRetry(() => import('@/pages/ProgramDay'));
 const LiveWorkout = lazyWithRetry(() => import('@/pages/LiveWorkout'));
 const SubscriptionReturn = lazyWithRetry(
@@ -156,6 +159,8 @@ function AuthenticatedApp() {
               <Route path="/photos" element={<ProgressPhotos />} />
 
               <Route path="/formlab" element={<FormLab />} />
+              <Route path="/muscle-heatmap" element={<MuscleHeatmapPage />} />
+              <Route path="/heatmap" element={<Navigate to="/muscle-heatmap" replace />} />
 
               <Route path="/about" element={<About />} />
 

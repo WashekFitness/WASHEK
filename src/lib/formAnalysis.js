@@ -64,6 +64,53 @@ export const FORM_EXERCISES = [
   { name: 'Other / Custom', category: 'dynamic' },
 ];
 
+// ── Check if an exercise is a static isometric hold ──────────
+
+export function isStaticHoldExercise(exerciseName = '', category = '') {
+  if (category === 'hold') return true;
+  if (!exerciseName || typeof exerciseName !== 'string') return false;
+  const normalized = exerciseName.trim().toLowerCase();
+
+  const found = FORM_EXERCISES.find((e) => e.name.toLowerCase() === normalized);
+  if (found) return found.category === 'hold';
+
+  // Specific dynamic movements that contain static words (e.g. "push-up", "raise")
+  const dynamicDisqualifiers = [
+    'push-up',
+    'pushup',
+    'push up',
+    'press',
+    'dip',
+    'pull-up',
+    'pullup',
+    'pull up',
+    'raise',
+    'curl',
+    'squat',
+    'row',
+  ];
+  if (dynamicDisqualifiers.some((d) => normalized.includes(d))) {
+    return false;
+  }
+
+  // Common static isometric hold identifiers
+  const staticPatterns = [
+    'hold',
+    'hang',
+    'l-sit',
+    'lsit',
+    'v-sit',
+    'vsit',
+    'manna',
+    'flag',
+    'lever',
+    'planche',
+    'handstand',
+  ];
+
+  return staticPatterns.some((p) => normalized.includes(p));
+}
+
 // ── Check if a training type includes calisthenics ──────────
 
 export function hasCalisthenics(
@@ -235,6 +282,179 @@ export function computeKinematicMetrics(
   };
 }
 
+// ── Frame-skipping algorithm: prioritize key movement phases ──────────
+
+export function prioritizeKeyframeIndices(
+  samples,
+  category = 'dynamic',
+  windowDuration = 10,
+  targetCount = 14
+) {
+  if (!Array.isArray(samples) || samples.length <= targetCount) {
+    return (samples || []).map((s, idx) => ({
+      sampleIndex: idx,
+      keyframeNumber: idx + 1,
+      timestamp: s.timestamp,
+      phase: s.phase || (idx === 0 ? 'Movement Setup / Initiation' : idx === samples.length - 1 ? 'Final Rep Completion' : 'Movement Phase'),
+      priority: 100,
+    }));
+  }
+
+  const n = samples.length;
+  const smoothedY = [];
+  const smoothedEnergy = [];
+
+  for (let i = 0; i < n; i++) {
+    const prev = samples[Math.max(0, i - 1)];
+    const curr = samples[i];
+    const next = samples[Math.min(n - 1, i + 1)];
+
+    smoothedY.push(
+      (prev.verticalCentroid + curr.verticalCentroid * 2 + next.verticalCentroid) / 4
+    );
+    smoothedEnergy.push(
+      (prev.motionEnergy + curr.motionEnergy * 2 + next.motionEnergy) / 4
+    );
+  }
+
+  const avgY = smoothedY.reduce((a, b) => a + b, 0) / n;
+  const varianceY = smoothedY.reduce((acc, val) => acc + Math.pow(val - avgY, 2), 0) / n;
+  const stdY = Math.sqrt(varianceY);
+  const avgEnergy = smoothedEnergy.reduce((a, b) => a + b, 0) / n;
+
+  const keyframeMap = new Map(); // index -> { priority, phase }
+
+  // 1. Always prioritize movement boundaries
+  keyframeMap.set(0, { priority: 95, phase: 'Movement Setup / Initiation' });
+  keyframeMap.set(n - 1, { priority: 95, phase: 'Final Rep Lockout / Completion' });
+
+  if (category === 'hold') {
+    // Static isometric holds:
+    const stabilityThreshold = Math.max(0.015, avgEnergy * 0.85);
+    let holdIndices = [];
+    for (let i = 0; i < n; i++) {
+      if (smoothedEnergy[i] <= stabilityThreshold) {
+        holdIndices.push(i);
+      }
+    }
+    if (holdIndices.length < 3) {
+      holdIndices = samples.map((_, i) => i);
+    }
+
+    const entryIdx = holdIndices[0];
+    keyframeMap.set(entryIdx, { priority: 100, phase: 'Hold Entry & Stabilization' });
+
+    const exitIdx = holdIndices[holdIndices.length - 1];
+    keyframeMap.set(exitIdx, { priority: 100, phase: 'Hold Exit / Dismount' });
+
+    // Pick evenly spaced hold anchors across the stable window
+    const internalSlots = Math.max(4, targetCount - 4);
+    for (let s = 1; s <= internalSlots; s++) {
+      const ratio = s / (internalSlots + 1);
+      const chosenIdx = holdIndices[Math.floor(ratio * (holdIndices.length - 1))];
+      if (chosenIdx !== undefined && !keyframeMap.has(chosenIdx)) {
+        keyframeMap.set(chosenIdx, {
+          priority: 85,
+          phase: `Hold Stability Anchor (${samples[chosenIdx].timestamp.toFixed(1)}s)`,
+        });
+      }
+    }
+  } else {
+    // Dynamic movements:
+    let repCount = 0;
+
+    for (let i = 1; i < n - 1; i++) {
+      const isLocalMax = smoothedY[i] > smoothedY[i - 1] && smoothedY[i] >= smoothedY[i + 1];
+      const isLocalMin = smoothedY[i] < smoothedY[i - 1] && smoothedY[i] <= smoothedY[i + 1];
+
+      // Turnaround inflection points (depth bottom or peak contraction)
+      if (isLocalMax && (Math.abs(smoothedY[i] - avgY) > stdY * 0.25 || smoothedEnergy[i] > avgEnergy * 0.4)) {
+        repCount++;
+        keyframeMap.set(i, {
+          priority: 100, // Never skip inflection points!
+          phase: `Inflection Point / Turnaround (Rep ${repCount})`,
+        });
+      }
+
+      // Lockout / extension inflection points
+      if (isLocalMin && (Math.abs(smoothedY[i] - avgY) > stdY * 0.25 || smoothedEnergy[i] > avgEnergy * 0.4)) {
+        keyframeMap.set(i, {
+          priority: 100, // Never skip inflection points!
+          phase: `Concentric Lockout / Extension (Rep ${Math.max(1, repCount)})`,
+        });
+      }
+    }
+
+    // Velocity reversals for subtle or partial range reps
+    for (let i = 2; i < n - 2; i++) {
+      if (keyframeMap.has(i)) continue;
+      const vPrev = smoothedY[i] - smoothedY[i - 1];
+      const vNext = smoothedY[i + 1] - smoothedY[i];
+      if (vPrev * vNext < 0 && Math.abs(vPrev - vNext) > stdY * 0.15) {
+        repCount++;
+        keyframeMap.set(i, {
+          priority: 90,
+          phase: `Phase Reversal / Turnaround (Rep ${Math.max(1, repCount)})`,
+        });
+      }
+    }
+
+    // Mid-phase transition frames to capture body alignment and range of motion path
+    const selectedSorted = Array.from(keyframeMap.keys()).sort((a, b) => a - b);
+    for (let g = 0; g < selectedSorted.length - 1; g++) {
+      const idxA = selectedSorted[g];
+      const idxB = selectedSorted[g + 1];
+      if (idxB - idxA >= 3) {
+        const mid = Math.round((idxA + idxB) / 2);
+        if (!keyframeMap.has(mid)) {
+          keyframeMap.set(mid, {
+            priority: 70,
+            phase: 'Movement Transition / Path of Motion',
+          });
+        }
+      }
+    }
+  }
+
+  // If fewer than targetCount, fill with highest motion energy candidate frames
+  if (keyframeMap.size < targetCount) {
+    const candidates = [];
+    for (let i = 0; i < n; i++) {
+      if (!keyframeMap.has(i)) {
+        const score = smoothedEnergy[i] + (Math.abs(smoothedY[i] - avgY) / (stdY || 1)) * 0.1;
+        candidates.push({ index: i, score });
+      }
+    }
+    candidates.sort((a, b) => b.score - a.score);
+    for (const cand of candidates) {
+      if (keyframeMap.size >= targetCount) break;
+      keyframeMap.set(cand.index, {
+        priority: 50,
+        phase: 'Movement Transition',
+      });
+    }
+  }
+
+  // If more than targetCount + 2, prune lowest-priority frames first (never prune priority >= 90)
+  if (keyframeMap.size > targetCount + 2) {
+    const entries = Array.from(keyframeMap.entries()).sort((a, b) => a[1].priority - b[1].priority);
+    for (const [idx, data] of entries) {
+      if (keyframeMap.size <= targetCount) break;
+      if (data.priority >= 90) continue; // Never skip inflection points or anchors!
+      keyframeMap.delete(idx);
+    }
+  }
+
+  const finalIndices = Array.from(keyframeMap.keys()).sort((a, b) => a - b);
+  return finalIndices.map((sampleIdx, keyframeNum) => ({
+    sampleIndex: sampleIdx,
+    keyframeNumber: keyframeNum + 1,
+    timestamp: samples[sampleIdx].timestamp,
+    phase: keyframeMap.get(sampleIdx).phase,
+    priority: keyframeMap.get(sampleIdx).priority,
+  }));
+}
+
 // ── Build the expert AI prompt for form analysis ───────────
 
 export function buildFormAnalysisPrompt(
@@ -361,21 +581,19 @@ CRITICAL SCOPING RULE:
 Count reps and measure hold times STRICTLY AND ONLY within this analyzed section.
 Do not count any repetitions or setup movements that occurred before ${trimStart != null ? trimStart.toFixed(2) + 's' : '0.00s'} or after ${trimEnd != null ? trimEnd.toFixed(2) + 's' : 'end of video'}.
 
-DYNAMIC REP COUNTING RULES:
-- ACCURACY IS CRITICAL: You must accurately and strictly count every single completed repetition inside this analyzed section.
-- If the athlete performs 10 reps in this section, you must count exactly 10 reps.
-- Track every full movement cycle (initiation / eccentric descent -> turnaround/depth inflection -> concentric ascent -> lockout/reset).
-- Count each completed repetition that reaches acceptable range of motion.
-- Look across all the chronological frames from first frame to last frame to tally each completed rep.
-- Set "rep_count" to the exact integer of completed reps (e.g., 10). Set "hold_time_seconds" to null.
+DYNAMIC REP COUNTING RULES (NEVER TAKE AWAY OR DROP REPS):
+- THE REP COUNTER MUST BE 100% REAL & EXACT: Do not guess, do not add phantom reps, and NEVER take away valid reps.
+- COUNT EVERY ATTEMPTED REPETITION: Count all repetitions the athlete performs in the analyzed window from the very first rep to the very last rep.
+- DO NOT DISQUALIFY REPS FOR FORM FLAWS: If a repetition has cut depth, partial range of motion, soft lockout, slight momentum, or technique breakdown near fatigue, IT STILL FULLY COUNTS AS A REP! A repetition is counted whenever the user initiates and reverses the movement (e.g. descends and presses back up, or pulls and lowers). Form flaws reduce the form score; they NEVER subtract from the rep count!
+- COUNT FIRST AND LAST REPS: Count the initial rep (even if fast or setting up) and count the final rep (even if reaching muscular failure).
+- Set "rep_count" to the exact total integer count of all repetitions performed.
+- Set "hold_time_seconds": null.
 
-STATIC ISOMETRIC HOLD RULES:
-- ACCURACY IS CRITICAL: Hold times must be spot-on in seconds strictly within the analyzed section.
-- Identify the exact timestamp when the athlete locks into the target isometric shape.
-- Identify the exact timestamp when the athlete breaks form, sags, drops, or when the analyzed section ends.
-- Calculate hold duration: hold_time_seconds = (end_timestamp - start_timestamp).
-- The hold time MUST be spot-on (e.g., 8.5 or 12.0) and CANNOT exceed the analyzed section duration (${trimStart != null && trimEnd != null ? (trimEnd - trimStart).toFixed(2) + 's' : 'window duration'}).
-- Set "hold_time_seconds" to the exact hold duration in seconds. Set "rep_count" to null.
+STATIC ISOMETRIC HOLD RULES (REAL HOLD DURATION):
+- NEVER COUNT REPS FOR STATIC HOLDS: For any static isometric hold (Planche, Front/Back Lever, L-Sit, V-Sit, Handstand, Dead Hang, Human Flag, etc.), do NOT count repetitions under any circumstances. Set "rep_count": null.
+- Measure the full continuous hold duration in seconds strictly within the analyzed section from the moment the athlete stabilizes in the hold until they completely drop, dismount, or touch down.
+- Minor wobbles, balance micro-adjustments, or slight form sagging DO NOT terminate the hold timer — the timer continues until the athlete actually drops or exits the hold. Form imperfections affect the form score, NOT the hold time duration.
+- Set "hold_time_seconds": number (e.g. 8.5 or 12.0). Set "rep_count" strictly to null.
 
 ============================================================
 3. ACTIVE RANGE
@@ -386,23 +604,28 @@ Estimate:
 - active_range_end (the second within the analyzed window where the final rep finishes or hold drops)
 
 ============================================================
-4. FORM SCORE (FAIR & ACCURATE RATING SYSTEM)
+4. FORM SCORE (REAL SCORE FROM 1%-100% — ABSOLUTELY NO SUGARCOATING)
 ============================================================
 
-Give an overall form score from 1-100.
+Give an overall form score from 1 to 100.
 
-Provide a balanced, objective, and FAIR rating. Do NOT be unrealistically harsh or give a low score if the athlete has not actually messed up their form:
-
-- 90–100: Exceptional technique. Clean alignment, strong stability, full range of motion, and textbook mechanics with no noticeable flaws.
-- 80–89: Solid, good form. Safe, technically sound execution with proper joint tracking and control. Only minor nuances or slight fatigue indicators. If the athlete performed the movement well without messing up their form, they deserve a rating in this 80-89 range.
-- 70–79: Decent execution with moderate technique points to refine. The movement is functional and safe, but there are clear areas for improvement (e.g., slight knee cave, minor spinal shift, early elbow flare, or slight momentum).
-- 55–69: Inconsistent form with noticeable breakdown that impairs movement efficiency or increases injury risk.
-- Below 55: Significant breakdown or severe form collapse.
-
-SCORING PRINCIPLES:
-- Be fair and objective: Reward good mechanics, stability, and control with solid scores (80+).
-- Differentiate between natural anatomical variations (e.g. torso-to-femur ratios, arm span, individual stance width) versus actual mechanical breakdown.
-- Deduct points ONLY for actual visible flaws clearly supported by the frames. Never invent issues or penalize an athlete whose movement is clean and safe.
+SCORING ACCURACY & TRUTH MANDATE (TELL LITERALLY EVERYTHING WRONG — NEVER SUGARCOAT):
+- The rating must be REAL, accurate, and completely honest. Stop sugarcoating. If form is bad or dangerous, TELL LITERALLY EVERYTHING WRONG WITH THE FORM. Bad or dangerous form is dangerous and must NEVER be scored high or sugarcoated to spare feelings.
+- Score anywhere from 1% to 100% based on honest reality:
+  * 1–20%: Dangerous or hazardous execution with high injury risk (e.g., collapsing lumbar spine under load, severe shoulder impingement shearing, uncontrolled dropping/falling).
+  * 20–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging, worming push-ups, heavy kipping/swinging, cutting half the range of motion, severe asymmetry, collapsed core tension).
+  * 45–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM, flared elbows >60°, uncontrolled eccentric cadence, soft lockout).
+  * 70–84%: Acceptable or moderate execution with clear technical flaws to fix.
+  * 85–94%: High-level execution with 1 minor technical refinement.
+  * 95–100%: Rare, flawless, gymnastics-grade textbook execution with full range of motion, locked body tension, and zero complaints.
+- Deductions:
+  * Minor tip: -5 to -8 pts
+  * Moderate flaw: -15 to -20 pts
+  * Major breakdown: -30 to -45 pts
+  * Critical safety hazard: -50 to -80 pts
+- If there are critical or dangerous flaws, the score MUST drop into the 1% to 25% range!
+- Multiple major flaws MUST drop the score into the 20s–40s range.
+- Deduct points for all actual visible flaws supported by the frames. Be direct, clear, and unvarnished.
 
 ============================================================
 5. JOINT POSITION
@@ -526,9 +749,11 @@ PUSH-UP:
 
 Identify only REAL, meaningful issues supported by the frames.
 
-If the movement was performed cleanly with good mechanics, it is completely acceptable to return an empty issues list [] or list only 1 subtle refinement. Do not manufacture problems or penalize the athlete if their technique is sound.
+CRITICAL ZERO COMPLAINTS RULE:
+If the movement was performed cleanly with textbook mechanics and you have no complaints or flaws to report, you MUST return an empty issues list: "issues": [].
+Do NOT manufacture fake problems or invent minor nitpicks if the athlete executed clean, safe form.
 
-For each issue (if any):
+For each issue (if any real breakdown exists):
 
 - area
 - problem
@@ -549,22 +774,17 @@ Corrective exercises should be specific to the identified problem.
 12. PRIORITY FOCUS
 ============================================================
 
-List the top 2-3 corrections in priority order.
-
-Focus on the corrections that would produce the largest improvement in safe, technically sound performance.
+If issues were found, list the top 1-3 actionable corrections in priority order.
+If the form was clean and textbook with no complaints (score is 100%), set:
+"priority_focus": ["Maintain this textbook form and joint alignment as you increase volume."]
 
 ============================================================
 13. OVERALL ASSESSMENT
 ============================================================
 
-Give a direct 3-5 sentence coaching summary.
-
-Explain:
-
-- what looks good
-- what needs improvement
-- the most important correction
-- any important safety issue
+Give a direct 3-5 sentence coaching summary that accurately matches the score and issues.
+- If the score is 100% (zero complaints): celebrate their flawless execution and praise their alignment, joint tracking, and control.
+- If issues exist: explain what looked good, what specific flaw needs refinement, and the single most important correction.
 
 ============================================================
 OUTPUT
@@ -577,8 +797,16 @@ Use exactly this structure:
 {
   "camera_angle_ok": true,
   "camera_angle_note": "string",
-  "score": 1,
+  "score": 88,
   "rep_count": null,
+  "rep_breakdown": [
+    {
+      "rep": 1,
+      "start_time_s": 0.0,
+      "inflection_time_s": 1.2,
+      "completion_time_s": 2.1
+    }
+  ],
   "hold_time_seconds": null,
   "active_range_start": null,
   "active_range_end": null,

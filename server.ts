@@ -1,7 +1,7 @@
 import express from 'express';
 import path from 'path';
 import { createServer as createViteServer } from 'vite';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 
 const app = express();
@@ -73,7 +73,7 @@ function getGeminiClient(): GoogleGenAI {
 
 app.post('/api/checkout/process', async (req, res) => {
   try {
-    const { userId, email, plan, paymentMethod, sessionId } = req.body || {};
+    const { userId, email, plan, paymentMethod, sessionId, status } = req.body || {};
     const validPlans = ['progress', 'performance', 'elite'];
     const cleanPlan = String(plan || '').toLowerCase().trim();
 
@@ -81,14 +81,16 @@ app.post('/api/checkout/process', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Invalid subscription plan.' });
     }
 
-    console.log('[API] Processing checkout for:', { userId, email, plan: cleanPlan, paymentMethod });
+    const cleanStatus = status === 'active' ? 'active' : 'trialing';
+
+    console.log('[API] Processing checkout for:', { userId, email, plan: cleanPlan, status: cleanStatus, paymentMethod });
 
     // Update Supabase profiles table
     if (userId || email) {
       try {
         let query = supabase.from('profiles').update({
           subscription_plan: cleanPlan,
-          subscription_status: 'active',
+          subscription_status: cleanStatus,
           subscription_tier: cleanPlan,
           stripe_price_id: cleanPlan === 'progress' ? 'price_1TTYrbRuQpZftYKRoSyLbQ0c' : cleanPlan === 'performance' ? 'price_1TTYs8RuQpZftYKR8ZzpNg7x' : 'price_1TTYsWRuQpZftYKRKIm8V10E',
           stripe_subscription_id: sessionId || `sub_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
@@ -112,9 +114,9 @@ app.post('/api/checkout/process', async (req, res) => {
 
     res.json({
       success: true,
-      message: `Successfully upgraded to ${cleanPlan.charAt(0).toUpperCase() + cleanPlan.slice(1)} plan!`,
+      message: `Successfully activated ${cleanPlan.charAt(0).toUpperCase() + cleanPlan.slice(1)} plan!`,
       plan: cleanPlan,
-      status: 'active',
+      status: cleanStatus,
     });
   } catch (err: any) {
     console.error('[API] checkout error:', err);
@@ -201,15 +203,15 @@ app.post('/api/cancel-subscription', async (req, res) => {
 
 const SYSTEM_INSTRUCTIONS: Record<string, string> = {
   kael: 'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. You are direct, scientifically grounded, encouraging, and focused on progressive overload, proper form, recovery, and nutrition. Always communicate in simple, everyday language that any beginner can easily understand, without confusing textbook jargon. Use intuitive real-world analogies when helpful to make concepts click, but never talk down to the athlete or sound like you are explaining things to a baby. Maintain a mature, supportive, and practical coaching presence.',
-  structure: 'You are an elite strength & conditioning program architect for WASHEK. Design workout structures and weekly splits tailored to the athlete goals. Return a single, strictly valid JSON object matching the requested schema.',
-  microcycle: 'You are an elite strength & conditioning program architect for WASHEK. Build comprehensive, progressive workout programming for the microcycle with days, exercise sequences, sets, reps, rest intervals, notes, and activation cues. Return a single valid JSON object with the "microcycle" key adhering to the requested schema.',
-  form_analysis: 'You are an expert biomechanist and strength coach for WASHEK Form Lab. Analyze the user exercise execution from the provided images or video frames. CRITICAL ACCURACY MANDATE: For rep-based exercises, accurately count every completed repetition ONLY WITHIN the analyzed section (if the athlete does 10 reps, count exactly 10). For static holds, measure the exact hold time spot-on in seconds strictly within the analyzed section. Evaluate posture, joint angles, movement path, tempo, and stability. Be accurate, objective, and fair: reward clean, safe mechanics with solid scores (80-95), and only deduct points when there is genuine, observable form breakdown or safety risk. Do not be overly harsh or dock points without visible technique errors. Return a valid JSON analysis.',
-  food_scan: 'You are a sports nutritionist and dietitian for WASHEK. Analyze the food photo or ingredients. Identify the foods, estimate portion sizes, and calculate accurate macronutrients (calories, protein, carbohydrates, fat). Return a valid JSON object.',
-  food_barcode: 'You are a sports nutritionist for WASHEK. Identify the product from the barcode information and estimate accurate nutritional values and serving sizes in a valid JSON object.',
-  progress_photo: 'You are a physique assessment specialist for WASHEK. Objectively assess the progress photo for body composition, estimated body fat percentage range, visible muscle definition, posture, and symmetry in a valid JSON object.',
-  weekly_update: 'You are Coach Kael conducting a comprehensive weekly athlete check-in for WASHEK. Review the athlete training, nutrition, sleep, and compliance data. Highlight key wins, areas to improve, and provide tailored, actionable advice for the next training week in a valid JSON object.',
+  structure: 'You are an elite strength & conditioning program architect for WASHEK. Design workout structures and weekly splits tailored to the athlete goals with proactive fatigue management and maximum safe progression velocity. Balance push/pull volume, prioritize high-CNS demands when fresh, and eliminate junk volume. STRICT OUTPUT MANDATE: Return raw JSON ONLY that strictly adheres to the requested schema. Never output conversational intros, explanations, greetings, or markdown code fences.',
+  microcycle: 'You are an elite strength & conditioning program architect for WASHEK. Build comprehensive, progressive workout programming for the microcycle with days, exercise sequences, sets, reps, rest intervals, notes, and activation cues. GOAL ACCELERATION & SYSTEMIC FATIGUE MANAGEMENT MANDATE: Program workouts to drive the athlete toward their specific goals as fast as safely possible while actively managing systemic, CNS, and joint fatigue. 1) High Stimulus-to-Fatigue Ratio (SFR): Select high-yield exercises, strictly eliminating junk volume. 2) 1-2 RIR on primary compounds to maximize neuromuscular adaptation without exhausting the CNS. 3) Order high-skill or heavy compound movements first when the athlete is fresh. 4) Prescribe adequate rest periods (90-180s on primary lifts, 60-90s on accessories) for full ATP replenishment. 5) Maintain strict push/pull and joint balance. STRICT OUTPUT MANDATE: Return a single valid JSON object with the "microcycle" key adhering to the requested schema. No markdown code fences, greetings, or preambles.',
+  form_analysis: 'You are an elite calisthenics biomechanist and uncompromising judge for WASHEK Form Lab. Analyze the user exercise execution across the provided video frames. ABSOLUTE HONESTY & REAL SCORE MANDATE (NO SUGARCOATING — SCORES RANGE FROM 1% TO 100%): You are an objective, clinical judge. Stop sugarcoating form. If form is bad, sloppy, or dangerous, TELL LITERALLY EVERYTHING WRONG WITH THE FORM. Bad or dangerous form is dangerous and must NEVER be inflated, praised, or excused to protect the athlete ego. Look at every joint and anatomical segment: cervical spine/neck hyperextension, scapular winging/elevation into ears, flared elbows (>60° creating shoulder impingement), lumbar spine sagging/hyperextension ("banana back"), lack of posterior pelvic tilt, knee collapse, hip sagging/piking, cutting range of motion, kipping, swinging, worming up, or asymmetrical drive. SCORE BRACKETS (1%–100%): 1%–20% for dangerous or hazardous execution with extreme injury risk (e.g., collapsing spine under load, severe joint shearing, uncontrolled falling/dropping); 20%–44% for poor, broken, or terrible form (severe lumbar hyperextension/sagging, worming push-ups, heavy swinging/kipping, cutting over half the range of motion, severe asymmetry, collapsed core tension); 45%–69% for sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM, flared elbows, uncontrolled cadence, soft lockout); 70%–84% for acceptable or moderate execution with clear technical flaws to fix; 85%–94% for high-level execution with 1 minor technical refinement; 95%–100% for rare, flawless, gymnastics-grade textbook execution with full range of motion and locked body tension. Deductions: Minor tip (-5 to -8 pts), Moderate flaw (-15 to -20 pts), Major breakdown (-30 to -45 pts), Critical safety hazard (-50 to -80 pts). MANDATORY ISSUES LIST: If there is ANY breakdown or flaw, you MUST populate the "issues" array with every single flaw, exact problem, severity ("minor", "moderate", "major", "critical"), and fix. Never leave "issues" empty if the form has mistakes! CRITICAL REP & HOLD COUNTER MANDATE (NEVER DROP REPS): Count EVERY attempted repetition across the video frames from start to finish. If a repetition has partial depth, soft lockout, slight momentum, or fatigued form, THAT REPETITION STILL COUNTS AS A REP! Imperfect form reduces the form score; it NEVER subtracts from the rep count. Set "rep_count" to the exact integer total of all repetitions performed; set "hold_time_seconds": null. For static holds (planche, levers, L-sit, handstand, dead hang, etc.): set "rep_count": null; measure the full actual hold duration in seconds ("hold_time_seconds": number). STRICT OUTPUT MANDATE: Return raw JSON ONLY matching the requested structure without markdown code blocks.',
+  food_scan: 'You are a sports nutritionist and dietitian for WASHEK. Analyze the food photo or ingredients. Identify the foods, estimate portion sizes, and calculate accurate macronutrients (calories, protein, carbohydrates, fat). STRICT OUTPUT MANDATE: Return raw JSON ONLY. No markdown, preambles, or conversational greetings.',
+  food_barcode: 'You are a sports nutritionist for WASHEK. Identify the product from the barcode information and estimate accurate nutritional values and serving sizes. STRICT OUTPUT MANDATE: Return raw JSON ONLY. No markdown, preambles, or conversational greetings.',
+  progress_photo: 'You are a physique assessment specialist for WASHEK. Objectively assess the progress photo for body composition, estimated body fat percentage range, visible muscle definition, posture, and symmetry. STRICT OUTPUT MANDATE: Return raw JSON ONLY. No markdown, preambles, or conversational greetings.',
+  weekly_update: 'You are Coach Kael conducting a comprehensive weekly athlete check-in for WASHEK. Review the athlete training, nutrition, sleep, and compliance data. Highlight key wins, areas to improve, and provide tailored, actionable advice for the next training week. STRICT OUTPUT MANDATE: Return raw JSON ONLY matching the schema. No markdown code fences or preambles.',
   live_workout: 'You are Coach Kael providing real-time coaching, motivation, and quick technique reminders during an active workout session.',
-  live_workout_adjustment: 'You are Coach Kael adjusting a live workout due to fatigue, equipment limitations, or pain. Provide safe, effective exercise alternatives or volume modifications in a valid JSON object.',
+  live_workout_adjustment: 'You are Coach Kael adjusting a live workout due to fatigue, equipment limitations, or pain. Provide safe, effective exercise alternatives or volume modifications. STRICT OUTPUT MANDATE: Return raw JSON ONLY adhering strictly to the schema. No markdown code fences or preambles.',
 };
 
 const JSON_TYPES = new Set([
@@ -549,7 +551,15 @@ app.post('/api/ai-generate', async (req, res) => {
 
     if (isJsonExpected) {
       config.responseMimeType = 'application/json';
+      if (response_json_schema || schema) {
+        config.responseSchema = response_json_schema || schema;
+      }
     }
+
+    // For form_analysis, enable thorough reasoning so Gemini inspects joint angles and spinal alignment across all frames
+    config.thinkingConfig = {
+      thinkingLevel: type === 'form_analysis' ? ThinkingLevel.HIGH : ThinkingLevel.LOW,
+    };
 
     // Tune generation parameters and system instructions based on server-verified plan tier
     if (type === 'kael') {
@@ -590,12 +600,10 @@ app.post('/api/ai-generate', async (req, res) => {
       }
     }
 
-    // High-speed, high-accuracy model hierarchy
-    const modelsToTry = [
-      'gemini-flash-lite-latest',
-      'gemini-3.5-flash-lite',
-      'gemini-3.5-flash',
-    ];
+    // High visual intelligence model gemini-3.8-flash is prioritized for form_analysis
+    const modelsToTry = type === 'form_analysis'
+      ? ['gemini-3.8-flash', 'gemini-3.1-flash-lite']
+      : ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
     let lastError: any = null;
     let response: any = null;
     let successfulModel = modelsToTry[0];
@@ -604,7 +612,7 @@ app.post('/api/ai-generate', async (req, res) => {
       try {
         console.log(`[Gemini API] Trying model "${currentModel}" for type="${type}"`);
         const controller = new AbortController();
-        const timeoutMs = isJsonExpected || (Array.isArray(file_urls) && file_urls.length > 0) ? 25000 : 15000;
+        const timeoutMs = (type === 'form_analysis') ? 25000 : (isJsonExpected || (Array.isArray(file_urls) && file_urls.length > 0)) ? 15000 : 8000;
         const timer = setTimeout(() => controller.abort(), timeoutMs);
 
         const callConfig = {
@@ -614,7 +622,7 @@ app.post('/api/ai-generate', async (req, res) => {
 
         response = await ai.models.generateContent({
           model: currentModel,
-          contents: { parts },
+          contents: parts,
           config: callConfig,
         });
         clearTimeout(timer);
@@ -774,6 +782,479 @@ app.post('/api/ai-generate', async (req, res) => {
       provider: 'Google Gemini',
       model: 'gemini-3.5-flash-lite',
     });
+  }
+});
+
+app.post('/api/ai-stream', async (req, res) => {
+  try {
+    const {
+      prompt,
+      type = 'general',
+      file_urls = [],
+      schema = null,
+      response_json_schema = null,
+      plan = 'free',
+    } = req.body;
+
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'A prompt string is required.',
+      });
+    }
+
+    const ai = getGeminiClient();
+
+    // Prepare multimodal parts with parallel, fast media fetching
+    const parts: any[] = [];
+
+    if (Array.isArray(file_urls) && file_urls.length > 0) {
+      const mediaParts = await Promise.all(
+        file_urls.map(async (item) => {
+          const raw = String(item || '').trim();
+          if (!raw) return null;
+
+          let urlToFetch = raw;
+          if (!urlToFetch.startsWith('data:') && !urlToFetch.startsWith('http://') && !urlToFetch.startsWith('https://')) {
+            try {
+              const bucket = process.env.SUPABASE_MEDIA_BUCKET || process.env.VITE_SUPABASE_MEDIA_BUCKET || 'washek-media';
+              const { data: signedData } = await supabase.storage.from(bucket).createSignedUrl(urlToFetch, 3600);
+              if (signedData?.signedUrl) {
+                urlToFetch = signedData.signedUrl;
+              }
+            } catch (storageErr) {
+              console.warn('[Gemini Stream] Could not create signed URL for path:', urlToFetch, storageErr);
+            }
+          }
+
+          if (urlToFetch.startsWith('data:')) {
+            const match = urlToFetch.match(/^data:([^;]+);base64,(.+)$/);
+            if (match) {
+              return {
+                inlineData: {
+                  mimeType: match[1],
+                  data: match[2],
+                },
+              };
+            }
+          } else if (urlToFetch.startsWith('http://') || urlToFetch.startsWith('https://')) {
+            try {
+              const controller = new AbortController();
+              const timer = setTimeout(() => controller.abort(), 4000);
+              const mediaRes = await fetch(urlToFetch, { signal: controller.signal });
+              clearTimeout(timer);
+              if (mediaRes.ok) {
+                const arrayBuffer = await mediaRes.arrayBuffer();
+                const base64 = Buffer.from(arrayBuffer).toString('base64');
+                const mimeType = mediaRes.headers.get('content-type') || 'image/jpeg';
+                return {
+                  inlineData: {
+                    mimeType,
+                    data: base64,
+                  },
+                };
+              }
+            } catch (fetchErr) {
+              console.warn('[Gemini Stream] Media fetch error for URL:', urlToFetch, fetchErr);
+            }
+          }
+          return null;
+        })
+      );
+
+      for (const m of mediaParts) {
+        if (m) parts.push(m);
+      }
+    }
+
+    parts.push({ text: prompt });
+
+    const isKael = type === 'kael';
+    let kaelQuota: any = null;
+    let kaelUserSession: any = null;
+    let effectivePlan = String(plan || 'free').toLowerCase();
+
+    if (isKael) {
+      const authHeader = req.headers.authorization;
+      const clientTimezone = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || '';
+
+      const getTimezoneMonthKey = (tz?: string): string => {
+        if (!tz) return new Date().toISOString().slice(0, 7);
+        try {
+          return new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+          }).format(new Date()).slice(0, 7);
+        } catch {
+          return new Date().toISOString().slice(0, 7);
+        }
+      };
+
+      if (authHeader && authHeader.startsWith('Bearer ')) {
+        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+        const { data: userData, error: userError } = await supabase.auth.getUser(token);
+
+        if (!userError && userData?.user?.id) {
+          const authUser = userData.user;
+          const { data: profileRow } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
+            .eq('id', authUser.id)
+            .maybeSingle();
+
+          const activeSub =
+            profileRow?.subscription_status === 'active' ||
+            profileRow?.subscription_status === 'trialing';
+
+          const PLAN_LIMITS: Record<string, number> = {
+            free: 100,
+            progress: 300,
+            performance: 800,
+            elite: 2000,
+          };
+
+          const rawPlan = activeSub ? (profileRow?.subscription_plan || 'free').toLowerCase() : 'free';
+          const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
+          effectivePlan = resolvedPlan;
+          const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
+
+          const effectiveTz = profileRow?.timezone || clientTimezone || 'UTC';
+          const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+          const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
+          const count = isCurrentMonth ? Number(profileRow?.kael_msg_count ?? 0) : 0;
+
+          const currentUsage = {
+            used: count,
+            limit: usageLimit,
+            remaining: Math.max(0, usageLimit - count),
+            monthKey: currentMonthKey,
+            plan: resolvedPlan,
+          };
+
+          if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+            return res.status(429).json({
+              success: false,
+              error: 'You have reached your monthly message limit for Coach Kael.',
+              error_code: 'KAEL_LIMIT_REACHED',
+              quota: {
+                allowed: false,
+                used: currentUsage.used,
+                limit: currentUsage.limit,
+                remaining: 0,
+                monthKey: currentUsage.monthKey,
+                plan: currentUsage.plan,
+                timezone: effectiveTz,
+              },
+              type: 'kael',
+            });
+          }
+
+          const userScopedClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+            global: {
+              headers: { Authorization: `Bearer ${token}` },
+            },
+          });
+
+          kaelUserSession = {
+            client: userScopedClient,
+            id: authUser.id,
+            effectiveTz,
+            usageLimit,
+            resolvedPlan,
+            currentMonthKey,
+            currentUsage,
+          };
+        }
+      }
+
+      if (!kaelUserSession && req.body?.user_id) {
+        const fallbackUserId = req.body.user_id;
+        const { data: profileRow } = await supabase
+          .from('profiles')
+          .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
+          .eq('id', fallbackUserId)
+          .maybeSingle();
+
+        const activeSub =
+          profileRow?.subscription_status === 'active' ||
+          profileRow?.subscription_status === 'trialing';
+
+        const PLAN_LIMITS: Record<string, number> = {
+          free: 100,
+          progress: 300,
+          performance: 800,
+          elite: 2000,
+        };
+
+        const rawPlan = activeSub ? (profileRow?.subscription_plan || 'free').toLowerCase() : 'free';
+        const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
+        effectivePlan = resolvedPlan;
+        const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
+
+        const effectiveTz = profileRow?.timezone || clientTimezone || 'UTC';
+        const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+        const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
+        const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
+        const count = isCurrentMonth ? Number(profileRow?.kael_msg_count ?? clientUsed) : clientUsed;
+
+        const currentUsage = {
+          used: count,
+          limit: usageLimit,
+          remaining: Math.max(0, usageLimit - count),
+          monthKey: currentMonthKey,
+          plan: resolvedPlan,
+        };
+
+        if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+          return res.status(429).json({
+            success: false,
+            error: 'You have reached your monthly message limit for Coach Kael.',
+            error_code: 'KAEL_LIMIT_REACHED',
+            quota: {
+              allowed: false,
+              used: currentUsage.used,
+              limit: currentUsage.limit,
+              remaining: 0,
+              monthKey: currentUsage.monthKey,
+              plan: currentUsage.plan,
+              timezone: effectiveTz,
+            },
+            type: 'kael',
+          });
+        }
+
+        kaelUserSession = {
+          client: supabase,
+          id: fallbackUserId || 'guest',
+          effectiveTz,
+          usageLimit,
+          resolvedPlan,
+          currentMonthKey,
+          currentUsage,
+        };
+      }
+    }
+
+    const isJsonExpected =
+      JSON_TYPES.has(type) ||
+      Boolean(schema) ||
+      Boolean(response_json_schema);
+
+    const config: Record<string, unknown> = {};
+
+    if (isJsonExpected) {
+      config.responseMimeType = 'application/json';
+      if (response_json_schema || schema) {
+        config.responseSchema = response_json_schema || schema;
+      }
+    }
+
+    config.thinkingConfig = {
+      thinkingLevel: ThinkingLevel.LOW,
+    };
+
+    if (type === 'kael') {
+      const kaelBaseMandate =
+        'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
+        'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
+        'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ';
+
+      if (effectivePlan === 'elite') {
+        config.systemInstruction =
+          kaelBaseMandate +
+          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
+        config.temperature = 0.25;
+        config.maxOutputTokens = 3500;
+      } else if (effectivePlan === 'performance') {
+        config.systemInstruction =
+          kaelBaseMandate +
+          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
+        config.temperature = 0.3;
+        config.maxOutputTokens = 2500;
+      } else if (effectivePlan === 'progress') {
+        config.systemInstruction =
+          kaelBaseMandate +
+          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
+        config.temperature = 0.35;
+        config.maxOutputTokens = 1800;
+      } else {
+        config.systemInstruction =
+          kaelBaseMandate +
+          'TIER: FREE. Deliver 100% scientifically accurate, direct, and concise coaching answers (~40–80 words). Provide the exact recommendation and key execution cue in plain, everyday language without confusing jargon, fluff, or filler.';
+        config.temperature = 0.4;
+        config.maxOutputTokens = 900;
+      }
+    } else {
+      const systemInstruction = SYSTEM_INSTRUCTIONS[type];
+      if (systemInstruction) {
+        config.systemInstruction = systemInstruction;
+      }
+    }
+
+    const modelsToTry = [
+      'gemini-3.1-flash-lite',
+      'gemini-flash-latest',
+      'gemini-3.8-flash',
+    ];
+
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
+    if (typeof (res as any).flushHeaders === 'function') {
+      (res as any).flushHeaders();
+    }
+
+    let fullOutput = '';
+    let streamResponse: any = null;
+    let lastError: any = null;
+
+    for (const currentModel of modelsToTry) {
+      try {
+        const controller = new AbortController();
+        const timeoutMs = isJsonExpected ? 18000 : 10000;
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+        const callConfig = {
+          ...config,
+          abortSignal: controller.signal,
+        };
+
+        streamResponse = await ai.models.generateContentStream({
+          model: currentModel,
+          contents: { parts },
+          config: callConfig,
+        });
+        clearTimeout(timer);
+        break;
+      } catch (modelErr: any) {
+        lastError = modelErr;
+        console.warn(`[Gemini Stream] Model "${currentModel}" failed:`, modelErr?.message || modelErr);
+      }
+    }
+
+    if (!streamResponse) {
+      res.write(`data: ${JSON.stringify({ error: lastError?.message || 'AI streaming failed.' })}\n\n`);
+      return res.end();
+    }
+
+    for await (const chunk of streamResponse) {
+      const text = chunk.text;
+      if (text) {
+        fullOutput += text;
+        res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+      }
+    }
+
+    if (isKael && kaelUserSession) {
+      const {
+        client,
+        id: userId,
+        effectiveTz,
+        usageLimit,
+        resolvedPlan,
+        currentMonthKey,
+        currentUsage,
+      } = kaelUserSession;
+
+      let claimResult: any = null;
+      try {
+        let { data: claimData, error: claimError } = await client.rpc('claim_kael_message');
+        if (claimError && claimError.code === 'PGRST202') {
+          const fallbackClaim = await client.rpc('claim_kael_message', {
+            p_timezone: effectiveTz,
+          });
+          if (!fallbackClaim.error) {
+            claimData = fallbackClaim.data;
+            claimError = null;
+          }
+        }
+        if (!claimError && claimData && typeof claimData.used === 'number') {
+          claimResult = claimData;
+        }
+      } catch (err) {
+        console.warn('[server.ts stream] claim_kael_message RPC error:', err);
+      }
+
+      if (!claimResult) {
+        const newCount = currentUsage.used + 1;
+        const updatePayload: Record<string, any> = {
+          kael_msg_count: newCount,
+          kael_msg_month: currentMonthKey,
+        };
+        if (effectiveTz) {
+          updatePayload.timezone = effectiveTz;
+        }
+        if (userId && userId !== 'guest') {
+          try {
+            await client.from('profiles').update(updatePayload).eq('id', userId);
+          } catch (dbErr) {
+            console.warn('[server.ts stream] Profile update fallback note:', dbErr);
+          }
+        }
+
+        claimResult = {
+          allowed: true,
+          used: newCount,
+          limit: usageLimit,
+          remaining: Math.max(0, usageLimit - newCount),
+          monthKey: currentMonthKey,
+          plan: resolvedPlan,
+          timezone: effectiveTz,
+        };
+      } else {
+        claimResult = {
+          ...claimResult,
+          remaining:
+            typeof claimResult.remaining === 'number'
+              ? claimResult.remaining
+              : Math.max(0, (claimResult.limit || usageLimit) - (claimResult.used || 0)),
+          timezone: effectiveTz,
+        };
+      }
+
+      kaelQuota = claimResult;
+    }
+
+    if (!kaelQuota && isKael) {
+      const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
+      const newCount = clientUsed + 1;
+      const PLAN_LIMITS: Record<string, number> = {
+        free: 100,
+        progress: 300,
+        performance: 800,
+        elite: 2000,
+      };
+      const resolvedPlan = PLAN_LIMITS[effectivePlan] ? effectivePlan : 'free';
+      const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
+      const clientTz = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || 'UTC';
+      let monthKey = new Date().toISOString().slice(0, 7);
+      try {
+        monthKey = new Intl.DateTimeFormat('en-CA', {
+          timeZone: clientTz,
+          year: 'numeric',
+          month: '2-digit',
+        }).format(new Date()).slice(0, 7);
+      } catch {}
+
+      kaelQuota = {
+        allowed: true,
+        used: newCount,
+        limit: usageLimit,
+        remaining: Math.max(0, usageLimit - newCount),
+        monthKey,
+        plan: resolvedPlan,
+        timezone: clientTz,
+      };
+    }
+
+    res.write(`data: ${JSON.stringify({ done: true, full: fullOutput, quota: kaelQuota })}\n\n`);
+    res.end();
+  } catch (error: any) {
+    console.error('[Gemini Stream Error]', error);
+    res.write(`data: ${JSON.stringify({ error: error?.message || 'Streaming failed.' })}\n\n`);
+    res.end();
   }
 });
 

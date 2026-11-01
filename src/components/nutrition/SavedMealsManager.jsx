@@ -18,6 +18,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { toast } from 'sonner';
 import { supabaseApi } from '@/lib/supabaseApi';
+import { getCachedSavedMeals, setCachedSavedMeals, removeCachedSavedMeal } from '@/lib/cacheStore';
 
 const MEAL_EMOJIS = {
   breakfast: '🌅',
@@ -54,18 +55,18 @@ export default function SavedMealsManager({
     queryKey: ['saved_meals', userKey],
     queryFn: async () => {
       try {
-        const results = await supabaseApi.entities.SavedMeal.filter(
-          { created_by: userKey },
-          '-created_at',
-          200
-        );
-        return results || [];
-      } catch (err) {
-        console.warn('[SavedMealsManager] Fetch fallback to list:', err);
         const list = await supabaseApi.entities.SavedMeal.list('-created_at', 200);
-        return list || [];
+        if (Array.isArray(list) && list.length > 0) {
+          setCachedSavedMeals(list, userKey);
+          return list;
+        }
+      } catch (err) {
+        console.warn('[SavedMealsManager] Fetch fallback to cache:', err);
       }
+      return getCachedSavedMeals(userKey);
     },
+    initialData: () => getCachedSavedMeals(userKey),
+    staleTime: 5 * 60 * 1000,
   });
 
   const createMutation = useMutation({
@@ -75,10 +76,12 @@ export default function SavedMealsManager({
         created_by: userKey,
       }),
     onSuccess: (saved) => {
-      queryClient.setQueryData(['saved_meals', userKey], (old = []) => [
+      const updateFn = (old = []) => [
         saved,
         ...old.filter((m) => m.id !== saved.id),
-      ]);
+      ];
+      queryClient.setQueryData(['saved_meals', userKey], updateFn);
+      queryClient.setQueryData(['saved_meals'], updateFn);
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
       toast.success(`Saved "${saved.name || 'meal'}" to your library!`);
       setIsCreating(false);
@@ -94,9 +97,10 @@ export default function SavedMealsManager({
     mutationFn: ({ id, data }) =>
       supabaseApi.entities.SavedMeal.update(id, data),
     onSuccess: (updated) => {
-      queryClient.setQueryData(['saved_meals', userKey], (old = []) =>
-        old.map((m) => (m.id === updated.id ? { ...m, ...updated } : m))
-      );
+      const updateFn = (old = []) =>
+        old.map((m) => (m.id === updated.id ? { ...m, ...updated } : m));
+      queryClient.setQueryData(['saved_meals', userKey], updateFn);
+      queryClient.setQueryData(['saved_meals'], updateFn);
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
       toast.success(`Updated "${updated.name}" macros!`);
       setEditingMeal(null);
@@ -111,9 +115,10 @@ export default function SavedMealsManager({
   const deleteMutation = useMutation({
     mutationFn: (id) => supabaseApi.entities.SavedMeal.delete(id),
     onSuccess: (_data, id) => {
-      queryClient.setQueryData(['saved_meals', userKey], (old = []) =>
-        old.filter((m) => m.id !== id)
-      );
+      removeCachedSavedMeal(id, userKey);
+      const filterFn = (old = []) => old.filter((m) => m.id !== id);
+      queryClient.setQueryData(['saved_meals', userKey], filterFn);
+      queryClient.setQueryData(['saved_meals'], filterFn);
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
       toast.success('Removed from saved meals.');
     },

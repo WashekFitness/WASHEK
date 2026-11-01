@@ -57,7 +57,7 @@ export default function NutritionSummary({ entries, user }) {
   );
 
   const goals =
-    calcNutritionGoals(user);
+    calcNutritionGoals(user, { userKey: user?.id || user?.uid });
 
   const calorieGoal =
     goals.calories || 1;
@@ -71,6 +71,7 @@ export default function NutritionSummary({ entries, user }) {
     {
       label: 'Protein',
       value: totals.protein,
+      goal: goals.protein,
       unit: 'g',
       icon: Drumstick,
       color: 'text-primary',
@@ -78,6 +79,7 @@ export default function NutritionSummary({ entries, user }) {
     {
       label: 'Carbs',
       value: totals.carbs,
+      goal: goals.carbs,
       unit: 'g',
       icon: Wheat,
       color: 'text-accent',
@@ -85,6 +87,7 @@ export default function NutritionSummary({ entries, user }) {
     {
       label: 'Fat',
       value: totals.fat,
+      goal: goals.fat,
       unit: 'g',
       icon: Droplets,
       color: 'text-chart-4',
@@ -100,12 +103,19 @@ export default function NutritionSummary({ entries, user }) {
           </div>
 
           <div>
-            <p className="font-heading font-bold text-sm tracking-tight">
-              Daily Fuel
-            </p>
+            <div className="flex items-center gap-1.5">
+              <p className="font-heading font-bold text-sm tracking-tight">
+                Daily Fuel
+              </p>
+              {goals?.adaptation?.currentWeek && (
+                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/10 border border-primary/25 text-primary leading-none">
+                  W{goals.adaptation.currentWeek} Adapted
+                </span>
+              )}
+            </div>
 
             <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
-              Nutrition Target
+              {goals?.adaptation?.phaseName ? `${goals.adaptation.phaseName.split('&')[0].trim()}` : 'Nutrition Target'}
             </p>
           </div>
         </div>
@@ -144,6 +154,7 @@ export default function NutritionSummary({ entries, user }) {
           ({
             label,
             value,
+            goal,
             unit,
             icon: Icon,
             color,
@@ -179,8 +190,8 @@ export default function NutritionSummary({ entries, user }) {
 
                 <p className="font-heading font-extrabold text-base sm:text-lg leading-none tabular-nums text-foreground">
                   {Math.round(value)}
-                  <span className="text-[11px] font-semibold text-muted-foreground ml-0.5 font-sans">
-                    {unit}
+                  <span className="text-[10px] sm:text-[11px] font-semibold text-muted-foreground ml-0.5 font-sans">
+                    / {Math.round(goal || 0)}{unit}
                   </span>
                 </p>
               </div>

@@ -11,7 +11,15 @@ import {
 } from '@/lib/firebase';
 import { getOrCreateUserProfile } from '@/lib/firebaseApi';
 import { isLogo } from '@/lib/avatarUtils';
-import { setCachedLogs, setCachedLastWorkout } from '@/lib/cacheStore';
+import {
+  setCachedLogs,
+  setCachedLastWorkout,
+  setCachedNutrition,
+  setCachedSavedMeals,
+  getCachedSavedMeals,
+  removeCachedSavedMeal,
+  getDeletedSavedMealIds,
+} from '@/lib/cacheStore';
 
 const MEDIA_BUCKET =
   import.meta.env.VITE_SUPABASE_MEDIA_BUCKET ||
@@ -516,9 +524,25 @@ function removeLocalEntityRecord(table, userId, recordId) {
   }
 }
 
+async function getEffectiveFbUser() {
+  if (firebaseAuth?.currentUser) return firebaseAuth.currentUser;
+  if (typeof firebaseAuth?.authStateReady === 'function') {
+    try {
+      await Promise.race([
+        firebaseAuth.authStateReady(),
+        new Promise((r) => setTimeout(r, 300)),
+      ]);
+      if (firebaseAuth?.currentUser) return firebaseAuth.currentUser;
+    } catch {
+      // Ignore timeout
+    }
+  }
+  return firebaseAuth?.currentUser || null;
+}
+
 async function syncToFirestore(table, record, action = 'set') {
   try {
-    const fbUser = firebaseAuth?.currentUser;
+    const fbUser = await getEffectiveFbUser();
     if (!fbUser || !firebaseDb) return;
     const subCol = table === 'nutrition_entries'
       ? 'nutrition_entries'
@@ -547,7 +571,7 @@ async function syncToFirestore(table, record, action = 'set') {
 
 async function fetchFromFirestore(table) {
   try {
-    const fbUser = firebaseAuth?.currentUser;
+    const fbUser = await getEffectiveFbUser();
     if (!fbUser || !firebaseDb) return [];
     const subCol = table === 'nutrition_entries'
       ? 'nutrition_entries'
@@ -574,6 +598,32 @@ async function fetchFromFirestore(table) {
       }
     }
 
+    // Cache fetched nutrition entries to local storage immediately
+    if (table === 'nutrition_entries' && records.length > 0) {
+      setCachedNutrition(records, fbUser.uid);
+      if (fbUser.email) setCachedNutrition(records, fbUser.email);
+    }
+
+    // Cache fetched saved meals to local storage immediately
+    if (table === 'saved_meals' && records.length > 0) {
+      setCachedSavedMeals(records, fbUser.uid);
+      if (fbUser.email) setCachedSavedMeals(records, fbUser.email);
+    }
+
+    // Cache fetched progress photos image data immediately
+    if (table === 'progress_photos' && records.length > 0) {
+      records.forEach((rec) => {
+        const imgUrl = rec.resolved_photo_url || rec.photo_url;
+        if (rec.id && imgUrl && (imgUrl.startsWith('data:') || imgUrl.startsWith('http') || imgUrl.startsWith('blob:'))) {
+          try {
+            localStorage.setItem(`washek_photo_${rec.id}`, imgUrl);
+          } catch (_err) {
+            // Ignore cache storage errors
+          }
+        }
+      });
+    }
+
     return records;
   } catch (err) {
     console.debug(`[Firestore] fetch ${table} note:`, err?.message || err);
@@ -593,7 +643,13 @@ const KNOWN_TABLE_COLUMNS = {
     'user_id',
     'created_by',
     'photo_url',
+    'resolved_photo_url',
     'date',
+    'created_date',
+    'label',
+    'custom_label',
+    'tags',
+    'notes',
     'weight_lbs',
     'body_fat_estimate',
     'body_fat_numeric',
@@ -1278,6 +1334,166 @@ async function uploadFile(input, folder = 'uploads') {
  * ------------------------------------------------------------
  */
 
+async function streamAI({
+  prompt,
+  file_urls = [],
+  model = null,
+  response_json_schema = null,
+  schema = null,
+  type = 'general',
+  plan = 'free',
+  onChunk = null,
+} = {}) {
+  try {
+    await requireUser();
+  } catch (_authErr) {
+    // Non-blocking
+  }
+
+  const normalizedFileUrls = Array.isArray(file_urls)
+    ? file_urls.map((value) => {
+        const path = getStoragePath(value);
+        return path || value;
+      })
+    : [];
+
+  let authToken = null;
+  try {
+    const { data: sessionData } = await supabase.auth.getSession();
+    authToken = sessionData?.session?.access_token || null;
+    if (!authToken) {
+      const { data: refreshed } = await supabase.auth.refreshSession();
+      authToken = refreshed?.session?.access_token || null;
+    }
+  } catch (_tokenErr) {
+    // Ignore
+  }
+
+  if (!authToken && typeof localStorage !== 'undefined') {
+    try {
+      authToken = localStorage.getItem('washek_auth_token') || null;
+    } catch (_err) {
+      // Ignore
+    }
+  }
+
+  let currentUserId = null;
+  let currentUsed = 0;
+  try {
+    const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
+    if (rawUser) {
+      const parsedUser = JSON.parse(rawUser);
+      currentUserId = parsedUser?.id || null;
+      currentUsed = Number(parsedUser?.kael_msg_count || 0);
+    }
+  } catch (_userErr) {
+    // Ignore
+  }
+
+  const userTz = getUserTimeZone();
+  const headers = {
+    'Content-Type': 'application/json',
+    'x-timezone': userTz,
+  };
+  if (authToken) {
+    headers['Authorization'] = `Bearer ${authToken}`;
+  }
+
+  try {
+    const res = await fetch('/api/ai-stream', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        type,
+        prompt,
+        file_urls: normalizedFileUrls,
+        model: model || 'gemini-3.1-flash-lite',
+        schema: schema || response_json_schema || null,
+        response_json_schema: response_json_schema || schema || null,
+        plan: plan || 'free',
+        timezone: userTz,
+        user_id: currentUserId,
+        current_used: currentUsed,
+      }),
+    });
+
+    if (res.status === 429) {
+      const errData = await res.json().catch(() => ({}));
+      if (errData?.quota && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('kael-quota-updated', { detail: errData.quota }));
+      }
+      return {
+        __ai_error: true,
+        message: errData?.error || 'You have reached your monthly message limit for Coach Kael.',
+        code: 'KAEL_LIMIT_REACHED',
+        details: errData,
+      };
+    }
+
+    if (res.ok && res.body) {
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let fullText = '';
+      let quota = null;
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (trimmed.startsWith('data:')) {
+            try {
+              const data = JSON.parse(trimmed.slice(5).trim());
+              if (data.error) {
+                throw new Error(data.error);
+              }
+              if (data.chunk) {
+                fullText = data.full || (fullText + data.chunk);
+                if (typeof onChunk === 'function') {
+                  onChunk(data.chunk, fullText);
+                }
+              }
+              if (data.quota) {
+                quota = data.quota;
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(new CustomEvent('kael-quota-updated', { detail: quota }));
+                }
+              }
+            } catch (_parseErr) {
+              // Ignore partial JSON chunks
+            }
+          }
+        }
+      }
+
+      if (fullText.trim()) {
+        return {
+          content: fullText.trim(),
+          quota,
+          result: fullText.trim(),
+        };
+      }
+    }
+  } catch (streamErr) {
+    console.warn('[streamAI] Stream error, falling back to unary invokeAI:', streamErr);
+  }
+
+  return invokeAI({
+    prompt,
+    file_urls,
+    model,
+    response_json_schema,
+    schema,
+    type,
+    plan,
+  });
+}
+
 async function invokeAI({
   prompt,
   file_urls = [],
@@ -1286,7 +1502,21 @@ async function invokeAI({
   schema = null,
   type = 'general',
   plan = 'free',
+  onChunk = null,
 } = {}) {
+  if (typeof onChunk === 'function') {
+    return streamAI({
+      prompt,
+      file_urls,
+      model,
+      response_json_schema,
+      schema,
+      type,
+      plan,
+      onChunk,
+    });
+  }
+
   try {
     await requireUser();
   } catch (_authErr) {
@@ -1659,7 +1889,171 @@ export const supabaseApi = {
     WorkoutProgram: entity('workout_programs'),
     WorkoutLog: entity('workout_logs'),
     NutritionEntry: entity('nutrition_entries'),
-    SavedMeal: entity('saved_meals'),
+    SavedMeal: {
+      ...entity('saved_meals'),
+
+      async list(sort = '-created_at', limit = 200) {
+        // 1. Get cached meals immediately (0ms)
+        const local = getCachedSavedMeals();
+        let remote = [];
+
+        // 2. Fetch from Firestore if available
+        try {
+          const fsRecords = await fetchFromFirestore('saved_meals');
+          if (Array.isArray(fsRecords) && fsRecords.length > 0) {
+            remote = fsRecords;
+          }
+        } catch (fsErr) {
+          console.debug('[SavedMeal.list] Firestore fetch note:', fsErr);
+        }
+
+        // 3. Fetch from Supabase if available
+        try {
+          const { data, error } = await supabase.from('saved_meals').select('*').limit(limit);
+          if (!error && Array.isArray(data) && data.length > 0) {
+            remote = [...remote, ...data];
+          }
+        } catch (_sbErr) {
+          // Ignore
+        }
+
+        const deletedIds = getDeletedSavedMealIds();
+        const map = new Map();
+
+        // Add local first
+        local.forEach((m) => {
+          if (m?.id && !deletedIds.has(String(m.id))) {
+            map.set(String(m.id), m);
+          }
+        });
+
+        // Add remote records
+        remote.forEach((m) => {
+          if (m?.id && !deletedIds.has(String(m.id))) {
+            const idStr = String(m.id);
+            const existing = map.get(idStr);
+            map.set(idStr, { ...(existing || {}), ...m });
+          }
+        });
+
+        const merged = Array.from(map.values()).sort((a, b) => {
+          const tA = a.created_at || a.date || '';
+          const tB = b.created_at || b.date || '';
+          return String(tB).localeCompare(String(tA));
+        });
+
+        if (merged.length > 0) {
+          setCachedSavedMeals(merged);
+        }
+
+        return merged.slice(0, limit);
+      },
+
+      async filter(_filters = {}, sort = '-created_at', limit = 200) {
+        // Saved meals belong to the user's permanent meal library on their account.
+        // Never filter out meals based on arbitrary created_by variations ('athlete' vs email vs uid).
+        return this.list(sort, limit);
+      },
+
+      async create(payload = {}) {
+        const generatedId = payload.id || `meal_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        const nowIso = new Date().toISOString();
+
+        const row = {
+          ...payload,
+          id: generatedId,
+          name: payload.name || payload.food_name || 'My Saved Meal',
+          food_name: payload.name || payload.food_name || 'My Saved Meal',
+          meal_type: payload.meal_type || 'snack',
+          serving_size: payload.serving_size || '1 serving',
+          calories: Number(payload.calories) || 0,
+          protein_g: Number(payload.protein_g) || 0,
+          carbs_g: Number(payload.carbs_g) || 0,
+          fat_g: Number(payload.fat_g) || 0,
+          items: Array.isArray(payload.items) ? payload.items : [],
+          created_at: payload.created_at || nowIso,
+          updated_at: nowIso,
+        };
+
+        // 1. Immediately cache locally so user sees it in 0ms
+        const currentMeals = getCachedSavedMeals();
+        const updatedMeals = [row, ...currentMeals.filter((m) => String(m.id) !== String(row.id))];
+        setCachedSavedMeals(updatedMeals);
+
+        // 2. Sync to Firestore in background
+        syncToFirestore('saved_meals', row, 'set').catch((e) => console.debug('[SavedMeal.create] FS sync note:', e));
+
+        // 3. Sync to Supabase in background
+        try {
+          const clean = sanitizeForSupabase('saved_meals', row);
+          await supabase.from('saved_meals').insert(clean);
+        } catch (_err) {
+          // Ignore
+        }
+
+        return row;
+      },
+
+      async update(id, patch = {}) {
+        if (!id) throw new Error('Meal ID required for update');
+        const nowIso = new Date().toISOString();
+
+        const currentMeals = getCachedSavedMeals();
+        const existing = currentMeals.find((m) => String(m.id) === String(id)) || {};
+
+        const updatedRow = {
+          ...existing,
+          ...patch,
+          id,
+          name: patch.name || patch.food_name || existing.name || 'Saved Meal',
+          food_name: patch.name || patch.food_name || existing.food_name || existing.name || 'Saved Meal',
+          calories: patch.calories !== undefined ? Number(patch.calories) : existing.calories,
+          protein_g: patch.protein_g !== undefined ? Number(patch.protein_g) : existing.protein_g,
+          carbs_g: patch.carbs_g !== undefined ? Number(patch.carbs_g) : existing.carbs_g,
+          fat_g: patch.fat_g !== undefined ? Number(patch.fat_g) : existing.fat_g,
+          updated_at: nowIso,
+        };
+
+        // 1. Update local cache immediately
+        const nextMeals = currentMeals.map((m) => (String(m.id) === String(id) ? updatedRow : m));
+        if (!nextMeals.some((m) => String(m.id) === String(id))) {
+          nextMeals.unshift(updatedRow);
+        }
+        setCachedSavedMeals(nextMeals);
+
+        // 2. Sync to Firestore
+        syncToFirestore('saved_meals', updatedRow, 'set').catch((e) => console.debug('[SavedMeal.update] FS sync note:', e));
+
+        // 3. Sync to Supabase
+        try {
+          const clean = sanitizeForSupabase('saved_meals', updatedRow);
+          await supabase.from('saved_meals').update(clean).eq('id', id);
+        } catch (_err) {
+          // Ignore
+        }
+
+        return updatedRow;
+      },
+
+      async delete(id) {
+        if (!id) return true;
+
+        // 1. Mark deliberately deleted and remove from local storage
+        removeCachedSavedMeal(id);
+
+        // 2. Delete from Firestore
+        syncToFirestore('saved_meals', { id }, 'delete').catch((e) => console.debug('[SavedMeal.delete] FS sync note:', e));
+
+        // 3. Delete from Supabase
+        try {
+          await supabase.from('saved_meals').delete().eq('id', id);
+        } catch (_err) {
+          // Ignore
+        }
+
+        return true;
+      },
+    },
     ProgressPhoto: entity('progress_photos'),
     MovementBaseline: entity('movement_baselines'),
     FormAnalysis: entity('form_analyses'),
@@ -1826,6 +2220,7 @@ export const supabaseApi = {
 
   ai: {
     invoke: invokeAI,
+    stream: streamAI,
   },
 
   email: {

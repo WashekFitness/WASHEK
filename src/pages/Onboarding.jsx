@@ -567,7 +567,7 @@ export default function Onboarding() {
         });
 
         const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('AI timeout')), 1800)
+          setTimeout(() => reject(new Error('AI timeout')), 5000)
         );
 
         const parsed = await Promise.race([aiPromise, timeoutPromise]);

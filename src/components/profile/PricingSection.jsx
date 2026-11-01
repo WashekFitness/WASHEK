@@ -19,7 +19,7 @@ import {
   applySubscriptionUpgrade,
   applySubscriptionCancellation,
 } from '@/lib/subscription';
-import { auth as firebaseAuth } from '@/lib/firebase';
+import { auth as firebaseAuth, db, doc, getDoc, setDoc } from '@/lib/firebase';
 import { firebaseApi } from '@/lib/firebaseApi';
 import { toast } from 'sonner';
 
@@ -146,84 +146,19 @@ export default function PricingSection({ onPlanChange }) {
     onPlanChangeRef.current = onPlanChange;
   }, [onPlanChange]);
 
-  const [loadingPlan, setLoadingPlan] =
-    useState(null);
-
-  const [cancelling, setCancelling] =
-    useState(false);
-
-  const [showCancelConfirm, setShowCancelConfirm] =
-    useState(false);
-
-  const [currentPlan, setCurrentPlan] =
-    useState('free');
-
-  const [subscription, setSubscription] =
-    useState(null);
-
-  const [error, setError] =
-    useState('');
-
-  const [loadingSubscription, setLoadingSubscription] =
-    useState(true);
-
+  const [loadingPlan, setLoadingPlan] = useState(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [currentPlan, setCurrentPlan] = useState('free');
+  const [subscription, setSubscription] = useState(null);
+  const [error, setError] = useState('');
+  const [loadingSubscription, setLoadingSubscription] = useState(true);
   const isLaunchingRef = useRef(false);
 
-
-  const loadSubscription = async () => {
+  const loadSubscription = useCallback(async () => {
     setLoadingSubscription(true);
 
     try {
-      const {
-        data: { user },
-      } =
-        await supabase.auth.getUser();
-
-      if (!user) {
-        // Fall back to local storage cached plan if Supabase auth user is not available
-        let localPlan = 'free';
-        try {
-          localPlan = localStorage.getItem('washek_subscription_plan') ||
-            JSON.parse(localStorage.getItem('washek_user') || '{}')?.subscription_plan ||
-            'free';
-        } catch (_err) {
-          // ignore
-        }
-        const safeLocal = normalizePlan(localPlan);
-        setCurrentPlan((prev) => {
-          if (prev !== safeLocal) {
-            onPlanChangeRef.current?.(safeLocal);
-          }
-          return safeLocal;
-        });
-        setSubscription(null);
-        return;
-      }
-
-      /*
-       * The profiles table is the single source of truth
-       * for the user's current subscription entitlement.
-       */
-      const {
-        data: profile,
-        error: profileError,
-      } =
-        await supabase
-          .from('profiles')
-          .select(
-            'subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id'
-          )
-          .eq('id', user.id)
-          .maybeSingle();
-
-      if (profileError) {
-        console.error(
-          '[PricingSection] Profile subscription lookup failed:',
-          profileError
-        );
-        throw profileError;
-      }
-
       const storedStatus = (() => {
         try {
           return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
@@ -233,27 +168,51 @@ export default function PricingSection({ onPlanChange }) {
       })();
       const isLocallyCanceled = storedStatus === 'canceled' || storedStatus === 'cancelled';
 
-      const profilePlan =
-        normalizePlan(
-          profile?.subscription_plan
-        );
-
-      const profileStatus =
-        String(
-          profile?.subscription_status || ''
-        ).toLowerCase();
-
-      const profileIsActive =
-        isActiveStatus(
-          profileStatus
-        );
-
-      // Only purge local overrides if the user or profile explicitly recorded a cancellation
-      if (isLocallyCanceled || profileStatus === 'canceled' || profileStatus === 'cancelled') {
-        applySubscriptionCancellation();
+      // 1. Check Firebase Auth user & Firestore profile first
+      let firestorePlan = null;
+      let firestoreStatus = null;
+      let firestoreSubId = null;
+      const fbUser = firebaseAuth?.currentUser;
+      if (fbUser?.uid) {
+        try {
+          const userDoc = await getDoc(doc(db, 'users', fbUser.uid));
+          if (userDoc.exists()) {
+            const data = userDoc.data();
+            firestorePlan = normalizePlan(data.subscription_plan || data.plan || data.tier);
+            firestoreStatus = String(data.subscription_status || '').toLowerCase();
+            firestoreSubId = data.stripe_subscription_id || null;
+          }
+        } catch (fsErr) {
+          console.debug('[PricingSection] Firestore lookup note:', fsErr);
+        }
       }
 
-      // Check if user has an upgraded local override
+      // 2. Check Supabase profile
+      let profilePlan = 'free';
+      let profileStatus = '';
+      let profileSubId = null;
+      let profilePriceId = null;
+      try {
+        const { data: authData } = await supabase.auth.getUser();
+        if (authData?.user) {
+          const { data: profile } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id')
+            .eq('id', authData.user.id)
+            .maybeSingle();
+
+          if (profile) {
+            profilePlan = normalizePlan(profile.subscription_plan);
+            profileStatus = String(profile.subscription_status || '').toLowerCase();
+            profileSubId = profile.stripe_subscription_id;
+            profilePriceId = profile.stripe_price_id;
+          }
+        }
+      } catch (sbErr) {
+        console.debug('[PricingSection] Supabase profile lookup note:', sbErr);
+      }
+
+      // 3. Check LocalStorage fallback
       const localPlanOverride = (() => {
         if (isLocallyCanceled) return null;
         try {
@@ -265,32 +224,29 @@ export default function PricingSection({ onPlanChange }) {
         }
       })();
 
-      const resolvedPlan = isLocallyCanceled
-        ? 'free'
-        : (profileIsActive && profilePlan !== 'free')
-          ? profilePlan
-          : (profileStatus !== 'canceled' && profileStatus !== 'cancelled' && localPlanOverride && localPlanOverride !== 'free' ? normalizePlan(localPlanOverride) : profilePlan || 'free');
+      // If explicit cancellation recorded, purge local overrides
+      if (isLocallyCanceled || firestoreStatus === 'canceled' || profileStatus === 'canceled') {
+        applySubscriptionCancellation();
+      }
 
-      if (
-        !isLocallyCanceled &&
-        profileIsActive &&
-        profile?.stripe_subscription_id
-      ) {
+      let resolvedPlan = 'free';
+      if (!isLocallyCanceled) {
+        if (firestorePlan && firestorePlan !== 'free' && firestoreStatus !== 'canceled') {
+          resolvedPlan = firestorePlan;
+        } else if (profilePlan && profilePlan !== 'free' && isActiveStatus(profileStatus)) {
+          resolvedPlan = profilePlan;
+        } else if (localPlanOverride && localPlanOverride !== 'free') {
+          resolvedPlan = normalizePlan(localPlanOverride);
+        }
+      }
+
+      if (!isLocallyCanceled && resolvedPlan !== 'free') {
         setSubscription({
-          id:
-            profile.stripe_subscription_id,
-
-          plan:
-            profilePlan,
-
-          plan_key:
-            profilePlan,
-
-          status:
-            profileStatus,
-
-          stripe_price_id:
-            profile.stripe_price_id,
+          id: firestoreSubId || profileSubId || `sub_${resolvedPlan}`,
+          plan: resolvedPlan,
+          plan_key: resolvedPlan,
+          status: firestoreStatus || profileStatus || 'active',
+          stripe_price_id: profilePriceId,
         });
       } else {
         setSubscription(null);
@@ -304,46 +260,28 @@ export default function PricingSection({ onPlanChange }) {
       });
 
       if (resolvedPlan !== 'free' && !isLocallyCanceled) {
-        applySubscriptionUpgrade(resolvedPlan, profileStatus || 'active');
+        applySubscriptionUpgrade(resolvedPlan, firestoreStatus || profileStatus || 'active');
       }
     } catch (loadError) {
-      console.error(
-        '[PricingSection] Failed to load subscription:',
-        loadError
-      );
-
+      console.error('[PricingSection] Failed to load subscription:', loadError);
       let fallbackLocal = 'free';
       try {
-        fallbackLocal = localStorage.getItem('washek_subscription_plan') ||
+        fallbackLocal =
+          localStorage.getItem('washek_subscription_plan') ||
           JSON.parse(localStorage.getItem('washek_user') || '{}')?.subscription_plan ||
           'free';
       } catch (_err) {
         // ignore
       }
       const safePlan = normalizePlan(fallbackLocal);
-      setCurrentPlan((prev) => {
-        if (prev !== safePlan) {
-          onPlanChangeRef.current?.(safePlan);
-        }
-        return safePlan;
-      });
-      setSubscription(null);
+      setCurrentPlan(safePlan);
     } finally {
       setLoadingSubscription(false);
     }
-  };
-
+  }, []);
 
   useEffect(() => {
     let active = true;
-
-    // Purge any legacy pending checkout flags
-    try {
-      localStorage.removeItem('washek_pending_checkout_plan');
-      sessionStorage.removeItem('washek_pending_checkout_plan');
-    } catch (_err) {
-      // ignore
-    }
 
     if (active) {
       loadSubscription();
@@ -363,14 +301,11 @@ export default function PricingSection({ onPlanChange }) {
     };
     document.addEventListener('visibilitychange', handleVisChange);
 
-    const {
-      data: authListener,
-    } =
-      supabase.auth.onAuthStateChange(() => {
-        if (active) {
-          loadSubscription();
-        }
-      });
+    const { data: authListener } = supabase.auth.onAuthStateChange(() => {
+      if (active) {
+        loadSubscription();
+      }
+    });
 
     return () => {
       active = false;
@@ -378,16 +313,10 @@ export default function PricingSection({ onPlanChange }) {
       document.removeEventListener('visibilitychange', handleVisChange);
       authListener?.subscription?.unsubscribe();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
+  }, [loadSubscription]);
 
   const handleCheckout = async (plan) => {
-    if (
-      !plan?.planKey ||
-      loadingPlan ||
-      isLaunchingRef.current
-    ) {
+    if (!plan?.planKey || loadingPlan || isLaunchingRef.current) {
       return;
     }
 
@@ -397,50 +326,30 @@ export default function PricingSection({ onPlanChange }) {
       return;
     }
 
-    // Immediately lock all checkout buttons to strictly prevent double payments
     isLaunchingRef.current = true;
     setLoadingPlan(plan.planKey);
     setError('');
 
     try {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-
-      if (!user && !plan.paymentUrl) {
-        throw new Error('Please sign in before upgrading your plan.');
-      }
-
-      /*
-       * Check the profile immediately before starting checkout to ensure
-       * an already-active plan cannot be purchased again.
-       */
-      if (user) {
-        const { data: freshProfile } = await supabase
-          .from('profiles')
-          .select('subscription_plan, subscription_status')
-          .eq('id', user.id)
-          .maybeSingle();
-
-        if (freshProfile) {
-          const freshPlan = normalizePlan(freshProfile.subscription_plan);
-          const freshStatus = String(freshProfile.subscription_status || '').toLowerCase();
-          if (freshPlan === plan.planKey && isActiveStatus(freshStatus)) {
-            setCurrentPlan(freshPlan);
-            setError(`You already have an active ${plan.name} subscription.`);
-            setLoadingPlan(null);
-            isLaunchingRef.current = false;
-            return;
-          }
+      const storedUser = (() => {
+        try {
+          return JSON.parse(localStorage.getItem('washek_user') || '{}');
+        } catch {
+          return {};
         }
+      })();
+
+      const fbUser = firebaseAuth?.currentUser;
+      const userEmail = fbUser?.email || storedUser?.email;
+      const userId = fbUser?.uid || storedUser?.id || storedUser?.uid;
+
+      try {
+        localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
+        sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
+      } catch (_err) {
+        // ignore
       }
 
-
-      /*
-       * Directly navigate to the designated Stripe Payment URL.
-       * Attach client_reference_id (user ID) and prefilled_email
-       * so Stripe automatically creates and attributes the customer.
-       */
       let destinationUrl = plan.paymentUrl;
       if (!destinationUrl) {
         throw new Error('Stripe payment URL is unavailable for this plan.');
@@ -448,20 +357,18 @@ export default function PricingSection({ onPlanChange }) {
 
       try {
         const urlObj = new URL(destinationUrl);
-        if (user?.email) {
-          urlObj.searchParams.set('prefilled_email', user.email);
+        if (userEmail) {
+          urlObj.searchParams.set('prefilled_email', userEmail);
         }
-        if (user?.id) {
-          urlObj.searchParams.set('client_reference_id', user.id);
+        if (userId) {
+          urlObj.searchParams.set('client_reference_id', userId);
         }
         destinationUrl = urlObj.toString();
       } catch (_err) {
         // URL parse fallback
       }
 
-      /*
-       * Perform reliable redirection out of iframe to the Stripe checkout page.
-       */
+      // Direct redirection to Stripe checkout
       let redirected = false;
       try {
         if (window.top && window.top !== window) {
@@ -482,6 +389,7 @@ export default function PricingSection({ onPlanChange }) {
       console.error('[PricingSection] Stripe redirect failed:', checkoutError);
       setError(checkoutError?.message || 'Unable to start checkout.');
       toast.error(checkoutError?.message || 'Unable to start checkout.');
+    } finally {
       setLoadingPlan(null);
       isLaunchingRef.current = false;
     }
@@ -752,18 +660,10 @@ export default function PricingSection({ onPlanChange }) {
                 <Button
                   className="w-full h-10 font-heading font-semibold transition-all"
                   variant="outline"
-                  onClick={() =>
-                    handleCheckout(
-                      plan
-                    )
-                  }
-                  disabled={
-                    !!loadingPlan ||
-                    loadingSubscription
-                  }
+                  onClick={() => handleCheckout(plan)}
+                  disabled={!!loadingPlan || loadingSubscription}
                 >
-                  {loadingPlan ===
-                  plan.planKey ? (
+                  {loadingPlan === plan.planKey ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                       Redirecting to Stripe…
@@ -781,64 +681,62 @@ export default function PricingSection({ onPlanChange }) {
         );
       })}
 
-      {currentPlan !==
-        'free' &&
-        !loadingSubscription && (
-          <div className="pt-2">
-            {showCancelConfirm ? (
-              <div className="p-4 rounded-xl border border-destructive/30 bg-destructive/5 space-y-3">
-                <div className="space-y-1">
-                  <p className="font-heading font-semibold text-sm text-destructive flex items-center gap-1.5">
-                    <XCircle className="w-4 h-4 shrink-0" />
-                    Cancel {currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} Subscription?
-                  </p>
-                  <p className="text-xs text-muted-foreground leading-relaxed">
-                    Your paid access will end immediately and your account will return to the Free baseline plan. You can re-subscribe at any time.
-                  </p>
-                </div>
-                <div className="flex gap-2">
-                  <Button
-                    type="button"
-                    variant="outline"
-                    size="sm"
-                    className="flex-1 text-xs"
-                    onClick={() => setShowCancelConfirm(false)}
-                    disabled={cancelling}
-                  >
-                    Keep My Plan
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="destructive"
-                    size="sm"
-                    className="flex-1 text-xs font-semibold"
-                    onClick={executeCancel}
-                    disabled={cancelling}
-                  >
-                    {cancelling ? (
-                      <>
-                        <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
-                        Cancelling...
-                      </>
-                    ) : (
-                      'Confirm Cancel'
-                    )}
-                  </Button>
-                </div>
+      {currentPlan !== 'free' && !loadingSubscription && (
+        <div className="pt-2">
+          {showCancelConfirm ? (
+            <div className="p-4 rounded-xl border border-destructive/30 bg-destructive/5 space-y-3">
+              <div className="space-y-1">
+                <p className="font-heading font-semibold text-sm text-destructive flex items-center gap-1.5">
+                  <XCircle className="w-4 h-4 shrink-0" />
+                  Cancel {currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} Subscription?
+                </p>
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  Your paid access will end immediately and your account will return to the Free baseline plan. You can re-subscribe at any time.
+                </p>
               </div>
-            ) : (
-              <Button
-                type="button"
-                variant="ghost"
-                className="w-full text-sm text-muted-foreground hover:text-destructive hover:bg-destructive/5"
-                onClick={() => setShowCancelConfirm(true)}
-                disabled={cancelling}
-              >
-                Cancel Subscription
-              </Button>
-            )}
-          </div>
-        )}
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  className="flex-1 text-xs"
+                  onClick={() => setShowCancelConfirm(false)}
+                  disabled={cancelling}
+                >
+                  Keep My Plan
+                </Button>
+                <Button
+                  type="button"
+                  variant="destructive"
+                  size="sm"
+                  className="flex-1 text-xs font-semibold"
+                  onClick={executeCancel}
+                  disabled={cancelling}
+                >
+                  {cancelling ? (
+                    <>
+                      <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+                      Cancelling...
+                    </>
+                  ) : (
+                    'Confirm Cancel'
+                  )}
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <Button
+              type="button"
+              variant="ghost"
+              className="w-full text-sm text-muted-foreground hover:text-destructive hover:bg-destructive/5"
+              onClick={() => setShowCancelConfirm(true)}
+              disabled={cancelling}
+            >
+              Cancel Subscription
+            </Button>
+          )}
+        </div>
+      )}
 
       <p className="text-[10px] text-muted-foreground text-center">
         Cancel anytime. Billed monthly.

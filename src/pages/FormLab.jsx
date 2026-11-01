@@ -45,6 +45,8 @@ import {
   FORM_EXERCISES,
   buildFormAnalysisPrompt,
   computeKinematicMetrics,
+  isStaticHoldExercise,
+  prioritizeKeyframeIndices,
 } from '@/lib/formAnalysis';
 
 
@@ -260,37 +262,26 @@ async function extractVideoFrames(
       );
 
     /*
-     * High-density biomechanical sampling density to guarantee exact rep counting and spot-on hold times:
-     * Provides multiple frames for every repetition's initiation, depth inflection, and lockout.
+     * Fast kinematic candidate pass:
+     * Samples 16-22 candidate timepoints across the window to capture
+     * all movement inflection points and transitions without heavy JPEG encoding.
      */
-    let frameCount = 14;
-    if (windowDuration > 25) {
-      frameCount = 28;
-    } else if (windowDuration > 15) {
-      frameCount = 24;
-    } else if (windowDuration > 8) {
-      frameCount = 20;
-    } else if (windowDuration > 4) {
-      frameCount = 16;
+    let candidateCount = 16;
+    if (windowDuration > 15) {
+      candidateCount = 22;
+    } else if (windowDuration > 7) {
+      candidateCount = 18;
     }
 
-    const timestamps = [];
-
-    for (
-      let i = 0;
-      i < frameCount;
-      i += 1
-    ) {
+    const candidateTimestamps = [];
+    for (let i = 0; i < candidateCount; i += 1) {
       const ratio =
-        frameCount === 1
+        candidateCount === 1
           ? 0
-          : i /
-            (frameCount - 1);
+          : i / (candidateCount - 1);
 
-      timestamps.push(
-        safeStart +
-          windowDuration *
-            ratio
+      candidateTimestamps.push(
+        safeStart + windowDuration * ratio
       );
     }
 
@@ -302,7 +293,7 @@ async function extractVideoFrames(
       video.videoHeight ||
       720;
 
-    const maxDimension = 540;
+    const maxDimension = 420;
     let targetWidth = sourceWidth;
     let targetHeight = sourceHeight;
 
@@ -316,60 +307,50 @@ async function extractVideoFrames(
       }
     }
 
-    const canvas =
-      document.createElement(
-        'canvas'
-      );
-
-    canvas.width = Math.max(1, targetWidth);
-    canvas.height = Math.max(1, targetHeight);
-
-    const ctx =
-      canvas.getContext(
-        '2d'
-      );
-
-    if (!ctx) {
-      throw new Error(
-        'Your browser could not prepare the video frames.'
-      );
-    }
-
-    // Lightweight offscreen motion canvas for kinematic tracking
+    // Motion canvas for microsecond pixel deltas & trajectory tracking
     const motionCanvas = document.createElement('canvas');
-    motionCanvas.width = 64;
-    motionCanvas.height = 64;
+    motionCanvas.width = 48;
+    motionCanvas.height = 48;
     const motionCtx = motionCanvas.getContext('2d', { willReadFrequently: true });
     let prevImageData = null;
-    const motionSamples = [];
 
-    const frames = [];
+    const candidateSamples = [];
 
-    for (
-      let i = 0;
-      i < timestamps.length;
-      i += 1
-    ) {
-      const timestamp =
-        timestamps[i];
+    for (let i = 0; i < candidateTimestamps.length; i += 1) {
+      const timestamp = candidateTimestamps[i];
+      await seekVideo(video, timestamp);
 
-      await seekVideo(
-        video,
-        timestamp
-      );
+      // Fast capture of decoded video frame without JPEG compression
+      let frameSource = null;
+      if (typeof window.createImageBitmap === 'function') {
+        try {
+          frameSource = await window.createImageBitmap(video, {
+            resizeWidth: targetWidth,
+            resizeHeight: targetHeight,
+            resizeQuality: 'medium',
+          });
+        } catch {
+          frameSource = null;
+        }
+      }
 
-      ctx.drawImage(
-        video,
-        0,
-        0,
-        canvas.width,
-        canvas.height
-      );
+      if (!frameSource) {
+        const offCanvas = document.createElement('canvas');
+        offCanvas.width = targetWidth;
+        offCanvas.height = targetHeight;
+        const offCtx = offCanvas.getContext('2d');
+        if (offCtx) {
+          offCtx.drawImage(video, 0, 0, targetWidth, targetHeight);
+          frameSource = offCanvas;
+        }
+      }
 
-      // Track motion energy and vertical displacement
+      let motionEnergy = 0;
+      let verticalCentroid = 0.5;
+
       if (motionCtx) {
-        motionCtx.drawImage(canvas, 0, 0, 64, 64);
-        const currData = motionCtx.getImageData(0, 0, 64, 64).data;
+        motionCtx.drawImage(video, 0, 0, 48, 48);
+        const currData = motionCtx.getImageData(0, 0, 48, 48).data;
         if (prevImageData) {
           let diffSum = 0;
           let weightedY = 0;
@@ -380,72 +361,117 @@ async function extractVideoFrames(
             const dB = Math.abs(currData[p + 2] - prevImageData[p + 2]);
             const pixelDiff = (dR + dG + dB) / 3;
             diffSum += pixelDiff;
-            const pixelY = Math.floor((p / 4) / 64) / 64;
+            const pixelY = Math.floor(p / 4 / 48) / 48;
             weightedY += pixelDiff * pixelY;
             totalWeight += pixelDiff;
           }
-          const motionEnergy = diffSum / (64 * 64 * 255);
-          const verticalCentroid = totalWeight > 0 ? weightedY / totalWeight : 0.5;
-          motionSamples.push({
-            timestamp,
-            motionEnergy,
-            verticalCentroid,
-          });
-        } else {
-          motionSamples.push({
-            timestamp,
-            motionEnergy: 0,
-            verticalCentroid: 0.5,
-          });
+          motionEnergy = diffSum / (48 * 48 * 255);
+          verticalCentroid = totalWeight > 0 ? weightedY / totalWeight : 0.5;
         }
         prevImageData = currData;
       }
 
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.72);
-
-      const blob =
-        await canvasToBlob(
-          canvas
-        );
-
-      frames.push({
-        index:
-          i + 1,
-
+      candidateSamples.push({
+        index: i,
         timestamp,
-
-        dataUrl,
-
-        file:
-          new File(
-            [blob],
-            `form-frame-${String(
-              i + 1
-            ).padStart(
-              2,
-              '0'
-            )}.jpg`,
-            {
-              type:
-                'image/jpeg',
-            }
-          ),
+        motionEnergy,
+        verticalCentroid,
+        frameSource,
       });
     }
 
+    // Kinematic metrics based on complete candidate sampling
     const kinematics = computeKinematicMetrics(
-      motionSamples,
+      candidateSamples,
       category,
       windowDuration
     );
 
+    /*
+     * FRAME-SKIPPING ALGORITHM:
+     * Select prioritized keyframes (inflection points, peak depth, lockouts, hold anchors)
+     * and skip redundant static/idle frames or identical intermediate frames.
+     */
+    const prioritizedKeyframes = prioritizeKeyframeIndices(
+      candidateSamples,
+      category,
+      windowDuration,
+      14 // Optimal keyframe target for speed + full rep phase visibility
+    );
+
+    // Selected sample index set for quick lookup
+    const selectedIndices = new Set(prioritizedKeyframes.map((k) => k.sampleIndex));
+
+    // Cleanup unused bitmaps immediately to minimize memory usage
+    for (let i = 0; i < candidateSamples.length; i += 1) {
+      if (!selectedIndices.has(i)) {
+        const src = candidateSamples[i].frameSource;
+        if (src && typeof src.close === 'function') {
+          src.close();
+        }
+      }
+    }
+
+    // Target canvas for encoding prioritized keyframes
+    const canvas = document.createElement('canvas');
+    canvas.width = targetWidth;
+    canvas.height = targetHeight;
+    const ctx = canvas.getContext('2d');
+
+    if (!ctx) {
+      throw new Error('Your browser could not prepare the video frames.');
+    }
+
+    const frames = [];
+    const totalKeyframes = prioritizedKeyframes.length;
+
+    for (let k = 0; k < totalKeyframes; k += 1) {
+      const keyInfo = prioritizedKeyframes[k];
+      const sample = candidateSamples[keyInfo.sampleIndex];
+      const { timestamp, frameSource } = sample;
+      const phase = keyInfo.phase || 'Movement Phase';
+
+      if (frameSource) {
+        ctx.drawImage(frameSource, 0, 0, canvas.width, canvas.height);
+        if (typeof frameSource.close === 'function') {
+          frameSource.close();
+        }
+      }
+
+      // Draw visible high-contrast frame & phase badge directly on the frame image
+      const labelText = `Keyframe ${k + 1}/${totalKeyframes} · ${timestamp.toFixed(2)}s · ${phase}`;
+      ctx.save();
+      ctx.font = 'bold 13px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
+      const textMetrics = ctx.measureText(labelText);
+      const bgWidth = Math.min(canvas.width - 16, textMetrics.width + 16);
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.82)';
+      ctx.fillRect(8, 8, bgWidth, 24);
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(labelText, 14, 25);
+      ctx.restore();
+
+      // Encode JPEG ONLY for prioritized keyframes
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+      const blob = await canvasToBlob(canvas);
+
+      frames.push({
+        index: k + 1,
+        timestamp,
+        phase,
+        dataUrl,
+        file: new File(
+          [blob],
+          `form-frame-${String(k + 1).padStart(2, '0')}.jpg`,
+          { type: 'image/jpeg' }
+        ),
+      });
+    }
+
     return {
       frames,
       duration,
-      start:
-        safeStart,
-      end:
-        safeEnd,
+      start: safeStart,
+      end: safeEnd,
       kinematics,
     };
   } finally {
@@ -565,7 +591,8 @@ function normalizeResult(
   fallbackStart,
   fallbackEnd,
   kinematics = null,
-  category = 'dynamic'
+  category = 'dynamic',
+  exercise = ''
 ) {
   const source =
     value && typeof value === 'object'
@@ -587,20 +614,155 @@ function normalizeResult(
     }
   }
 
-  const safeScore =
-    Number.isFinite(score) && score > 0
-      ? Math.max(1, Math.min(100, Math.round(score)))
-      : (source.camera_angle_ok === false ? 45 : 75);
+  // 1. Process issues / complaints
+  const rawIssues = Array.isArray(source.issues)
+    ? source.issues
+    : (Array.isArray(source.flaws) ? source.flaws : []);
+
+  // Filter out any entries that are empty, or that say "None", "No issues", "N/A", "Perfect form"
+  const realComplaints = rawIssues.filter((iss) => {
+    if (!iss || typeof iss !== 'object') return false;
+    const problem = String(iss.problem || '').trim().toLowerCase();
+    const area = String(iss.area || '').trim().toLowerCase();
+    const fix = String(iss.fix || '').trim().toLowerCase();
+    const combined = `${area} ${problem} ${fix}`.trim();
+    if (!combined) return false;
+
+    const benignKeywords = [
+      'no issue',
+      'no flaw',
+      'no major issue',
+      'no complaints',
+      'none',
+      'n/a',
+      'na',
+      'nothing',
+      'perfect',
+      'flawless',
+      'solid',
+      'clean form',
+      'textbook',
+      'good form',
+      'keep it up',
+      'maintain current',
+    ];
+    return !benignKeywords.some((bk) => problem === bk || problem.startsWith(bk) || area === bk);
+  });
+
+  // Extract complaints from priority_focus or assessment text if issues array was omitted or sparse
+  const textBlob = `${source.overall_assessment || ''} ${source.summary || ''} ${source.critique || ''}`.toLowerCase();
+  const priorityList = Array.isArray(source.priority_focus) ? source.priority_focus : (Array.isArray(source.cues) ? source.cues : []);
+
+  for (const prio of priorityList) {
+    if (typeof prio === 'string' && prio.trim().length > 4) {
+      const pLower = prio.toLowerCase();
+      const correctiveWords = ['avoid', 'stop', 'fix', 'prevent', 'do not', "don't", 'sag', 'flare', 'kip', 'momentum', 'arch', 'collapse', 'cheat', 'cut depth', 'parallel', 'hyperexten', 'sway', 'strain'];
+      if (correctiveWords.some((w) => pLower.includes(w))) {
+        const alreadyCaptured = realComplaints.some((c) => pLower.includes(String(c.problem || '').toLowerCase().slice(0, 10)));
+        if (!alreadyCaptured) {
+          const isCritical = pLower.includes('dangerous') || pLower.includes('collapse') || pLower.includes('hyperexten') || pLower.includes('spine') || pLower.includes('injury');
+          const isMajor = pLower.includes('sag') || pLower.includes('worm') || pLower.includes('kip') || pLower.includes('momentum');
+          realComplaints.push({
+            area: isCritical || isMajor ? 'Spine / Core Alignment' : 'Movement Technique',
+            problem: prio,
+            severity: isCritical ? 'critical' : isMajor ? 'major' : 'moderate',
+            fix: prio,
+            corrective_exercises: [],
+          });
+        }
+      }
+    }
+  }
+
+  if (realComplaints.length === 0) {
+    if (textBlob.includes('dangerous') || textBlob.includes('injury') || textBlob.includes('severe') || textBlob.includes('hazard')) {
+      realComplaints.push({
+        area: 'Movement Safety & Joint Mechanics',
+        problem: 'Dangerous technical breakdown observed during execution.',
+        severity: 'critical',
+        fix: 'Immediately cease this progression level; master baseline joint alignment and core tension.',
+        corrective_exercises: ['Hollow body hold', 'Plank with posterior pelvic tilt'],
+      });
+    } else if (textBlob.includes('sag') || textBlob.includes('worm') || textBlob.includes('kip') || textBlob.includes('flare') || textBlob.includes('arch') || textBlob.includes('cheat') || textBlob.includes('poor')) {
+      realComplaints.push({
+        area: 'Kinetic Chain Alignment',
+        problem: 'Noticeable technical breakdown detected during movement path.',
+        severity: 'major',
+        fix: 'Lock core and maintain strict joint alignment throughout full range of motion.',
+        corrective_exercises: ['Strict tempo reps', 'Eccentric control drills'],
+      });
+    }
+  }
+
+  // 2. Score calibration (REAL 1% TO 100% — NO SUGARCOATING):
+  let finalScore;
+  const modelScore = (Number.isFinite(score) && score >= 1 && score <= 100) ? Math.round(score) : null;
+
+  if (source.camera_angle_ok === false) {
+    finalScore = 25;
+  } else if (realComplaints.length === 0) {
+    // Only grant high score if zero complaints exist and assessment text contains zero critique
+    if (modelScore !== null) {
+      finalScore = modelScore;
+    } else {
+      finalScore = 95;
+    }
+  } else {
+    // Uncompromising deduction scale based on true mechanical severity:
+    // Minor tip: -6 to -8 pts
+    // Moderate flaw: -16 to -20 pts
+    // Major breakdown: -32 to -45 pts
+    // Critical safety hazard: -55 to -85 pts
+    let totalDeduction = 0;
+    let hasCritical = false;
+    let majorCount = 0;
+
+    for (const comp of realComplaints) {
+      const sev = String(comp.severity || 'minor').toLowerCase();
+      if (sev === 'critical') {
+        totalDeduction += 60;
+        hasCritical = true;
+      } else if (sev === 'major') {
+        totalDeduction += 35;
+        majorCount++;
+      } else if (sev === 'moderate') {
+        totalDeduction += 18;
+      } else {
+        totalDeduction += 7;
+      }
+    }
+
+    let calculatedScore = Math.max(1, 100 - totalDeduction);
+
+    // Hard caps for dangerous or broken execution (Never sugarcoat!):
+    if (hasCritical) {
+      calculatedScore = Math.min(calculatedScore, 20); // 1% - 20%
+    } else if (majorCount >= 2) {
+      calculatedScore = Math.min(calculatedScore, 35); // 20% - 35%
+    } else if (majorCount === 1) {
+      calculatedScore = Math.min(calculatedScore, 55); // max 55%
+    }
+
+    if (modelScore !== null) {
+      // If the model gave a low score, honor it! If model gave an inflated high score despite real breakdowns, enforce deductions!
+      finalScore = Math.min(modelScore, calculatedScore);
+    } else {
+      finalScore = calculatedScore;
+    }
+  }
+
+  finalScore = Math.max(1, Math.min(100, Math.round(finalScore)));
 
   const windowDuration = Math.max(0.1, fallbackEnd - fallbackStart);
-  const isHold = category === 'hold';
+  const isHold = isStaticHoldExercise(source.exercise_name || exercise, category);
 
   let finalRepCount = null;
   let finalHoldTime = null;
 
   if (isHold) {
-    // Static isometric holds do not have rep counts
-    finalRepCount = null;
+    // Static isometric holds strictly do not count reps:
+    // "If the thing being scored is a static, a hold, then reps will be "N/A" and it'll count the actual time held, not the start and finish time, just the full actual hold time duration."
+    finalRepCount = 'N/A';
 
     let rawHold = source.hold_time_seconds ?? source.hold_time ?? source.duration_seconds;
     if (rawHold != null) {
@@ -611,7 +773,7 @@ function normalizeResult(
       }
     }
 
-    // If model didn't provide hold time or returned 0, use kinematically measured hold time
+    // If model didn't provide hold time or returned 0, use measured hold time bounded by section
     if (finalHoldTime == null || finalHoldTime <= 0) {
       if (kinematics?.detectedHoldSeconds && kinematics.detectedHoldSeconds > 0) {
         finalHoldTime = Math.min(windowDuration, Math.round(kinematics.detectedHoldSeconds * 10) / 10);
@@ -620,8 +782,10 @@ function normalizeResult(
       }
     }
   } else {
-    // Dynamic rep-based exercises do not have static hold times
-    finalHoldTime = null;
+    // Dynamic rep-based exercises:
+    // "If it's reps, it counts reps and the hold time stays as "N/A"."
+    // "And second, the rep or hold time counter has to be real. It counts wrong reps... It adds or takes away from reps constantly... Making it accurate doesn't mean more strict on score"
+    finalHoldTime = 'N/A';
 
     let rawReps = source.rep_count ?? source.reps ?? source.repetition_count;
     let modelReps = null;
@@ -632,20 +796,63 @@ function normalizeResult(
       }
     }
 
-    if (modelReps !== null && modelReps > 0) {
-      finalRepCount = modelReps;
-      // If kinematic analysis detected a higher verified complete cycle count (e.g. 10 reps)
-      // that the model slightly undercounted due to frame sampling
-      if (kinematics?.detectedReps && kinematics.detectedReps > 0) {
-        if (kinematics.detectedReps > modelReps && (kinematics.detectedReps - modelReps) >= 2) {
-          finalRepCount = kinematics.detectedReps;
-        }
+    // Check if the model provided a verified rep_breakdown array
+    const breakdownLength = Array.isArray(source.rep_breakdown) ? source.rep_breakdown.length : 0;
+
+    // Check if the overall assessment or summary explicitly mentions a rep count
+    let textMentionedReps = null;
+    const textBlob = `${source.overall_assessment || ''} ${source.summary || ''} ${source.critique || ''}`;
+    const repMatch = textBlob.match(/\b(?:completed|performed|across all|total of|did)\s+(\d{1,2})\s+(?:reps?|repetitions?|push-?ups?|pull-?ups?|dips?|squats?|curls?|rows?)\b/i);
+    if (repMatch) {
+      const parsedTextReps = parseInt(repMatch[1], 10);
+      if (Number.isFinite(parsedTextReps) && parsedTextReps > 0 && parsedTextReps <= 40) {
+        textMentionedReps = parsedTextReps;
       }
+    }
+
+    // NEVER let a truncated breakdown or missed phase take away reps that were performed!
+    // Take the maximum of all verified signals so reps are never subtracted
+    const repCandidates = [];
+    if (modelReps !== null && modelReps > 0) repCandidates.push(modelReps);
+    if (breakdownLength > 0) repCandidates.push(breakdownLength);
+    if (textMentionedReps !== null && textMentionedReps > 0) repCandidates.push(textMentionedReps);
+
+    if (repCandidates.length > 0) {
+      finalRepCount = Math.max(...repCandidates);
     } else if (kinematics?.detectedReps && kinematics.detectedReps > 0) {
       finalRepCount = kinematics.detectedReps;
     } else {
-      finalRepCount = modelReps !== null ? modelReps : 1;
+      finalRepCount = 1;
     }
+  }
+
+  let finalIssues = realComplaints;
+  let finalPriorityFocus = Array.isArray(source.priority_focus)
+    ? source.priority_focus
+    : (Array.isArray(source.cues) ? source.cues : []);
+
+  let finalAssessment = String(
+    source.overall_assessment ||
+    source.summary ||
+    source.critique ||
+    ''
+  ).trim();
+
+  // Only format as 100% flawless if score is at least 98% and zero complaints exist
+  if (finalScore >= 98 && realComplaints.length === 0) {
+    finalIssues = [];
+    if (!finalPriorityFocus.length) {
+      finalPriorityFocus = ['Maintain this textbook form and joint alignment as you increase volume.'];
+    }
+    if (!finalAssessment) {
+      finalAssessment = 'Flawless execution. Your posture, alignment, joint tracking, and control were textbook with zero detectable breakdown.';
+    }
+  } else if (!finalAssessment) {
+    finalAssessment = finalScore < 30
+      ? 'Critical biomechanical breakdown detected. Continuing with this execution carries immediate injury risk. Address the listed issues before training this movement.'
+      : finalScore < 60
+      ? 'Noticeable form breakdowns and momentum detected. Review the listed flaws and focus on strict joint positioning.'
+      : 'Form analysis complete. Review the technical corrections below to optimize your joint angles and progression.';
   }
 
   return {
@@ -658,7 +865,7 @@ function normalizeResult(
       ),
 
     score:
-      safeScore,
+      finalScore,
 
     rep_count:
       finalRepCount,
@@ -673,22 +880,13 @@ function normalizeResult(
       source.active_range_end == null ? fallbackEnd : Number(source.active_range_end),
 
     overall_assessment:
-      String(
-        source.overall_assessment ||
-        source.summary ||
-        source.critique ||
-        'The biomechanical analysis of your movement is complete.'
-      ),
+      finalAssessment,
 
     issues:
-      Array.isArray(source.issues)
-        ? source.issues
-        : (Array.isArray(source.flaws) ? source.flaws : []),
+      finalIssues,
 
     priority_focus:
-      Array.isArray(source.priority_focus)
-        ? source.priority_focus
-        : (Array.isArray(source.cues) ? source.cues : []),
+      finalPriorityFocus,
   };
 }
 
@@ -703,8 +901,12 @@ function buildFrameAnalysisPrompt(
   start,
   end,
   frameTimeline,
-  kinematicSummary = ''
+  kinematics = null
 ) {
+  const kinematicSummary = kinematics?.summary
+    ? `KINEMATIC MOVEMENT ANALYSIS:\n- ${kinematics.summary}\n- Detected movement cycles: ${kinematics.detectedReps ?? 'N/A'}\n- Detected hold duration: ${kinematics.detectedHoldSeconds != null ? kinematics.detectedHoldSeconds + 's' : 'N/A'}`
+    : '';
+
   const basePrompt =
     buildFormAnalysisPrompt(
       exercise,
@@ -718,16 +920,24 @@ function buildFrameAnalysisPrompt(
   return `
 ${basePrompt}
 
-CHRONOLOGICAL FRAME TIMELINE (ANALYZED SECTION ONLY: ${start.toFixed(2)}s to ${end.toFixed(2)}s):
+CHRONOLOGICAL KEYFRAME TIMELINE (FRAME-SKIPPED FOR KEY MOVEMENT PHASES: ${start.toFixed(2)}s to ${end.toFixed(2)}s):
 
 ${frameTimeline}
 
-${kinematicSummary ? `KINEMATIC SUMMARY OF ANALYZED SECTION:\n${kinematicSummary}\n` : ''}
-
-VERY IMPORTANT ACCURACY RULES:
-1. COUNTING REPS: If the athlete performs 10 reps in this analyzed section, you must count exactly 10 reps.
-2. HOLD TIMES: For static holds, measure the exact duration in seconds held strictly within this analyzed section.
-3. BOUNDARIES: Only analyze movement within this analyzed section (${start.toFixed(2)}s to ${end.toFixed(2)}s).
+VERY IMPORTANT ACCURACY & FAIRNESS RULES:
+1. KEY MOVEMENT PHASES PRIORITIZED: The provided frames have been intelligently filtered using frame-skipping to prioritize crucial inflection points (bottom turnaround depth, peak contraction, top lockout) and hold stability while skipping redundant idle/static pause frames.
+2. REAL REP COUNTER (NEVER DROP OR TAKE AWAY REPS): For dynamic movements, count EVERY single repetition the athlete attempts or performs across the video frames from start to finish. If a repetition had cut depth, partial range of motion, soft lockout, slight momentum, or fatigue breakdown near the end, THAT REPETITION STILL FULLY COUNTS AS A REP! Imperfect execution affects the form score, NEVER the rep count! Always count the initial rep and the final rep. Set "rep_count" to the exact total integer count of all repetitions performed. Set "hold_time_seconds": null.
+3. HOLD TIMES (FULL DURATION): For static holds, measure the continuous duration in seconds held strictly within this analyzed section until the athlete completely drops, releases, or touches down. Form adjustments or wobbles do NOT stop the hold timer. Set "hold_time_seconds": number. Set "rep_count": null.
+4. REAL SCORE MANDATE (1% TO 100% — ABSOLUTELY NO SUGARCOATING — TELL LITERALLY EVERYTHING WRONG):
+The score MUST be completely realistic, honest, and anywhere from 1% to 100%. Stop sugarcoating bad form. Bad or dangerous form is dangerous and must NEVER receive a high score or be excused to protect the athlete ego.
+- 1%–20%: Dangerous or hazardous execution with extreme injury risk (e.g. collapsing lumbar spine under load, severe shoulder impingement shearing, uncontrolled dropping/falling).
+- 20%–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging, worming push-ups, heavy swinging/kipping, cutting half the range of motion, severe asymmetry, collapsed core tension).
+- 45%–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM, flared elbows >60°, uncontrolled eccentric cadence, soft lockout).
+- 70%–84%: Acceptable or moderate execution with clear technical flaws to fix.
+- 85%–94%: High-level execution with 1 minor technical refinement.
+- 95%–100%: Rare, flawless, gymnastics-grade textbook execution with full range of motion, locked body tension, and zero detectable complaints.
+MANDATORY: You MUST list literally every single flaw in the "issues" array with exact problem, severity, and fix! Never leave "issues" empty if the athlete makes mistakes!
+5. BOUNDARIES: Only analyze movement within this analyzed section (${start.toFixed(2)}s to ${end.toFixed(2)}s).
 
 OUTPUT RULE:
 Return ONLY valid JSON matching the structure. Do not use markdown. Do not wrap in backticks.
@@ -968,7 +1178,7 @@ export default function FormLab() {
 
   const exCategory =
     selectedEx?.category ||
-    'dynamic';
+    (isStaticHoldExercise(exercise) ? 'hold' : 'dynamic');
 
 
   /*
@@ -1076,29 +1286,21 @@ export default function FormLab() {
           );
         }
 
-        const uploaded =
-          await supabaseApi.storage.uploadFile(
-            {
-              file,
+        // Instant local preview object URL - instantaneous playback and scrub, zero latency, never fails
+        const localBlobUrl = URL.createObjectURL(file);
+        setVideoUrl(localBlobUrl);
+        setVideoPath(`local/${file.name}`);
+
+        // Non-blocking background upload for optional cloud storage
+        supabaseApi.storage.uploadFile({ file, folder: 'form-analysis' })
+          .then((uploaded) => {
+            if (uploaded?.path) {
+              setVideoPath(uploaded.path);
             }
-          );
-
-        if (
-          !uploaded?.file_url ||
-          !uploaded?.path
-        ) {
-          throw new Error(
-            'The video uploaded, but no video URL or storage path was returned.'
-          );
-        }
-
-        setVideoUrl(
-          uploaded.file_url
-        );
-
-        setVideoPath(
-          uploaded.path
-        );
+          })
+          .catch((storageErr) => {
+            console.debug('[FormLab] Optional background video backup note:', storageErr?.message || storageErr);
+          });
 
         const nextParams =
           new URLSearchParams(
@@ -1117,13 +1319,13 @@ export default function FormLab() {
         error
       ) {
         console.error(
-          '[FormLab] Upload failed:',
+          '[FormLab] Video selection note:',
           error
         );
 
         setErrorMessage(
           error?.message ||
-            'The video could not be uploaded.'
+            'Unable to load the selected video.'
         );
 
         setVideoFile(
@@ -1325,7 +1527,7 @@ export default function FormLab() {
          */
 
         setAnalysisStatus(
-          'Preparing high-resolution biomechanical keyframes…'
+          'Extracting prioritized movement keyframes…'
         );
 
         const uploadedFrames =
@@ -1336,23 +1538,13 @@ export default function FormLab() {
             timestamp:
               frame.timestamp,
 
+            phase:
+              frame.phase || 'Movement Phase',
+
             url:
               frame.dataUrl ||
               '',
           }));
-
-        // Fire background storage persistence without blocking the fast AI response
-        Promise.all(
-          frames.map(f =>
-            supabaseApi.storage
-              .uploadFile({
-                file: f.file,
-                folder: 'form-analysis-frames',
-              })
-              .catch(() => null)
-          )
-        ).catch(() => {});
-
 
         /*
          * ------------------------------------------------------
@@ -1364,14 +1556,13 @@ export default function FormLab() {
           uploadedFrames
             .map(
               frame =>
-                `Frame ${frame.index}: ${frame.timestamp.toFixed(
+                `Keyframe ${frame.index}: ${frame.timestamp.toFixed(
                   2
-                )}s`
+                )}s · [Phase: ${frame.phase}]`
             )
             .join(
               '\n'
             );
-
 
         /*
          * ------------------------------------------------------
@@ -1391,7 +1582,7 @@ export default function FormLab() {
             start,
             end,
             frameTimeline,
-            kinematics?.summary || ''
+            kinematics
           );
 
 
@@ -1453,7 +1644,8 @@ export default function FormLab() {
             start,
             end,
             kinematics,
-            exCategory
+            exCategory,
+            exercise
           );
 
         setResult(
@@ -1545,10 +1737,10 @@ export default function FormLab() {
                 cleaned.score,
 
               rep_count:
-                cleaned.rep_count,
+                cleaned.rep_count === 'N/A' || cleaned.rep_count == null ? null : Number(cleaned.rep_count),
 
               hold_time_seconds:
-                cleaned.hold_time_seconds,
+                cleaned.hold_time_seconds === 'N/A' || cleaned.hold_time_seconds == null ? null : Number(cleaned.hold_time_seconds),
 
               analysis:
                 cleaned.overall_assessment,
@@ -1604,6 +1796,14 @@ export default function FormLab() {
 
   const reset =
     () => {
+      if (videoUrl && videoUrl.startsWith('blob:')) {
+        try {
+          URL.revokeObjectURL(videoUrl);
+        } catch (_e) {
+          // ignore
+        }
+      }
+
       setVideoFile(
         null
       );

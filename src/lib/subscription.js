@@ -10,6 +10,8 @@
  * of inventing their own subscription rules.
  */
 
+import { auth as firebaseAuth, db, doc, setDoc } from '@/lib/firebase';
+
 export const PLAN_HIERARCHY = [
   'free',
   'progress',
@@ -447,6 +449,50 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     console.debug('[subscription] LocalStorage upgrade sync note:', err);
   }
 
+  // Persist directly to Firestore if Firebase user is authenticated
+  try {
+    const fbUser = firebaseAuth?.currentUser;
+    if (fbUser?.uid) {
+      const userRef = doc(db, 'users', fbUser.uid);
+      setDoc(
+        userRef,
+        {
+          subscription_plan: normPlan,
+          subscription_status: status,
+          tier: normPlan,
+          plan: normPlan,
+          subscription_tier: normPlan,
+          updated_at: new Date().toISOString(),
+        },
+        { merge: true }
+      ).catch((fsErr) => console.debug('[subscription] Firestore sync note:', fsErr));
+    }
+  } catch (_e) {
+    // Non-blocking
+  }
+
+  // Background server sync to keep Supabase profiles table in sync
+  try {
+    const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
+    const syncUid = firebaseAuth?.currentUser?.uid || stored?.id || stored?.uid;
+    const syncEmail = firebaseAuth?.currentUser?.email || stored?.email;
+    if (syncUid || syncEmail) {
+      fetch('/api/checkout/process', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: syncUid,
+          email: syncEmail,
+          plan: normPlan,
+          status,
+          sessionId: details?.sessionId || `upgrade_${Date.now()}`,
+        }),
+      }).catch(() => {});
+    }
+  } catch (_e) {
+    // Non-blocking
+  }
+
   // Dispatch global events for instant reactive UI updates
   if (typeof window !== 'undefined') {
     window.dispatchEvent(
@@ -504,6 +550,47 @@ export function applySubscriptionCancellation(details = {}) {
     localStorage.setItem('washek_user', JSON.stringify(userObj));
   } catch (err) {
     console.debug('[subscription] LocalStorage cancellation sync note:', err);
+  }
+
+  // Persist cancellation to Firestore
+  try {
+    const fbUser = firebaseAuth?.currentUser;
+    if (fbUser?.uid) {
+      const userRef = doc(db, 'users', fbUser.uid);
+      setDoc(
+        userRef,
+        {
+          subscription_plan: 'free',
+          subscription_status: 'canceled',
+          tier: 'free',
+          plan: 'free',
+          subscription_tier: 'free',
+          updated_at: new Date().toISOString(),
+        },
+        { merge: true }
+      ).catch((fsErr) => console.debug('[subscription] Firestore cancel sync note:', fsErr));
+    }
+  } catch (_e) {
+    // Non-blocking
+  }
+
+  // Background server sync for cancellation
+  try {
+    const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
+    const syncUid = firebaseAuth?.currentUser?.uid || stored?.id || stored?.uid;
+    const syncEmail = firebaseAuth?.currentUser?.email || stored?.email;
+    if (syncUid || syncEmail) {
+      fetch('/api/cancel-subscription', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: syncUid,
+          email: syncEmail,
+        }),
+      }).catch(() => {});
+    }
+  } catch (_e) {
+    // Non-blocking
   }
 
   // Dispatch global events for instant reactive UI updates

@@ -49,6 +49,7 @@ export default function SubscriptionReturn() {
   const [searchParams] = useSearchParams();
 
   const [status, setStatus] = useState('loading');
+  const [subStatus, setSubStatus] = useState('trialing');
   const [planName, setPlanName] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
 
@@ -57,6 +58,10 @@ export default function SubscriptionReturn() {
 
     // Detect plan from query parameters, with pending checkout storage fallback
     const rawPlanParam = searchParams.get('plan') || '';
+    const rawStatusParam = searchParams.get('status') || '';
+    const resolvedStatus = rawStatusParam === 'active' ? 'active' : 'trialing';
+    setSubStatus(resolvedStatus);
+
     const pendingPlan = (() => {
       try {
         return (
@@ -83,7 +88,7 @@ export default function SubscriptionReturn() {
     setPlanName(friendlyName);
 
     // Apply upgrade instantly across all local storage & application state
-    applySubscriptionUpgrade(resolvedPlan, 'active', { sessionId });
+    applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { sessionId });
 
     // Clean up temporary pending plan
     try {
@@ -122,6 +127,7 @@ export default function SubscriptionReturn() {
             userId: uid,
             email,
             plan: resolvedPlan,
+            status: resolvedStatus,
             sessionId: sessionId || `return_${Date.now()}`,
           }),
         }).catch(() => {});
@@ -134,7 +140,7 @@ export default function SubscriptionReturn() {
         if (firebaseAuth?.currentUser) {
           await firebaseApi.auth.updateProfile({
             subscription_plan: resolvedPlan,
-            subscription_status: 'active',
+            subscription_status: resolvedStatus,
             tier: resolvedPlan,
             plan: resolvedPlan,
             subscription_tier: resolvedPlan,
@@ -151,7 +157,7 @@ export default function SubscriptionReturn() {
             .from('profiles')
             .update({
               subscription_plan: resolvedPlan,
-              subscription_status: 'active',
+              subscription_status: resolvedStatus,
               updated_at: new Date().toISOString(),
             })
             .eq('id', uid);
@@ -177,7 +183,7 @@ export default function SubscriptionReturn() {
         if (!cancelled) {
           navigate('/', { replace: true });
         }
-      }, 2000);
+      }, 3500);
 
       return () => clearTimeout(timer);
     };
@@ -189,52 +195,7 @@ export default function SubscriptionReturn() {
     };
   }, [navigate, searchParams]);
 
-  const handleManualActivate = async (planKey) => {
-    setStatus('loading');
-    const friendlyName = (PLAN_LABELS && PLAN_LABELS[planKey]) || planKey.charAt(0).toUpperCase() + planKey.slice(1);
-    setPlanName(friendlyName);
-    applySubscriptionUpgrade(planKey, 'active', { sessionId: `manual_${Date.now()}` });
 
-    try {
-      const { data: authData } = await supabase.auth.getUser();
-      const storedUser = JSON.parse(localStorage.getItem('washek_user') || '{}');
-      const uid = authData?.user?.id || storedUser?.id || storedUser?.uid;
-      const email = authData?.user?.email || storedUser?.email;
-
-      await fetch('/api/checkout/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId: uid, email, plan: planKey }),
-      }).catch(() => {});
-
-      if (uid) {
-        await supabase
-          .from('profiles')
-          .update({
-            subscription_plan: planKey,
-            subscription_status: 'active',
-            updated_at: new Date().toISOString(),
-          })
-          .eq('id', uid);
-      }
-
-      if (firebaseAuth?.currentUser) {
-        await firebaseApi.auth.updateProfile({
-          subscription_plan: planKey,
-          subscription_status: 'active',
-          tier: planKey,
-          plan: planKey,
-        });
-      }
-    } catch (err) {
-      console.debug('[SubscriptionReturn] Manual activate note:', err);
-    }
-
-    setStatus('success');
-    window.setTimeout(() => {
-      navigate('/', { replace: true });
-    }, 2000);
-  };
 
   /*
    * ==========================================================
@@ -250,11 +211,11 @@ export default function SubscriptionReturn() {
           </div>
 
           <h1 className="font-heading font-bold text-2xl tracking-tight">
-            Confirming your subscription…
+            Confirming your 7-day free trial…
           </h1>
 
           <p className="text-sm text-muted-foreground leading-relaxed">
-            Stripe payment completed. WASHEK is unlocking your new {planName || 'paid'} features now.
+            Stripe checkout completed. WASHEK is unlocking all {planName || 'plan'} features for your 7-day free trial now ($0 charged today).
           </p>
 
           <div className="flex items-center justify-center gap-2 text-primary font-medium text-sm pt-2">
@@ -272,6 +233,8 @@ export default function SubscriptionReturn() {
    * ==========================================================
    */
   if (status === 'success') {
+    const isTrial = subStatus === 'trialing';
+
     return (
       <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
         <div className="space-y-5 max-w-sm w-full">
@@ -281,11 +244,13 @@ export default function SubscriptionReturn() {
 
           <div className="space-y-2">
             <h1 className="font-heading font-bold text-2xl tracking-tight">
-              You're on {planName}!
+              {isTrial ? `Your 7-Day Free Trial is Active!` : `You're on ${planName}!`}
             </h1>
 
             <p className="text-sm text-muted-foreground leading-relaxed">
-              Your subscription has been confirmed and all your paid features are immediately unlocked.
+              {isTrial
+                ? `All ${planName} features are immediately unlocked for your 7-day trial ($0 today). Auto-renews after 7 days · Cancel anytime in your profile.`
+                : `Your subscription has been confirmed and all your ${planName} features are immediately unlocked.`}
             </p>
           </div>
 
@@ -299,12 +264,22 @@ export default function SubscriptionReturn() {
                 <p className="text-sm font-semibold">{planName} Tier</p>
               </div>
             </div>
-            <span className="text-[11px] font-medium text-emerald-500 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/20">
-              Active
+            <span className="text-[11px] font-semibold text-emerald-500 bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
+              {isTrial ? '7-Day Trial Active' : 'Active'}
             </span>
           </div>
 
-          <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground pt-3">
+          <div className="pt-2">
+            <Button
+              className="w-full font-heading font-semibold"
+              onClick={() => navigate('/', { replace: true })}
+            >
+              Enter WASHEK Dashboard
+              <ArrowRight className="w-4 h-4 ml-1.5" />
+            </Button>
+          </div>
+
+          <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground pt-1">
             <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
             <span>Redirecting to your dashboard automatically…</span>
           </div>
@@ -315,7 +290,7 @@ export default function SubscriptionReturn() {
 
   /*
    * ==========================================================
-   * ERROR OR MANUAL REDIRECT
+   * ERROR OR INVALID SESSION
    * ==========================================================
    */
   return (
@@ -326,51 +301,28 @@ export default function SubscriptionReturn() {
         </div>
 
         <h1 className="font-heading font-bold text-2xl tracking-tight">
-          Subscription Return
+          Subscription Verification
         </h1>
 
         <p className="text-muted-foreground text-sm leading-relaxed">
-          {errorMessage ? `${errorMessage} If you just completed payment on Stripe, tap the plan you purchased below to activate it immediately:` : 'Tap the plan you purchased on Stripe to activate and unlock your account:'}
+          {errorMessage || 'No active payment session was detected. If you completed checkout on Stripe, please check your email confirmation or return to your profile.'}
         </p>
 
-        <div className="space-y-2 pt-2">
+        <div className="pt-2 flex items-center gap-2">
           <Button
-            className="w-full h-11 bg-accent/90 hover:bg-accent text-accent-foreground font-heading font-semibold text-xs shadow-sm"
-            onClick={() => handleManualActivate('progress')}
+            variant="outline"
+            className="flex-1 text-xs"
+            onClick={() => navigate('/profile', { replace: true })}
           >
-            Activate Progress ($9.99/mo)
+            Return to Profile
           </Button>
-
           <Button
-            className="w-full h-11 bg-primary hover:bg-primary/90 text-primary-foreground font-heading font-semibold text-xs shadow-sm"
-            onClick={() => handleManualActivate('performance')}
+            variant="default"
+            className="flex-1 text-xs"
+            onClick={() => navigate('/', { replace: true })}
           >
-            Activate Performance ($17.99/mo)
+            Dashboard
           </Button>
-
-          <Button
-            className="w-full h-11 bg-chart-4 hover:bg-chart-4/90 text-white font-heading font-semibold text-xs shadow-sm"
-            onClick={() => handleManualActivate('elite')}
-          >
-            Activate Elite ($34.99/mo)
-          </Button>
-
-          <div className="pt-2 flex items-center gap-2">
-            <Button
-              variant="outline"
-              className="flex-1 text-xs"
-              onClick={() => navigate('/profile', { replace: true })}
-            >
-              Return to Profile
-            </Button>
-            <Button
-              variant="ghost"
-              className="flex-1 text-xs"
-              onClick={() => navigate('/', { replace: true })}
-            >
-              Dashboard
-            </Button>
-          </div>
         </div>
       </div>
     </div>

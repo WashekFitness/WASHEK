@@ -225,7 +225,7 @@ export async function generateNewProgram(options = {}) {
     });
 
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('AI timeout')), 2200)
+      setTimeout(() => reject(new Error('AI timeout')), 5000)
     );
 
     const parsed = await Promise.race([aiPromise, timeoutPromise]);

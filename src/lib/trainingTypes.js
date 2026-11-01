@@ -275,52 +275,73 @@ function getTrainingTypeRules(trainingType) {
   switch (trainingType) {
     case 'calisthenics':
       return `TRAINING TYPE: CALISTHENICS
-- Prioritize bodyweight strength, skill acquisition, relative strength, mobility, and progressive exercise variations.
-- Do not prescribe external weights unless the athlete's equipment/goals explicitly support weighted work.
-- Skill work should generally be performed early in the session while the athlete is fresh.
-- Use progressions/regressions appropriate to the athlete's level.
-- Build toward the athlete's stated skills rather than randomly rotating advanced movements.`;
+- GOAL ACCELERATION: Drive bodyweight strength, skill acquisition (handstands, planche, levers, muscle-ups), and relative power toward the athlete's goals as fast as safely possible.
+- FATIGUE & TENDON MANAGEMENT: Calisthenics straight-arm holds place severe mechanical strain on distal biceps tendons, wrists, and shoulders. High-demand skills MUST be programmed first while the CNS is completely fresh. Keep all skill attempts at 1-2 RIR (stop 2-3 seconds before failure) to build neural pathways without frying connective tissues.
+- HIGH STIMULUS-TO-FATIGUE (SFR): Use premier compound bodyweight exercises (strict pull-ups, parallel bar dips, pike/handstand push-ups, hollow body holds) with zero junk volume.
+- REST INTERVALS: Prescribe 90-150s rest on skill work and heavy compounds to allow full phosphocreatine restoration.
+- BALANCED PUSH/PULL: Equalize horizontal and vertical pulling to protect shoulders from internal rotation.`;
 
     case 'weighted_calisthenics':
       return `TRAINING TYPE: WEIGHTED CALISTHENICS
-- Prioritize weighted pull-ups, weighted dips, loaded bodyweight movements, and skill-specific calisthenics.
-- Skill work should generally occur before heavy loaded work when technical quality matters.
-- Progress external load gradually while preserving full range of motion and strict technique.
-- Include sufficient unweighted skill practice to maintain movement quality.`;
+- GOAL ACCELERATION: Rapidly build elite relative and absolute pulling and pushing strength through weighted pull-ups, weighted dips, and loaded bodyweight variations.
+- FATIGUE & JOINT MANAGEMENT: Adding load to bodyweight movements multiplies joint shear forces. Always enforce 1-2 RIR on primary compounds (never grind to failure). Prescribe 120-180s rest on primary weighted compounds to manage systemic fatigue and maintain high force production.
+- NEURAL SEQUENCING: Unweighted skill practice (e.g. handstand balance, lever holds) must strictly precede heavy loaded sets.
+- PROGRESSION VELOCITY: Use double progression—hit the top of the rep range (e.g. 5-6 reps) with textbook lockout before adding external load (+2.5 to 5 lbs).
+- ACCESSORY RESILIENCE: Include scapular pull-up shrugs, face pulls, and grip work to insulate wrists, elbows, and shoulders.`;
 
     case 'weights':
       return `TRAINING TYPE: WEIGHT TRAINING
-- Prioritize free weights, cables, machines, and other available resistance equipment.
-- Program progressive overload for strength and/or hypertrophy according to the athlete's goals.
-- Use appropriate exercise selection, volume, intensity, rest periods, and movement patterns.
-- Do not randomly insert calisthenics skill work unless the athlete specifically wants it.`;
+- GOAL ACCELERATION: Maximize muscle hypertrophy and raw strength as fast as safely possible through progressive mechanical tension.
+- FATIGUE MANAGEMENT: Maximize Stimulus-to-Fatigue Ratio (SFR). Eliminate junk volume by programming 3-4 intense, focused working sets per exercise. Keep primary barbell/dumbbell compounds at 1-2 RIR (RPE 8-9) to avoid CNS exhaustion and excessive muscle damage that impairs recovery.
+- NEURAL SEQUENCING: Heavy multi-joint compounds (Squats, Bench Press, Rows, Overhead Press, RDLs) placed first, followed by secondary compounds and isolation accessories.
+- REST PERIODS: 120-180s rest on heavy compounds to ensure full motor unit recruitment without cardiovascular fatigue limiting mechanical tension. 60-90s on isolation exercises.
+- AXIAL FATIGUE MANAGEMENT: Prevent spinal overload by balancing axial-loaded lifts with chest-supported and cable movements.`;
 
     case 'hybrid':
-      return `TRAINING TYPE: HYBRID
-- Combine calisthenics skill/strength work with weight training.
-- Place technically demanding calisthenics skill work earlier in sessions when appropriate.
-- Use weight training to strengthen muscles and patterns that support the athlete's calisthenics goals.
-- Balance fatigue carefully so weight training does not undermine skill quality.`;
+      return `TRAINING TYPE: HYBRID TRAINING
+- GOAL ACCELERATION: Synergistically build calisthenics skill mastery and raw gym hypertrophy at the fastest safe speed.
+- FATIGUE BUDGET & ORDERING: Strictly budget central nervous system fatigue. Calisthenics skill work (handstands, planche/lever progressions) MUST be performed first when the CNS is fresh with 1-2 RIR and 90-150s rest. Follow with heavy weight training compounds, and finish with muscle-building isolation accessories.
+- SYNERGISTIC EXERCISE SELECTION: Choose weights that reinforce calisthenics weak points (e.g. overhead barbell presses for handstand push-up strength; heavy rows for front lever lat power; weighted dips for pressing dominance) while avoiding redundant joint fatigue.
+- RECOVERY: Balance total weekly volume so neither skill neural patterning nor muscular hypertrophy is compromised.`;
 
     default:
       return `TRAINING TYPE: GENERAL FITNESS
-- Use a balanced combination of strength, hypertrophy, conditioning, mobility, and recovery work appropriate to the athlete's goals and available equipment.`;
+- GOAL ACCELERATION: Build functional strength, lean muscle mass, cardiovascular conditioning, and joint resilience as fast as safely possible.
+- FATIGUE MANAGEMENT: Balanced volume with 1-2 RIR on strength movements, active recovery intervals, and balanced push/pull/legs/core distribution to prevent systemic fatigue.`;
   }
 }
 
 function buildRecoveryRules() {
-  return `── RECOVERY & FATIGUE MANAGEMENT ──
-- Recovery is part of programming, not an afterthought.
-- Do not automatically increase volume every week.
-- Use progressive overload only when the athlete can reasonably recover from it.
-- Distinguish productive training fatigue from accumulating fatigue.
-- If performance is repeatedly declining, technique is deteriorating, soreness is unusually persistent, or the athlete reports poor recovery, reduce training stress before adding more.
-- Use planned easier weeks/deloads where appropriate.
-- A deload should reduce training stress while preserving movement patterns and technique.
-- Do not prescribe a deload solely because a calendar says so if the athlete is progressing well and recovery is good.
-- When a deload is used, typically reduce volume substantially and/or reduce intensity/load while maintaining quality technique.
-- Never diagnose an injury or medical condition from training data.
-- Persistent, severe, worsening, or unusual pain should be referred to an appropriate healthcare professional.`;
+  return `── GOAL ACCELERATION & SYSTEMIC FATIGUE MANAGEMENT ENGINE (MANDATORY) ──
+Every workout program generated MUST actively manage fatigue while driving the athlete toward their specific goals at the maximum safe velocity. The fastest path to any goal (muscle growth, strength, skill mastery, body recomp, endurance) is consistent, unrelenting stimulus WITHOUT accumulating excessive fatigue, connective tissue breakdown, or central nervous system (CNS) burnout.
+
+1. PROXIMITY TO FAILURE & RIR DISCIPLINE (1-2 RIR MANDATE):
+   - For all primary compound lifts and heavy skill holds, program working sets at 1-2 Reps In Reserve (RIR / RPE 8-9).
+   - NEVER program compounds to grind to absolute muscular failure (0 RIR / failure). Stopping 1-2 reps shy of failure delivers 95-99% of maximal hypertrophy and strength adaptation while cutting CNS and joint fatigue by more than half.
+   - Only isolation accessories or final burnout sets may safely approach 0-1 RIR.
+
+2. STIMULUS-TO-FATIGUE RATIO (SFR) & ZERO JUNK VOLUME:
+   - High SFR exercise selection: Prioritize movements that deliver high mechanical tension and motor recruitment to the target tissue with minimal spinal/axial exhaustion and minimal joint shear.
+   - Eliminate junk volume: 3 to 4 focused, high-intent working sets per exercise create the ideal adaptive stimulus. Excessive sets (5+ sloppy sets) create fatigue debt that halts progress for days without additional growth.
+
+3. NEURAL HIERARCHY & EXERCISE SEQUENCING:
+   - Always place the most neurologically demanding exercises (technical calisthenics skills, heavy compound barbell/weighted lifts, explosive movements) at the very START of the session when the nervous system and stabilizers are fresh.
+   - Place secondary compound accessories in the middle of the session.
+   - Place isolation work, high-rep pump movements, and direct core work at the END of the session.
+
+4. REST INTERVALS FOR COMPLETE METABOLIC & CNS RESTORATION:
+   - Heavy compound lifts (Barbell Squats, Deadlifts/RDLs, Bench Press, Weighted Pull-ups, Weighted Dips, Overhead Press) and advanced skill holds require 120-180 seconds of rest. Rushing rest periods on heavy compounds drops force production, degrades technique, and spikes systemic fatigue without building strength.
+   - Moderate compound movements and antagonist supersets require 90-120 seconds.
+   - Isolation accessories and core exercises require 60-90 seconds.
+
+5. AGONIST-ANTAGONIST JOINT INTEGRITY:
+   - Always balance push volume with equal or slightly greater pull volume (horizontal and vertical) to maintain shoulder health, scapular retraction, and thoracic integrity.
+   - Calisthenics athletes must balance anterior delt/chest pressing with rear delt, rotator cuff, and lower trap retraction.
+
+6. PROGRESSIVE OVERLOAD VELOCITY (DOUBLE PROGRESSION):
+   - Drive progress systematically: increase reps within the prescribed bracket first. Once the top rep count is achieved with textbook form and 1-2 RIR, advance external load (+2.5 to 5 lbs) or leverage progression.
+   - Deload / fatigue dissipation: when planned or when fatigue accumulates, reduce volume by 30-50% while maintaining crisp technical loads to clear fatigue and unleash supercompensation.
+   - Never diagnose an injury or medical condition from training data; refer persistent or severe pain to a healthcare professional.`;
 }
 
 function buildAdaptationRules(adaptationHistory = []) {
@@ -402,24 +423,22 @@ ${buildRecoveryRules()}
 ${buildAdaptationRules(adaptationHistory)}
 
 ── PROGRAM DESIGN RULES ──
-1. Build a coherent 12-week macrocycle, not 12 unrelated weeks.
-2. Use progressive overload appropriate to the athlete and training type.
-3. Progress exercise difficulty, load, reps, sets, density, or quality strategically.
-4. Do not increase every variable simultaneously.
-5. Include appropriate recovery days.
-6. Include deload/reduced-fatigue periods when justified by the program structure and athlete context.
-7. Respect available equipment.
-8. Respect stated restrictions and requirements.
-9. Avoid unnecessary exercise duplication.
-10. Maintain balanced movement patterns.
-11. Skill-heavy work should receive appropriate recovery and technical practice.
-12. Do not use arbitrary advanced exercises simply to make the program look impressive.
-13. Every exercise must have a specific activation_cue.
-14. Sets must be numeric.
-15. Reps must be a string.
-16. Rest must be expressed in seconds.
-17. Keep exercise notes concise but useful.
-18. Make the program realistic for the athlete's stated schedule and experience.
+1. GOAL ACCELERATION & FATIGUE MANAGEMENT: Build workouts programmed to manage fatigue and drive towards the athlete's specific goals as fast as safely possible.
+2. Build a coherent 12-week macrocycle, not 12 unrelated weeks.
+3. Proximity to Failure: Enforce 1-2 RIR on primary compounds to protect the CNS and joints while maximizing hypertrophic and strength adaptations.
+4. Neural Sequencing: Place highest skill demands and heavy compound lifts at the beginning of each session when the athlete is fresh.
+5. Prescribe adequate rest periods (90-180s on primary compound lifts, 60-90s on accessories) for complete neuromuscular recovery.
+6. Progress exercise difficulty, load, reps, sets, density, or quality strategically using double progression.
+7. Eliminate junk volume: prescribe 3-4 high-intent sets per exercise; do not inflate volume needlessly.
+8. Include appropriate recovery days and balanced agonist/antagonist volume.
+9. Include deload/reduced-fatigue periods when justified by the program structure and athlete context.
+10. Respect available equipment and stated restrictions.
+11. Every exercise must have a specific activation_cue.
+12. Sets must be numeric.
+13. Reps must be a string.
+14. Rest must be expressed in seconds.
+15. Keep exercise notes concise but useful, reinforcing fatigue discipline and safe progression.
+16. Make the program realistic for the athlete's stated schedule and experience.
 
 ${OUTPUT_FORMAT}
 
@@ -668,8 +687,15 @@ export function buildWeekPrompt(
 OUTPUT: Return ONLY a JSON object containing ONE weekly microcycle for week ${safeWeek}.
 The microcycle must use mesocycle_index ${mesocycleIndex} and week_type appropriate for the week.
 
+FATIGUE MANAGEMENT & GOAL ACCELERATION MANDATE:
+- Program workouts to manage fatigue and drive towards the athlete's goals as fast as safely possible.
+- Enforce 1-2 RIR on primary compounds (never grind to muscular failure) with 90-180s rest to preserve CNS and accelerate strength adaptations.
+- Place highest neural/skill demands first in each workout.
+- Eliminate junk volume (3-4 high-quality sets per exercise).
+- Balance push/pull movements for joint longevity.
+
 Each day has day_name, workout_type, and exercises array.
-Each exercise has name, sets (number), reps (string), rest_seconds (number), notes (a short coaching cue, 6 words or fewer — a phrase, not a sentence), and activation_cue (a short activation/form cue, 6 words or fewer — a phrase, not a sentence). Keep both fields brief on every exercise; this keeps the response fast to generate without losing the cue itself.
+Each exercise has name, sets (number), reps (string), rest_seconds (number), notes (a short coaching cue, 6-10 words focused on fatigue management, RIR, and progression), and activation_cue (a short activation/form cue, 6-10 words). Keep both fields brief on every exercise; this keeps the response fast to generate without losing the cue itself.
 
 Respond with exactly this structure:
 {

@@ -12,6 +12,9 @@ import {
   Drumstick,
   Wheat,
   Droplets,
+  Sparkles,
+  TrendingUp,
+  Activity,
 } from 'lucide-react';
 
 import { toast } from 'sonner';
@@ -27,6 +30,16 @@ import PageHeader from '@/components/layout/PageHeader';
 
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
+import {
+  getCachedNutrition,
+  setCachedNutrition,
+  getCachedSavedMeals,
+  setCachedSavedMeals,
+  getCachedActiveProgram,
+  setCachedActiveProgram,
+  getCachedLogs,
+  setCachedLogs,
+} from '@/lib/cacheStore';
 
 export default function Nutrition() {
   const queryClient =
@@ -176,16 +189,23 @@ function getSmartDefaultMeal() {
       userKey,
     ],
 
-    queryFn: () =>
-      supabaseApi.entities.NutritionEntry.filter(
+    queryFn: async () => {
+      const res = await supabaseApi.entities.NutritionEntry.filter(
         {
           date: today,
           created_by: userKey,
         },
         '-created_date',
         100
-      ),
+      );
+      if (Array.isArray(res) && res.length > 0) {
+        setCachedNutrition(res, userKey, today);
+      }
+      return res || [];
+    },
 
+    initialData: () => getCachedNutrition(userKey, today),
+    staleTime: 60 * 1000,
     enabled: true,
   });
 
@@ -195,21 +215,70 @@ function getSmartDefaultMeal() {
    * ============================================================
    */
   const { data: savedMeals = [] } = useQuery({
-    queryKey: ['saved_meals', userKey],
+    queryKey: ['saved_meals'],
     queryFn: async () => {
       try {
-        const results = await supabaseApi.entities.SavedMeal.filter(
-          { created_by: userKey },
-          '-created_at',
-          200
-        );
-        return results || [];
+        const list = await supabaseApi.entities.SavedMeal.list('-created_at', 200);
+        if (Array.isArray(list) && list.length > 0) {
+          return list;
+        }
       } catch (err) {
         console.warn('[Nutrition] Fetch saved meals note:', err);
-        const list = await supabaseApi.entities.SavedMeal.list('-created_at', 200);
-        return list || [];
       }
+      return getCachedSavedMeals(userKey);
     },
+    initialData: () => getCachedSavedMeals(userKey),
+    staleTime: 5 * 60 * 1000,
+    enabled: true,
+  });
+
+  /*
+   * ============================================================
+   * 12-WEEK ACTIVE PROGRAM & RECENT WORKOUT PERFORMANCE
+   * ============================================================
+   */
+  const { data: activeProgram = null } = useQuery({
+    queryKey: ['active_program', userKey],
+    queryFn: async () => {
+      try {
+        const progs = await supabaseApi.entities.WorkoutProgram.filter(
+          { created_by: userKey, is_active: true },
+          '-created_at',
+          1
+        );
+        if (progs?.[0]) {
+          setCachedActiveProgram(progs[0], userKey);
+          return progs[0];
+        }
+      } catch (err) {
+        console.debug('[Nutrition] Active program query note:', err);
+      }
+      return getCachedActiveProgram(userKey);
+    },
+    initialData: () => getCachedActiveProgram(userKey),
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const { data: workoutLogs = [] } = useQuery({
+    queryKey: ['logs', userKey],
+    queryFn: async () => {
+      try {
+        const results = await supabaseApi.entities.WorkoutLog.filter(
+          { created_by: userKey },
+          '-date',
+          50
+        );
+        if (Array.isArray(results) && results.length > 0) {
+          setCachedLogs(results, userKey);
+          return results;
+        }
+      } catch (err) {
+        console.debug('[Nutrition] Workout logs query note:', err);
+      }
+      return getCachedLogs(userKey);
+    },
+    initialData: () => getCachedLogs(userKey),
+    staleTime: 5 * 60 * 1000,
   });
 
   const saveToMealsMutation = useMutation({
@@ -219,10 +288,14 @@ function getSmartDefaultMeal() {
         created_by: userKey,
       }),
     onSuccess: (saved) => {
-      queryClient.setQueryData(['saved_meals', userKey], (old = []) => [
-        saved,
-        ...old.filter((m) => m.id !== saved.id),
-      ]);
+      queryClient.setQueryData(['saved_meals', userKey], (old = []) => {
+        const updated = [
+          saved,
+          ...old.filter((m) => m.id !== saved.id),
+        ];
+        setCachedSavedMeals(updated, userKey);
+        return updated;
+      });
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
       toast.success(`Saved "${saved.name || saved.food_name || 'meal'}" to your Saved Meals!`);
     },
@@ -364,7 +437,9 @@ function getSmartDefaultMeal() {
               const filtered = current.filter(
                 (item) => !String(item.id).startsWith('_opt_') && item.id !== savedEntry.id
               );
-              return [...filtered, savedEntry];
+              const next = [...filtered, savedEntry];
+              setCachedNutrition(next, key, today);
+              return next;
             }
           );
         }
@@ -481,10 +556,13 @@ function getSmartDefaultMeal() {
               today,
               key,
             ],
-            (old) =>
-              (old || []).map((entry) =>
+            (old) => {
+              const updated = (old || []).map((entry) =>
                 entry.id === updatedEntry.id ? { ...entry, ...updatedEntry } : entry
-              )
+              );
+              setCachedNutrition(updated, key, today);
+              return updated;
+            }
           );
         }
 
@@ -585,11 +663,14 @@ function getSmartDefaultMeal() {
             today,
             key,
           ],
-          (old) =>
-            (old || []).filter(
+          (old) => {
+            const next = (old || []).filter(
               (entry) =>
                 entry.id !== id
-            )
+            );
+            setCachedNutrition(next, key, today);
+            return next;
+          }
         );
 
         queryClient.invalidateQueries({
@@ -667,7 +748,12 @@ function getSmartDefaultMeal() {
 
   const goals =
     calcNutritionGoals(
-      user
+      user,
+      {
+        program: activeProgram,
+        workoutLogs,
+        userKey,
+      }
     );
 
 
@@ -784,6 +870,63 @@ function getSmartDefaultMeal() {
           shadow-[0_4px_24px_rgba(15,23,42,0.06),0_1px_3px_rgba(15,23,42,0.03)]
           dark:shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05),0_8px_32px_rgba(0,0,0,0.45)]
         ">
+
+          {/* 12-Week Adaptive Periodization & Performance Fueling Banner */}
+          <div className="mb-5 p-4 rounded-xl bg-gradient-to-r from-primary/10 via-amber-500/10 to-primary/5 border border-primary/25 dark:border-primary/20 shadow-2xs">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2.5">
+              <div className="flex items-start sm:items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-primary/20 border border-primary/30 flex items-center justify-center shrink-0 mt-0.5 sm:mt-0">
+                  <TrendingUp className="w-4 h-4 text-primary" />
+                </div>
+                <div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-heading font-bold text-xs uppercase tracking-wider text-primary">
+                      12-Week Adaptive Fueling
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary/15 border border-primary/25 text-primary leading-none">
+                      Week {goals.adaptation?.currentWeek || 1} • Phase {goals.adaptation?.phaseNumber || 1}
+                    </span>
+                  </div>
+                  <h4 className="text-sm font-bold text-foreground font-heading mt-0.5">
+                    {goals.adaptation?.phaseName || 'Foundation & Work Capacity'}
+                  </h4>
+                </div>
+              </div>
+
+              {goals.adaptation?.totalCalorieDelta > 0 && (
+                <div className="flex items-center gap-2 self-start sm:self-auto px-3 py-1.5 rounded-lg bg-background/80 dark:bg-card/90 border border-border/80 shadow-2xs text-xs font-semibold">
+                  <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                  <span className="text-foreground">
+                    +{goals.adaptation.totalCalorieDelta} kcal
+                  </span>
+                  <span className="text-muted-foreground">•</span>
+                  <span className="text-blue-500 dark:text-blue-400 font-bold">
+                    +{goals.adaptation.totalProteinDelta}g protein
+                  </span>
+                </div>
+              )}
+            </div>
+
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              {goals.adaptation?.phaseDescription}
+            </p>
+
+            <div className="mt-3 pt-2.5 border-t border-border/60 dark:border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+              <div className="flex items-center gap-2.5 flex-wrap">
+                <span className="inline-flex items-center gap-1.5">
+                  <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                  Recent: <strong className="text-foreground font-semibold">{goals.adaptation?.recentWorkoutsCount || 0} sessions</strong> (last 7d)
+                </span>
+                <span>•</span>
+                <span>
+                  Total completed: <strong className="text-foreground font-semibold">{goals.adaptation?.totalWorkoutsCount || 0} workouts</strong>
+                </span>
+              </div>
+              <span className="text-primary font-semibold text-[10px] uppercase tracking-wider">
+                Dynamically scaled to training load
+              </span>
+            </div>
+          </div>
 
           {/* Calorie Overview Header */}
           <div className="

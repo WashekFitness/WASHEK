@@ -260,8 +260,8 @@ function calculateExerciseProgression({
       targetSets = baseSets;
       targetReps = baseReps;
       targetRest = baseRest;
-      predictedProgress = 'Movement baseline: establish clean tempo and technical lockout';
-      periodizationNote = 'Establish crisp movement cadence and joint alignment.';
+      predictedProgress = 'Movement baseline: establish clean tempo, 1-2 RIR, and manage fatigue';
+      periodizationNote = 'Baseline: 1-2 RIR, manage fatigue, and establish clean cadence.';
       break;
 
     case 'volume':
@@ -269,9 +269,9 @@ function calculateExerciseProgression({
       targetReps = baseReps;
       targetRest = baseRest;
       predictedProgress = isCompound
-        ? 'Projected +1 set volume (+25% work capacity)'
+        ? 'Projected +1 set volume (+25% work capacity, 1-2 RIR)'
         : 'Projected technical perfection across all sets';
-      periodizationNote = 'Volume accumulation: +1 set on primary lifts with crisp execution.';
+      periodizationNote = 'Volume accumulation: +1 set on primary lifts, maintain 1-2 RIR to avoid CNS fatigue.';
       break;
 
     case 'intensity':
@@ -281,7 +281,7 @@ function calculateExerciseProgression({
       predictedProgress = isWeights
         ? 'Projected +2.5-5 lbs load increase or +1 rep per set (1-2 RIR)'
         : 'Projected +1-2 reps per set with full range of motion (1-2 RIR)';
-      periodizationNote = 'Phase 1 peak: drive intensity while maintaining clean form.';
+      periodizationNote = 'Phase 1 peak: 1-2 RIR, accelerate goal progression while managing fatigue.';
       break;
 
     case 'recovery':
@@ -297,9 +297,9 @@ function calculateExerciseProgression({
       targetReps = progressRepsForPhase(baseReps, 2, overload);
       targetRest = baseRest + 15;
       predictedProgress = isCalisthenics
-        ? 'Phase 2: Stricter 3-0-1-0 eccentric tempo or elevated progression leverage'
-        : 'Phase 2: Heavier resistance threshold (~+5-8% load) with strict control';
-      periodizationNote = 'Phase 2 base: heavier resistance threshold and focused mechanical tension.';
+        ? 'Phase 2: Stricter 3-0-1-0 eccentric tempo or elevated progression leverage (1-2 RIR)'
+        : 'Phase 2: Heavier resistance threshold (~+5-8% load) with strict control (1-2 RIR)';
+      periodizationNote = 'Phase 2 base: heavier resistance threshold, 1-2 RIR, focused mechanical tension.';
       break;
 
     case 'phase2_volume':
@@ -307,7 +307,7 @@ function calculateExerciseProgression({
       targetReps = progressRepsForPhase(baseReps, 2, overload);
       targetRest = baseRest + 15;
       predictedProgress = 'Projected +15% tonnage under stricter Phase 2 tension';
-      periodizationNote = 'Volume overload: control a 3-second eccentric tempo on every repetition.';
+      periodizationNote = 'Volume overload: 3s eccentric, manage fatigue with 1-2 RIR on all sets.';
       break;
 
     case 'phase2_peak':
@@ -315,7 +315,7 @@ function calculateExerciseProgression({
       targetReps = progressRepsForPhase(baseReps, 2, overload);
       targetRest = baseRest + 30;
       predictedProgress = 'Phase 2 peak intensity: 1 rep in reserve, top mechanical tension';
-      periodizationNote = 'Phase 2 peak: maximum controlled loading, leaving 1-2 reps in reserve.';
+      periodizationNote = 'Phase 2 peak: maximum controlled loading, strictly leaving 1-2 reps in reserve.';
       break;
 
     case 'phase3_base':
@@ -323,9 +323,9 @@ function calculateExerciseProgression({
       targetReps = progressRepsForPhase(baseReps, 3, overload);
       targetRest = baseRest + 30;
       predictedProgress = isCalisthenics
-        ? 'Phase 3: Explosive concentric power / advanced skill tier'
-        : 'Phase 3: Heavy power recruitment (85%+ 1RM equivalent)';
-      periodizationNote = 'Phase 3 power: explosive intent on the concentric phase with heavier resistance.';
+        ? 'Phase 3: Explosive concentric power / advanced skill tier (1-2 RIR)'
+        : 'Phase 3: Heavy power recruitment (85%+ 1RM equivalent, 1-2 RIR)';
+      periodizationNote = 'Phase 3 power: explosive intent on concentric phase, 1-2 RIR, full rest recovery.';
       break;
 
     case 'phase3_overload':
@@ -333,7 +333,7 @@ function calculateExerciseProgression({
       targetReps = progressRepsForPhase(baseReps, 3, overload);
       targetRest = baseRest + 30;
       predictedProgress = 'Projected top-end strength capacity with full recovery';
-      periodizationNote = 'Peak capacity: heavy compound work with full recovery between sets.';
+      periodizationNote = 'Peak capacity: heavy compound work with full 120-180s recovery between sets.';
       break;
 
     case 'phase3_climax':
@@ -341,7 +341,7 @@ function calculateExerciseProgression({
       targetReps = progressRepsForPhase(baseReps, 3, overload);
       targetRest = baseRest + 45;
       predictedProgress = 'Cycle climax: Near-maximal threshold before taper';
-      periodizationNote = 'Cycle climax: express accumulated adaptations across all key movements.';
+      periodizationNote = 'Cycle climax: express accumulated adaptations across all key movements with fatigue managed.';
       break;
 
     case 'taper_pr':
@@ -508,7 +508,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: isBeginner ? 3 : 4,
               reps: isBeginner ? '8-10' : '6-8',
               rest_seconds: 120,
-              notes: 'Retract scapulae into bench, lower bar with 3s eccentric to mid-chest, drive up with authority.',
+              notes: 'Retract scapulae into bench, 3s eccentric, leave 1-2 RIR to manage CNS fatigue and accelerate strength gains.',
               activation_cue: 'Pack lats and maintain unbroken leg drive.',
             },
             {
@@ -516,7 +516,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '8-10',
               rest_seconds: 90,
-              notes: 'Set bench at 30 degrees. Focus on clavicular chest contraction at the apex.',
+              notes: 'Set bench at 30 degrees. Focus on clavicular chest contraction at the apex (1-2 RIR).',
               activation_cue: 'Keep elbows tucked at 45-degree angle.',
             },
             {
@@ -524,7 +524,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '6-8',
               rest_seconds: 120,
-              notes: 'Squeeze glutes and brace core. Press directly in vertical bar path overhead.',
+              notes: 'Squeeze glutes and brace core. Press vertical bar path overhead, 1-2 RIR to protect shoulder stabilizers.',
               activation_cue: 'Lock ribcage down to prevent lumbar hyperextension.',
             },
             {
@@ -554,7 +554,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: isBeginner ? 3 : 4,
               reps: '8-10',
               rest_seconds: 120,
-              notes: 'Hinge at hips to 45 degrees, pull bar to upper navel driving elbows back.',
+              notes: 'Hinge hips to 45 degrees, pull bar to navel, 1-2 RIR for high stimulus-to-fatigue ratio.',
               activation_cue: 'Initiate pull through scapular retraction.',
             },
             {
@@ -562,7 +562,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '8-10',
               rest_seconds: 90,
-              notes: 'Drive elbows down to waist, achieve full lat stretch at apex.',
+              notes: 'Drive elbows down to waist, achieve full lat stretch at apex (1-2 RIR).',
               activation_cue: 'Depress shoulder blades before bending elbows.',
             },
             {
@@ -600,7 +600,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: isBeginner ? 3 : 4,
               reps: isBeginner ? '8-10' : '6-8',
               rest_seconds: 150,
-              notes: 'Descend to parallel with upright torso, drive through mid-foot.',
+              notes: 'Descend to parallel with upright torso, 1-2 RIR to protect lower back and maximize quad recruitment.',
               activation_cue: 'Screw feet into floor and spread the knees.',
             },
             {
@@ -608,7 +608,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '8-10',
               rest_seconds: 120,
-              notes: 'Hinge back pushing hips to rear wall until deep hamstring stretch is felt.',
+              notes: 'Hinge hips back, flat spine, 1-2 RIR to manage spinal fatigue while loading hamstrings.',
               activation_cue: 'Keep bar tight against shins and lats engaged.',
             },
             {
@@ -687,7 +687,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 4,
               reps: isBeginner ? '6-8' : '5-6',
               rest_seconds: 150,
-              notes: 'Slight forward lean, lower to 90 degrees elbow flexion, drive up to locked elbows.',
+              notes: 'Slight forward lean, lower to 90 degrees elbow flexion, 1-2 RIR to protect shoulders and maximize power.',
               activation_cue: 'Depress scapulae actively and lock core into hollow body.',
             },
             {
@@ -695,7 +695,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '8-10',
               rest_seconds: 90,
-              notes: 'Chest touches floor every rep, full protraction at top.',
+              notes: 'Chest touches floor every rep, full protraction at top (1-2 RIR).',
               activation_cue: 'Push ground away to engage serratus anterior.',
             },
             {
@@ -725,7 +725,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 4,
               reps: isBeginner ? '5-6' : '4-5',
               rest_seconds: 150,
-              notes: 'Full dead hang to chin clearly cleared over bar. Zero kipping.',
+              notes: 'Full dead hang to chin clearly cleared over bar. 1-2 RIR to build raw strength without elbow fatigue.',
               activation_cue: 'Drive elbows down into back pockets.',
             },
             {
@@ -842,7 +842,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 4,
               reps: '30s',
               rest_seconds: 90,
-              notes: 'Skill practice while CNS is fresh. Focus on fingertip grip and active shoulders.',
+              notes: 'Skill practice first while CNS is fresh. Stop 2-3s before breakdown to manage fatigue.',
               activation_cue: 'Claw floor with fingertips to control balance.',
             },
             {
@@ -850,7 +850,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '8-10',
               rest_seconds: 90,
-              notes: 'Controlled descent, drive through palms to complete lockout.',
+              notes: 'Controlled descent, drive through palms, leave 1-2 RIR to protect shoulder joints.',
               activation_cue: 'Depress shoulders and brace core.',
             },
             {
@@ -858,7 +858,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 3,
               reps: '8-10',
               rest_seconds: 90,
-              notes: 'Hybrid hypertrophy overload for upper pectorals.',
+              notes: 'Hybrid hypertrophy overload for upper pectorals (1-2 RIR).',
               activation_cue: 'Squeeze chest at top without losing scapular pinch.',
             },
             {
@@ -880,7 +880,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
               sets: 4,
               reps: '6-8',
               rest_seconds: 120,
-              notes: 'Master the vertical pull baseline. Dead hang to chin over bar.',
+              notes: 'Vertical pull baseline first. Dead hang to chin over bar, 1-2 RIR for clean power.',
               activation_cue: 'Scapular pull first, then drive elbows down.',
             },
             {
@@ -998,7 +998,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
             sets: 4,
             reps: isBeginner ? '8-10' : '10-12',
             rest_seconds: 90,
-            notes: 'Lower with 3s eccentric tempo, chest touches ground, lock elbows and protract scapulae at top.',
+            notes: 'Lower 3s eccentric, full lockout, leave 1-2 RIR to build clean muscle without burnout.',
             activation_cue: 'Squeeze glutes and tuck pelvis into hollow body posture.',
           },
           {
@@ -1006,7 +1006,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
             sets: 3,
             reps: isBeginner ? '8-10' : '6-8',
             rest_seconds: 90,
-            notes: 'Descend under control to 90 degrees elbow bend, drive through palms.',
+            notes: 'Descend under control to 90 degrees, drive up, 1-2 RIR to manage sternum/shoulder fatigue.',
             activation_cue: 'Depress shoulder blades; do not allow shoulders to shrug.',
           },
           {
@@ -1074,7 +1074,7 @@ export function buildScientificBaselineWeekOne(options = {}) {
             sets: 4,
             reps: isBeginner ? '8-10' : '6-8',
             rest_seconds: 120,
-            notes: 'Full dead hang, pull chest to bar with no kipping or momentum.',
+            notes: 'Full dead hang, pull chest to bar, 1-2 RIR to prevent tendon fatigue and accelerate pulling power.',
             activation_cue: 'Initiate pull by retracting and depressing scapulae.',
           },
           {

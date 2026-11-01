@@ -21,7 +21,7 @@ const Toaster = ({
         theme
       }
       className="toaster group"
-      position="top-right"
+      position="bottom-right"
       closeButton={true}
       richColors={true}
       duration={5000}

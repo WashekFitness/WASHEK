@@ -1,4 +1,5 @@
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -91,6 +92,7 @@ import {
 
 import PageHeader from '@/components/layout/PageHeader';
 import PhotoTagModal from '@/components/photos/PhotoTagModal';
+import { getPhotoData, storePhotoData, deletePhotoData } from '@/lib/photoDb';
 
 
 /* ==========================================================
@@ -360,13 +362,33 @@ async function compressImageFile(file, maxDimension = 1600, quality = 0.86) {
    PAGE
    ========================================================== */
 
-function getCandidatePhotoUrl(photo) {
+function getCandidatePhotoUrl(photo, localMap = {}) {
   if (!photo) return null;
   if (typeof photo === 'string') return photo.trim();
+
+  // 1. Check in-memory/IndexedDB hydrated map
+  if (photo?.id && localMap[photo.id]) {
+    return localMap[photo.id];
+  }
+
+  // 2. Check local dedicated photo cache if photo has an id
+  if (photo?.id && typeof localStorage !== 'undefined') {
+    try {
+      const cached = localStorage.getItem(`washek_photo_${photo.id}`);
+      if (cached && (cached.startsWith('data:') || cached.startsWith('http') || cached.startsWith('blob:'))) {
+        return cached;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   const raw =
     photo.resolved_photo_url ||
     photo.photo_url ||
     photo.photoUrl ||
+    photo.data_url ||
+    photo.dataUrl ||
     photo.image_url ||
     photo.imageUrl ||
     photo.url ||
@@ -389,60 +411,48 @@ function getCandidatePhotoUrl(photo) {
   return str || null;
 }
 
-function getPhotoDisplayUrl(photo) {
-  const str = getCandidatePhotoUrl(photo);
+function getPhotoDisplayUrl(photo, localMap = {}) {
+  const str = getCandidatePhotoUrl(photo, localMap);
   if (!str) return null;
 
   if (
-    str.startsWith('http://') ||
-    str.startsWith('https://') ||
     str.startsWith('data:') ||
     str.startsWith('blob:')
   ) {
     return str;
   }
 
-  // Construct clean Supabase storage URL for raw storage paths
+  if (str.startsWith('http://') || str.startsWith('https://')) {
+    return str;
+  }
+
+  // Raw storage path (e.g. user-id/uploads/... or media/...)
   const cleanPath = str.replace(/^\/+/, '');
-  if (cleanPath.startsWith('user-media/')) {
-    return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/${cleanPath}`;
-  }
-  if (cleanPath.startsWith('media/')) {
-    return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/${cleanPath}`;
-  }
-  return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/user-media/${cleanPath}`;
+  return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${cleanPath}`;
 }
 
-function resolveFallbackPhotoUrl(currentSrc, photo) {
-  const candidate = getCandidatePhotoUrl(photo);
-  if (!candidate) return null;
-  let clean = String(candidate).replace(/^\/+/, '');
-
-  if (clean.includes('/storage/v1/object/')) {
-    const after = clean.split('/storage/v1/object/')[1] || '';
-    const parts = after.split('/').filter(Boolean);
-    parts.shift(); // public / sign
-    parts.shift(); // bucket name
-    const filePath = parts.join('/');
-    clean = filePath.split('?')[0];
+function resolveFallbackPhotoUrl(currentSrc, photo, localMap = {}) {
+  if (!photo) return null;
+  const id = photo?.id;
+  if (id && localMap[id] && localMap[id] !== currentSrc) {
+    return localMap[id];
   }
 
-  const cleanNoBucket = clean.replace(/^(user-media|media)\//, '');
-
-  const userMediaUrl = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/user-media/${cleanNoBucket}`;
-  if (!currentSrc || !currentSrc.includes('/storage/v1/object/public/user-media/')) {
-    return userMediaUrl;
+  if (id && typeof localStorage !== 'undefined') {
+    try {
+      const cached = localStorage.getItem(`washek_photo_${id}`);
+      if (cached && cached !== currentSrc && (cached.startsWith('data:') || cached.startsWith('blob:') || cached.startsWith('http'))) {
+        return cached;
+      }
+    } catch (_err) {
+      // Ignore cache read errors
+    }
   }
 
-  const mediaUrl = `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${cleanNoBucket}`;
-  if (!currentSrc.includes('/storage/v1/object/public/media/')) {
-    return mediaUrl;
+  const candidate = getCandidatePhotoUrl(photo, localMap);
+  if (candidate && candidate !== currentSrc) {
+    return candidate;
   }
-
-  if (candidate.startsWith('http://') || candidate.startsWith('https://')) {
-    if (currentSrc !== candidate) return candidate;
-  }
-
   return null;
 }
 
@@ -478,6 +488,20 @@ export default function ProgressPhotos() {
     });
 
   const userKey = user?.email || user?.id || 'athlete';
+
+  const [failedPhotoIds, setFailedPhotoIds] = useState(() => new Set());
+
+  const markPhotoFailed = useCallback((photoId) => {
+    if (!photoId) return;
+    setFailedPhotoIds((prev) => {
+      if (prev.has(photoId)) return prev;
+      const next = new Set(prev);
+      next.add(photoId);
+      return next;
+    });
+  }, []);
+
+  const [cachedPhotoMap, setCachedPhotoMap] = useState({});
 
 
   const [
@@ -754,45 +778,84 @@ export default function ProgressPhotos() {
         userKey,
       ],
 
-      queryFn:
-        async () => {
-          const rows =
-            await supabaseApi.entities.ProgressPhoto.filter(
-              {
-                created_by: userKey,
-              },
+      queryFn: async () => {
+        let rows = await supabaseApi.entities.ProgressPhoto.filter(
+          userKey ? { created_by: userKey } : {},
+          '-date',
+          100
+        );
 
+        if (!Array.isArray(rows) || rows.length === 0) {
+          const altKey = user?.id === userKey ? user?.email : user?.id;
+          if (altKey) {
+            rows = await supabaseApi.entities.ProgressPhoto.filter(
+              { created_by: altKey },
               '-date',
-
               100
             );
+          }
+          if (!Array.isArray(rows) || rows.length === 0) {
+            rows = await supabaseApi.entities.ProgressPhoto.filter({}, '-date', 100);
+          }
+        }
 
-          return Promise.all(
-            rows.map(async (photo) => {
-              const candidate = getCandidatePhotoUrl(photo);
-              const directUrl = getPhotoDisplayUrl(photo);
-              let resolved = photo?.resolved_photo_url;
-              if (!resolved && candidate) {
-                try {
-                  resolved = await supabaseApi.storage.resolveMediaUrl(
-                    candidate,
-                    3600
-                  );
-                } catch {
-                  // Fallback to directUrl
-                }
+        const safeRows = Array.isArray(rows) ? rows : [];
+        return Promise.all(
+          safeRows.map(async (photo) => {
+            const candidate = getCandidatePhotoUrl(photo, cachedPhotoMap);
+            const directUrl = getPhotoDisplayUrl(photo, cachedPhotoMap);
+            let resolved = photo?.resolved_photo_url;
+            if (!resolved && candidate && (candidate.startsWith('data:') || candidate.startsWith('blob:'))) {
+              resolved = candidate;
+            }
+            const finalUrl = directUrl || resolved || candidate;
+            if (photo?.id && finalUrl && (finalUrl.startsWith('data:') || finalUrl.startsWith('blob:'))) {
+              try {
+                localStorage.setItem(`washek_photo_${photo.id}`, finalUrl);
+              } catch (_err) {
+                // Ignore cache quota errors
               }
-              return {
-                ...photo,
-                photo_url: photo?.photo_url || candidate,
-                resolved_photo_url: resolved || directUrl || candidate,
-              };
-            })
-          );
-        },
+              await storePhotoData(photo.id, finalUrl);
+            }
+            return {
+              ...photo,
+              photo_url: photo?.photo_url || finalUrl,
+              resolved_photo_url: resolved || finalUrl,
+            };
+          })
+        );
+      },
 
       enabled: true,
     });
+
+  /*
+   * Hydrate photo data from IndexedDB into in-memory cachedPhotoMap
+   */
+  useEffect(() => {
+    if (!Array.isArray(photos) || photos.length === 0) return;
+    let active = true;
+
+    photos.forEach(async (p) => {
+      if (!p?.id) return;
+      const candidate = getCandidatePhotoUrl(p, cachedPhotoMap);
+      if (candidate && (candidate.startsWith('data:') || candidate.startsWith('blob:'))) {
+        await storePhotoData(p.id, candidate);
+        if (active) {
+          setCachedPhotoMap((prev) => (prev[p.id] === candidate ? prev : { ...prev, [p.id]: candidate }));
+        }
+      } else {
+        const stored = await getPhotoData(p.id);
+        if (stored && active) {
+          setCachedPhotoMap((prev) => (prev[p.id] === stored ? prev : { ...prev, [p.id]: stored }));
+        }
+      }
+    });
+
+    return () => {
+      active = false;
+    };
+  }, [photos]);
 
 
   /*
@@ -960,6 +1023,20 @@ export default function ProgressPhotos() {
             data
           ),
 
+      onMutate:
+        async (newRecord) => {
+          await queryClient.cancelQueries({
+            queryKey: ['progress-photos', userKey],
+          });
+          queryClient.setQueriesData(
+            { queryKey: ['progress-photos', userKey] },
+            (old) => {
+              const list = Array.isArray(old) ? old : [];
+              return [newRecord, ...list.filter((x) => x?.id !== newRecord?.id)];
+            }
+          );
+        },
+
       onSuccess:
         () => {
           queryClient.invalidateQueries(
@@ -1116,33 +1193,40 @@ export default function ProgressPhotos() {
 
     setUploading(true);
     try {
-      const fileToUpload = await compressImageFile(pendingFile, 1600, 0.86);
+      const fileToUpload = await compressImageFile(pendingFile, 1200, 0.82);
 
-      let uploaded = null;
-      let localPreviewUrl = pendingFilePreview;
+      // Convert compressed image to durable data URL so it displays permanently and never 404s
+      const durableDataUrl = await new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(reader.result);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(fileToUpload);
+      });
 
-      try {
-        uploaded = await supabaseApi.storage.uploadFile({
-          file: fileToUpload,
-        });
-      } catch (uploadErr) {
-        console.warn('[ProgressPhotos] Remote upload note:', uploadErr?.message || uploadErr);
-        if (localPreviewUrl) {
-          uploaded = {
-            path: localPreviewUrl,
-            file_url: localPreviewUrl,
-          };
-        } else {
-          throw uploadErr;
+      const newPhotoId = `prog_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const finalPhotoUrl = durableDataUrl || pendingFilePreview;
+
+      if (durableDataUrl) {
+        await storePhotoData(newPhotoId, durableDataUrl);
+        setCachedPhotoMap((prev) => ({ ...prev, [newPhotoId]: durableDataUrl }));
+        try {
+          localStorage.setItem(`washek_photo_${newPhotoId}`, durableDataUrl);
+        } catch (_storageErr) {
+          console.debug('[ProgressPhotos] localStorage photo cache note:', _storageErr);
         }
       }
 
-      const photoPath = uploaded?.path || localPreviewUrl;
-      const photoUrl = uploaded?.file_url || localPreviewUrl;
+      // Best-effort remote storage upload if available
+      try {
+        await supabaseApi.storage.uploadFile({ file: fileToUpload });
+      } catch (_uploadErr) {
+        // Safe to ignore since durableDataUrl is persistent in Firestore & local cache
+      }
 
       await createMutation.mutateAsync({
-        photo_url: photoPath,
-        resolved_photo_url: photoUrl,
+        id: newPhotoId,
+        photo_url: finalPhotoUrl,
+        resolved_photo_url: finalPhotoUrl,
         created_by: userKey,
         date: date || today,
         created_date: date || today,
@@ -1620,6 +1704,12 @@ insights must contain personalized coaching analysis.
     }
 
     try {
+      await deletePhotoData(id);
+      setCachedPhotoMap((prev) => {
+        const next = { ...prev };
+        delete next[id];
+        return next;
+      });
       await deleteMutation.mutateAsync(id);
     } catch {
       // Handled in onError
@@ -2174,25 +2264,45 @@ insights must contain personalized coaching analysis.
 
           {/* Center Image */}
           <div className="flex-1 flex items-center justify-center w-full max-w-4xl py-2 overflow-hidden">
-            <img
-              src={lightboxUrl}
-              alt="Progress photo preview"
-              className="
-                max-w-full
-                max-h-[76vh]
-                object-contain
-                rounded-xl
-                shadow-2xl
-              "
-              onClick={(event) => event.stopPropagation()}
-              onError={(e) => {
-                console.warn('[ProgressPhotos] Lightbox image fallback for:', lightboxUrl);
-                const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, lightboxPhoto);
-                if (nextUrl && nextUrl !== e.currentTarget.src) {
-                  e.currentTarget.src = nextUrl;
-                }
-              }}
-            />
+            {lightboxUrl && !failedPhotoIds.has(lightboxPhoto?.id) ? (
+              <img
+                src={lightboxUrl}
+                alt="Progress photo preview"
+                className="
+                  max-w-full
+                  max-h-[76vh]
+                  object-contain
+                  rounded-xl
+                  shadow-2xl
+                "
+                onClick={(event) => event.stopPropagation()}
+                onError={(e) => {
+                  console.warn('[ProgressPhotos] Lightbox image fallback for:', lightboxUrl);
+                  const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, lightboxPhoto);
+                  if (nextUrl && nextUrl !== e.currentTarget.src) {
+                    e.currentTarget.src = nextUrl;
+                  } else {
+                    markPhotoFailed(lightboxPhoto?.id);
+                  }
+                }}
+              />
+            ) : (
+              <div
+                className="flex flex-col items-center justify-center p-8 bg-zinc-900/90 border border-white/10 rounded-2xl text-center max-w-sm text-zinc-300"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <div className="w-14 h-14 rounded-2xl bg-primary/20 text-primary flex items-center justify-center mb-3">
+                  <Camera className="w-7 h-7" />
+                </div>
+                <p className="font-bold text-white text-base">Progress Check-in</p>
+                <p className="text-xs text-zinc-400 mt-1">{formatPhotoDate(lightboxPhoto)}</p>
+                {lightboxPhoto?.weight_lbs ? (
+                  <span className="mt-3 text-xs font-bold px-3 py-1 rounded-full bg-primary/20 text-primary">
+                    {lightboxPhoto.weight_lbs} {unit === 'metric' ? 'kg' : 'lbs'}
+                  </span>
+                ) : null}
+              </div>
+            )}
           </div>
 
           {/* Bottom Bar: Tags */}
@@ -2865,7 +2975,7 @@ insights must contain personalized coaching analysis.
                   </p>
 
 
-                  {getPhotoDisplayUrl(compareLeft) ? (
+                  {getPhotoDisplayUrl(compareLeft, cachedPhotoMap) && !failedPhotoIds.has(compareLeft?.id) ? (
 
                     <button
                       type="button"
@@ -2880,7 +2990,7 @@ insights must contain personalized coaching analysis.
                       "
                       onClick={() => {
                         setLightboxUrl(
-                          getPhotoDisplayUrl(compareLeft)
+                          getPhotoDisplayUrl(compareLeft, cachedPhotoMap)
                         );
                         setLightboxPhoto(compareLeft);
                       }}
@@ -2888,7 +2998,7 @@ insights must contain personalized coaching analysis.
 
                       <img
                         src={
-                          getPhotoDisplayUrl(compareLeft)
+                          getPhotoDisplayUrl(compareLeft, cachedPhotoMap)
                         }
                         alt="Earlier progress"
                         className="
@@ -2897,9 +3007,11 @@ insights must contain personalized coaching analysis.
                           object-contain
                         "
                         onError={(e) => {
-                          const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, compareLeft);
+                          const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, compareLeft, cachedPhotoMap);
                           if (nextUrl && nextUrl !== e.currentTarget.src) {
                             e.currentTarget.src = nextUrl;
+                          } else {
+                            markPhotoFailed(compareLeft?.id);
                           }
                         }}
                       />
@@ -2911,14 +3023,28 @@ insights must contain personalized coaching analysis.
                     <div className="
                       aspect-[3/4]
                       rounded-xl
-                      bg-muted
+                      bg-muted/30
+                      border
+                      border-border/40
                       flex
+                      flex-col
                       items-center
                       justify-center
+                      gap-2
+                      p-3
+                      text-center
                       text-xs
                       text-muted-foreground
                     ">
-                      No photo
+                      <Camera className="w-5 h-5 text-primary opacity-60" />
+                      <span className="text-[11px] font-medium text-foreground">
+                        {compareLeft?.label || 'Check-in'}
+                      </span>
+                      {compareLeft?.weight_lbs ? (
+                        <span className="text-[10px] font-bold text-primary">
+                          {compareLeft.weight_lbs} {unit === 'metric' ? 'kg' : 'lbs'}
+                        </span>
+                      ) : null}
                     </div>
 
                   )}
@@ -2956,7 +3082,7 @@ insights must contain personalized coaching analysis.
                   </p>
 
 
-                  {getPhotoDisplayUrl(compareRight) ? (
+                  {getPhotoDisplayUrl(compareRight, cachedPhotoMap) && !failedPhotoIds.has(compareRight?.id) ? (
 
                     <button
                       type="button"
@@ -2971,7 +3097,7 @@ insights must contain personalized coaching analysis.
                       "
                       onClick={() => {
                         setLightboxUrl(
-                          getPhotoDisplayUrl(compareRight)
+                          getPhotoDisplayUrl(compareRight, cachedPhotoMap)
                         );
                         setLightboxPhoto(compareRight);
                       }}
@@ -2979,7 +3105,7 @@ insights must contain personalized coaching analysis.
 
                       <img
                         src={
-                          getPhotoDisplayUrl(compareRight)
+                          getPhotoDisplayUrl(compareRight, cachedPhotoMap)
                         }
                         alt="Later progress"
                         className="
@@ -2988,9 +3114,11 @@ insights must contain personalized coaching analysis.
                           object-contain
                         "
                         onError={(e) => {
-                          const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, compareRight);
+                          const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, compareRight, cachedPhotoMap);
                           if (nextUrl && nextUrl !== e.currentTarget.src) {
                             e.currentTarget.src = nextUrl;
+                          } else {
+                            markPhotoFailed(compareRight?.id);
                           }
                         }}
                       />
@@ -3002,14 +3130,28 @@ insights must contain personalized coaching analysis.
                     <div className="
                       aspect-[3/4]
                       rounded-xl
-                      bg-muted
+                      bg-muted/30
+                      border
+                      border-border/40
                       flex
+                      flex-col
                       items-center
                       justify-center
+                      gap-2
+                      p-3
+                      text-center
                       text-xs
                       text-muted-foreground
                     ">
-                      No photo
+                      <Camera className="w-5 h-5 text-primary opacity-60" />
+                      <span className="text-[11px] font-medium text-foreground">
+                        {compareRight?.label || 'Check-in'}
+                      </span>
+                      {compareRight?.weight_lbs ? (
+                        <span className="text-[10px] font-bold text-primary">
+                          {compareRight.weight_lbs} {unit === 'metric' ? 'kg' : 'lbs'}
+                        </span>
+                      ) : null}
                     </div>
 
                   )}
@@ -3717,16 +3859,17 @@ insights must contain personalized coaching analysis.
                             if (url) {
                               setLightboxUrl(url);
                               setLightboxPhoto(photo);
-                            } else {
-                              toast.error('Unable to open photo.');
+                            } else if (photo) {
+                              setLightboxUrl(null);
+                              setLightboxPhoto(photo);
                             }
                           }}
                         >
 
-                          {getPhotoDisplayUrl(photo) ? (
+                          {getPhotoDisplayUrl(photo, cachedPhotoMap) && !failedPhotoIds.has(photo.id) ? (
                             <img
                               src={
-                                getPhotoDisplayUrl(photo)
+                                getPhotoDisplayUrl(photo, cachedPhotoMap)
                               }
                               alt="Progress"
                               className="
@@ -3738,16 +3881,32 @@ insights must contain personalized coaching analysis.
                                 group-hover:scale-[1.01]
                               "
                               onError={(e) => {
-                                const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, photo);
+                                const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, photo, cachedPhotoMap);
                                 if (nextUrl && nextUrl !== e.currentTarget.src) {
                                   e.currentTarget.src = nextUrl;
+                                } else {
+                                  markPhotoFailed(photo?.id);
                                 }
                               }}
                             />
                           ) : (
-                            <div className="w-full h-60 bg-muted/30 flex flex-col items-center justify-center gap-2 text-muted-foreground p-4 text-center">
-                              <Camera className="w-8 h-8 opacity-40 text-primary" />
-                              <span className="text-xs font-medium">Photo Check-in</span>
+                            <div className="w-full h-64 bg-gradient-to-br from-card via-muted/20 to-card flex flex-col items-center justify-center gap-2.5 text-muted-foreground p-5 text-center select-none border-b border-border/40">
+                              <div className="w-12 h-12 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center text-primary">
+                                <Camera className="w-6 h-6" />
+                              </div>
+                              <div>
+                                <span className="text-xs font-semibold text-foreground block">
+                                  {photo?.label || photo?.custom_label || 'Progress Check-in'}
+                                </span>
+                                <span className="text-[11px] text-muted-foreground mt-0.5 block">
+                                  {formatPhotoDate(photo)}
+                                </span>
+                              </div>
+                              {photo?.weight_lbs ? (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary/15 text-primary border border-primary/20">
+                                  {photo.weight_lbs} {unit === 'metric' ? 'kg' : 'lbs'}
+                                </span>
+                              ) : null}
                             </div>
                           )}
 

@@ -1,5 +1,6 @@
 import { useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import { Link } from 'react-router-dom';
 import {
   BarChart,
   Bar,
@@ -534,6 +535,36 @@ export default function Progress() {
           </BarChart>
         </ResponsiveContainer>
       </Card>
+
+      {/* Muscle Heatmap Performance Tool Link Card */}
+      <Link to="/muscle-heatmap" className="block mb-4 group">
+        <Card className="p-4 sm:p-5 bg-gradient-to-br from-emerald-500/[0.07] via-card to-card border-border/80 hover:border-emerald-500/50 hover:shadow-[0_8px_24px_-4px_rgba(16,185,129,0.18)] transition-all">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center text-emerald-500 group-hover:scale-105 transition-transform shadow-2xs shrink-0">
+                <Activity className="w-5 h-5 text-emerald-500" />
+              </div>
+              <div>
+                <div className="flex items-center gap-2">
+                  <p className="font-heading font-bold text-sm sm:text-base text-foreground group-hover:text-emerald-500 transition-colors">
+                    Weekly Muscle Heatmap
+                  </p>
+                  <span className="text-[10px] font-semibold text-emerald-600 dark:text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-md border border-emerald-500/20">
+                    Live Anatomy
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground mt-0.5 leading-snug">
+                  Visual sets, reps, and hold-time distribution across all muscle groups
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1 text-xs font-semibold text-emerald-500 group-hover:translate-x-0.5 transition-transform shrink-0">
+              <span className="hidden sm:inline">View Heatmap</span>
+              <span>→</span>
+            </div>
+          </div>
+        </Card>
+      </Link>
 
       <Card className="p-4 mb-4">
         <div className="flex items-center gap-2 mb-4">

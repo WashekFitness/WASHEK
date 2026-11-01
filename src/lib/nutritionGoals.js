@@ -12,6 +12,8 @@
  * - These are estimates, not medical prescriptions.
  */
 
+import { getCachedActiveProgram, getCachedLogs } from '@/lib/cacheStore';
+
 const KG_PER_LB = 0.453592;
 const CM_PER_INCH = 2.54;
 
@@ -139,7 +141,20 @@ function getPrimaryGoal(user) {
  * This intentionally uses conservative activity assumptions because
  * WASHEK does not currently ask users for a formal activity level.
  */
-export function calcNutritionGoals(user) {
+export function calcNutritionGoals(user, options = {}) {
+  const userKey = options?.userKey || user?.id || user?.uid || null;
+
+  // Resolve active program and workout logs from options or synchronous cache
+  const program = options?.program || getCachedActiveProgram(userKey);
+  const workoutLogs = Array.isArray(options?.workoutLogs)
+    ? options.workoutLogs
+    : getCachedLogs(userKey);
+
+  const rawWeek = options?.currentWeek != null
+    ? options.currentWeek
+    : (program?.current_week || 1);
+  const currentWeek = Math.max(1, Math.min(12, Number(rawWeek) || 1));
+
   const weightLbs = getWeightLbs(user);
   const weightKg = weightLbs * KG_PER_LB;
 
@@ -160,7 +175,7 @@ export function calcNutritionGoals(user) {
   ).toLowerCase();
 
   /**
-   * Mifflin-St Jeor equation.
+   * Mifflin-St Jeor equation for baseline BMR.
    */
   const bmr =
     gender === 'female'
@@ -174,11 +189,7 @@ export function calcNutritionGoals(user) {
         5;
 
   /**
-   * Conservative activity estimates.
-   *
-   * We deliberately do NOT use 1.55–1.60 as the default.
-   * Those values can overestimate maintenance calories when a user
-   * exercises but otherwise has a relatively normal daily activity level.
+   * Activity estimates.
    */
   let activityMultiplier = 1.35;
 
@@ -196,23 +207,6 @@ export function calcNutritionGoals(user) {
 
   const primaryGoal = getPrimaryGoal(user);
 
-  /**
-   * Goal adjustments are intentionally modest.
-   *
-   * Fat loss:
-   *   ~15% deficit
-   *
-   * Muscle gain:
-   *   ~5% surplus
-   *
-   * Strength/endurance:
-   *   ~3% surplus
-   *
-   * Recomp/maintenance:
-   *   maintenance
-   *
-   * Crucially, only ONE of these adjustments is ever applied.
-   */
   let goalMultiplier = 1.0;
 
   switch (primaryGoal) {
@@ -243,11 +237,6 @@ export function calcNutritionGoals(user) {
     estimatedMaintenance * goalMultiplier
   );
 
-  /**
-   * Prevent the calculation from producing an unusually low target.
-   *
-   * This is still only an estimate and is intentionally conservative.
-   */
   const conservativeMinimum = Math.round(
     bmr * 1.20
   );
@@ -258,10 +247,8 @@ export function calcNutritionGoals(user) {
   );
 
   /**
-   * Protein:
-   *
-   * Uses body weight rather than inflating calories directly.
-   * The target is intentionally kept in a reasonable training range.
+   * Baseline Protein calculation:
+   * Keeps a solid baseline intake.
    */
   let proteinPerLb = 0.8;
 
@@ -275,10 +262,6 @@ export function calcNutritionGoals(user) {
     proteinPerLb = 0.9;
   }
 
-  /**
-   * Cap protein so very heavy users don't cause the macro calculation
-   * to consume an unreasonable amount of the calorie target.
-   */
   const protein = Math.round(
     Math.min(
       Math.max(weightLbs * proteinPerLb, 100),
@@ -288,10 +271,6 @@ export function calcNutritionGoals(user) {
 
   const proteinCals = protein * 4;
 
-  /**
-   * Fat:
-   * Keep fat around 25% of calories.
-   */
   const fatPercentage =
     primaryGoal === 'lose'
       ? 0.25
@@ -303,9 +282,6 @@ export function calcNutritionGoals(user) {
 
   const fatCals = fat * 9;
 
-  /**
-   * Carbohydrates receive the remaining calories.
-   */
   const remainingCalories = Math.max(
     calories - proteinCals - fatCals,
     0
@@ -315,11 +291,152 @@ export function calcNutritionGoals(user) {
     remainingCalories / 4
   );
 
+  // ── 12-WEEK PERIODIZED MACROCYCLE PROGRESSION ──
+  // Workouts get harder and more intense later on in the 12 weeks.
+  // As the user builds strength and muscle, their energy expenditure,
+  // muscle protein synthesis demand, and recovery needs progressively elevate.
+
+  let phaseNumber = 1;
+  let phaseName = 'Foundation & Work Capacity';
+  let phaseDescription = 'Building baseline movement mechanics, work capacity, and neuromuscular coordination.';
+  let phaseCalorieDelta = 0;
+  let phaseProteinDelta = 0;
+  let phaseCarbDelta = 0;
+  let phaseFatDelta = 0;
+
+  if (currentWeek >= 1 && currentWeek <= 4) {
+    phaseNumber = 1;
+    phaseName = 'Foundation & Work Capacity';
+    phaseDescription = 'Establishing movement mechanics, tendon strength, and baseline work capacity.';
+    if (currentWeek >= 3) {
+      // Gentle ramp in weeks 3-4 as initial conditioning volume builds
+      phaseCalorieDelta = 35;
+      phaseProteinDelta = 4;
+      phaseCarbDelta = 5;
+    }
+  } else if (currentWeek >= 5 && currentWeek <= 8) {
+    phaseNumber = 2;
+    phaseName = 'Intensification & Progressive Overload';
+    phaseDescription = 'Workouts intensify with heavier loads, harder skill progressions, and denser mechanical tension. Fueling accelerated muscle protein synthesis and glycogen recovery.';
+    const weekOffset = currentWeek - 5; // 0, 1, 2, 3
+    phaseCalorieDelta = 120 + (weekOffset * 20); // 120, 140, 160, 180 kcal
+    phaseProteinDelta = 12 + Math.round(weekOffset * 2); // +12g to +18g protein
+    phaseCarbDelta = 14 + (weekOffset * 3); // +14g to +23g carbs
+    phaseFatDelta = 3 + Math.round(weekOffset * 0.7); // +3g to +5g fat
+  } else if (currentWeek >= 9 && currentWeek <= 11) {
+    phaseNumber = 3;
+    phaseName = 'Peak Strength & Neuromuscular Demand';
+    phaseDescription = 'Maximum mechanical tension, heaviest resistance, and maximal neural drive. Maximizing intramuscular glycogen saturation and preventing catabolism.';
+    const weekOffset = currentWeek - 9; // 0, 1, 2
+    phaseCalorieDelta = 200 + (weekOffset * 35); // 200, 235, 270 kcal
+    phaseProteinDelta = 18 + Math.round(weekOffset * 3); // +18g to +24g protein
+    phaseCarbDelta = 24 + (weekOffset * 5); // +24g to +34g carbs
+    phaseFatDelta = 4 + (weekOffset * 1); // +4g to +6g fat
+  } else if (currentWeek === 12) {
+    phaseNumber = 3;
+    phaseName = 'Peak Benchmark & Taper';
+    phaseDescription = 'Strategic recovery, nervous system deload, and full glycogen replenishment for maximum power output on PR benchmark tests.';
+    phaseCalorieDelta = 100;
+    phaseProteinDelta = 15;
+    phaseCarbDelta = 15;
+    phaseFatDelta = 2;
+  }
+
+  // ── PERFORMANCE & WORKOUT CONSISTENCY MODIFIER ──
+  // Logged performance and workout frequency dynamically adjust daily targets.
+  let performanceCalorieDelta = 0;
+  let performanceProteinDelta = 0;
+  let performanceCarbDelta = 0;
+  let performanceFatDelta = 0;
+  let recentWorkoutsCount = 0;
+  let totalWorkoutsCount = 0;
+
+  if (Array.isArray(workoutLogs) && workoutLogs.length > 0) {
+    totalWorkoutsCount = workoutLogs.length;
+
+    const now = Date.now();
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+
+    const recentLogs = workoutLogs.filter((l) => {
+      if (!l) return false;
+      const dStr = l.date || l.created_at;
+      if (!dStr) return false;
+      const t = new Date(dStr).getTime();
+      return Number.isFinite(t) && now - t <= sevenDaysMs;
+    });
+
+    recentWorkoutsCount = recentLogs.length;
+
+    if (recentWorkoutsCount >= 4) {
+      // 4+ workouts in last 7 days: high metabolic throughput & elevated protein turnover
+      performanceCalorieDelta += 80;
+      performanceProteinDelta += 6;
+      performanceCarbDelta += 11;
+      performanceFatDelta += 2;
+    } else if (recentWorkoutsCount >= 2) {
+      // 2-3 workouts in last 7 days: consistent active training cadence
+      performanceCalorieDelta += 40;
+      performanceProteinDelta += 3;
+      performanceCarbDelta += 6;
+      performanceFatDelta += 1;
+    }
+
+    // Long-term physical adaptation: as workouts accumulate over the 12 weeks,
+    // the athlete has built denser muscle mass, increasing basal metabolic expenditure.
+    if (totalWorkoutsCount >= 24) {
+      performanceCalorieDelta += 45;
+      performanceProteinDelta += 4;
+      performanceCarbDelta += 6;
+    } else if (totalWorkoutsCount >= 12) {
+      performanceCalorieDelta += 25;
+      performanceProteinDelta += 2;
+      performanceCarbDelta += 3;
+    }
+  }
+
+  const totalCalorieDelta = phaseCalorieDelta + performanceCalorieDelta;
+  const totalProteinDelta = phaseProteinDelta + performanceProteinDelta;
+  const totalCarbDelta = phaseCarbDelta + performanceCarbDelta;
+  const totalFatDelta = phaseFatDelta + performanceFatDelta;
+
+  const finalCalories = Math.round(calories + totalCalorieDelta);
+  const finalProtein = Math.round(protein + totalProteinDelta);
+  const finalCarbs = Math.round(carbs + totalCarbDelta);
+  const finalFat = Math.round(fat + totalFatDelta);
+
   return {
-    calories,
-    protein: Math.max(protein, 50),
-    carbs: Math.max(carbs, 50),
-    fat: Math.max(fat, 30),
+    calories: finalCalories,
+    protein: Math.max(finalProtein, 50),
+    carbs: Math.max(finalCarbs, 50),
+    fat: Math.max(finalFat, 30),
+    base: {
+      calories,
+      protein: Math.max(protein, 50),
+      carbs: Math.max(carbs, 50),
+      fat: Math.max(fat, 30),
+    },
+    adaptation: {
+      isAdapted: totalCalorieDelta > 0 || totalProteinDelta > 0,
+      currentWeek,
+      phaseNumber,
+      phaseName,
+      phaseDescription,
+      phaseCalorieDelta,
+      phaseProteinDelta,
+      phaseCarbDelta,
+      phaseFatDelta,
+      performanceCalorieDelta,
+      performanceProteinDelta,
+      performanceCarbDelta,
+      performanceFatDelta,
+      totalCalorieDelta,
+      totalProteinDelta,
+      totalCarbDelta,
+      totalFatDelta,
+      recentWorkoutsCount,
+      totalWorkoutsCount,
+      summary: `Week ${currentWeek} · ${phaseName} (+${totalCalorieDelta} kcal, +${totalProteinDelta}g protein)`,
+    },
   };
 }
 

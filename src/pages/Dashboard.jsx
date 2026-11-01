@@ -163,12 +163,12 @@ export default function Dashboard() {
         100
       );
       if (Array.isArray(res) && res.length > 0) {
-        setCachedNutrition(res, userKey);
+        setCachedNutrition(res, userKey, today);
       }
       return res;
     },
 
-    initialData: () => getCachedNutrition(userKey),
+    initialData: () => getCachedNutrition(userKey, today),
     staleTime: 5 * 60 * 1000,
     enabled: true,
   });

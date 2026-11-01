@@ -76,7 +76,7 @@ import {
 import MessageBubble from '@/components/kael/MessageBubble';
 
 
-const CONTEXT_MESSAGE_COUNT = 30;
+const CONTEXT_MESSAGE_COUNT = 10;
 
 const STORAGE_CHATS_PREFIX = 'washek_kael_chats_';
 const STORAGE_ACTIVE_PREFIX = 'washek_kael_active_chat_';
@@ -1249,8 +1249,9 @@ export default function Kael() {
          * it cannot be skipped or bypassed by calling the Edge
          * Function directly.
          */
+        let streamedSoFar = '';
         const result =
-          await supabaseApi.ai.invoke(
+          await supabaseApi.ai.stream(
             {
               prompt,
               type:
@@ -1258,6 +1259,14 @@ export default function Kael() {
               plan:
                 plan ||
                 'free',
+              onChunk: (_chunk, accumulated) => {
+                streamedSoFar = accumulated;
+                setMessages((prev) =>
+                  prev.map((m) =>
+                    m.id === temporaryId ? { ...m, content: accumulated } : m
+                  )
+                );
+              },
             }
           );
 
@@ -1296,14 +1305,14 @@ export default function Kael() {
         }
 
         const responseText =
-          typeof result ===
-          'string'
+          streamedSoFar ||
+          (typeof result === 'string'
             ? result
             : result?.content ||
               result?.response ||
               result?.text ||
               result?.message ||
-              '';
+              '');
 
         if (!responseText) {
           throw new Error(
@@ -1382,10 +1391,18 @@ export default function Kael() {
             });
         }
 
-        await typeAssistantResponse(
-          responseText,
-          temporaryId
-        );
+        if (!streamedSoFar) {
+          await typeAssistantResponse(
+            responseText,
+            temporaryId
+          );
+        } else {
+          setMessages((prev) =>
+            prev.map((msg) =>
+              msg.id === temporaryId ? { ...msg, content: responseText } : msg
+            )
+          );
+        }
 
         typingCancelledRef.current =
           false;
