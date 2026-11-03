@@ -871,7 +871,7 @@ function getSmartDefaultMeal() {
           dark:shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05),0_8px_32px_rgba(0,0,0,0.45)]
         ">
 
-          {/* 12-Week Adaptive Periodization & Performance Fueling Banner */}
+          {/* Adaptive Performance Fueling Banner */}
           <div className="mb-5 p-4 rounded-xl bg-gradient-to-r from-primary/10 via-amber-500/10 to-primary/5 border border-primary/25 dark:border-primary/20 shadow-2xs">
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2.5">
               <div className="flex items-start sm:items-center gap-2.5">
@@ -881,19 +881,19 @@ function getSmartDefaultMeal() {
                 <div>
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-heading font-bold text-xs uppercase tracking-wider text-primary">
-                      12-Week Adaptive Fueling
+                      Adaptive Performance Fueling
                     </span>
                     <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary/15 border border-primary/25 text-primary leading-none">
-                      Week {goals.adaptation?.currentWeek || 1} • Phase {goals.adaptation?.phaseNumber || 1}
+                      {goals.adaptation?.demandBadge || goals.adaptation?.demandTier || 'Active Output'}
                     </span>
                   </div>
                   <h4 className="text-sm font-bold text-foreground font-heading mt-0.5">
-                    {goals.adaptation?.phaseName || 'Foundation & Work Capacity'}
+                    {goals.adaptation?.statusTitle || goals.adaptation?.phaseName || 'Performance Fueling'}
                   </h4>
                 </div>
               </div>
 
-              {goals.adaptation?.totalCalorieDelta > 0 && (
+              {goals.adaptation?.totalCalorieDelta > 0 ? (
                 <div className="flex items-center gap-2 self-start sm:self-auto px-3 py-1.5 rounded-lg bg-background/80 dark:bg-card/90 border border-border/80 shadow-2xs text-xs font-semibold">
                   <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
                   <span className="text-foreground">
@@ -903,6 +903,10 @@ function getSmartDefaultMeal() {
                   <span className="text-blue-500 dark:text-blue-400 font-bold">
                     +{goals.adaptation.totalProteinDelta}g protein
                   </span>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1.5 self-start sm:self-auto px-2.5 py-1 rounded-lg bg-background/60 dark:bg-card/70 border border-border/60 text-[11px] text-muted-foreground">
+                  <span>Basal Recovery (0 surplus kcal)</span>
                 </div>
               )}
             </div>
@@ -915,7 +919,7 @@ function getSmartDefaultMeal() {
               <div className="flex items-center gap-2.5 flex-wrap">
                 <span className="inline-flex items-center gap-1.5">
                   <Activity className="w-3.5 h-3.5 text-emerald-500" />
-                  Recent: <strong className="text-foreground font-semibold">{goals.adaptation?.recentWorkoutsCount || 0} sessions</strong> (last 7d)
+                  Actual 7d Output: <strong className="text-foreground font-semibold">{goals.adaptation?.recentWorkoutsCount || 0} sessions ({goals.adaptation?.recentSetsCount || 0} sets{goals.adaptation?.recentMinutes ? `, ${goals.adaptation.recentMinutes}m` : ''})</strong>
                 </span>
                 <span>•</span>
                 <span>
@@ -923,7 +927,7 @@ function getSmartDefaultMeal() {
                 </span>
               </div>
               <span className="text-primary font-semibold text-[10px] uppercase tracking-wider">
-                Dynamically scaled to training load
+                Calibrated to actual output, not ideal schedule
               </span>
             </div>
           </div>

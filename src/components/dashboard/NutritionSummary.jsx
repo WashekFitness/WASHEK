@@ -5,7 +5,7 @@ import { Flame, Drumstick, Wheat, Droplets } from 'lucide-react';
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import { getLocalDateKey } from '@/lib/messageLimit';
 
-export default function NutritionSummary({ entries, user }) {
+export default function NutritionSummary({ entries, user, logs, program }) {
   const [today, setToday] = useState(
     () => getLocalDateKey()
   );
@@ -57,7 +57,11 @@ export default function NutritionSummary({ entries, user }) {
   );
 
   const goals =
-    calcNutritionGoals(user, { userKey: user?.id || user?.uid });
+    calcNutritionGoals(user, {
+      userKey: user?.id || user?.uid || user?.email,
+      workoutLogs: logs,
+      program,
+    });
 
   const calorieGoal =
     goals.calories || 1;
@@ -107,15 +111,23 @@ export default function NutritionSummary({ entries, user }) {
               <p className="font-heading font-bold text-sm tracking-tight">
                 Daily Fuel
               </p>
-              {goals?.adaptation?.currentWeek && (
+              {goals?.adaptation?.demandBadge ? (
+                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/10 border border-primary/25 text-primary leading-none">
+                  {goals.adaptation.demandBadge}
+                </span>
+              ) : goals?.adaptation?.currentWeek ? (
                 <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/10 border border-primary/25 text-primary leading-none">
                   W{goals.adaptation.currentWeek} Adapted
                 </span>
-              )}
+              ) : null}
             </div>
 
             <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
-              {goals?.adaptation?.phaseName ? `${goals.adaptation.phaseName.split('&')[0].trim()}` : 'Nutrition Target'}
+              {goals?.adaptation?.statusTitle
+                ? goals.adaptation.statusTitle
+                : goals?.adaptation?.phaseName
+                  ? `${goals.adaptation.phaseName.split('&')[0].trim()}`
+                  : 'Nutrition Target'}
             </p>
           </div>
         </div>

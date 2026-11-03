@@ -13,6 +13,7 @@
  */
 
 import { getCachedActiveProgram, getCachedLogs } from '@/lib/cacheStore';
+import { parseExerciseVolumeMetrics } from '@/lib/muscleDistribution';
 
 const KG_PER_LB = 0.453592;
 const CM_PER_INCH = 2.54;
@@ -291,65 +292,24 @@ export function calcNutritionGoals(user, options = {}) {
     remainingCalories / 4
   );
 
-  // ── 12-WEEK PERIODIZED MACROCYCLE PROGRESSION ──
-  // Workouts get harder and more intense later on in the 12 weeks.
-  // As the user builds strength and muscle, their energy expenditure,
-  // muscle protein synthesis demand, and recovery needs progressively elevate.
+  // ── ADAPTIVE NUTRITION: DRIVEN BY THE ATHLETE'S ACTUAL PERFORMANCE ──
+  // Adaptive targets are calibrated directly to what the athlete ACTUALLY executed,
+  // rather than theoretical expectations of what they were supposed to do if they
+  // followed the program schedule perfectly.
+  //
+  // - If the athlete trained 0 times recently, surplus is paused (0 kcal) to prevent unwanted body fat.
+  // - If the athlete trained lightly (1-2 sessions, low sets), targets adapt modestly for gentle recovery.
+  // - If the athlete achieved optimal stimulus (3-4 sessions, 16-36 sets), targets ramp up to fuel peak protein synthesis and glycogen resynthesis.
+  // - If the athlete trained heavily (5+ sessions or > 36 sets), targets scale higher to prevent catabolism and replenish glycogen.
+  // - If recent check-ins report high fatigue/soreness, an extra cellular repair and anti-fatigue cushion is allocated.
 
-  let phaseNumber = 1;
-  let phaseName = 'Foundation & Work Capacity';
-  let phaseDescription = 'Building baseline movement mechanics, work capacity, and neuromuscular coordination.';
-  let phaseCalorieDelta = 0;
-  let phaseProteinDelta = 0;
-  let phaseCarbDelta = 0;
-  let phaseFatDelta = 0;
-
-  if (currentWeek >= 1 && currentWeek <= 4) {
-    phaseNumber = 1;
-    phaseName = 'Foundation & Work Capacity';
-    phaseDescription = 'Establishing movement mechanics, tendon strength, and baseline work capacity.';
-    if (currentWeek >= 3) {
-      // Gentle ramp in weeks 3-4 as initial conditioning volume builds
-      phaseCalorieDelta = 35;
-      phaseProteinDelta = 4;
-      phaseCarbDelta = 5;
-    }
-  } else if (currentWeek >= 5 && currentWeek <= 8) {
-    phaseNumber = 2;
-    phaseName = 'Intensification & Progressive Overload';
-    phaseDescription = 'Workouts intensify with heavier loads, harder skill progressions, and denser mechanical tension. Fueling accelerated muscle protein synthesis and glycogen recovery.';
-    const weekOffset = currentWeek - 5; // 0, 1, 2, 3
-    phaseCalorieDelta = 120 + (weekOffset * 20); // 120, 140, 160, 180 kcal
-    phaseProteinDelta = 12 + Math.round(weekOffset * 2); // +12g to +18g protein
-    phaseCarbDelta = 14 + (weekOffset * 3); // +14g to +23g carbs
-    phaseFatDelta = 3 + Math.round(weekOffset * 0.7); // +3g to +5g fat
-  } else if (currentWeek >= 9 && currentWeek <= 11) {
-    phaseNumber = 3;
-    phaseName = 'Peak Strength & Neuromuscular Demand';
-    phaseDescription = 'Maximum mechanical tension, heaviest resistance, and maximal neural drive. Maximizing intramuscular glycogen saturation and preventing catabolism.';
-    const weekOffset = currentWeek - 9; // 0, 1, 2
-    phaseCalorieDelta = 200 + (weekOffset * 35); // 200, 235, 270 kcal
-    phaseProteinDelta = 18 + Math.round(weekOffset * 3); // +18g to +24g protein
-    phaseCarbDelta = 24 + (weekOffset * 5); // +24g to +34g carbs
-    phaseFatDelta = 4 + (weekOffset * 1); // +4g to +6g fat
-  } else if (currentWeek === 12) {
-    phaseNumber = 3;
-    phaseName = 'Peak Benchmark & Taper';
-    phaseDescription = 'Strategic recovery, nervous system deload, and full glycogen replenishment for maximum power output on PR benchmark tests.';
-    phaseCalorieDelta = 100;
-    phaseProteinDelta = 15;
-    phaseCarbDelta = 15;
-    phaseFatDelta = 2;
-  }
-
-  // ── PERFORMANCE & WORKOUT CONSISTENCY MODIFIER ──
-  // Logged performance and workout frequency dynamically adjust daily targets.
-  let performanceCalorieDelta = 0;
-  let performanceProteinDelta = 0;
-  let performanceCarbDelta = 0;
-  let performanceFatDelta = 0;
   let recentWorkoutsCount = 0;
   let totalWorkoutsCount = 0;
+  let recentSetsCount = 0;
+  let recentRepsCount = 0;
+  let recentHoldSeconds = 0;
+  let recentMinutes = 0;
+  let hasHighFatigue = false;
 
   if (Array.isArray(workoutLogs) && workoutLogs.length > 0) {
     totalWorkoutsCount = workoutLogs.length;
@@ -367,37 +327,121 @@ export function calcNutritionGoals(user, options = {}) {
 
     recentWorkoutsCount = recentLogs.length;
 
-    if (recentWorkoutsCount >= 4) {
-      // 4+ workouts in last 7 days: high metabolic throughput & elevated protein turnover
-      performanceCalorieDelta += 80;
-      performanceProteinDelta += 6;
-      performanceCarbDelta += 11;
-      performanceFatDelta += 2;
-    } else if (recentWorkoutsCount >= 2) {
-      // 2-3 workouts in last 7 days: consistent active training cadence
-      performanceCalorieDelta += 40;
-      performanceProteinDelta += 3;
-      performanceCarbDelta += 6;
-      performanceFatDelta += 1;
-    }
+    for (const log of recentLogs) {
+      recentMinutes += Number(log?.duration_minutes) || 0;
 
-    // Long-term physical adaptation: as workouts accumulate over the 12 weeks,
-    // the athlete has built denser muscle mass, increasing basal metabolic expenditure.
-    if (totalWorkoutsCount >= 24) {
-      performanceCalorieDelta += 45;
-      performanceProteinDelta += 4;
-      performanceCarbDelta += 6;
-    } else if (totalWorkoutsCount >= 12) {
-      performanceCalorieDelta += 25;
-      performanceProteinDelta += 2;
-      performanceCarbDelta += 3;
+      // Check fatigue signals in post_workout_checkin or ai_adjustment_notes
+      const checkinText = `${log?.post_workout_checkin || ''} ${log?.ai_adjustment_notes || ''}`.toLowerCase();
+      if (
+        checkinText.includes('sore') ||
+        checkinText.includes('exhaust') ||
+        checkinText.includes('fatigue') ||
+        checkinText.includes('heavy') ||
+        checkinText.includes('tired') ||
+        checkinText.includes('hard') ||
+        checkinText.includes('rpe 9') ||
+        checkinText.includes('rpe 10')
+      ) {
+        hasHighFatigue = true;
+      }
+
+      // Parse actual exercises completed
+      const exercises = Array.isArray(log?.exercises_completed) ? log.exercises_completed : [];
+      for (const ex of exercises) {
+        if (!ex) continue;
+        const setsCount = Math.max(
+          1,
+          Number(ex?.sets_completed) ||
+            (Array.isArray(ex?.sets) ? ex.sets.length : Number(ex?.sets) || 1)
+        );
+        recentSetsCount += setsCount;
+
+        const repsStr = ex?.reps_achieved || ex?.reps || '';
+        const volumeMetrics = parseExerciseVolumeMetrics(repsStr, setsCount);
+        recentRepsCount += volumeMetrics.totalReps;
+        recentHoldSeconds += volumeMetrics.totalHoldSeconds;
+      }
     }
   }
 
-  const totalCalorieDelta = phaseCalorieDelta + performanceCalorieDelta;
-  const totalProteinDelta = phaseProteinDelta + performanceProteinDelta;
-  const totalCarbDelta = phaseCarbDelta + performanceCarbDelta;
-  const totalFatDelta = phaseFatDelta + performanceFatDelta;
+  // Calculate dynamic adaptive deltas based on actual completed training load
+  let adaptiveCalorieDelta = 0;
+  let adaptiveProteinDelta = 0;
+  let adaptiveCarbDelta = 0;
+  let adaptiveFatDelta = 0;
+  let demandTier = 'Basal Recovery';
+  let demandBadge = 'Rest Base';
+  let statusTitle = 'Basal Recovery (0 Logged Sessions)';
+  let phaseDescription =
+    'Calibrated to your actual recent output. Adaptive surplus is paused until workouts are logged to protect your body composition.';
+
+  if (recentWorkoutsCount === 0 || recentSetsCount === 0) {
+    demandTier = 'Basal Recovery';
+    demandBadge = 'Rest Base';
+    statusTitle = 'Basal Recovery (0 Logged Sessions)';
+    phaseDescription =
+      'Calibrated to your actual training logs. Surplus calories are paused until workouts are logged, protecting you from unwanted body fat while keeping baseline protein high for tissue preservation.';
+    adaptiveCalorieDelta = 0;
+    adaptiveProteinDelta = 0;
+    adaptiveCarbDelta = 0;
+    adaptiveFatDelta = 0;
+  } else if (recentWorkoutsCount <= 2 && recentSetsCount < 16) {
+    demandTier = 'Active Maintenance';
+    demandBadge = 'Light Output';
+    statusTitle = 'Light Active Recovery';
+    phaseDescription = `Calibrated to your actual logged volume (${recentSetsCount} completed sets across ${recentWorkoutsCount} session${recentWorkoutsCount === 1 ? '' : 's'}). Providing gentle recovery fueling without caloric surplus creep.`;
+    adaptiveCalorieDelta = Math.round(45 + recentSetsCount * 2.0); // ~55-75 kcal
+    adaptiveProteinDelta = Math.round(5 + recentSetsCount * 0.2); // ~6-8g protein
+    adaptiveCarbDelta = Math.round(7 + recentSetsCount * 0.35); // ~8-12g carbs
+    adaptiveFatDelta = 1;
+  } else if (recentWorkoutsCount <= 4 && recentSetsCount <= 36) {
+    demandTier = 'Optimal Stimulus';
+    demandBadge = 'Optimal Output';
+    statusTitle = 'Optimal Training Output Fueling';
+    phaseDescription = `Calibrated to your actual completed workload (${recentSetsCount} sets, ${recentRepsCount} reps over ${recentMinutes}m). Fueling peak muscle protein synthesis and replenishing glycogen reserves.`;
+    adaptiveCalorieDelta = Math.round(110 + Math.min(75, recentSetsCount * 2.1)); // ~145-185 kcal
+    adaptiveProteinDelta = Math.round(11 + Math.min(8, recentSetsCount * 0.22)); // ~14-18g protein
+    adaptiveCarbDelta = Math.round(15 + Math.min(10, recentSetsCount * 0.3)); // ~19-25g carbs
+    adaptiveFatDelta = Math.round(2 + Math.min(2, recentSetsCount * 0.06)); // ~2-3g fat
+  } else {
+    // 5+ workouts or > 36 sets (Heavy Volume / High Demand)
+    demandTier = 'High Demand';
+    demandBadge = 'High Output';
+    statusTitle = 'High-Volume Performance Fueling';
+    phaseDescription = `Calibrated to your heavy actual training output (${recentSetsCount} sets, ${recentMinutes}m of mechanical tension). Accelerating systemic recovery, replenishing depleted glycogen, and mitigating catabolism.`;
+    const extraSets = Math.max(0, recentSetsCount - 36);
+    adaptiveCalorieDelta = Math.round(200 + Math.min(100, extraSets * 2.5)); // ~210-300 kcal
+    adaptiveProteinDelta = Math.round(18 + Math.min(10, extraSets * 0.25)); // ~20-28g protein
+    adaptiveCarbDelta = Math.round(26 + Math.min(16, extraSets * 0.4)); // ~28-42g carbs
+    adaptiveFatDelta = Math.round(4 + Math.min(2, extraSets * 0.06)); // ~4-6g fat
+  }
+
+  // Self-reported fatigue / strain recovery cushion
+  let fatigueCalorieDelta = 0;
+  let fatigueProteinDelta = 0;
+  let fatigueCarbDelta = 0;
+  if (hasHighFatigue && recentWorkoutsCount > 0) {
+    fatigueCalorieDelta = 35;
+    fatigueProteinDelta = 4;
+    fatigueCarbDelta = 4;
+    phaseDescription += ' Includes anti-fatigue & tissue repair buffer based on your logged check-in feedback.';
+  }
+
+  // Lifetime consistency adaptation (denser muscular mass with training longevity)
+  let consistencyCalorieDelta = 0;
+  let consistencyProteinDelta = 0;
+  if (totalWorkoutsCount >= 24) {
+    consistencyCalorieDelta = 35;
+    consistencyProteinDelta = 4;
+  } else if (totalWorkoutsCount >= 12) {
+    consistencyCalorieDelta = 20;
+    consistencyProteinDelta = 2;
+  }
+
+  const totalCalorieDelta = adaptiveCalorieDelta + fatigueCalorieDelta + consistencyCalorieDelta;
+  const totalProteinDelta = adaptiveProteinDelta + fatigueProteinDelta + consistencyProteinDelta;
+  const totalCarbDelta = adaptiveCarbDelta + fatigueCarbDelta;
+  const totalFatDelta = adaptiveFatDelta;
 
   const finalCalories = Math.round(calories + totalCalorieDelta);
   const finalProtein = Math.round(protein + totalProteinDelta);
@@ -418,24 +462,30 @@ export function calcNutritionGoals(user, options = {}) {
     adaptation: {
       isAdapted: totalCalorieDelta > 0 || totalProteinDelta > 0,
       currentWeek,
-      phaseNumber,
-      phaseName,
+      demandTier,
+      demandBadge,
+      statusTitle,
+      phaseName: statusTitle,
       phaseDescription,
-      phaseCalorieDelta,
-      phaseProteinDelta,
-      phaseCarbDelta,
-      phaseFatDelta,
-      performanceCalorieDelta,
-      performanceProteinDelta,
-      performanceCarbDelta,
-      performanceFatDelta,
+      adaptiveCalorieDelta,
+      adaptiveProteinDelta,
+      adaptiveCarbDelta,
+      adaptiveFatDelta,
+      fatigueCalorieDelta,
+      fatigueProteinDelta,
+      consistencyCalorieDelta,
       totalCalorieDelta,
       totalProteinDelta,
       totalCarbDelta,
       totalFatDelta,
       recentWorkoutsCount,
+      recentSetsCount,
+      recentRepsCount,
+      recentHoldSeconds,
+      recentMinutes,
       totalWorkoutsCount,
-      summary: `Week ${currentWeek} · ${phaseName} (+${totalCalorieDelta} kcal, +${totalProteinDelta}g protein)`,
+      hasHighFatigue,
+      summary: `${demandTier} · ${recentWorkoutsCount} sessions (${recentSetsCount} sets) (+${totalCalorieDelta} kcal, +${totalProteinDelta}g protein)`,
     },
   };
 }

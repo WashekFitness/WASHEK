@@ -248,8 +248,7 @@ export default function Dashboard() {
               {user?.first_name ||
                 user?.full_name?.split(' ')[0] ||
                 'Athlete'}
-            </span>{' '}
-            👋
+            </span>
           </h1>
 
 
@@ -285,6 +284,8 @@ export default function Dashboard() {
           <NutritionSummary
             entries={nutrition}
             user={user}
+            logs={logs}
+            program={activeProgram}
           />
 
 
