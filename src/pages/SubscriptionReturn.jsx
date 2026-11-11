@@ -156,15 +156,19 @@ export default function SubscriptionReturn() {
 
       // 4. Update Supabase profile if present
       try {
-        if (uid) {
-          await supabase
-            .from('profiles')
-            .update({
-              subscription_plan: resolvedPlan,
-              subscription_status: resolvedStatus,
-              updated_at: new Date().toISOString(),
-            })
-            .eq('id', uid);
+        const profileUpdatePayload = {
+          subscription_plan: resolvedPlan,
+          subscription_status: resolvedStatus,
+          updated_at: new Date().toISOString(),
+        };
+        const isUUID = typeof uid === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uid.trim());
+        let updated = false;
+        if (isUUID) {
+          const { error: dbErr } = await supabase.from('profiles').update(profileUpdatePayload).eq('id', uid);
+          if (!dbErr) updated = true;
+        }
+        if (!updated && email) {
+          await supabase.from('profiles').update(profileUpdatePayload).ilike('email', email.trim());
         }
       } catch (err) {
         console.debug('[SubscriptionReturn] Supabase profile sync note:', err);

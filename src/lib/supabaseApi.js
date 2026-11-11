@@ -1233,12 +1233,14 @@ async function streamAI({
   }
 
   let currentUserId = null;
+  let currentUserEmail = null;
   let currentUsed = 0;
   try {
     const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
     if (rawUser) {
       const parsedUser = JSON.parse(rawUser);
       currentUserId = parsedUser?.id || null;
+      currentUserEmail = parsedUser?.email || null;
       currentUsed = Number(parsedUser?.kael_msg_count || 0);
     }
   } catch (_userErr) {
@@ -1268,6 +1270,7 @@ async function streamAI({
         plan: plan || 'free',
         timezone: userTz,
         user_id: currentUserId,
+        email: currentUserEmail,
         current_used: currentUsed,
       }),
     });
@@ -1338,15 +1341,30 @@ async function streamAI({
     console.warn('[streamAI] Stream error, falling back to unary invokeAI:', streamErr);
   }
 
-  return invokeAI({
+  const fallback = await invokeAI({
     prompt,
     file_urls,
-    model,
+    model: model || 'gemini-3.1-flash-lite',
     response_json_schema,
     schema,
     type,
     plan,
   });
+
+  const text =
+    typeof fallback === 'string'
+      ? fallback
+      : (fallback?.result || fallback?.content || fallback?.text || '');
+
+  if (typeof onChunk === 'function' && text) {
+    onChunk(text, text);
+  }
+
+  return {
+    content: text,
+    result: text,
+    quota: fallback?.quota,
+  };
 }
 
 async function invokeAI({
@@ -1409,12 +1427,14 @@ async function invokeAI({
   // Primary: Google Gemini Server Backend
   try {
     let currentUserId = null;
+    let currentUserEmail = null;
     let currentUsed = 0;
     try {
       const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
       if (rawUser) {
         const parsedUser = JSON.parse(rawUser);
         currentUserId = parsedUser?.id || null;
+        currentUserEmail = parsedUser?.email || null;
         currentUsed = Number(parsedUser?.kael_msg_count || 0);
       }
     } catch (_userErr) {
@@ -1437,12 +1457,13 @@ async function invokeAI({
         type,
         prompt,
         file_urls: normalizedFileUrls,
-        model: model || 'gemini-3.5-flash-lite',
+        model: model || 'gemini-3.1-flash-lite',
         schema: schema || response_json_schema || null,
         response_json_schema: response_json_schema || schema || null,
         plan: plan || 'free',
         timezone: userTz,
         user_id: currentUserId,
+        email: currentUserEmail,
         current_used: currentUsed,
       }),
     });
@@ -1457,7 +1478,7 @@ async function invokeAI({
           type,
           prompt,
           file_urls: normalizedFileUrls,
-          model: model || 'gemini-3.5-flash-lite',
+          model: model || 'gemini-3.1-flash-lite',
           schema: schema || response_json_schema || null,
           response_json_schema: response_json_schema || schema || null,
           plan: 'free',

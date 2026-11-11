@@ -487,6 +487,9 @@ async function syncSubscriptionToProfile(
   subscription: Stripe.Subscription,
   explicitUserId:
     | string
+    | null = null,
+  explicitPlan:
+    | string
     | null = null
 ) {
   const userId =
@@ -496,21 +499,18 @@ async function syncSubscriptionToProfile(
     );
 
   if (!userId) {
-    throw new Error(
-      `Stripe subscription ${subscription.id} is missing metadata.user_id`
+    console.warn(
+      `[WASHEK WEBHOOK] syncSubscriptionToProfile called without userId for ${subscription.id}. Skipping.`
     );
+    return null;
   }
 
   const plan =
+    explicitPlan ||
     getSubscriptionPlan(
       subscription
-    );
-
-  if (!plan) {
-    throw new Error(
-      `Unable to determine Washek plan for Stripe subscription ${subscription.id}`
-    );
-  }
+    ) ||
+    'progress';
 
   const status =
     String(
@@ -816,20 +816,14 @@ async function cancelOldSubscription(
       oldSubscriptionId
     );
   } catch (error) {
-    /*
-     * IMPORTANT:
-     *
-     * Throw the error so Stripe retries this webhook.
-     *
-     * We never silently leave two subscriptions running.
-     */
-
-    throw new Error(
-      `The new subscription was paid, but the old subscription ${oldSubscriptionId} could not be canceled: ${
-        error instanceof Error
-          ? error.message
-          : String(error)
-      }`
+    const errMsg = error instanceof Error ? error.message : String(error);
+    if (errMsg.includes('No such subscription') || errMsg.includes('resource_missing')) {
+      console.log('[WASHEK REPLACEMENT] Old subscription not found or already removed in Stripe:', oldSubscriptionId);
+      return;
+    }
+    console.warn(
+      `[WASHEK REPLACEMENT] Note canceling old subscription ${oldSubscriptionId}:`,
+      errMsg
     );
   }
 }
@@ -976,9 +970,16 @@ async function handleCheckoutCompleted(
    * subscription before the old subscription is canceled.
    */
 
+  const sessionPlan =
+    getMetadataPlan(session.metadata) ||
+    getPlanFromPriceId(
+      (session as any).line_items?.data?.[0]?.price?.id
+    );
+
   await syncSubscriptionToProfile(
     newSubscription,
-    userId
+    userId,
+    sessionPlan
   );
 
   /*
@@ -1088,15 +1089,110 @@ async function handleSubscriptionEvent(
       subscriptionId
     );
 
-  const userId =
+  let userId =
     getSubscriptionUserId(
       subscription
     );
 
   if (!userId) {
-    throw new Error(
-      `Subscription ${subscriptionId} is missing metadata.user_id`
+    const { data: profileBySub } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('stripe_subscription_id', subscriptionId)
+      .maybeSingle();
+
+    if (profileBySub?.id) {
+      userId = profileBySub.id;
+    }
+  }
+
+  const customerId =
+    typeof subscription.customer === 'string'
+      ? subscription.customer
+      : (subscription.customer as any)?.id || null;
+
+  if (!userId && customerId) {
+    const { data: profileByCust } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('stripe_customer_id', customerId)
+      .maybeSingle();
+
+    if (profileByCust?.id) {
+      userId = profileByCust.id;
+    }
+  }
+
+  if (!userId && customerId) {
+    try {
+      const cust = await stripe.customers.retrieve(customerId);
+      if (cust && !(cust as any).deleted && (cust as any).email) {
+        const { data: profileByEmail } = await supabase
+          .from('profiles')
+          .select('id')
+          .ilike('email', (cust as any).email.trim())
+          .maybeSingle();
+
+        if (profileByEmail?.id) {
+          userId = profileByEmail.id;
+        }
+      }
+    } catch (custErr) {
+      console.warn('[WASHEK WEBHOOK] Customer retrieve note:', custErr);
+    }
+  }
+
+  if (!userId) {
+    try {
+      const sessions = await stripe.checkout.sessions.list({
+        subscription: subscriptionId,
+        limit: 1,
+      });
+      if (sessions?.data?.length > 0) {
+        const s = sessions.data[0];
+        const sUid = (typeof s.client_reference_id === 'string' && s.client_reference_id.trim())
+          ? s.client_reference_id.trim()
+          : getMetadataUserId(s.metadata);
+
+        if (sUid) {
+          userId = sUid;
+        } else {
+          const sEmail = s.customer_details?.email || (typeof s.customer_email === 'string' ? s.customer_email : null);
+          if (sEmail) {
+            const { data: profileByEmail } = await supabase
+              .from('profiles')
+              .select('id')
+              .ilike('email', sEmail.trim())
+              .maybeSingle();
+            if (profileByEmail?.id) {
+              userId = profileByEmail.id;
+            }
+          }
+        }
+      }
+    } catch (sessErr) {
+      console.warn('[WASHEK WEBHOOK] Sessions lookup note:', sessErr);
+    }
+  }
+
+  if (!userId) {
+    console.log(
+      `[WASHEK WEBHOOK] Subscription ${subscriptionId} does not match an existing profile. Event acknowledged cleanly.`
     );
+    return;
+  }
+
+  // Backfill metadata onto Stripe subscription so future events contain metadata.user_id
+  try {
+    const plan = getSubscriptionPlan(subscription) || 'progress';
+    await stripe.subscriptions.update(subscriptionId, {
+      metadata: {
+        user_id: userId,
+        plan,
+      },
+    });
+  } catch (updErr) {
+    console.warn('[WASHEK WEBHOOK] Subscription metadata backfill note:', updErr);
   }
 
   /*

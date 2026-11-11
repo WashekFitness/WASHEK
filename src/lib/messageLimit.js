@@ -117,14 +117,31 @@ export async function getServerMessageStats(timeZone = null) {
       return stats;
     }
 
+function isValidUUID(val) {
+  if (typeof val !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val.trim());
+}
+
     // Direct profile table fallback if RPC is ever unreachable or unauthenticated
-    if (effectiveUserId) {
+    if (effectiveUserId || cachedUser?.email) {
       try {
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
-          .eq('id', effectiveUserId)
-          .maybeSingle();
+        let profile = null;
+        if (effectiveUserId && isValidUUID(effectiveUserId)) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
+            .eq('id', effectiveUserId)
+            .maybeSingle();
+          profile = data;
+        }
+        if (!profile && cachedUser?.email) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
+            .ilike('email', String(cachedUser.email).trim())
+            .maybeSingle();
+          profile = data;
+        }
 
         if (profile) {
           // If cachedUser has a higher count for current month, use the higher count
@@ -251,16 +268,28 @@ export async function claimMessage(timeZone = null) {
     const newCount = prevCount + 1;
 
     // Update profiles table in database if user is known
-    if (userId) {
+    const userEmail = localUser?.email || (typeof localStorage !== 'undefined' ? JSON.parse(localStorage.getItem('washek_user') || '{}')?.email : null);
+    if (userId || userEmail) {
       try {
-        await supabase
-          .from('profiles')
-          .update({
-            kael_msg_count: newCount,
-            kael_msg_month: currentMonthKey,
-            timezone: effectiveTz,
-          })
-          .eq('id', userId);
+        const updatePayload = {
+          kael_msg_count: newCount,
+          kael_msg_month: currentMonthKey,
+          timezone: effectiveTz,
+        };
+        let updated = false;
+        if (userId && isValidUUID(userId)) {
+          const { error: dbErr } = await supabase
+            .from('profiles')
+            .update(updatePayload)
+            .eq('id', userId);
+          if (!dbErr) updated = true;
+        }
+        if (!updated && userEmail) {
+          await supabase
+            .from('profiles')
+            .update(updatePayload)
+            .ilike('email', String(userEmail).trim());
+        }
       } catch (dbErr) {
         console.warn('[messageLimit] Fallback profile update note:', dbErr);
       }

@@ -1394,7 +1394,8 @@ export default function Kael() {
           streamedSoFar ||
           (typeof result === 'string'
             ? result
-            : result?.content ||
+            : result?.result ||
+              result?.content ||
               result?.response ||
               result?.text ||
               result?.message ||
@@ -1462,18 +1463,36 @@ export default function Kael() {
 
         // 4. Persist updated count to server / database in background
         const userIdToSync = user?.id || authUser?.id;
-        if (userIdToSync) {
+        const userEmailToSync = user?.email || authUser?.email;
+        const isUUID = typeof userIdToSync === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userIdToSync.trim());
+        const countPayload = {
+          kael_msg_count: newUsed,
+          kael_msg_month: currentMonthKey,
+          timezone: effectiveTz,
+        };
+
+        if (isUUID) {
           supabase
             .from('profiles')
-            .update({
-              kael_msg_count: newUsed,
-              kael_msg_month: currentMonthKey,
-              timezone: effectiveTz,
-            })
+            .update(countPayload)
             .eq('id', userIdToSync)
-            .then(() => {})
+            .then(({ error: syncErr }) => {
+              if (syncErr && userEmailToSync) {
+                supabase.from('profiles').update(countPayload).ilike('email', userEmailToSync).catch(() => {});
+              }
+            })
+            .catch(() => {
+              if (userEmailToSync) {
+                supabase.from('profiles').update(countPayload).ilike('email', userEmailToSync).catch(() => {});
+              }
+            });
+        } else if (userEmailToSync) {
+          supabase
+            .from('profiles')
+            .update(countPayload)
+            .ilike('email', userEmailToSync)
             .catch((err) => {
-              console.warn('[KAEL] Background profile count sync:', err);
+              console.warn('[KAEL] Background profile count sync by email note:', err);
             });
         }
 

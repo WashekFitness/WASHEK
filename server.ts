@@ -47,6 +47,13 @@ const SUPABASE_ANON_KEY =
 // Supabase client instance for storage & server-side operations
 const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
+function isValidUUID(val: any): boolean {
+  return (
+    typeof val === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val.trim())
+  );
+}
+
 // Lazy initialization of the Google Gemini AI client
 let aiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
@@ -89,7 +96,7 @@ app.post('/api/checkout/process', async (req, res) => {
     // Update Supabase profiles table, permanently recording trial usage to prevent trial looping
     if (userId || email) {
       try {
-        let query = supabase.from('profiles').update({
+        const updatePayload = {
           subscription_plan: cleanPlan,
           subscription_status: cleanStatus,
           subscription_tier: cleanPlan,
@@ -99,17 +106,16 @@ app.post('/api/checkout/process', async (req, res) => {
           stripe_subscription_id: sessionId || `sub_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
           subscription_updated_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
-        });
+        };
 
-        if (userId) {
-          query = query.eq('id', userId);
-          const { error: dbError } = await query;
-          if (dbError) {
-            console.debug('[API] checkout profile update note:', dbError.message);
-          }
-        } else if (email) {
-          query = query.eq('email', email);
-          await query;
+        let updated = false;
+        if (userId && isValidUUID(userId)) {
+          const { error: dbError } = await supabase.from('profiles').update(updatePayload).eq('id', userId);
+          if (!dbError) updated = true;
+        }
+        if (!updated && email) {
+          const { error: emailErr } = await supabase.from('profiles').update(updatePayload).ilike('email', String(email).trim());
+          if (!emailErr) updated = true;
         }
       } catch (dbErr: any) {
         console.debug('[API] checkout db error note:', dbErr?.message);
@@ -199,6 +205,8 @@ app.post('/api/create-checkout-session', async (req, res) => {
         params.set('metadata[plan]', cleanPlan);
         params.set('metadata[user_id]', cleanUserId);
         params.set('metadata[has_used_trial]', String(hasUsedTrial));
+        if (cleanUserId) params.set('subscription_data[metadata][user_id]', cleanUserId);
+        params.set('subscription_data[metadata][plan]', cleanPlan);
 
         // If user hasn't used trial yet, grant 7 days free trial. If they have already used it, charge immediately!
         if (!hasUsedTrial) {
@@ -307,7 +315,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     backend: 'Google Gemini',
-    model: 'gemini-3.5-flash-lite',
+    model: 'gemini-3.1-flash-lite',
     hasKey: Boolean(process.env.GEMINI_API_KEY),
   });
 });
@@ -1339,7 +1347,7 @@ app.post('/api/ai-generate', async (req, res) => {
           } else if (urlToFetch.startsWith('http://') || urlToFetch.startsWith('https://')) {
             try {
               const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort(), 4000);
+              const timer = setTimeout(() => controller.abort(), 15000);
               const mediaRes = await fetch(urlToFetch, { signal: controller.signal });
               clearTimeout(timer);
               if (mediaRes.ok) {
@@ -1530,6 +1538,7 @@ app.post('/api/ai-generate', async (req, res) => {
       // Fallback session handling when token is absent or invalid (e.g. preview mode or local user)
       if (!kaelUserSession) {
         const fallbackUserId = req.body?.user_id || null;
+        const fallbackEmail = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
         const effectiveTz = clientTimezone || 'UTC';
         const currentMonthKey = getTimezoneMonthKey(effectiveTz);
         const PLAN_LIMITS: Record<string, number> = {
@@ -1540,16 +1549,28 @@ app.post('/api/ai-generate', async (req, res) => {
         };
 
         let profileRow: any = null;
-        if (fallbackUserId) {
+        if (fallbackUserId && isValidUUID(fallbackUserId)) {
           try {
             const { data } = await supabase
               .from('profiles')
-              .select('subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+              .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
               .eq('id', fallbackUserId)
               .maybeSingle();
             profileRow = data;
           } catch (profileErr) {
             console.warn('[server.ts] Fallback profile lookup note:', profileErr);
+          }
+        }
+        if (!profileRow && fallbackEmail) {
+          try {
+            const { data } = await supabase
+              .from('profiles')
+              .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+              .ilike('email', fallbackEmail)
+              .maybeSingle();
+            profileRow = data;
+          } catch (profileErr) {
+            console.warn('[server.ts] Fallback email profile lookup note:', profileErr);
           }
         }
 
@@ -1590,7 +1611,8 @@ app.post('/api/ai-generate', async (req, res) => {
 
         kaelUserSession = {
           client: supabase,
-          id: fallbackUserId || 'guest',
+          id: profileRow?.id || fallbackUserId || 'guest',
+          email: fallbackEmail || null,
           effectiveTz,
           usageLimit,
           resolvedPlan,
@@ -1615,11 +1637,6 @@ app.post('/api/ai-generate', async (req, res) => {
       }
     }
 
-    // For form_analysis, enable thorough reasoning so Gemini inspects joint angles and spinal alignment across all frames
-    config.thinkingConfig = {
-      thinkingLevel: type === 'form_analysis' ? ThinkingLevel.HIGH : ThinkingLevel.LOW,
-    };
-
     // Tune generation parameters and system instructions based on server-verified plan tier
     if (type === 'kael') {
       const kaelBaseMandate =
@@ -1631,26 +1648,18 @@ app.post('/api/ai-generate', async (req, res) => {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
-        config.temperature = 0.25;
-        config.maxOutputTokens = 3500;
       } else if (effectivePlan === 'performance') {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
-        config.temperature = 0.3;
-        config.maxOutputTokens = 2500;
       } else if (effectivePlan === 'progress') {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
-        config.temperature = 0.35;
-        config.maxOutputTokens = 1800;
       } else {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: FREE. Deliver 100% scientifically accurate, direct, and concise coaching answers (~40–80 words). Provide the exact recommendation and key execution cue in plain, everyday language without confusing jargon, fluff, or filler.';
-        config.temperature = 0.4;
-        config.maxOutputTokens = 900;
       }
     } else {
       const systemInstruction = SYSTEM_INSTRUCTIONS[type];
@@ -1659,38 +1668,63 @@ app.post('/api/ai-generate', async (req, res) => {
       }
     }
 
-    // High visual intelligence model gemini-3.8-flash is prioritized for form_analysis
-    const modelsToTry = type === 'form_analysis'
-      ? ['gemini-3.8-flash', 'gemini-3.1-flash-lite']
-      : ['gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+    // High visual intelligence & fast generative models with rock-solid fallback
+    const modelsToTry = [
+      'gemini-3.1-flash-lite',
+      'gemini-3-flash-preview',
+      'gemini-3.8-flash',
+    ];
     let lastError: any = null;
     let response: any = null;
     let successfulModel = modelsToTry[0];
 
     for (const currentModel of modelsToTry) {
-      try {
-        console.log(`[Gemini API] Trying model "${currentModel}" for type="${type}"`);
-        const controller = new AbortController();
-        const timeoutMs = (type === 'form_analysis') ? 25000 : (isJsonExpected || (Array.isArray(file_urls) && file_urls.length > 0)) ? 15000 : 8000;
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const callConfig = { ...config };
+      // Omit prohibited sampling parameters for gemini-3.8-flash per gemini-api guidelines
+      if (currentModel === 'gemini-3.8-flash' || currentModel.includes('3.8')) {
+        delete (callConfig as any).temperature;
+        delete (callConfig as any).topP;
+        delete (callConfig as any).topK;
+      }
 
-        const callConfig = {
-          ...config,
-          abortSignal: controller.signal,
-        };
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          console.log(`[Gemini API] Trying model "${currentModel}" (attempt ${attempt}) for type="${type}"`);
+          const controller = new AbortController();
+          const timeoutMs = type === 'form_analysis' ? 45000 : 35000;
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-        response = await ai.models.generateContent({
-          model: currentModel,
-          contents: parts,
-          config: callConfig,
-        });
-        clearTimeout(timer);
-        successfulModel = currentModel;
+          const fullConfig = {
+            ...callConfig,
+            abortSignal: controller.signal,
+          };
+
+          response = await ai.models.generateContent({
+            model: currentModel,
+            contents: parts,
+            config: fullConfig,
+          });
+          clearTimeout(timer);
+          successfulModel = currentModel;
+          break;
+        } catch (modelErr: any) {
+          lastError = modelErr;
+          const errMsg = modelErr?.message || String(modelErr);
+          console.warn(`[Gemini API] Model "${currentModel}" attempt ${attempt} failed:`, errMsg);
+          const isRetryable =
+            errMsg.includes('503') ||
+            errMsg.includes('UNAVAILABLE') ||
+            errMsg.includes('high demand') ||
+            errMsg.includes('429');
+          if (attempt === 1 && isRetryable) {
+            await new Promise((r) => setTimeout(r, 400));
+            continue;
+          }
+          break;
+        }
+      }
+      if (response) {
         break;
-      } catch (modelErr: any) {
-        lastError = modelErr;
-        console.warn(`[Gemini API] Model "${currentModel}" failed:`, modelErr?.message || modelErr);
-        // Continue to fallback model immediately
       }
     }
 
@@ -1744,14 +1778,27 @@ app.post('/api/ai-generate', async (req, res) => {
         if (effectiveTz) {
           updatePayload.timezone = effectiveTz;
         }
-        if (userId && userId !== 'guest') {
+        const userEmail = kaelUserSession.email;
+        let profileUpdated = false;
+        if (userId && userId !== 'guest' && isValidUUID(userId)) {
+          try {
+            const { error: dbErr } = await client
+              .from('profiles')
+              .update(updatePayload)
+              .eq('id', userId);
+            if (!dbErr) profileUpdated = true;
+          } catch (dbErr) {
+            console.warn('[server.ts] Profile update fallback note:', dbErr);
+          }
+        }
+        if (!profileUpdated && userEmail) {
           try {
             await client
               .from('profiles')
               .update(updatePayload)
-              .eq('id', userId);
-          } catch (dbErr) {
-            console.warn('[server.ts] Profile update fallback note:', dbErr);
+              .ilike('email', userEmail);
+          } catch (emailErr) {
+            console.warn('[server.ts] Profile update by email fallback note:', emailErr);
           }
         }
 
@@ -1839,7 +1886,7 @@ app.post('/api/ai-generate', async (req, res) => {
       success: false,
       error: error?.message || 'Google Gemini AI generation failed.',
       provider: 'Google Gemini',
-      model: 'gemini-3.5-flash-lite',
+      model: 'gemini-3.1-flash-lite',
     });
   }
 });
@@ -2027,13 +2074,26 @@ app.post('/api/ai-stream', async (req, res) => {
         }
       }
 
-      if (!kaelUserSession && req.body?.user_id) {
-        const fallbackUserId = req.body.user_id;
-        const { data: profileRow } = await supabase
-          .from('profiles')
-          .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
-          .eq('id', fallbackUserId)
-          .maybeSingle();
+      if (!kaelUserSession && (req.body?.user_id || req.body?.email)) {
+        const fallbackUserId = req.body?.user_id || null;
+        const fallbackEmail = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
+        let profileRow: any = null;
+        if (fallbackUserId && isValidUUID(fallbackUserId)) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
+            .eq('id', fallbackUserId)
+            .maybeSingle();
+          profileRow = data;
+        }
+        if (!profileRow && fallbackEmail) {
+          const { data } = await supabase
+            .from('profiles')
+            .select('id, subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
+            .ilike('email', fallbackEmail)
+            .maybeSingle();
+          profileRow = data;
+        }
 
         const activeSub =
           profileRow?.subscription_status === 'active' ||
@@ -2085,7 +2145,8 @@ app.post('/api/ai-stream', async (req, res) => {
 
         kaelUserSession = {
           client: supabase,
-          id: fallbackUserId || 'guest',
+          id: profileRow?.id || fallbackUserId || 'guest',
+          email: fallbackEmail || null,
           effectiveTz,
           usageLimit,
           resolvedPlan,
@@ -2123,26 +2184,18 @@ app.post('/api/ai-stream', async (req, res) => {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
-        config.temperature = 0.25;
-        config.maxOutputTokens = 3500;
       } else if (effectivePlan === 'performance') {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
-        config.temperature = 0.3;
-        config.maxOutputTokens = 2500;
       } else if (effectivePlan === 'progress') {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
-        config.temperature = 0.35;
-        config.maxOutputTokens = 1800;
       } else {
         config.systemInstruction =
           kaelBaseMandate +
           'TIER: FREE. Deliver 100% scientifically accurate, direct, and concise coaching answers (~40–80 words). Provide the exact recommendation and key execution cue in plain, everyday language without confusing jargon, fluff, or filler.';
-        config.temperature = 0.4;
-        config.maxOutputTokens = 900;
       }
     } else {
       const systemInstruction = SYSTEM_INSTRUCTIONS[type];
@@ -2153,7 +2206,7 @@ app.post('/api/ai-stream', async (req, res) => {
 
     const modelsToTry = [
       'gemini-3.1-flash-lite',
-      'gemini-flash-latest',
+      'gemini-3-flash-preview',
       'gemini-3.8-flash',
     ];
 
@@ -2170,40 +2223,90 @@ app.post('/api/ai-stream', async (req, res) => {
     let lastError: any = null;
 
     for (const currentModel of modelsToTry) {
+      let attempts = 0;
+      while (attempts < 2) {
+        attempts++;
+        try {
+          const controller = new AbortController();
+          const timeoutMs = 45000;
+          const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+          const callConfig = {
+            ...config,
+            abortSignal: controller.signal,
+          };
+
+          streamResponse = await ai.models.generateContentStream({
+            model: currentModel,
+            contents: { parts },
+            config: callConfig,
+          });
+          clearTimeout(timer);
+          break;
+        } catch (modelErr: any) {
+          lastError = modelErr;
+          const errMsg = modelErr?.message || String(modelErr);
+          const isTransient =
+            errMsg.includes('503') ||
+            errMsg.includes('429') ||
+            errMsg.includes('high demand') ||
+            errMsg.includes('UNAVAILABLE') ||
+            errMsg.includes('ResourceExhausted');
+
+          if (isTransient && attempts < 2) {
+            console.warn(`[Gemini Stream] Model "${currentModel}" transient demand spike, retrying in 350ms...`);
+            await new Promise((r) => setTimeout(r, 350));
+            continue;
+          }
+          console.warn(`[Gemini Stream] Model "${currentModel}" failed:`, errMsg);
+          break;
+        }
+      }
+      if (streamResponse) break;
+    }
+
+    if (streamResponse) {
       try {
-        const controller = new AbortController();
-        const timeoutMs = isJsonExpected ? 18000 : 10000;
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-        const callConfig = {
-          ...config,
-          abortSignal: controller.signal,
-        };
-
-        streamResponse = await ai.models.generateContentStream({
-          model: currentModel,
-          contents: { parts },
-          config: callConfig,
-        });
-        clearTimeout(timer);
-        break;
-      } catch (modelErr: any) {
-        lastError = modelErr;
-        console.warn(`[Gemini Stream] Model "${currentModel}" failed:`, modelErr?.message || modelErr);
+        for await (const chunk of streamResponse) {
+          const text = chunk.text;
+          if (text) {
+            fullOutput += text;
+            res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+          }
+        }
+      } catch (streamIterErr) {
+        console.warn('[Gemini Stream] Stream iteration interrupted:', streamIterErr);
       }
     }
 
-    if (!streamResponse) {
-      res.write(`data: ${JSON.stringify({ error: lastError?.message || 'AI streaming failed.' })}\n\n`);
+    // Unary fallback if streaming yielded empty output
+    if (!fullOutput) {
+      console.warn('[Gemini Stream] Stream output empty or failed, running reliable unary fallback...');
+      for (const fallbackModel of modelsToTry) {
+        try {
+          const unaryRes = await ai.models.generateContent({
+            model: fallbackModel,
+            contents: { parts },
+            config: {
+              ...config,
+              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            },
+          });
+          const text = unaryRes.text || '';
+          if (text) {
+            fullOutput = text;
+            res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+            break;
+          }
+        } catch (unaryErr: any) {
+          console.warn(`[Gemini Stream Unary Fallback] ${fallbackModel} failed:`, unaryErr?.message || unaryErr);
+        }
+      }
+    }
+
+    if (!fullOutput) {
+      res.write(`data: ${JSON.stringify({ error: lastError?.message || 'AI streaming failed to generate a response.' })}\n\n`);
       return res.end();
-    }
-
-    for await (const chunk of streamResponse) {
-      const text = chunk.text;
-      if (text) {
-        fullOutput += text;
-        res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
-      }
     }
 
     if (isKael && kaelUserSession) {
@@ -2245,11 +2348,21 @@ app.post('/api/ai-stream', async (req, res) => {
         if (effectiveTz) {
           updatePayload.timezone = effectiveTz;
         }
-        if (userId && userId !== 'guest') {
+        const userEmail = kaelUserSession.email;
+        let profileUpdated = false;
+        if (userId && userId !== 'guest' && isValidUUID(userId)) {
           try {
-            await client.from('profiles').update(updatePayload).eq('id', userId);
+            const { error: dbErr } = await client.from('profiles').update(updatePayload).eq('id', userId);
+            if (!dbErr) profileUpdated = true;
           } catch (dbErr) {
             console.warn('[server.ts stream] Profile update fallback note:', dbErr);
+          }
+        }
+        if (!profileUpdated && userEmail) {
+          try {
+            await client.from('profiles').update(updatePayload).ilike('email', userEmail);
+          } catch (emailErr) {
+            console.warn('[server.ts stream] Profile update fallback by email note:', emailErr);
           }
         }
 
