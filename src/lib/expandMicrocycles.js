@@ -214,6 +214,21 @@ function normalizeDay(day, dayIndex = 0) {
       0
     ),
 
+    is_rest_day: Boolean(
+      source.is_rest_day ??
+      source.isRest ??
+      (exercises.length === 0 &&
+        (String(source.workout_type || '').toLowerCase().includes('rest') ||
+         String(source.day_name || '').toLowerCase().includes('rest')))
+    ),
+
+    recovery_focus: safeString(
+      source.recovery_focus ??
+        source.recovery ??
+        source.focus,
+      ""
+    ),
+
     exercises
   };
 }

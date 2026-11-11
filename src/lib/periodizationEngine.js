@@ -424,6 +424,22 @@ export function buildSingleWeekMicrocycle(baseWeek1, config, options = {}) {
 
   // Build periodized days for weeks 2 through 12
   const periodizedDays = baseWeek1.days.map((day) => {
+    const exercises = day.exercises || [];
+    const isRest =
+      day.is_rest_day ||
+      exercises.length === 0 ||
+      String(day.workout_type || '').toLowerCase().includes('rest') ||
+      String(day.day_name || '').toLowerCase().includes('rest');
+
+    if (isRest) {
+      return {
+        ...day,
+        is_rest_day: true,
+        workout_type: day.workout_type || 'Rest & Active Recovery',
+        exercises: [],
+      };
+    }
+
     let workoutType = day.workout_type || 'Strength & Conditioning';
 
     if (overload === 'recovery') {
@@ -434,7 +450,7 @@ export function buildSingleWeekMicrocycle(baseWeek1, config, options = {}) {
       workoutType = `${workoutType} (Benchmark & Taper)`;
     }
 
-    const periodizedExercises = (day.exercises || []).map((ex, exIndex) =>
+    const periodizedExercises = exercises.map((ex, exIndex) =>
       calculateExerciseProgression({
         exercise: ex,
         exIndex,

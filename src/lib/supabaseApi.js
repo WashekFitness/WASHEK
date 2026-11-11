@@ -1,15 +1,5 @@
 import { supabase } from '@/lib/supabase';
 import { getUserTimeZone } from '@/lib/dateUtils';
-import {
-  auth as firebaseAuth,
-  db as firebaseDb,
-  doc as firestoreDoc,
-  setDoc as firestoreSetDoc,
-  deleteDoc as firestoreDeleteDoc,
-  collection as firestoreCollection,
-  getDocs as firestoreGetDocs,
-} from '@/lib/firebase';
-import { getOrCreateUserProfile } from '@/lib/firebaseApi';
 import { isLogo } from '@/lib/avatarUtils';
 import {
   setCachedLogs,
@@ -104,33 +94,6 @@ async function requireUser() {
     console.warn('[supabaseApi] getUser network error:', err);
   }
 
-  // 3. Check Firebase active auth user
-  try {
-    if (!firebaseAuth?.currentUser && typeof firebaseAuth?.authStateReady === 'function') {
-      await Promise.race([
-        firebaseAuth.authStateReady(),
-        new Promise((r) => setTimeout(r, 250)),
-      ]);
-    }
-    if (firebaseAuth?.currentUser) {
-      const fb = firebaseAuth.currentUser;
-      const validId = ensureValidUuid(fb.uid);
-      return {
-        id: validId,
-        uid: fb.uid,
-        email: fb.email || '',
-        user_metadata: {
-          first_name: fb.displayName ? fb.displayName.split(' ')[0] : '',
-          last_name: fb.displayName ? fb.displayName.split(' ').slice(1).join(' ') : '',
-          full_name: fb.displayName || fb.email?.split('@')[0] || 'Athlete',
-          email: fb.email || '',
-          role: 'athlete',
-        },
-      };
-    }
-  } catch (err) {
-    console.debug('[supabaseApi] firebase currentUser check note:', err);
-  }
 
   // 4. Check cached user in localStorage (washek_user)
   try {
@@ -250,6 +213,15 @@ function normalizeUser(authUser, profile = {}) {
  */
 
 async function currentUser(forceFresh = false) {
+  const rawLocalPlan = (() => {
+    try {
+      const p = localStorage.getItem('washek_subscription_plan');
+      return p && p !== 'free' ? p : null;
+    } catch {
+      return null;
+    }
+  })();
+
   const storedStatus = (() => {
     try {
       return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
@@ -257,39 +229,17 @@ async function currentUser(forceFresh = false) {
       return '';
     }
   })();
-  const isCanceled = storedStatus === 'canceled' || storedStatus === 'cancelled';
 
-  const activeLocalPlan = (() => {
-    if (isCanceled) return 'free';
+  // If a paid plan is stored locally, the user is active, NOT canceled
+  const isCanceled = !rawLocalPlan && (storedStatus === 'canceled' || storedStatus === 'cancelled');
+  const activeLocalPlan = rawLocalPlan || (isCanceled ? 'free' : null);
+
+  if (rawLocalPlan && (storedStatus === 'canceled' || storedStatus === 'cancelled')) {
     try {
-      return localStorage.getItem('washek_subscription_plan') || null;
+      localStorage.setItem('washek_subscription_status', 'active');
     } catch {
-      return null;
+      /* ignore */
     }
-  })();
-
-  // 1. If Firebase auth currentUser exists, resolve or create Firestore profile
-  try {
-    if (firebaseAuth?.currentUser) {
-      const fbProfile = await getOrCreateUserProfile(firebaseAuth.currentUser);
-      if (fbProfile) {
-        if (isCanceled) {
-          fbProfile.subscription_plan = 'free';
-          fbProfile.subscription_status = 'canceled';
-          fbProfile.tier = 'free';
-          fbProfile.plan = 'free';
-          fbProfile.subscription_tier = 'free';
-        } else if (activeLocalPlan && activeLocalPlan !== 'free' && (!fbProfile.subscription_plan || fbProfile.subscription_plan === 'free')) {
-          fbProfile.subscription_plan = activeLocalPlan;
-          fbProfile.tier = activeLocalPlan;
-          fbProfile.plan = activeLocalPlan;
-          fbProfile.subscription_tier = activeLocalPlan;
-        }
-        return fbProfile;
-      }
-    }
-  } catch (err) {
-    console.debug('[supabaseApi] Firebase profile error note:', err);
   }
 
   // 2. If stored in localStorage and not forceFresh, return cached washek_user
@@ -525,110 +475,15 @@ function removeLocalEntityRecord(table, userId, recordId) {
 }
 
 async function getEffectiveFbUser() {
-  if (firebaseAuth?.currentUser) return firebaseAuth.currentUser;
-  if (typeof firebaseAuth?.authStateReady === 'function') {
-    try {
-      await Promise.race([
-        firebaseAuth.authStateReady(),
-        new Promise((r) => setTimeout(r, 300)),
-      ]);
-      if (firebaseAuth?.currentUser) return firebaseAuth.currentUser;
-    } catch {
-      // Ignore timeout
-    }
-  }
-  return firebaseAuth?.currentUser || null;
+  return null;
 }
 
-async function syncToFirestore(table, record, action = 'set') {
-  try {
-    const fbUser = await getEffectiveFbUser();
-    if (!fbUser || !firebaseDb) return;
-    const subCol = table === 'nutrition_entries'
-      ? 'nutrition_entries'
-      : (table === 'saved_meals'
-        ? 'saved_meals'
-        : (table === 'workout_logs'
-          ? 'workouts'
-          : (table === 'progress_photos'
-            ? 'progress_photos'
-            : (table === 'weight_history' ? 'weight_history' : null))));
-    if (!subCol) return;
-    const ref = firestoreDoc(firebaseDb, 'users', fbUser.uid, subCol, record.id);
-    if (action === 'delete') {
-      await firestoreDeleteDoc(ref);
-    } else {
-      await firestoreSetDoc(ref, record, { merge: true });
-      if (table === 'workout_logs') {
-        setCachedLastWorkout(record, fbUser.uid);
-        if (fbUser.email) setCachedLastWorkout(record, fbUser.email);
-      }
-    }
-  } catch (err) {
-    console.debug(`[Firestore] ${table} ${action} note:`, err?.message || err);
-  }
+async function syncToFirestore(_table, _record, _action = 'set') {
+  return;
 }
 
-async function fetchFromFirestore(table) {
-  try {
-    const fbUser = await getEffectiveFbUser();
-    if (!fbUser || !firebaseDb) return [];
-    const subCol = table === 'nutrition_entries'
-      ? 'nutrition_entries'
-      : (table === 'saved_meals'
-        ? 'saved_meals'
-        : (table === 'workout_logs'
-          ? 'workouts'
-          : (table === 'progress_photos' ? 'progress_photos' : null)));
-    if (!subCol) return [];
-    const colRef = firestoreCollection(firebaseDb, 'users', fbUser.uid, subCol);
-    const snap = await firestoreGetDocs(colRef);
-    const records = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-
-    // Cache fetched workouts to local storage immediately
-    if (table === 'workout_logs' && records.length > 0) {
-      records.sort((a, b) =>
-        String(b.date || b.created_at || '').localeCompare(String(a.date || a.created_at || ''))
-      );
-      setCachedLogs(records, fbUser.uid);
-      if (fbUser.email) setCachedLogs(records, fbUser.email);
-      if (records[0]) {
-        setCachedLastWorkout(records[0], fbUser.uid);
-        if (fbUser.email) setCachedLastWorkout(records[0], fbUser.email);
-      }
-    }
-
-    // Cache fetched nutrition entries to local storage immediately
-    if (table === 'nutrition_entries' && records.length > 0) {
-      setCachedNutrition(records, fbUser.uid);
-      if (fbUser.email) setCachedNutrition(records, fbUser.email);
-    }
-
-    // Cache fetched saved meals to local storage immediately
-    if (table === 'saved_meals' && records.length > 0) {
-      setCachedSavedMeals(records, fbUser.uid);
-      if (fbUser.email) setCachedSavedMeals(records, fbUser.email);
-    }
-
-    // Cache fetched progress photos image data immediately
-    if (table === 'progress_photos' && records.length > 0) {
-      records.forEach((rec) => {
-        const imgUrl = rec.resolved_photo_url || rec.photo_url;
-        if (rec.id && imgUrl && (imgUrl.startsWith('data:') || imgUrl.startsWith('http') || imgUrl.startsWith('blob:'))) {
-          try {
-            localStorage.setItem(`washek_photo_${rec.id}`, imgUrl);
-          } catch (_err) {
-            // Ignore cache storage errors
-          }
-        }
-      });
-    }
-
-    return records;
-  } catch (err) {
-    console.debug(`[Firestore] fetch ${table} note:`, err?.message || err);
-    return [];
-  }
+async function fetchFromFirestore(_table) {
+  return [];
 }
 
 /*
@@ -2077,15 +1932,33 @@ export const supabaseApi = {
           created_at: payload.created_at || new Date().toISOString(),
         };
 
-        // Cache message locally so history is never lost even if unauthenticated
-        try {
-          const storageKey = `washek_kael_messages_${validUserId || 'guest'}`;
-          const existing = JSON.parse(localStorage.getItem(storageKey) || '[]');
-          existing.push(row);
-          localStorage.setItem(storageKey, JSON.stringify(existing.slice(-1000)));
-        } catch (_storageErr) {
-          // Ignore localStorage cache errors
+        // Cache message locally across user-specific and universal keys so history is never lost
+        const targetKeys = new Set([
+          `washek_kael_messages_${validUserId || 'guest'}`,
+          'washek_kael_messages_all',
+          'washek_kael_messages_guest',
+        ]);
+        if (validUserId) {
+          targetKeys.add(`washek_kael_messages_${validUserId}`);
         }
+
+        targetKeys.forEach((storageKey) => {
+          try {
+            const existing = JSON.parse(localStorage.getItem(storageKey) || '[]');
+            const idx = existing.findIndex((m) => m?.id === row.id);
+            if (idx >= 0) {
+              existing[idx] = { ...existing[idx], ...row };
+            } else {
+              existing.push(row);
+            }
+            localStorage.setItem(storageKey, JSON.stringify(existing.slice(-1000)));
+          } catch (_storageErr) {
+            // Ignore localStorage cache errors
+          }
+        });
+
+        // Sync to Firestore in background
+        syncToFirestore('kael_messages', row, 'set').catch(() => {});
 
         // Attempt Supabase insert if a valid Supabase auth session exists
         try {
@@ -2133,13 +2006,52 @@ export const supabaseApi = {
           // Ignore remote query errors and fallback to local cache
         }
 
-        let localMessages = [];
+        // Fetch from Firestore
+        let firestoreMessages = [];
         try {
-          const storageKey = `washek_kael_messages_${validUserId || 'guest'}`;
-          const raw = localStorage.getItem(storageKey);
-          if (raw) {
-            localMessages = JSON.parse(raw);
+          firestoreMessages = await fetchFromFirestore('kael_messages');
+        } catch (_fsErr) {
+          // Ignore Firestore fetch errors
+        }
+
+        // Read all local messages across all relevant localStorage keys
+        const localMessages = [];
+        const seenLocalIds = new Set();
+        try {
+          const keysToScan = new Set([
+            `washek_kael_messages_${validUserId || 'guest'}`,
+            'washek_kael_messages_all',
+            'washek_kael_messages_guest',
+            'washek_kael_messages_athlete',
+          ]);
+
+          if (typeof localStorage !== 'undefined') {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (k && k.startsWith('washek_kael_messages_')) {
+                keysToScan.add(k);
+              }
+            }
           }
+
+          keysToScan.forEach((storageKey) => {
+            try {
+              const raw = localStorage.getItem(storageKey);
+              if (raw) {
+                const parsed = JSON.parse(raw);
+                if (Array.isArray(parsed)) {
+                  parsed.forEach((m) => {
+                    if (m?.id && !seenLocalIds.has(m.id)) {
+                      seenLocalIds.add(m.id);
+                      localMessages.push(m);
+                    }
+                  });
+                }
+              }
+            } catch (_e) {
+              // Ignore parse errors
+            }
+          });
         } catch (_storageErr) {
           // Ignore localStorage read errors
         }
@@ -2148,18 +2060,33 @@ export const supabaseApi = {
         localMessages.forEach((m) => {
           if (m?.id) map.set(m.id, m);
         });
+        firestoreMessages.forEach((m) => {
+          if (m?.id) map.set(m.id, { ...(map.get(m.id) || {}), ...m });
+        });
         dbMessages.forEach((m) => {
-          if (m?.id) map.set(m.id, m);
+          if (m?.id) map.set(m.id, { ...(map.get(m.id) || {}), ...m });
         });
 
-        const merged = Array.from(map.values());
+        let merged = Array.from(map.values());
+
+        // Apply filters if any
+        if (filters && Object.keys(filters).length > 0) {
+          merged = merged.filter((item) => {
+            for (const [key, value] of Object.entries(filters)) {
+              if (value === undefined || value === null) continue;
+              if (item[key] !== value) return false;
+            }
+            return true;
+          });
+        }
+
         merged.sort((a, b) => {
           const tA = new Date(a.created_at || a.created_date || 0).getTime();
           const tB = new Date(b.created_at || b.created_date || 0).getTime();
           return tA - tB;
         });
 
-        return merged;
+        return merged.slice(0, limit);
       },
 
       async deleteChat(chatId) {
@@ -2172,14 +2099,35 @@ export const supabaseApi = {
           // Guest session
         }
 
+        // Clean all localStorage keys containing messages
         try {
-          const storageKey = `washek_kael_messages_${validUserId || 'guest'}`;
-          const existing = JSON.parse(localStorage.getItem(storageKey) || '[]');
-          const filtered = existing.filter((m) => {
-            const mChat = m.created_by || 'chat_initial';
-            return chatId === 'chat_initial' ? (mChat !== 'chat_initial' && mChat !== null) : mChat !== chatId;
+          const keysToClean = new Set([
+            `washek_kael_messages_${validUserId || 'guest'}`,
+            'washek_kael_messages_all',
+            'washek_kael_messages_guest',
+            'washek_kael_messages_athlete',
+          ]);
+          if (typeof localStorage !== 'undefined') {
+            for (let i = 0; i < localStorage.length; i++) {
+              const k = localStorage.key(i);
+              if (k && k.startsWith('washek_kael_messages_')) {
+                keysToClean.add(k);
+              }
+            }
+          }
+
+          keysToClean.forEach((storageKey) => {
+            try {
+              const existing = JSON.parse(localStorage.getItem(storageKey) || '[]');
+              const filtered = existing.filter((m) => {
+                const mChat = m.created_by || 'chat_initial';
+                return chatId === 'chat_initial' ? (mChat !== 'chat_initial' && mChat !== null) : mChat !== chatId;
+              });
+              localStorage.setItem(storageKey, JSON.stringify(filtered));
+            } catch (_err) {
+              // Ignore
+            }
           });
-          localStorage.setItem(storageKey, JSON.stringify(filtered));
         } catch (_err) {
           // Ignore localStorage delete errors
         }

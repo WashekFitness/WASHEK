@@ -93,8 +93,19 @@ export default function Nutrition() {
         );
       });
 
+    const handleSubUpdated = (e) => {
+      const newPlan = e.detail?.plan;
+      if (newPlan && active) {
+        setUser((prev) => (prev ? { ...prev, subscription_plan: newPlan, plan: newPlan } : prev));
+      }
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
+
     return () => {
       active = false;
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
     };
   }, []);
 
@@ -242,7 +253,7 @@ function getSmartDefaultMeal() {
     queryFn: async () => {
       try {
         const progs = await supabaseApi.entities.WorkoutProgram.filter(
-          { created_by: userKey, is_active: true },
+          { status: 'active' },
           '-created_at',
           1
         );
@@ -1240,7 +1251,13 @@ function getSmartDefaultMeal() {
             onSaveToMeals={handleSaveToMeals}
             userPlan={
               user?.subscription_plan ||
-              'free'
+              (() => {
+                try {
+                  return localStorage.getItem('washek_subscription_plan') || 'free';
+                } catch {
+                  return 'free';
+                }
+              })()
             }
           />
 

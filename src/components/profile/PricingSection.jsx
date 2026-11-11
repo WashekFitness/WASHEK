@@ -19,9 +19,8 @@ import {
   applySubscriptionUpgrade,
   applySubscriptionCancellation,
 } from '@/lib/subscription';
-import { auth as firebaseAuth, db, doc, getDoc, setDoc } from '@/lib/firebase';
-import { firebaseApi } from '@/lib/firebaseApi';
 import { toast } from 'sonner';
+import { useAuth } from '@/lib/AuthContext';
 
 const freePlan = {
   name: 'Free',
@@ -30,15 +29,15 @@ const freePlan = {
   period: '/forever',
   icon: ShieldCheck,
   color: 'text-muted-foreground',
-  borderColor: 'border-slate-300 dark:border-border/60',
-  bgColor: 'bg-slate-100/70 dark:bg-muted/10',
+  borderColor: 'border-border/60',
+  bgColor: 'bg-card/75 backdrop-blur-md',
   badge: null,
   features: [
-    '100 Kael AI messages/month',
-    'Super accurate baseline coaching (100% scientific & biomechanical accuracy on every answer)',
-    'Direct, concise guidance (~40–80 words) with essential execution cues',
+    '100 Coach Kael messages/month',
+    'Scientific & biomechanical accuracy on every answer',
+    'Direct, concise guidance with essential execution cues',
     'Full live workout tracker with auto-rest timer',
-    'Standard response streaming speed',
+    'Standard response delivery speed',
   ],
 };
 
@@ -50,16 +49,19 @@ const plans = [
     period: '/mo',
     paymentUrl: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
     icon: Flame,
-    color: 'text-emerald-600 dark:text-accent',
-    borderColor: 'border-emerald-500/45 dark:border-accent/30',
-    bgColor: 'bg-emerald-500/[0.08] dark:bg-accent/5',
+    color: 'text-emerald-400',
+    borderColor: 'border-emerald-500/40 hover:border-emerald-500/70',
+    bgColor: 'bg-gradient-to-b from-emerald-500/[0.08] via-card to-card',
+    glowClass: 'shadow-[0_0_25px_rgba(16,185,129,0.12)]',
+    iconGlow: 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400',
     badge: null,
+    buttonClass: 'bg-emerald-600 hover:bg-emerald-500 text-white font-heading font-semibold shadow-sm transition-colors',
     features: [
-      '300 Kael AI messages/month (3x Free)',
-      'Faster & smarter Kael AI — answers quicker with biomechanical rationale & progression milestones',
+      '300 Coach Kael messages/month (3x Free)',
+      'In-depth Coach Kael — biomechanical rationale & progression milestones',
       'Full custom workout adjustments',
-      'Adaptive programming — Kael learns from your workout edits',
-      'Food & package scan',
+      'Adaptive programming — calibrated from your workout performance',
+      'Food & package nutrition scan',
       'Advanced macro tracking',
       'Save & compare progress photos',
     ],
@@ -71,20 +73,24 @@ const plans = [
     period: '/mo',
     paymentUrl: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
     icon: Zap,
-    color: 'text-blue-600 dark:text-primary',
-    borderColor: 'border-blue-500/50 dark:border-primary/40',
-    bgColor: 'bg-blue-500/[0.08] dark:bg-primary/5',
+    color: 'text-primary',
+    borderColor: 'border-primary/60 hover:border-primary/90',
+    bgColor: 'bg-gradient-to-b from-primary/[0.10] via-card to-card',
+    glowClass: 'shadow-[0_0_30px_rgba(59,130,246,0.18)] ring-1 ring-primary/40',
+    iconGlow: 'bg-primary/15 border-primary/30 text-primary',
     badge: 'Most Popular',
+    badgeClass: 'bg-primary/15 text-primary border border-primary/30',
+    buttonClass: 'bg-primary hover:bg-primary/90 text-primary-foreground font-heading font-semibold shadow-sm transition-colors',
     features: [
-      '800 Kael AI messages/month (8x Free)',
-      'Even faster & higher-intelligence Kael — tempo breakdowns, activation cues & fueling synergy',
+      '800 Coach Kael messages/month (8x Free)',
+      'High-performance coaching — tempo breakdowns, activation cues & fueling synergy',
       'Everything in Progress',
-      'AI body fat % scanner*',
+      'Body composition scanner*',
       'Nutrition insights & suggestions',
       'Workout analytics dashboard',
     ],
     disclaimer:
-      '* AI body fat estimates are approximations only and may not be fully accurate.',
+      '* Body composition estimates are approximations only and may not be fully accurate.',
   },
   {
     name: 'Elite',
@@ -93,19 +99,23 @@ const plans = [
     period: '/mo',
     paymentUrl: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
     icon: Crown,
-    color: 'text-amber-600 dark:text-chart-4',
-    borderColor: 'border-amber-500/50 dark:border-chart-4/40',
-    bgColor: 'bg-amber-500/[0.08] dark:bg-chart-4/5',
-    badge: 'Best',
+    color: 'text-amber-400',
+    borderColor: 'border-amber-500/50 hover:border-amber-500/80',
+    bgColor: 'bg-gradient-to-b from-amber-500/[0.08] via-card to-card',
+    glowClass: 'shadow-[0_0_25px_rgba(245,158,11,0.15)]',
+    iconGlow: 'bg-amber-500/15 border-amber-500/30 text-amber-400',
+    badge: 'Best Value',
+    badgeClass: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
+    buttonClass: 'bg-amber-500 hover:bg-amber-400 text-zinc-950 font-heading font-bold shadow-sm transition-colors',
     features: [
-      '2,000 Kael AI messages/month (20x Free)',
-      'Lightning-fast, masterclass Kael AI — kinetic chain mastery, insider secrets & recovery diagnostics',
+      '2,000 Coach Kael messages/month (20x Free)',
+      'Masterclass coaching — kinetic chain mastery & recovery diagnostics',
       'Everything in Performance',
       'Live workout adjustments (real-time coaching while training)',
-      'AI calisthenics form analysis with video',
-      'AI form scoring, rep/hold counting & corrective drills',
-      'Elite tips & insider coaching secrets',
-      'Deep recovery & deload guidance',
+      'Form Lab video analysis',
+      'Technical form scoring, rep/hold counting & corrective drills',
+      'Elite tips & coaching insights',
+      'Deep recovery & deload protocols',
     ],
   },
 ];
@@ -122,6 +132,13 @@ const ACTIVE_STATUSES = [
   'past_due',
   'unpaid',
 ];
+
+const TIER_LEVELS = {
+  free: 0,
+  progress: 1,
+  performance: 2,
+  elite: 3,
+};
 
 function normalizePlan(value) {
   const plan =
@@ -140,7 +157,8 @@ function isActiveStatus(status) {
   );
 }
 
-export default function PricingSection({ onPlanChange }) {
+export default function PricingSection({ onPlanChange, currentPlanProp }) {
+  const { user } = useAuth();
   const onPlanChangeRef = useRef(onPlanChange);
   useEffect(() => {
     onPlanChangeRef.current = onPlanChange;
@@ -149,11 +167,104 @@ export default function PricingSection({ onPlanChange }) {
   const [loadingPlan, setLoadingPlan] = useState(null);
   const [cancelling, setCancelling] = useState(false);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
-  const [currentPlan, setCurrentPlan] = useState('free');
+  const [currentPlan, setCurrentPlan] = useState(() => {
+    if (currentPlanProp && currentPlanProp !== 'free') {
+      return normalizePlan(currentPlanProp);
+    }
+    try {
+      const stored = localStorage.getItem('washek_subscription_plan');
+      if (stored && stored !== 'free') return normalizePlan(stored);
+      const userObj = JSON.parse(localStorage.getItem('washek_user') || '{}');
+      if (userObj?.subscription_plan && userObj.subscription_plan !== 'free') {
+        return normalizePlan(userObj.subscription_plan);
+      }
+    } catch {
+      // ignore
+    }
+    return 'free';
+  });
+
+  useEffect(() => {
+    if (currentPlanProp) {
+      const safe = normalizePlan(currentPlanProp);
+      setCurrentPlan(safe);
+    }
+  }, [currentPlanProp]);
+
   const [subscription, setSubscription] = useState(null);
   const [error, setError] = useState('');
   const [loadingSubscription, setLoadingSubscription] = useState(true);
   const isLaunchingRef = useRef(false);
+
+  const storedUser = (() => {
+    try {
+      return JSON.parse(localStorage.getItem('washek_user') || '{}');
+    } catch {
+      return {};
+    }
+  })();
+
+  const hasUsedTrial = Boolean(
+    user?.has_used_trial ||
+    user?.trial_used ||
+    storedUser?.has_used_trial ||
+    storedUser?.trial_used ||
+    localStorage.getItem('washek_has_used_trial') === 'true' ||
+    subscription?.status === 'canceled'
+  );
+
+  // Listen for verified payment signals from the checkout return tab
+  useEffect(() => {
+    const handlePlanVerified = (planKey) => {
+      const safePlan = normalizePlan(planKey);
+      if (safePlan && safePlan !== 'free') {
+        applySubscriptionUpgrade(safePlan, 'active');
+        toast.success(`Payment verified! Reloading with your new ${safePlan} plan...`);
+        setTimeout(() => {
+          window.location.reload();
+        }, 600);
+      }
+    };
+
+    const handleWindowMsg = (event) => {
+      if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
+        handlePlanVerified(event.data.plan);
+      }
+    };
+    window.addEventListener('message', handleWindowMsg);
+
+    let bc = null;
+    try {
+      bc = new BroadcastChannel('washek_subscription_sync');
+      bc.onmessage = (event) => {
+        if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
+          handlePlanVerified(event.data.plan);
+        }
+      };
+    } catch {
+      /* BroadcastChannel not supported in this environment */
+    }
+
+    const handleStorageEvent = (event) => {
+      if (event.key === 'washek_subscription_success_event' && event.newValue) {
+        try {
+          const parsed = JSON.parse(event.newValue);
+          if (parsed?.plan && parsed.plan !== 'free') {
+            handlePlanVerified(parsed.plan);
+          }
+        } catch {
+          /* ignore JSON parse errors on invalid storage events */
+        }
+      }
+    };
+    window.addEventListener('storage', handleStorageEvent);
+
+    return () => {
+      window.removeEventListener('message', handleWindowMsg);
+      window.removeEventListener('storage', handleStorageEvent);
+      bc?.close();
+    };
+  }, []);
 
   const loadSubscription = useCallback(async () => {
     setLoadingSubscription(true);
@@ -168,24 +279,15 @@ export default function PricingSection({ onPlanChange }) {
       })();
       const isLocallyCanceled = storedStatus === 'canceled' || storedStatus === 'cancelled';
 
-      // 1. Check Firebase Auth user & Firestore profile first
-      let firestorePlan = null;
-      let firestoreStatus = null;
-      let firestoreSubId = null;
-      const fbUser = firebaseAuth?.currentUser;
-      if (fbUser?.uid) {
+      // 1. Check LocalStorage plan directly
+      const localPlanRaw = (() => {
         try {
-          const userDoc = await getDoc(doc(db, 'users', fbUser.uid));
-          if (userDoc.exists()) {
-            const data = userDoc.data();
-            firestorePlan = normalizePlan(data.subscription_plan || data.plan || data.tier);
-            firestoreStatus = String(data.subscription_status || '').toLowerCase();
-            firestoreSubId = data.stripe_subscription_id || null;
-          }
-        } catch (fsErr) {
-          console.debug('[PricingSection] Firestore lookup note:', fsErr);
+          const p = localStorage.getItem('washek_subscription_plan');
+          return p && p !== 'free' ? normalizePlan(p) : null;
+        } catch {
+          return null;
         }
-      }
+      })();
 
       // 2. Check Supabase profile
       let profilePlan = 'free';
@@ -212,40 +314,43 @@ export default function PricingSection({ onPlanChange }) {
         console.debug('[PricingSection] Supabase profile lookup note:', sbErr);
       }
 
-      // 3. Check LocalStorage fallback
-      const localPlanOverride = (() => {
-        if (isLocallyCanceled) return null;
-        try {
-          const stored = localStorage.getItem('washek_subscription_status');
-          if (stored === 'canceled' || stored === 'cancelled') return null;
-          return localStorage.getItem('washek_subscription_plan') || null;
-        } catch {
-          return null;
+      // 4. Check stored user object
+      let userObjPlan = null;
+      try {
+        const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
+        if (u?.subscription_status !== 'canceled' && u?.subscription_status !== 'cancelled' && u?.subscription_plan) {
+          userObjPlan = normalizePlan(u.subscription_plan);
         }
-      })();
-
-      // If explicit cancellation recorded, purge local overrides
-      if (isLocallyCanceled || firestoreStatus === 'canceled' || profileStatus === 'canceled') {
-        applySubscriptionCancellation();
+      } catch {
+        /* ignore */
       }
 
+      // Resolve the true active plan
       let resolvedPlan = 'free';
-      if (!isLocallyCanceled) {
-        if (firestorePlan && firestorePlan !== 'free' && firestoreStatus !== 'canceled') {
-          resolvedPlan = firestorePlan;
-        } else if (profilePlan && profilePlan !== 'free' && isActiveStatus(profileStatus)) {
-          resolvedPlan = profilePlan;
-        } else if (localPlanOverride && localPlanOverride !== 'free') {
-          resolvedPlan = normalizePlan(localPlanOverride);
-        }
+      if (currentPlanProp && currentPlanProp !== 'free') {
+        resolvedPlan = normalizePlan(currentPlanProp);
+      } else if (localPlanRaw && localPlanRaw !== 'free') {
+        resolvedPlan = localPlanRaw;
+      } else if (userObjPlan && userObjPlan !== 'free') {
+        resolvedPlan = userObjPlan;
+      } else if (profilePlan && profilePlan !== 'free' && isActiveStatus(profileStatus)) {
+        resolvedPlan = profilePlan;
       }
 
-      if (!isLocallyCanceled && resolvedPlan !== 'free') {
+      if (resolvedPlan !== 'free') {
+        // Clear any stale canceled marker since user has a paid tier
+        try {
+          localStorage.setItem('washek_subscription_status', profileStatus || 'active');
+          localStorage.setItem('washek_subscription_plan', resolvedPlan);
+        } catch {
+          /* ignore */
+        }
+
         setSubscription({
-          id: firestoreSubId || profileSubId || `sub_${resolvedPlan}`,
+          id: profileSubId || `sub_${resolvedPlan}`,
           plan: resolvedPlan,
           plan_key: resolvedPlan,
-          status: firestoreStatus || profileStatus || 'active',
+          status: profileStatus || 'active',
           stripe_price_id: profilePriceId,
         });
       } else {
@@ -259,8 +364,8 @@ export default function PricingSection({ onPlanChange }) {
         return resolvedPlan;
       });
 
-      if (resolvedPlan !== 'free' && !isLocallyCanceled) {
-        applySubscriptionUpgrade(resolvedPlan, firestoreStatus || profileStatus || 'active');
+      if (resolvedPlan !== 'free') {
+        applySubscriptionUpgrade(resolvedPlan, profileStatus || 'active');
       }
     } catch (loadError) {
       console.error('[PricingSection] Failed to load subscription:', loadError);
@@ -316,82 +421,80 @@ export default function PricingSection({ onPlanChange }) {
   }, [loadSubscription]);
 
   const handleCheckout = async (plan) => {
-    if (!plan?.planKey || loadingPlan || isLaunchingRef.current) {
+    if (!plan?.planKey || loadingPlan) {
       return;
     }
 
-    if (currentPlan === plan.planKey) {
-      setError(`You already have an active ${plan.name} subscription.`);
-      toast.info(`You already have an active ${plan.name} subscription.`);
+    if (currentPlan === plan.planKey && subscription?.status === 'active') {
+      toast.info(`You already have active access to the ${plan.name} plan.`);
       return;
     }
 
-    isLaunchingRef.current = true;
     setLoadingPlan(plan.planKey);
     setError('');
 
     try {
-      const storedUser = (() => {
-        try {
-          return JSON.parse(localStorage.getItem('washek_user') || '{}');
-        } catch {
-          return {};
-        }
-      })();
+      const userEmail = user?.email || storedUser?.email;
+      const userId = user?.id || storedUser?.id || storedUser?.uid;
 
-      const fbUser = firebaseAuth?.currentUser;
-      const userEmail = fbUser?.email || storedUser?.email;
-      const userId = fbUser?.uid || storedUser?.id || storedUser?.uid;
+      localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
+      sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
+      document.cookie = `washek_pending_checkout_plan=${plan.planKey}; path=/; max-age=86400; SameSite=Lax`;
 
-      try {
-        localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
-        sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
-      } catch (_err) {
-        // ignore
-      }
-
+      // 1. Request Stripe Checkout Session from server
       let destinationUrl = plan.paymentUrl;
-      if (!destinationUrl) {
-        throw new Error('Stripe payment URL is unavailable for this plan.');
-      }
-
       try {
-        const urlObj = new URL(destinationUrl);
-        if (userEmail) {
-          urlObj.searchParams.set('prefilled_email', userEmail);
+        const token = localStorage.getItem('washek_auth_token') || '';
+        const sessionRes = await fetch('/api/create-checkout-session', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            plan: plan.planKey,
+            userId,
+            email: userEmail,
+            returnUrl: window.location.origin,
+            hasUsedTrial,
+          }),
+        });
+        const sessionData = await sessionRes.json();
+        if (sessionData?.url) {
+          destinationUrl = sessionData.url;
         }
-        if (userId) {
-          urlObj.searchParams.set('client_reference_id', userId);
-        }
-        destinationUrl = urlObj.toString();
-      } catch (_err) {
-        // URL parse fallback
+      } catch (err) {
+        console.debug('[PricingSection] create-checkout-session fetch note:', err);
       }
 
-      // Direct redirection to Stripe checkout
-      let redirected = false;
+      // 2. Open Stripe Checkout in new tab reliably with anchor click fallback
+      let tabOpened = false;
       try {
-        if (window.top && window.top !== window) {
-          window.top.location.href = destinationUrl;
-          redirected = true;
+        const win = window.open(destinationUrl, '_blank', 'noopener,noreferrer');
+        if (win && !win.closed && typeof win.closed !== 'undefined') {
+          tabOpened = true;
         }
-      } catch (_err) {
-        redirected = false;
+      } catch (_e) {
+        // window.open blocked
       }
 
-      if (!redirected) {
-        const stripeWin = window.open(destinationUrl, '_blank', 'noopener,noreferrer');
-        if (!stripeWin || stripeWin.closed || typeof stripeWin.closed === 'undefined') {
-          window.location.assign(destinationUrl);
-        }
+      if (!tabOpened) {
+        const link = document.createElement('a');
+        link.href = destinationUrl;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        document.body.appendChild(link);
+        link.click();
+        document.body.removeChild(link);
       }
+
+      toast.info(`Stripe Checkout opened in new tab. Complete checkout to unlock ${plan.name}.`);
     } catch (checkoutError) {
       console.error('[PricingSection] Stripe redirect failed:', checkoutError);
       setError(checkoutError?.message || 'Unable to start checkout.');
       toast.error(checkoutError?.message || 'Unable to start checkout.');
     } finally {
       setLoadingPlan(null);
-      isLaunchingRef.current = false;
     }
   };
 
@@ -428,9 +531,9 @@ export default function PricingSection({ onPlanChange }) {
         // ignore
       }
 
-      if (!currentUserId && firebaseAuth?.currentUser) {
-        currentUserId = firebaseAuth.currentUser.uid;
-        currentUserEmail = firebaseAuth.currentUser.email;
+      if (!currentUserId && user?.id) {
+        currentUserId = user.id;
+        currentUserEmail = user.email;
       }
 
       const cancelPayload = {
@@ -461,20 +564,7 @@ export default function PricingSection({ onPlanChange }) {
         console.debug('[PricingSection] Server cancel endpoint note:', srvErr);
       }
 
-      // 5. Client-side sync to Firebase / Firestore profile
-      try {
-        if (firebaseAuth?.currentUser) {
-          await firebaseApi.auth.updateProfile({
-            subscription_plan: 'free',
-            subscription_status: 'canceled',
-            tier: 'free',
-            plan: 'free',
-            subscription_tier: 'free',
-          });
-        }
-      } catch (fbErr) {
-        console.debug('[PricingSection] Firestore sync note:', fbErr);
-      }
+
 
       toast.success('Your subscription has been canceled. Your account is now on the Free Plan.');
     } catch (cancelError) {
@@ -494,9 +584,14 @@ export default function PricingSection({ onPlanChange }) {
 
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-4 relative">
+      {/* Ambient background glows for luminous luxury aesthetic */}
+      <div className="absolute -top-10 left-1/2 -translate-x-1/2 w-96 h-96 bg-primary/20 rounded-full blur-[120px] pointer-events-none" />
+      <div className="absolute top-1/2 -left-20 w-80 h-80 bg-emerald-500/15 rounded-full blur-[100px] pointer-events-none" />
+      <div className="absolute bottom-10 -right-20 w-80 h-80 bg-amber-500/15 rounded-full blur-[100px] pointer-events-none" />
+
       {error && (
-        <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm">
+        <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm relative z-10">
           <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
 
           <span>
@@ -506,31 +601,21 @@ export default function PricingSection({ onPlanChange }) {
       )}
 
 
-      {/* =========================================================
-          SECTION HEADER
-          ========================================================= */}
-      <div className="flex items-center gap-2 mb-1">
-        <Crown className="w-4 h-4 text-chart-4" />
 
-        <h3 className="font-heading font-bold text-sm text-muted-foreground uppercase tracking-wider">
-          Plans & Upgrades
-        </h3>
-      </div>
 
-      <p className="text-xs text-muted-foreground -mt-2 mb-3">
-        The Live Workout Tracker and baseline coaching are free for everyone.
-        Upgrades unlock higher monthly Kael message volumes, progressively faster and deeper AI coaching, and specialized athletic tools.
-      </p>
+
 
       {/* =========================================================
           FREE PLAN (BASELINE)
           ========================================================= */}
       <Card
-        className={`p-4 border-2 ${freePlan.borderColor} ${freePlan.bgColor} relative`}
+        className={`p-5 rounded-3xl border ${freePlan.borderColor} ${freePlan.bgColor} shadow-sm relative overflow-hidden backdrop-blur-xl z-10`}
       >
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <ShieldCheck className={`w-5 h-5 ${freePlan.color}`} />
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2.5">
+            <div className="w-10 h-10 rounded-2xl bg-muted/60 border border-white/5 flex items-center justify-center">
+              <ShieldCheck className={`w-5 h-5 ${freePlan.color}`} />
+            </div>
 
             <span className="font-heading font-bold text-base">
               {freePlan.name}
@@ -538,39 +623,32 @@ export default function PricingSection({ onPlanChange }) {
           </div>
 
           <div className="flex items-baseline gap-0.5">
-            <span className={`font-heading font-bold text-xl ${freePlan.color}`}>
+            <span className={`font-heading font-black text-2xl ${freePlan.color}`}>
               {freePlan.price}
             </span>
 
-            <span className="text-xs text-muted-foreground">
+            <span className="text-xs text-muted-foreground font-medium">
               {freePlan.period}
             </span>
           </div>
         </div>
 
-        <ul className="space-y-1.5 mb-3">
+        <ul className="space-y-2.5 mb-4">
           {freePlan.features.map((feature) => (
             <li
               key={feature}
-              className="flex items-start gap-2 text-sm"
+              className="flex items-start gap-2.5 text-xs text-muted-foreground"
             >
-              <Check className="w-3.5 h-3.5 mt-0.5 text-muted-foreground flex-shrink-0" />
-
-              <span>
-                {feature}
-              </span>
+              <Check className="w-3.5 h-3.5 mt-0.5 text-muted-foreground/80 flex-shrink-0" />
+              <span>{feature}</span>
             </li>
           ))}
         </ul>
 
         {currentPlan === 'free' ? (
-          <Button
-            className="w-full h-10 font-heading font-semibold"
-            variant="outline"
-            disabled
-          >
-            Current Plan
-          </Button>
+          <div className="w-full h-11 rounded-2xl bg-muted/50 border border-border/60 flex items-center justify-center font-heading font-bold text-xs text-muted-foreground tracking-wider uppercase">
+            Current Baseline Plan
+          </div>
         ) : (
           <div className="text-[11px] text-center text-muted-foreground italic py-1">
             Included with your account baseline
@@ -582,98 +660,106 @@ export default function PricingSection({ onPlanChange }) {
           PAID UPGRADE PLANS
           ========================================================= */}
       {plans.map((plan) => {
-        const Icon =
-          plan.icon;
-
-        const isCurrent =
-          currentPlan ===
-          plan.planKey;
+        const Icon = plan.icon;
+        const currentTierLevel = TIER_LEVELS[currentPlan] || 0;
+        const cardTierLevel = TIER_LEVELS[plan.planKey] || 0;
+        const isCurrent = currentPlan === plan.planKey;
+        const isIncludedInHigherTier = cardTierLevel < currentTierLevel;
 
         return (
           <Card
             key={plan.name}
-            className={`p-4 border-2 ${plan.borderColor} ${plan.bgColor} relative`}
+            className={`p-5 sm:p-6 rounded-3xl border-2 ${plan.borderColor} ${plan.bgColor} ${plan.glowClass} relative overflow-hidden transition-all duration-200 z-10`}
           >
-            {plan.badge && (
-              <Badge className="absolute -top-2.5 right-4 bg-primary text-primary-foreground text-[10px] px-2 py-0.5">
-                {plan.badge}
-              </Badge>
-            )}
+            {/* Header: Title + Inline Badge on Left, Price on Right (Unobstructed) */}
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div className="flex items-start gap-3">
+                <div className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 border ${plan.iconGlow}`}>
+                  <Icon className={`w-5 h-5 ${plan.color}`} />
+                </div>
 
-            <div className="flex items-center justify-between mb-3">
-              <div className="flex items-center gap-2">
-                <Icon
-                  className={`w-5 h-5 ${plan.color}`}
-                />
-
-                <span className="font-heading font-bold text-base">
-                  {plan.name}
-                </span>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="font-heading font-extrabold text-lg text-foreground tracking-tight">
+                      {plan.name}
+                    </span>
+                    {plan.badge && (
+                      <span className={`inline-flex items-center text-[10px] font-heading font-bold uppercase tracking-wider px-2 py-0.5 rounded-full ${plan.badgeClass}`}>
+                        {plan.badge}
+                      </span>
+                    )}
+                  </div>
+                  <span className="text-xs text-muted-foreground font-medium block mt-0.5">
+                    {plan.planKey === 'progress'
+                      ? 'Daily Progression'
+                      : plan.planKey === 'performance'
+                        ? 'High Performance'
+                        : 'Masterclass Athlete'}
+                  </span>
+                </div>
               </div>
 
-              <div className="flex items-baseline gap-0.5">
-                <span
-                  className={`font-heading font-bold text-xl ${plan.color}`}
-                >
-                  {plan.price}
-                </span>
-
-                <span className="text-xs text-muted-foreground">
-                  {plan.period}
-                </span>
+              {/* Price: Cleanly isolated on right with zero overlapping badges */}
+              <div className="text-right shrink-0">
+                <div className="flex items-baseline justify-end gap-0.5">
+                  <span className={`font-heading font-black text-2xl sm:text-3xl ${plan.color} tracking-tight`}>
+                    {plan.price}
+                  </span>
+                  <span className="text-xs text-muted-foreground font-medium">
+                    {plan.period}
+                  </span>
+                </div>
               </div>
             </div>
 
-            <ul className="space-y-1.5 mb-3">
-              {plan.features.map(
-                (feature) => (
-                  <li
-                    key={feature}
-                    className="flex items-start gap-2 text-sm"
-                  >
-                    <Check className="w-3.5 h-3.5 mt-0.5 text-accent flex-shrink-0" />
-
-                    <span>
-                      {feature}
-                    </span>
-                  </li>
-                )
-              )}
+            <ul className="space-y-2.5 mb-5">
+              {plan.features.map((feature) => (
+                <li
+                  key={feature}
+                  className="flex items-start gap-2.5 text-xs text-foreground/90 font-medium"
+                >
+                  <Check className={`w-3.5 h-3.5 mt-0.5 ${plan.color} flex-shrink-0 drop-shadow-[0_0_6px_rgba(59,130,246,0.4)]`} />
+                  <span>{feature}</span>
+                </li>
+              ))}
             </ul>
 
             {plan.disclaimer && (
-              <p className="text-[10px] text-muted-foreground italic mb-3">
+              <p className="text-[10px] text-muted-foreground italic mb-4 leading-relaxed">
                 {plan.disclaimer}
               </p>
             )}
 
+            {/* Plan Button or Locked Down Current Tier */}
             {isCurrent ? (
-              <Button
-                className="w-full h-10 font-heading font-semibold"
-                variant="outline"
-                disabled
-              >
-                Current Plan
-              </Button>
+              <div className="w-full h-11 rounded-xl bg-secondary/80 border border-border/80 flex items-center justify-center gap-2 font-heading font-bold text-xs text-foreground tracking-wider uppercase shadow-sm">
+                <Check className="w-4 h-4 text-emerald-400" />
+                Current Plan · Active
+              </div>
+            ) : isIncludedInHigherTier ? (
+              <div className="w-full h-11 rounded-xl bg-muted/40 border border-border/40 flex items-center justify-center font-heading font-medium text-xs text-muted-foreground tracking-wider uppercase">
+                Included with your {currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} plan
+              </div>
             ) : (
               <div className="space-y-1.5">
                 <Button
-                  className="w-full h-10 font-heading font-semibold transition-all"
-                  variant="outline"
+                  className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide ${plan.buttonClass}`}
                   onClick={() => handleCheckout(plan)}
                   disabled={!!loadingPlan || loadingSubscription}
                 >
                   {loadingPlan === plan.planKey ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Redirecting to Stripe…
+                      Opening Stripe Checkout…
                     </>
                   ) : (
-                    `Get ${plan.name}`
+                    `Upgrade to ${plan.name}`
                   )}
                 </Button>
-                <p className="text-[11px] text-center text-muted-foreground">
-                  7 days free, then {plan.price}/mo · Cancel anytime in 1 tap
+                <p className="text-[11px] text-center text-muted-foreground font-medium">
+                  {hasUsedTrial
+                    ? `Billed today: ${plan.price}/mo · Cancel anytime`
+                    : `7 days free, then ${plan.price}/mo · Cancel anytime`}
                 </p>
               </div>
             )}

@@ -105,7 +105,16 @@ export default function Progress() {
   const effectiveUser = user || storedUser;
   const email = effectiveUser?.email;
   const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
-  const plan = effectiveUser?.subscription_plan || 'free';
+  const plan =
+    effectiveUser?.subscription_plan && effectiveUser.subscription_plan !== 'free'
+      ? effectiveUser.subscription_plan
+      : (() => {
+          try {
+            return localStorage.getItem('washek_subscription_plan') || 'free';
+          } catch {
+            return 'free';
+          }
+        })();
   const hasWorkoutAnalytics = canAccess(
     plan,
     'workout_analytics'

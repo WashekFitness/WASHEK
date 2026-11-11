@@ -99,24 +99,27 @@ export default function NutritionSummary({ entries, user, logs, program }) {
   ];
 
   return (
-    <Card className="p-4 sm:p-5">
-      <div className="flex items-center justify-between mb-3.5">
+    <Card className="p-4 sm:p-5 bg-card/95 border border-border/80 dark:border-white/10 dark:hover:border-primary/40 shadow-lg dark:shadow-[0_8px_32px_rgba(0,0,0,0.4)] rounded-3xl relative overflow-hidden group">
+      {/* Ambient fuel glow */}
+      <div className="absolute top-0 right-0 w-48 h-32 bg-emerald-500/[0.08] rounded-full blur-2xl pointer-events-none" />
+
+      <div className="flex items-center justify-between mb-3.5 relative z-10">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-chart-4/15 border border-chart-4/25 flex items-center justify-center">
+          <div className="w-8 h-8 rounded-xl bg-chart-4/15 border border-chart-4/30 shadow-[0_0_10px_rgba(245,158,11,0.2)] flex items-center justify-center">
             <Flame className="w-4 h-4 text-chart-4" />
           </div>
 
           <div>
             <div className="flex items-center gap-1.5">
-              <p className="font-heading font-bold text-sm tracking-tight">
+              <p className="font-heading font-bold text-sm tracking-tight text-foreground">
                 Daily Fuel
               </p>
               {goals?.adaptation?.demandBadge ? (
-                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/10 border border-primary/25 text-primary leading-none">
+                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/15 border border-primary/30 text-primary shadow-[0_0_8px_rgba(37,99,235,0.25)] leading-none">
                   {goals.adaptation.demandBadge}
                 </span>
               ) : goals?.adaptation?.currentWeek ? (
-                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/10 border border-primary/25 text-primary leading-none">
+                <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/15 border border-primary/30 text-primary shadow-[0_0_8px_rgba(37,99,235,0.25)] leading-none">
                   W{goals.adaptation.currentWeek} Adapted
                 </span>
               ) : null}
@@ -140,7 +143,7 @@ export default function NutritionSummary({ entries, user, logs, program }) {
         </Link>
       </div>
 
-      <div className="mb-4 bg-slate-100/90 dark:bg-background/50 p-3 rounded-xl border border-slate-200/80 dark:border-white/[0.04]">
+      <div className="mb-4 bg-slate-100/90 dark:bg-background/50 p-3 rounded-2xl border border-slate-200/80 dark:border-white/[0.06] relative z-10">
         <div className="flex items-center justify-between mb-2">
           <span className="text-xs text-muted-foreground font-medium">
             Calories Consumed
@@ -153,7 +156,7 @@ export default function NutritionSummary({ entries, user, logs, program }) {
 
         <div className="h-2.5 rounded-full bg-slate-200/80 dark:bg-muted/80 overflow-hidden relative">
           <div
-            className="h-full rounded-full bg-gradient-to-r from-primary to-accent transition-all duration-500 shadow-sm shadow-primary/30"
+            className="h-full rounded-full bg-gradient-to-r from-primary via-blue-500 to-accent transition-all duration-500 shadow-[0_0_12px_rgba(37,99,235,0.5)]"
             style={{
               width: `${progress}%`,
             }}

@@ -72,6 +72,9 @@ const SubscriptionReturn = lazyWithRetry(
   () => import('@/pages/SubscriptionReturn')
 );
 
+import { applySubscriptionUpgrade, normalizePlan } from '@/lib/subscription';
+import { toast } from 'sonner';
+
 function PageLoader() {
   return (
     <div className="fixed inset-0 flex items-center justify-center bg-background">
@@ -83,6 +86,76 @@ function PageLoader() {
 function GlobalMidnightWatcher() {
   const { user } = useAuth();
   useMidnightSync(user);
+  return null;
+}
+
+function SubscriptionWatcher() {
+  const location = useLocation();
+
+  React.useEffect(() => {
+    // 1. Check for query parameter return (?subscribed=... or ?plan=...)
+    const params = new URLSearchParams(location.search);
+    const subPlan = params.get('subscribed') || params.get('plan');
+    if (subPlan && subPlan !== 'free') {
+      const normalized = normalizePlan(subPlan);
+      if (normalized && normalized !== 'free') {
+        applySubscriptionUpgrade(normalized, 'active');
+        toast.success(`Welcome to the ${normalized.charAt(0).toUpperCase() + normalized.slice(1)} plan! Your features are now active.`);
+        // Clean URL so query params do not linger
+        const cleanPath = location.pathname;
+        window.history.replaceState({}, document.title, cleanPath);
+      }
+    }
+
+    // 2. Listen for cross-tab or return tab events (BroadcastChannel, storage, postMessage)
+    const handleUpgradeMessage = (plan) => {
+      const safe = normalizePlan(plan);
+      if (safe && safe !== 'free') {
+        applySubscriptionUpgrade(safe, 'active');
+        toast.success(`Payment confirmed! You are now upgraded to the ${safe.charAt(0).toUpperCase() + safe.slice(1)} plan.`);
+      }
+    };
+
+    const onWindowMsg = (e) => {
+      if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && e.data?.plan) {
+        handleUpgradeMessage(e.data.plan);
+      }
+    };
+    window.addEventListener('message', onWindowMsg);
+
+    let bc = null;
+    try {
+      bc = new BroadcastChannel('washek_subscription_sync');
+      bc.onmessage = (e) => {
+        if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && e.data?.plan) {
+          handleUpgradeMessage(e.data.plan);
+        }
+      };
+    } catch {
+      /* ignore */
+    }
+
+    const onStorage = (e) => {
+      if (e.key === 'washek_subscription_success_event' && e.newValue) {
+        try {
+          const parsed = JSON.parse(e.newValue);
+          if (parsed?.plan && parsed.plan !== 'free') {
+            handleUpgradeMessage(parsed.plan);
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+    window.addEventListener('storage', onStorage);
+
+    return () => {
+      window.removeEventListener('message', onWindowMsg);
+      window.removeEventListener('storage', onStorage);
+      bc?.close();
+    };
+  }, [location.search, location.pathname]);
+
   return null;
 }
 
@@ -116,6 +189,7 @@ function AuthenticatedApp() {
   return (
     <>
       <OfflineIndicator />
+      <SubscriptionWatcher />
       {isAuthenticated && <GlobalMidnightWatcher />}
       {isAuthenticated && <ProgramWeekBootstrap />}
 

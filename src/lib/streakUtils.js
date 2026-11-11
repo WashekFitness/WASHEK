@@ -5,6 +5,7 @@ import {
   getDayOfWeekShort,
   getUserTimeZone,
 } from '@/lib/dateUtils';
+import { getCachedActiveProgram } from '@/lib/cacheStore';
 
 /**
  * Determines whether a given date key ('YYYY-MM-DD') or Date is a scheduled workout day
@@ -18,6 +19,16 @@ import {
  */
 export function isScheduledWorkoutDay(dateOrKey, program = null, user = null, timeZone = null) {
   const effectiveTz = timeZone || getUserTimeZone(user);
+  let effectiveProgram = program;
+  if (!effectiveProgram && typeof window !== 'undefined') {
+    try {
+      const uKey = user?.id || user?.uid || user?.email || 'athlete';
+      effectiveProgram = getCachedActiveProgram(uKey);
+    } catch (_) {
+      // Ignore cache lookup error
+    }
+  }
+
   let dateObj;
   if (dateOrKey instanceof Date) {
     dateObj = dateOrKey;
@@ -33,8 +44,8 @@ export function isScheduledWorkoutDay(dateOrKey, program = null, user = null, ti
   const weekdayShort = getDayOfWeekShort(dateObj, effectiveTz).toLowerCase();
 
   // If program provides custom training_days array (e.g. ['Monday', 'Wednesday', 'Friday'])
-  if (Array.isArray(program?.training_days) && program.training_days.length > 0) {
-    return program.training_days.some(
+  if (Array.isArray(effectiveProgram?.training_days) && effectiveProgram.training_days.length > 0) {
+    return effectiveProgram.training_days.some(
       (td) =>
         String(td).toLowerCase().includes(weekdayName) ||
         String(td).toLowerCase().includes(weekdayShort)
@@ -42,11 +53,11 @@ export function isScheduledWorkoutDay(dateOrKey, program = null, user = null, ti
   }
 
   // Check program microcycles
-  if (Array.isArray(program?.microcycles) && program.microcycles.length > 0) {
-    const currentWeekNum = Number(program.current_week) || 1;
+  if (Array.isArray(effectiveProgram?.microcycles) && effectiveProgram.microcycles.length > 0) {
+    const currentWeekNum = Number(effectiveProgram.current_week) || 1;
     const currentWeekData =
-      program.microcycles.find((m) => m.week_number === currentWeekNum) ||
-      program.microcycles[0];
+      effectiveProgram.microcycles.find((m) => m.week_number === currentWeekNum) ||
+      effectiveProgram.microcycles[0];
 
     const days = Array.isArray(currentWeekData?.days) ? currentWeekData.days : [];
 
@@ -164,6 +175,16 @@ export function calcStreak(logs, optionsOrTz = null, maybeUser = null, maybeProg
     manualRestDays = optionsOrTz.manualRestDays || null;
   }
 
+  let effectiveProgram = program;
+  if (!effectiveProgram && typeof window !== 'undefined') {
+    try {
+      const uKey = user?.id || user?.uid || user?.email || 'athlete';
+      effectiveProgram = getCachedActiveProgram(uKey);
+    } catch (_) {
+      // Ignore cache lookup error
+    }
+  }
+
   // Fallback to localStorage for manualRestDays if not explicitly passed
   if (!manualRestDays && typeof window !== 'undefined') {
     try {
@@ -211,16 +232,15 @@ export function calcStreak(logs, optionsOrTz = null, maybeUser = null, maybeProg
       checkDate = getPreviousLocalDateKey(checkDate, effectiveTz);
     } else {
       // No workout logged on checkDate.
-      const isWorkoutDay = isScheduledWorkoutDay(checkDate, program, user, effectiveTz);
+      const isWorkoutDay = isScheduledWorkoutDay(checkDate, effectiveProgram, user, effectiveTz);
       const isManualRest = Boolean(manualRestDays?.[checkDate]);
 
-      // This only works for actual rest days:
-      // An authorized rest day is either an actual scheduled rest day, or confirmed manual rest day on a rest day
-      const isRest = !isWorkoutDay || (isManualRest && !isWorkoutDay);
+      // If this date is a scheduled rest day (or marked rest day):
+      // The streak is NOT taken away on rest days! It stays intact (does NOT break, does NOT decrement).
+      const isRest = !isWorkoutDay || isManualRest;
 
       if (isRest) {
-        // Authorized REST DAY!
-        // The streak stays where it is: does NOT break, does NOT increment.
+        // Scheduled REST DAY! Streak is protected and preserved.
         checkDate = getPreviousLocalDateKey(checkDate, effectiveTz);
       } else {
         // A scheduled workout day was MISSED in the past!

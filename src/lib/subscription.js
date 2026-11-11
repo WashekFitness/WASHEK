@@ -10,7 +10,6 @@
  * of inventing their own subscription rules.
  */
 
-import { auth as firebaseAuth, db, doc, setDoc } from '@/lib/firebase';
 
 export const PLAN_HIERARCHY = [
   'free',
@@ -60,46 +59,27 @@ export function hasPlan(
         resolvedUserPlan.subscription_plan ||
         resolvedUserPlan.plan ||
         resolvedUserPlan.tier ||
+        resolvedUserPlan.subscription_tier ||
         'free';
     }
   }
 
-  // Check if globally canceled in localStorage
-  try {
-    const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-    if (storedStatus === 'canceled' || storedStatus === 'cancelled') {
-      if (typeof userPlan === 'object') {
-        const objStatus = String(userPlan?.subscription_status || '').toLowerCase().trim();
-        if (objStatus !== 'active' && objStatus !== 'trialing') {
-          resolvedUserPlan = 'free';
-        }
-      } else {
-        resolvedUserPlan = 'free';
-      }
-    }
-  } catch {
-    // Storage access fallback
-  }
-
-  // If missing or free, check localStorage fallback for upgraded status
+  // If missing or free, check localStorage fallback for active upgraded status
   if (!resolvedUserPlan || resolvedUserPlan === 'free') {
     try {
+      const storedPlan = localStorage.getItem('washek_subscription_plan');
       const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus !== 'canceled' && storedStatus !== 'cancelled') {
-        const storedPlan = localStorage.getItem('washek_subscription_plan');
-        if (storedPlan && storedPlan !== 'free') {
-          resolvedUserPlan = storedPlan;
-        } else {
-          const storedUser = localStorage.getItem('washek_user');
-          if (storedUser) {
-            const parsed = JSON.parse(storedUser);
-            if (
-              parsed?.subscription_status !== 'canceled' &&
-              parsed?.subscription_status !== 'cancelled' &&
-              parsed?.subscription_plan &&
-              parsed.subscription_plan !== 'free'
-            ) {
-              resolvedUserPlan = parsed.subscription_plan;
+      if (storedPlan && storedPlan !== 'free' && storedStatus !== 'canceled' && storedStatus !== 'cancelled') {
+        resolvedUserPlan = storedPlan;
+      } else {
+        const storedUser = localStorage.getItem('washek_user');
+        if (storedUser) {
+          const parsed = JSON.parse(storedUser);
+          const userStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
+          if (userStatus !== 'canceled' && userStatus !== 'cancelled') {
+            const p = parsed?.subscription_plan || parsed?.plan || parsed?.tier || parsed?.subscription_tier;
+            if (p && p !== 'free') {
+              resolvedUserPlan = p;
             }
           }
         }
@@ -427,6 +407,7 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
   try {
     localStorage.setItem('washek_subscription_plan', normPlan);
     localStorage.setItem('washek_subscription_status', status);
+    localStorage.removeItem('washek_subscription_cancelled_at');
 
     const storedUser = localStorage.getItem('washek_user');
     let userObj = {};
@@ -449,33 +430,11 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     console.debug('[subscription] LocalStorage upgrade sync note:', err);
   }
 
-  // Persist directly to Firestore if Firebase user is authenticated
-  try {
-    const fbUser = firebaseAuth?.currentUser;
-    if (fbUser?.uid) {
-      const userRef = doc(db, 'users', fbUser.uid);
-      setDoc(
-        userRef,
-        {
-          subscription_plan: normPlan,
-          subscription_status: status,
-          tier: normPlan,
-          plan: normPlan,
-          subscription_tier: normPlan,
-          updated_at: new Date().toISOString(),
-        },
-        { merge: true }
-      ).catch((fsErr) => console.debug('[subscription] Firestore sync note:', fsErr));
-    }
-  } catch (_e) {
-    // Non-blocking
-  }
-
   // Background server sync to keep Supabase profiles table in sync
   try {
     const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
-    const syncUid = firebaseAuth?.currentUser?.uid || stored?.id || stored?.uid;
-    const syncEmail = firebaseAuth?.currentUser?.email || stored?.email;
+    const syncUid = stored?.id || stored?.uid;
+    const syncEmail = stored?.email;
     if (syncUid || syncEmail) {
       fetch('/api/checkout/process', {
         method: 'POST',
@@ -552,33 +511,11 @@ export function applySubscriptionCancellation(details = {}) {
     console.debug('[subscription] LocalStorage cancellation sync note:', err);
   }
 
-  // Persist cancellation to Firestore
-  try {
-    const fbUser = firebaseAuth?.currentUser;
-    if (fbUser?.uid) {
-      const userRef = doc(db, 'users', fbUser.uid);
-      setDoc(
-        userRef,
-        {
-          subscription_plan: 'free',
-          subscription_status: 'canceled',
-          tier: 'free',
-          plan: 'free',
-          subscription_tier: 'free',
-          updated_at: new Date().toISOString(),
-        },
-        { merge: true }
-      ).catch((fsErr) => console.debug('[subscription] Firestore cancel sync note:', fsErr));
-    }
-  } catch (_e) {
-    // Non-blocking
-  }
-
   // Background server sync for cancellation
   try {
     const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
-    const syncUid = firebaseAuth?.currentUser?.uid || stored?.id || stored?.uid;
-    const syncEmail = firebaseAuth?.currentUser?.email || stored?.email;
+    const syncUid = stored?.id || stored?.uid;
+    const syncEmail = stored?.email;
     if (syncUid || syncEmail) {
       fetch('/api/cancel-subscription', {
         method: 'POST',

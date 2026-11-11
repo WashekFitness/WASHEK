@@ -19,7 +19,6 @@ import {
   Play,
   Loader2,
   AlertCircle,
-  Sparkles,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Link } from 'react-router-dom';
@@ -232,8 +231,8 @@ export default function Program() {
         </p>
 
         <Link to="/onboarding">
-          <Button className="h-12 px-7 rounded-xl font-heading font-semibold text-sm bg-gradient-to-r from-primary to-blue-600 shadow-xl shadow-primary/25 hover:opacity-95 transition-all">
-            <Sparkles className="w-4 h-4 mr-2" />
+          <Button className="h-12 px-7 rounded-xl font-heading font-semibold text-sm shadow-md">
+            <Dumbbell className="w-4 h-4 mr-2" />
             Build My 12-Week Program
           </Button>
         </Link>
@@ -367,7 +366,9 @@ export default function Program() {
                   font-heading
                   font-semibold
                   text-primary-foreground
-                  shadow
+                  shadow-[0_0_15px_rgba(37,99,235,0.45)]
+                  border
+                  border-primary/30
                   pointer-events-none
                 "
               >

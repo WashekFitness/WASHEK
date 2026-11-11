@@ -32,118 +32,151 @@ function positiveNumber(value, fallback = 0) {
 /**
  * Get the user's weight in pounds.
  */
+function resolveUserProfile(user) {
+  let localData = {};
+  try {
+    if (typeof window !== 'undefined') {
+      const stored = localStorage.getItem('washek_user');
+      if (stored) localData = JSON.parse(stored);
+    }
+  } catch (_e) {
+    // Ignore storage parse errors
+  }
+  return { ...localData, ...(user || {}) };
+}
+
+/**
+ * Get the user's weight in pounds.
+ */
 function getWeightLbs(user) {
-  const weightLbs = positiveNumber(user?.weight_lbs);
+  const merged = resolveUserProfile(user);
+  const weightLbs = positiveNumber(merged?.weight_lbs);
 
   if (weightLbs > 0) {
     return weightLbs;
   }
 
-  const weightKg = positiveNumber(user?.weight_kg);
+  const weightKg = positiveNumber(merged?.weight_kg);
 
   if (weightKg > 0) {
     return weightKg / KG_PER_LB;
   }
 
-  return 150;
+  return 165;
 }
 
 /**
  * Get the user's height in centimeters.
  */
 function getHeightCm(user) {
-  const heightCm = positiveNumber(user?.height_cm);
+  const merged = resolveUserProfile(user);
+  const heightCm = positiveNumber(merged?.height_cm);
 
   if (heightCm > 0) {
     return heightCm;
   }
 
-  const heightInches = positiveNumber(user?.height_inches);
+  const heightInches = positiveNumber(merged?.height_inches);
 
   if (heightInches > 0) {
     return heightInches * CM_PER_INCH;
   }
 
-  return 68 * CM_PER_INCH;
+  return 70 * CM_PER_INCH;
 }
 
 /**
  * Determine the user's primary nutrition goal.
- *
- * We intentionally collapse all goal arrays into one priority order so
- * calories cannot accidentally be adjusted twice.
+ * Inspects all possible goal sources including arrays, strings, and custom goal text.
  */
 function getPrimaryGoal(user) {
-  const fitnessGoals = Array.isArray(user?.fitness_goals)
-    ? user.fitness_goals
-    : [];
+  const merged = resolveUserProfile(user);
 
-  const weightGoals = Array.isArray(user?.weight_goals)
-    ? user.weight_goals
-    : [];
+  const rawGoals = [];
+  if (Array.isArray(merged.fitness_goals)) rawGoals.push(...merged.fitness_goals);
+  else if (typeof merged.fitness_goals === 'string') rawGoals.push(...merged.fitness_goals.split(','));
 
-  const goals = new Set([
-    ...fitnessGoals,
-    ...weightGoals,
-  ]);
+  if (Array.isArray(merged.weight_goals)) rawGoals.push(...merged.weight_goals);
+  else if (typeof merged.weight_goals === 'string') rawGoals.push(...merged.weight_goals.split(','));
 
-  // Fat loss takes priority if explicitly selected.
+  if (merged.primary_goal) rawGoals.push(merged.primary_goal);
+  if (merged.goal_description) rawGoals.push(merged.goal_description);
+  if (merged.goal) rawGoals.push(merged.goal);
+  if (merged.training_requirements) rawGoals.push(merged.training_requirements);
+
+  const combinedStr = rawGoals.map((g) => String(g || '').toLowerCase()).join(' ');
+
+  // 1. Fat Loss / Cutting
   if (
-    goals.has('lose_weight') ||
-    goals.has('fat_loss') ||
-    goals.has('weight_loss')
+    combinedStr.includes('lose') ||
+    combinedStr.includes('fat_loss') ||
+    combinedStr.includes('weight_loss') ||
+    combinedStr.includes('fat loss') ||
+    combinedStr.includes('cut') ||
+    combinedStr.includes('cutting') ||
+    combinedStr.includes('shred') ||
+    combinedStr.includes('lean out') ||
+    combinedStr.includes('drop weight')
   ) {
     return 'lose';
   }
 
-  // Muscle gain takes priority next.
+  // 2. Muscle Gain / Hypertrophy / Bulking
   if (
-    goals.has('gain_muscle') ||
-    goals.has('muscle_growth') ||
-    goals.has('build_muscle')
+    combinedStr.includes('gain_muscle') ||
+    combinedStr.includes('muscle_growth') ||
+    combinedStr.includes('build_muscle') ||
+    combinedStr.includes('gain muscle') ||
+    combinedStr.includes('hypertrophy') ||
+    combinedStr.includes('bulk') ||
+    combinedStr.includes('bulking') ||
+    combinedStr.includes('mass') ||
+    combinedStr.includes('size')
   ) {
     return 'gain';
   }
 
-  // Recomposition should generally sit around maintenance.
+  // 3. Body Recomposition
   if (
-    goals.has('body_recomp') ||
-    goals.has('recomp')
+    combinedStr.includes('body_recomp') ||
+    combinedStr.includes('recomp') ||
+    combinedStr.includes('tone') ||
+    combinedStr.includes('recomposition')
   ) {
     return 'recomp';
   }
 
+  // 4. Strength & Power / Calisthenics Mastery
   if (
-    goals.has('get_stronger') ||
-    goals.has('gain_strength') ||
-    goals.has('strength')
+    combinedStr.includes('strength') ||
+    combinedStr.includes('stronger') ||
+    combinedStr.includes('power') ||
+    combinedStr.includes('skill')
   ) {
     return 'strength';
   }
 
+  // 5. Endurance & Conditioning / Hybrid
   if (
-    goals.has('improve_endurance') ||
-    goals.has('endurance')
+    combinedStr.includes('endurance') ||
+    combinedStr.includes('stamina') ||
+    combinedStr.includes('hybrid') ||
+    combinedStr.includes('cardio') ||
+    combinedStr.includes('running')
   ) {
     return 'endurance';
-  }
-
-  // Aesthetics without a specific weight goal is treated as maintenance.
-  if (goals.has('aesthetics')) {
-    return 'maintenance';
   }
 
   return 'maintenance';
 }
 
 /**
- * Estimate daily calorie needs.
- *
- * This intentionally uses conservative activity assumptions because
- * WASHEK does not currently ask users for a formal activity level.
+ * Estimate daily calorie and macronutrient needs based on the athlete's
+ * real biometrics, training discipline, fitness level, and goals.
  */
 export function calcNutritionGoals(user, options = {}) {
-  const userKey = options?.userKey || user?.id || user?.uid || null;
+  const mergedUser = resolveUserProfile(user);
+  const userKey = options?.userKey || mergedUser?.id || mergedUser?.uid || null;
 
   // Resolve active program and workout logs from options or synchronous cache
   const program = options?.program || getCachedActiveProgram(userKey);
@@ -156,23 +189,27 @@ export function calcNutritionGoals(user, options = {}) {
     : (program?.current_week || 1);
   const currentWeek = Math.max(1, Math.min(12, Number(rawWeek) || 1));
 
-  const weightLbs = getWeightLbs(user);
+  const weightLbs = getWeightLbs(mergedUser);
   const weightKg = weightLbs * KG_PER_LB;
 
-  const heightCm = getHeightCm(user);
+  const heightCm = getHeightCm(mergedUser);
 
   const age = Math.min(
     Math.max(
-      positiveNumber(user?.age, 25),
-      13
+      positiveNumber(mergedUser?.age, 25),
+      14
     ),
     100
   );
 
-  const gender = String(user?.gender || 'male').toLowerCase();
+  const gender = String(mergedUser?.gender || 'male').toLowerCase();
 
   const trainingType = String(
-    user?.training_type || 'calisthenics'
+    mergedUser?.training_type || program?.training_type || 'calisthenics'
+  ).toLowerCase();
+
+  const fitnessLevel = String(
+    mergedUser?.fitness_level || program?.fitness_level || 'intermediate'
   ).toLowerCase();
 
   /**
@@ -190,47 +227,80 @@ export function calcNutritionGoals(user, options = {}) {
         5;
 
   /**
-   * Activity estimates.
+   * Activity multiplier based on training discipline and fitness level.
    */
-  let activityMultiplier = 1.35;
+  let activityMultiplier = 1.48;
 
   if (trainingType === 'weights') {
-    activityMultiplier = 1.40;
+    activityMultiplier = 1.55;
   } else if (trainingType === 'hybrid') {
-    activityMultiplier = 1.40;
+    activityMultiplier = 1.65;
   } else if (trainingType === 'weighted_calisthenics') {
-    activityMultiplier = 1.375;
+    activityMultiplier = 1.52;
   } else if (trainingType === 'calisthenics') {
-    activityMultiplier = 1.35;
+    activityMultiplier = 1.48;
+  }
+
+  // Adjust for training volume capacity based on fitness level
+  if (fitnessLevel === 'advanced') {
+    activityMultiplier *= 1.05;
+  } else if (fitnessLevel === 'elite') {
+    activityMultiplier *= 1.10;
+  } else if (fitnessLevel === 'beginner') {
+    activityMultiplier *= 0.95;
   }
 
   const estimatedMaintenance = bmr * activityMultiplier;
 
-  const primaryGoal = getPrimaryGoal(user);
+  const primaryGoal = getPrimaryGoal(mergedUser);
 
   let goalMultiplier = 1.0;
+  let proteinPerLb = 1.0;
+  let fatPercentage = 0.26;
 
   switch (primaryGoal) {
     case 'lose':
-      goalMultiplier = 0.85;
+      // 18% deficit - optimal fat loss rate while sparing athletic performance & muscle
+      goalMultiplier = 0.82;
+      // High protein (1.15g/lb) is scientifically proven to preserve lean mass in a deficit
+      proteinPerLb = 1.15;
+      fatPercentage = 0.25;
       break;
 
     case 'gain':
-      goalMultiplier = 1.05;
-      break;
-
-    case 'strength':
-      goalMultiplier = 1.03;
-      break;
-
-    case 'endurance':
-      goalMultiplier = 1.03;
+      // 12% surplus - optimal lean mass accrual with minimal fat gain
+      goalMultiplier = 1.12;
+      // 1.05g/lb fuels muscle protein synthesis and recovery
+      proteinPerLb = 1.05;
+      fatPercentage = 0.26;
       break;
 
     case 'recomp':
+      // Mild 4% deficit with high protein enables body recomposition
+      goalMultiplier = 0.96;
+      proteinPerLb = 1.15;
+      fatPercentage = 0.25;
+      break;
+
+    case 'strength':
+      // Maintenance fueling for optimal neurological & muscular power output
+      goalMultiplier = 1.00;
+      proteinPerLb = 1.05;
+      fatPercentage = 0.27;
+      break;
+
+    case 'endurance':
+      // +5% surplus covers elevated aerobic glycogen depletion
+      goalMultiplier = 1.05;
+      proteinPerLb = 1.00;
+      fatPercentage = 0.22; // lower fat, higher carbs
+      break;
+
     case 'maintenance':
     default:
-      goalMultiplier = 1.0;
+      goalMultiplier = 1.00;
+      proteinPerLb = 1.00;
+      fatPercentage = 0.26;
       break;
   }
 
@@ -248,34 +318,16 @@ export function calcNutritionGoals(user, options = {}) {
   );
 
   /**
-   * Baseline Protein calculation:
-   * Keeps a solid baseline intake.
+   * Personalized Protein calculation based on athlete weight and specific goal.
    */
-  let proteinPerLb = 0.8;
-
-  if (primaryGoal === 'lose') {
-    proteinPerLb = 0.9;
-  } else if (primaryGoal === 'gain') {
-    proteinPerLb = 0.9;
-  } else if (primaryGoal === 'strength') {
-    proteinPerLb = 0.9;
-  } else if (primaryGoal === 'recomp') {
-    proteinPerLb = 0.9;
-  }
-
   const protein = Math.round(
     Math.min(
-      Math.max(weightLbs * proteinPerLb, 100),
-      220
+      Math.max(weightLbs * proteinPerLb, 110),
+      350
     )
   );
 
   const proteinCals = protein * 4;
-
-  const fatPercentage =
-    primaryGoal === 'lose'
-      ? 0.25
-      : 0.27;
 
   const fat = Math.round(
     (calories * fatPercentage) / 9

@@ -46,29 +46,29 @@ export default function StreakCard({ logs, user, timeZone, program }) {
   if (streak === 0) return null;
 
   return (
-    <Card className="p-4 sm:p-5 flex items-center gap-4 border-amber-500/35 bg-gradient-to-r from-amber-500/15 via-orange-500/10 to-card shadow-[0_8px_30px_rgba(245,158,11,0.15)] relative overflow-hidden group">
-      {/* Ambient background warm pulse */}
-      <div className="absolute top-0 right-0 w-36 h-36 bg-amber-500/10 rounded-full blur-2xl pointer-events-none -mr-8 -mt-8 group-hover:bg-amber-500/15 transition-all duration-500" />
+    <Card className="p-4 sm:p-5 flex items-center gap-4.5 bg-gradient-to-r from-amber-500/[0.09] via-card to-card border border-amber-500/30 dark:border-amber-500/25 shadow-lg shadow-amber-950/20 rounded-3xl relative overflow-hidden group">
+      {/* Subtle background warm ember glow */}
+      <div className="absolute top-0 left-0 w-36 h-36 bg-amber-500/10 rounded-full blur-2xl pointer-events-none" />
 
-      <div className="w-13 h-13 rounded-2xl bg-gradient-to-br from-amber-500/25 via-orange-500/20 to-amber-500/10 border border-amber-500/35 flex items-center justify-center shrink-0 shadow-md shadow-amber-500/20 group-hover:scale-105 transition-transform duration-300">
-        <Flame className="w-6 h-6 text-amber-500 fill-amber-500/20 drop-shadow-[0_2px_10px_rgba(245,158,11,0.5)] animate-pulse" />
+      <div className="w-12 h-12 rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center shrink-0 shadow-sm relative z-10">
+        <Flame className="w-6 h-6 text-amber-500 fill-amber-500/30" />
       </div>
       <div className="min-w-0 flex-1 relative z-10">
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-baseline gap-2">
-            <span className="font-heading font-extrabold text-2xl sm:text-3xl text-amber-600 dark:text-amber-500 tracking-tight leading-none tabular-nums">
+            <span className="font-heading font-black text-2xl sm:text-3xl text-amber-500 tracking-tight leading-none tabular-nums font-mono">
               {streak}
             </span>
-            <span className="font-heading font-bold text-xs sm:text-sm text-amber-600/90 dark:text-amber-500/90 uppercase tracking-wider">
+            <span className="font-heading font-extrabold text-xs sm:text-sm text-foreground uppercase tracking-wider">
               {streak === 1 ? 'Day Streak' : 'Days Strong'}
             </span>
           </div>
 
-          <span className="text-[10px] font-bold uppercase tracking-widest text-amber-600 dark:text-amber-400 bg-amber-500/10 border border-amber-500/25 px-2 py-0.5 rounded-full shrink-0">
+          <span className="text-[10px] font-bold uppercase tracking-widest text-amber-500 bg-amber-500/15 border border-amber-500/30 px-2.5 py-0.5 rounded-full shrink-0 font-heading">
             Unbroken
           </span>
         </div>
-        <p className="text-xs text-muted-foreground mt-1 truncate sm:whitespace-normal leading-relaxed">
+        <p className="text-xs text-muted-foreground mt-1 truncate sm:whitespace-normal leading-relaxed font-medium">
           {msg}
         </p>
       </div>

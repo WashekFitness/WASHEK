@@ -102,8 +102,100 @@ function recordDeletedChatId(userId, chatId) {
     const set = getDeletedChatIds(userId);
     set.add(chatId);
     localStorage.setItem(STORAGE_DELETED_CHATS_PREFIX + userId, JSON.stringify(Array.from(set)));
+    // Also record in global deleted list
+    const globalSet = getDeletedChatIds('all');
+    globalSet.add(chatId);
+    localStorage.setItem(STORAGE_DELETED_CHATS_PREFIX + 'all', JSON.stringify(Array.from(globalSet)));
   } catch {
     // fallback
+  }
+}
+
+function getAllCachedChats(userId, deletedIds = new Set()) {
+  const chatMap = new Map();
+  const keysToScan = new Set([
+    STORAGE_CHATS_PREFIX + (userId || 'guest'),
+    STORAGE_CHATS_PREFIX + 'all',
+    STORAGE_CHATS_PREFIX + 'guest',
+    STORAGE_CHATS_PREFIX + 'athlete',
+  ]);
+  if (userId) {
+    keysToScan.add(STORAGE_CHATS_PREFIX + userId);
+  }
+
+  if (typeof localStorage !== 'undefined') {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith(STORAGE_CHATS_PREFIX)) {
+        keysToScan.add(k);
+      }
+    }
+  }
+
+  keysToScan.forEach((key) => {
+    try {
+      const raw = localStorage.getItem(key);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          parsed.forEach((c) => {
+            if (c && c.id && (!deletedIds || !deletedIds.has(c.id))) {
+              const existing = chatMap.get(c.id);
+              if (!existing) {
+                chatMap.set(c.id, { ...c });
+              } else {
+                const cTime = new Date(c.updated_at || c.created_at || 0).getTime();
+                const exTime = new Date(existing.updated_at || existing.created_at || 0).getTime();
+                if (cTime > exTime) {
+                  chatMap.set(c.id, { ...existing, ...c });
+                }
+              }
+            }
+          });
+        }
+      }
+    } catch (_e) {
+      // Ignore parse error
+    }
+  });
+
+  return Array.from(chatMap.values());
+}
+
+function persistConversations(chats, activeId, userId) {
+  if (!Array.isArray(chats)) return;
+  const targetKeys = new Set([
+    STORAGE_CHATS_PREFIX + 'all',
+    STORAGE_CHATS_PREFIX + (userId || 'guest'),
+    STORAGE_CHATS_PREFIX + 'guest',
+  ]);
+  if (userId) {
+    targetKeys.add(STORAGE_CHATS_PREFIX + userId);
+  }
+
+  targetKeys.forEach((key) => {
+    try {
+      localStorage.setItem(key, JSON.stringify(chats));
+    } catch (_e) {
+      // Ignore storage error
+    }
+  });
+
+  if (activeId) {
+    const activeKeys = new Set([
+      STORAGE_ACTIVE_PREFIX + 'all',
+      STORAGE_ACTIVE_PREFIX + (userId || 'guest'),
+    ]);
+    if (userId) {
+      activeKeys.add(STORAGE_ACTIVE_PREFIX + userId);
+    }
+    activeKeys.forEach((key) => {
+      try {
+        localStorage.setItem(key, activeId);
+      } catch (_e) {
+        // Ignore storage error
+      }
+    });
   }
 }
 
@@ -516,26 +608,19 @@ export default function Kael() {
    */
 
   useEffect(() => {
-    const currentUserId = user?.id || authUser?.id || 'guest';
+    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
     let active = true;
 
     const deletedIds = getDeletedChatIds(currentUserId);
+    getDeletedChatIds('all').forEach((id) => deletedIds.add(id));
 
-    // 1. Read cached conversation threads from localStorage
-    let cachedChats = [];
-    try {
-      const raw = localStorage.getItem(STORAGE_CHATS_PREFIX + currentUserId);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          cachedChats = parsed.filter((c) => c && c.id && !deletedIds.has(c.id));
-        }
-      }
-    } catch (e) {
-      console.warn('[KAEL] Failed to parse cached chats:', e);
-    }
+    // 1. Read cached conversation threads across all storage keys
+    const cachedChats = getAllCachedChats(currentUserId, deletedIds);
 
-    const savedActiveId = localStorage.getItem(STORAGE_ACTIVE_PREFIX + currentUserId);
+    const savedActiveId =
+      localStorage.getItem(STORAGE_ACTIVE_PREFIX + currentUserId) ||
+      localStorage.getItem(STORAGE_ACTIVE_PREFIX + 'all') ||
+      localStorage.getItem(STORAGE_ACTIVE_PREFIX + 'guest');
 
     supabaseApi.entities.KaelMessage
       .filter(
@@ -655,15 +740,25 @@ export default function Kael() {
         setActiveChatId(selectedChatId);
         setMessages(validMessages);
 
-        const currentUserId = user?.id || authUser?.id || 'guest';
-        localStorage.setItem(STORAGE_CHATS_PREFIX + currentUserId, JSON.stringify(mergedChats));
-        localStorage.setItem(STORAGE_ACTIVE_PREFIX + currentUserId, selectedChatId);
+        persistConversations(mergedChats, selectedChatId, currentUserId);
       })
       .catch((error) => {
         console.error(
           '[KAEL] Failed to load conversation:',
           error
         );
+
+        // Recover local messages so messages are never wiped out
+        let localMsgs = [];
+        try {
+          const raw = localStorage.getItem(`washek_kael_messages_${currentUserId}`) || localStorage.getItem('washek_kael_messages_all');
+          if (raw) localMsgs = JSON.parse(raw);
+        } catch (_err) {
+          // Ignore local storage error
+        }
+        if (localMsgs.length > 0) {
+          setMessages(localMsgs);
+        }
 
         if (cachedChats.length > 0) {
           setConversations(cachedChats);
@@ -689,6 +784,8 @@ export default function Kael() {
     };
   }, [
     user?.id,
+    authUser?.id,
+    authUser?.uid,
   ]);
 
 
@@ -710,16 +807,15 @@ export default function Kael() {
       last_message: '',
     };
 
-    const currentUserId = user?.id || authUser?.id || 'guest';
+    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
 
     setConversations((prev) => {
       const next = [newChat, ...prev];
-      localStorage.setItem(STORAGE_CHATS_PREFIX + currentUserId, JSON.stringify(next));
+      persistConversations(next, newChat.id, currentUserId);
       return next;
     });
 
     setActiveChatId(newChat.id);
-    localStorage.setItem(STORAGE_ACTIVE_PREFIX + currentUserId, newChat.id);
     setIsHistoryOpen(false);
     setInput('');
     window.requestAnimationFrame(() => {
@@ -732,11 +828,11 @@ export default function Kael() {
       setIsHistoryOpen(false);
       return;
     }
-    const currentUserId = user?.id || authUser?.id || 'guest';
+    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
     typingCancelledRef.current = true;
     setLoading(false);
     setActiveChatId(chatId);
-    localStorage.setItem(STORAGE_ACTIVE_PREFIX + currentUserId, chatId);
+    persistConversations(conversations, chatId, currentUserId);
     setIsHistoryOpen(false);
     setInput('');
     window.requestAnimationFrame(() => {
@@ -750,12 +846,10 @@ export default function Kael() {
       return;
     }
 
-    const userId = effectiveUser?.id || user?.id || authUser?.id;
+    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
 
     // 1. Immediately record in deleted blacklist so it is never re-discovered
-    if (userId) {
-      recordDeletedChatId(userId, chatId);
-    }
+    recordDeletedChatId(currentUserId, chatId);
 
     // 2. Remove only messages belonging to this chat from in-memory state
     setMessages((prev) => prev.filter((m) => getMessageChatId(m) !== chatId));
@@ -765,17 +859,12 @@ export default function Kael() {
       const remaining = prev.filter((c) => c.id !== chatId);
 
       if (remaining.length > 0) {
-        if (userId) {
-          localStorage.setItem(STORAGE_CHATS_PREFIX + userId, JSON.stringify(remaining));
-        }
-        // If the chat being deleted was the active one, switch to the first remaining chat
+        let nextActiveId = activeChatId;
         if (activeChatId === chatId) {
-          const nextActiveId = remaining[0].id;
+          nextActiveId = remaining[0].id;
           setActiveChatId(nextActiveId);
-          if (userId) {
-            localStorage.setItem(STORAGE_ACTIVE_PREFIX + userId, nextActiveId);
-          }
         }
+        persistConversations(remaining, nextActiveId, currentUserId);
         return remaining;
       }
 
@@ -787,15 +876,12 @@ export default function Kael() {
         updated_at: new Date().toISOString(),
         last_message: '',
       };
-      if (userId) {
-        localStorage.setItem(STORAGE_CHATS_PREFIX + userId, JSON.stringify([freshChat]));
-        localStorage.setItem(STORAGE_ACTIVE_PREFIX + userId, freshChat.id);
-      }
+      persistConversations([freshChat], freshChat.id, currentUserId);
       setActiveChatId(freshChat.id);
       return [freshChat];
     });
 
-    // 4. Delete only this chat's messages from Supabase
+    // 4. Delete only this chat's messages from database
     try {
       await supabaseApi.entities.KaelMessage.deleteChat(chatId);
     } catch (err) {
@@ -807,12 +893,12 @@ export default function Kael() {
 
   const handleRenameChat = (chatId, newTitle) => {
     const cleanTitle = (newTitle || '').trim() || 'Chat';
-    const currentUserId = user?.id || authUser?.id || 'guest';
+    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
     setConversations((prev) => {
       const next = prev.map((c) =>
         c.id === chatId ? { ...c, title: cleanTitle } : c
       );
-      localStorage.setItem(STORAGE_CHATS_PREFIX + currentUserId, JSON.stringify(next));
+      persistConversations(next, activeChatId, currentUserId);
       return next;
     });
     setEditingChatId(null);
@@ -1460,8 +1546,8 @@ export default function Kael() {
               new Date(b.updated_at || b.created_at || 0).getTime() -
               new Date(a.updated_at || a.created_at || 0).getTime()
           );
-          const currentUserId = user?.id || authUser?.id || 'guest';
-          localStorage.setItem(STORAGE_CHATS_PREFIX + currentUserId, JSON.stringify(next));
+          const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
+          persistConversations(next, currentChatId, currentUserId);
           return next;
         });
 
@@ -1642,15 +1728,14 @@ export default function Kael() {
               h-9
               rounded-2xl
               bg-gradient-to-br
-              from-primary/25
+              from-primary/30
               to-primary/10
               flex
               items-center
               justify-center
               border
-              border-primary/30
-              shadow-sm
-              shadow-primary/20
+              border-primary/45
+              shadow-[0_0_18px_rgba(37,99,235,0.4)]
             ">
               <Zap className="
                 w-4
@@ -1662,7 +1747,6 @@ export default function Kael() {
               className="absolute -bottom-0.5 -right-0.5 flex h-2.5 w-2.5"
               title="Kael Active"
             >
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-accent opacity-60" />
               <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-accent ring-2 ring-card" />
             </span>
           </div>
@@ -1682,7 +1766,7 @@ export default function Kael() {
               </h1>
 
               <span className="text-[10px] font-semibold text-accent uppercase tracking-wider hidden xs:inline">
-                · AI Performance Coach
+                · Performance Coach
               </span>
             </div>
 
@@ -2126,8 +2210,8 @@ export default function Kael() {
               hover:from-primary/95
               hover:to-blue-600/95
               text-white
-              shadow-md
-              shadow-primary/25
+              shadow-[0_0_20px_rgba(37,99,235,0.45)]
+              hover:shadow-[0_0_28px_rgba(37,99,235,0.65)]
               disabled:opacity-40
               disabled:shadow-none
               flex-shrink-0

@@ -4,6 +4,54 @@
     <meta charset="UTF-8" />
     <script>
       (function() {
+        // Neutralize Vite HMR WebSocket in preview iframe so it never attempts a doomed connection
+        // and never triggers "WebSocket closed without opened" in @vite/client
+        if (typeof window !== 'undefined' && window.WebSocket) {
+          var NativeWS = window.WebSocket;
+          var SafeWS = function(url, protocols) {
+            var isHmr = (
+              protocols === 'vite-hmr' ||
+              (Array.isArray(protocols) && protocols.indexOf('vite-hmr') !== -1) ||
+              (typeof url === 'string' && (url.indexOf('vite-hmr') !== -1 || url.indexOf('ais-dev-') !== -1 || url.indexOf('/@vite') !== -1))
+            );
+            if (isHmr) {
+              var listeners = {};
+              var dummy = {
+                binaryType: 'blob',
+                bufferedAmount: 0,
+                extensions: '',
+                protocol: 'vite-hmr',
+                readyState: 1, // WebSocket.OPEN
+                url: String(url),
+                send: function() {},
+                close: function() {},
+                addEventListener: function(type, fn) {
+                  listeners[type] = listeners[type] || [];
+                  listeners[type].push(fn);
+                },
+                removeEventListener: function(type, fn) {
+                  if (!listeners[type]) return;
+                  var i = listeners[type].indexOf(fn);
+                  if (i !== -1) listeners[type].splice(i, 1);
+                },
+                dispatchEvent: function() { return true; },
+                onopen: null,
+                onmessage: null,
+                onerror: null,
+                onclose: null,
+              };
+              return dummy;
+            }
+            return new (Function.prototype.bind.apply(NativeWS, [null].concat(Array.prototype.slice.call(arguments))))();
+          };
+          SafeWS.prototype = NativeWS.prototype;
+          SafeWS.CONNECTING = 0;
+          SafeWS.OPEN = 1;
+          SafeWS.CLOSING = 2;
+          SafeWS.CLOSED = 3;
+          window.WebSocket = SafeWS;
+        }
+
         function isExtensionNoise(msg, src, err) {
           var str = '';
           try {
@@ -16,10 +64,10 @@
             str = '';
           }
           return (
-            str.indexOf('WebSocket closed without opened') !== -1 ||
-            str.indexOf('[vite]') !== -1 && str.indexOf('WebSocket') !== -1 ||
-            str.indexOf('@vite/client') !== -1 && str.indexOf('WebSocket') !== -1 ||
-            str.indexOf('WebSocket') !== -1 && str.indexOf('ais-dev-') !== -1 ||
+            str.indexOf('WebSocket') !== -1 ||
+            str.indexOf('closed without opened') !== -1 ||
+            str.indexOf('[vite]') !== -1 ||
+            str.indexOf('@vite/client') !== -1 ||
             str.indexOf('chrome-extension://') !== -1 ||
             str.indexOf('moz-extension://') !== -1 ||
             str.indexOf('safari-extension://') !== -1 ||

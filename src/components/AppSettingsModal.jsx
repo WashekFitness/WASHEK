@@ -15,20 +15,16 @@ import {
   LogOut,
   Trash2,
   Dumbbell,
-  Sparkles,
   RefreshCw,
   ShieldCheck,
+  Shield,
   HeartPulse,
 } from 'lucide-react';
 
 import { useQuery } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
-import { Switch } from '@/components/ui/switch';
-import { generateNewProgram } from '@/lib/programService';
 import { useProgramCooldown } from '@/lib/programCooldown';
-import { isActualRestDay } from '@/lib/streakUtils';
-import { getLocalDateKey, getUserTimeZone, getDayOfWeekName } from '@/lib/dateUtils';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 
 import {
@@ -46,18 +42,6 @@ import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
 import { toast } from 'sonner';
-
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog';
 
 
 function SearchableDropdown({
@@ -475,11 +459,9 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
   const {
     settings,
     updateSettings,
-    toggleManualRestDay,
-    isRestDayMarked,
   } = useAppSettings();
 
-  const { logout, user } = useAuth();
+  const { logout, user, deleteAccount, changePassword } = useAuth();
   const navigate = useNavigate();
   const { isLocked: isProgramLocked, remainingDays: programRemainingDays } = useProgramCooldown(user);
 
@@ -496,14 +478,6 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
   });
   const activeProgram = programs[0] ? normalizeWorkoutProgram(programs[0]) : null;
 
-  const effectiveTz = getUserTimeZone(user);
-  const todayKey = getLocalDateKey(new Date(), effectiveTz);
-  const todayDayName = getDayOfWeekName(new Date(), effectiveTz);
-  const todayIsActualRestDay = isActualRestDay(todayKey, activeProgram, user, effectiveTz);
-  const isTodayMarkedRest = isRestDayMarked
-    ? isRestDayMarked(todayKey)
-    : Boolean(settings?.manualRestDays?.[todayKey]);
-
   const [open, setOpen] =
     useState(false);
 
@@ -513,10 +487,12 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
     );
 
   const [showChangePassword, setShowChangePassword] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
   const [changingPassword, setChangingPassword] = useState(false);
   const [deletingAccount, setDeletingAccount] = useState(false);
+  const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
 
   // Training program regeneration state
@@ -554,6 +530,13 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
     'calisthenics';
 
   const handleProceedToOnboarding = () => {
+    if (isProgramLocked) {
+      toast.error(
+        `Workout program generation is locked. You can generate a new program in ${programRemainingDays} day${programRemainingDays === 1 ? '' : 's'}.`
+      );
+      setConfirmRegenerateOpen(false);
+      return;
+    }
     setConfirmRegenerateOpen(false);
     closeModal();
     navigate('/onboarding');
@@ -609,6 +592,7 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
 
   const closeChangePassword = () => {
     setShowChangePassword(false);
+    setCurrentPassword('');
     setNewPassword('');
     setConfirmNewPassword('');
   };
@@ -629,11 +613,32 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
     setChangingPassword(true);
 
     try {
-      const { error } = await supabase.auth.updateUser({
-        password: newPassword,
-      });
-
-      if (error) throw error;
+      if (changePassword) {
+        await changePassword({
+          newPassword,
+          currentPassword: currentPassword || undefined,
+          email: user?.email,
+        });
+      } else {
+        const token = localStorage.getItem('washek_auth_token') || '';
+        const res = await fetch('/api/auth/change-password', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(token ? { Authorization: `Bearer ${token}` } : {}),
+          },
+          body: JSON.stringify({
+            newPassword,
+            currentPassword: currentPassword || undefined,
+            email: user?.email,
+            accessToken: token || undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data?.success) {
+          throw new Error(data?.error || 'Unable to update password.');
+        }
+      }
 
       toast.success('Password changed successfully.');
       closeChangePassword();
@@ -678,35 +683,14 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
     setDeletingAccount(true);
 
     try {
-      const {
-        data,
-        error,
-      } =
-        await supabase.functions.invoke(
-          'delete-account',
-          {
-            body: {},
-          }
-        );
-
-      if (error) {
-        throw error;
+      if (deleteAccount) {
+        await deleteAccount();
+      } else {
+        await logout();
       }
 
-      if (!data?.success) {
-        throw new Error(
-          data?.error ||
-            'Failed to delete your account.'
-        );
-      }
-
+      setConfirmDeleteOpen(false);
       closeModal();
-      await logout();
-      try {
-        await supabaseApi.auth.logout();
-      } catch (err) {
-        console.debug('[SETTINGS] Secondary auth cleanup error:', err);
-      }
 
       toast.success(
         'Your account has been permanently deleted.'
@@ -1231,70 +1215,6 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                   </p>
                 </div>
 
-                {/* Rest Day & Recovery */}
-                <div>
-                  <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
-                    <Moon className="w-3.5 h-3.5 text-primary" />
-                    Rest Day &amp; Recovery
-                  </p>
-
-                  <div className="p-3.5 rounded-2xl border border-border bg-muted/20 space-y-2">
-                    <div className="flex items-center justify-between gap-3">
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm font-semibold text-foreground">
-                            Mark Today as Rest Day
-                          </p>
-                          <span
-                            className={cn(
-                              "text-[10px] font-bold px-2 py-0.5 rounded-full uppercase tracking-wider",
-                              todayIsActualRestDay
-                                ? isTodayMarkedRest
-                                  ? "bg-emerald-500/15 text-emerald-500 border border-emerald-500/30"
-                                  : "bg-primary/10 text-primary border border-primary/20"
-                                : "bg-muted text-muted-foreground border border-border"
-                            )}
-                          >
-                            {todayIsActualRestDay
-                              ? isTodayMarkedRest
-                                ? 'Active Rest Day'
-                                : 'Scheduled Rest'
-                              : 'Workout Day'}
-                          </span>
-                        </div>
-                        <p className="text-xs text-muted-foreground mt-1 leading-relaxed">
-                          {todayIsActualRestDay
-                            ? isTodayMarkedRest
-                              ? `Today (${todayDayName}) is marked as a Rest Day. Shown on your dashboard and streak is protected.`
-                              : `Today (${todayDayName}) is a scheduled rest day. Toggle on to show it on your dashboard and ensure your streak is preserved.`
-                            : `Only works for actual rest days. Today (${todayDayName}) is a scheduled workout session.`}
-                        </p>
-                      </div>
-
-                      <Switch
-                        id="toggle-rest-day"
-                        checked={isTodayMarkedRest}
-                        disabled={!todayIsActualRestDay}
-                        onCheckedChange={(checked) => {
-                          if (!todayIsActualRestDay) {
-                            toast.error("Rest day marking only works for actual rest days.");
-                            return;
-                          }
-                          toggleManualRestDay(todayKey);
-                          if (checked) {
-                            toast.success("Today marked as a Rest Day. Your streak is protected.");
-                          } else {
-                            toast.info("Rest day marker removed.");
-                          }
-                        }}
-                      />
-                    </div>
-                  </div>
-                  <p className="text-[11px] text-muted-foreground mt-1.5 px-0.5 leading-normal">
-                    Manually marking a rest day prevents accidental streak resets while leaving your workout program untouched.
-                  </p>
-                </div>
-
                 {/* Change Password */}
 
                 <div>
@@ -1375,95 +1295,35 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                       )}
                     </button>
 
-
-                    <AlertDialog>
-
-                      <AlertDialogTrigger
-                        asChild
-                      >
-
-                        <button
-                          type="button"
-                          disabled={deletingAccount}
-                          className="
-                            w-full
-                            h-12
-                            rounded-xl
-                            border
-                            border-border
-                            bg-muted/30
-                            text-sm
-                            font-semibold
-                            text-destructive/70
-                            hover:border-destructive/40
-                            hover:bg-muted
-                            hover:text-destructive
-                            transition-all
-                            pointer-events-auto
-                            touch-manipulation
-                            flex
-                            items-center
-                            justify-center
-                            gap-2
-                          "
-                        >
-                          <Trash2 className="w-4 h-4" />
-                          Delete Account
-                        </button>
-
-                      </AlertDialogTrigger>
-
-
-                      <AlertDialogContent>
-
-                        <AlertDialogHeader>
-
-                          <AlertDialogTitle>
-                            Delete Account
-                          </AlertDialogTitle>
-
-                          <AlertDialogDescription>
-                            This will permanently delete your account
-                            and all associated data including your workout
-                            programs, logs, nutrition entries, and progress
-                            photos. This action cannot be undone.
-                          </AlertDialogDescription>
-
-                        </AlertDialogHeader>
-
-
-                        <AlertDialogFooter>
-
-                          <AlertDialogCancel
-                            disabled={deletingAccount}
-                          >
-                            Cancel
-                          </AlertDialogCancel>
-
-
-                          <AlertDialogAction
-                            className="
-                              bg-destructive
-                              text-destructive-foreground
-                              hover:bg-destructive/90
-                            "
-                            onClick={
-                              handleDeleteAccount
-                            }
-                            disabled={
-                              deletingAccount
-                            }
-                          >
-                            {deletingAccount
-                              ? 'Deleting...'
-                              : 'Delete My Account'}
-                          </AlertDialogAction>
-
-                        </AlertDialogFooter>
-
-                      </AlertDialogContent>
-
-                    </AlertDialog>
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDeleteOpen(true)}
+                      disabled={deletingAccount}
+                      className="
+                        w-full
+                        h-12
+                        rounded-xl
+                        border
+                        border-border
+                        bg-muted/30
+                        text-sm
+                        font-semibold
+                        text-destructive/70
+                        hover:border-destructive/40
+                        hover:bg-muted
+                        hover:text-destructive
+                        transition-all
+                        pointer-events-auto
+                        touch-manipulation
+                        flex
+                        items-center
+                        justify-center
+                        gap-2
+                      "
+                    >
+                      <Trash2 className="w-4 h-4" />
+                      Delete Account
+                    </button>
 
                   </div>
 
@@ -1548,7 +1408,15 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
               <form onSubmit={handleChangePassword} className="space-y-4">
                 <Input
                   type="password"
-                  placeholder="New password"
+                  placeholder="Current password (optional)"
+                  value={currentPassword}
+                  onChange={(event) => setCurrentPassword(event.target.value)}
+                  autoComplete="current-password"
+                />
+
+                <Input
+                  type="password"
+                  placeholder="New password (min 6 chars)"
                   value={newPassword}
                   onChange={(event) => setNewPassword(event.target.value)}
                   minLength={6}
@@ -1594,7 +1462,7 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
               <div className="flex items-start justify-between gap-3">
                 <div className="space-y-1">
                   <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-primary/10 text-primary border border-primary/20">
-                    <Sparkles className="w-3.5 h-3.5" />
+                    <Dumbbell className="w-3.5 h-3.5" />
                     <span>New Program Onboarding</span>
                   </div>
                   <h2 className="font-heading font-bold text-xl text-foreground">
@@ -1649,11 +1517,106 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                 </Button>
                 <Button
                   type="button"
+                  disabled={isProgramLocked}
                   onClick={handleProceedToOnboarding}
-                  className="w-full sm:w-1/2 h-12 rounded-xl font-heading font-semibold text-xs shadow-md order-1 sm:order-2"
+                  className={cn(
+                    "w-full sm:w-1/2 h-12 rounded-xl font-heading font-semibold text-xs shadow-md order-1 sm:order-2",
+                    isProgramLocked && "opacity-60 cursor-not-allowed"
+                  )}
                 >
-                  <Sparkles className="w-4 h-4 mr-2" />
-                  Continue to Onboarding
+                  {isProgramLocked ? (
+                    <>
+                      <Lock className="w-4 h-4 mr-2" />
+                      Locked ({programRemainingDays}d)
+                    </>
+                  ) : (
+                    <>
+                      <Dumbbell className="w-4 h-4 mr-2" />
+                      Continue to Onboarding
+                    </>
+                  )}
+                </Button>
+              </div>
+            </section>
+          </div>,
+          document.body
+        )
+      : null;
+
+  const confirmDeleteModal =
+    confirmDeleteOpen &&
+    typeof document !== 'undefined'
+      ? createPortal(
+          <div
+            className="fixed inset-0 z-[99999] isolate flex items-center justify-center p-4 bg-black/80 backdrop-blur-md"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Delete Account Confirmation"
+          >
+            {/* Backdrop click to dismiss */}
+            <div
+              className="absolute inset-0 bg-black/70"
+              onClick={() => {
+                if (!deletingAccount) setConfirmDeleteOpen(false);
+              }}
+            />
+
+            <section className="relative z-10 w-full max-w-sm rounded-3xl border border-destructive/30 bg-card p-6 shadow-2xl space-y-4">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-10 h-10 rounded-2xl bg-destructive/15 border border-destructive/25 flex items-center justify-center text-destructive shrink-0">
+                    <Trash2 className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h2 className="font-heading font-bold text-lg text-foreground">
+                      Delete Account
+                    </h2>
+                    <p className="text-xs text-muted-foreground">
+                      Permanent and irreversible
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteOpen(false)}
+                  disabled={deletingAccount}
+                  aria-label="Close dialog"
+                  className="w-8 h-8 rounded-xl bg-muted hover:bg-muted/80 flex items-center justify-center shrink-0 transition-colors"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+
+              <p className="text-xs text-muted-foreground leading-relaxed">
+                This will permanently delete your account and all associated data including your workout programs, logs, nutrition entries, Coach Kael chats, and progress photos.
+              </p>
+
+              <div className="p-3 rounded-2xl bg-destructive/10 border border-destructive/20 text-[11px] text-destructive-foreground/90 space-y-1">
+                <span className="font-semibold text-foreground flex items-center gap-1.5">
+                  <Shield className="w-3.5 h-3.5 text-primary" /> Automatic Subscription Cancellation
+                </span>
+                <p className="text-muted-foreground leading-normal">
+                  If you have an active paid subscription (Progress, Performance, or Elite), it will be automatically canceled with Stripe immediately. You will not be billed again.
+                </p>
+              </div>
+
+              <div className="flex flex-col sm:flex-row gap-2 pt-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => setConfirmDeleteOpen(false)}
+                  disabled={deletingAccount}
+                  className="w-full sm:w-1/2 h-11 rounded-xl text-xs font-semibold order-2 sm:order-1"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  onClick={handleDeleteAccount}
+                  disabled={deletingAccount}
+                  className="w-full sm:w-1/2 h-11 rounded-xl text-xs font-semibold bg-destructive text-destructive-foreground hover:bg-destructive/90 order-1 sm:order-2"
+                >
+                  {deletingAccount ? 'Deleting...' : 'Delete & Cancel Subscription'}
                 </Button>
               </div>
             </section>
@@ -1709,6 +1672,7 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
       {modal}
       {changePasswordModal}
       {confirmRegenerateModal}
+      {confirmDeleteModal}
 
     </>
   );

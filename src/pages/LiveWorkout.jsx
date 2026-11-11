@@ -1943,7 +1943,7 @@ export default function LiveWorkout() {
                     {allDone ? (
                       <CheckCircle2 className="w-4 h-4 text-accent flex-shrink-0" />
                     ) : i === exIndex ? (
-                      <div className="w-2 h-2 bg-primary rounded-full flex-shrink-0 animate-pulse ml-1" />
+                      <div className="w-2 h-2 bg-primary rounded-full flex-shrink-0 shadow-[0_0_8px_rgba(37,99,235,0.8)] ml-1" />
                     ) : (
                       <Circle className="w-4 h-4 text-muted-foreground flex-shrink-0" />
                     )}

@@ -71,180 +71,375 @@ function BodyHeatmapMap({ distribution, selectedMuscle, onSelectMuscle, mode }) 
       </div>
 
       {/* Anatomical Heatmap SVG */}
-      <div className="relative w-48 h-64 sm:w-56 sm:h-72 flex items-center justify-center select-none">
+      <div className="relative w-52 h-76 sm:w-60 sm:h-84 flex items-center justify-center select-none">
         <svg
-          viewBox="0 0 200 280"
+          viewBox="0 0 200 300"
+          preserveAspectRatio="xMidYMid meet"
           className="w-full h-full drop-shadow-md transition-all duration-300"
           xmlns="http://www.w3.org/2000/svg"
         >
-          {/* Base Head & Neck */}
-          <ellipse cx="100" cy="24" rx="14" ry="18" fill="#475569" opacity="0.6" />
-          <path d="M93 42 L107 42 L109 52 L91 52 Z" fill="#475569" opacity="0.6" />
+          {/* Base Head & Neck (Sculpted Athletic Cranium & Jaw) */}
+          <ellipse cx="100" cy="18" rx="8.5" ry="11.5" fill="#334155" opacity="0.8" />
+          <path d="M93 21 L95 28 Q100 32 105 28 L107 21 Z" fill="#334155" opacity="0.85" />
+          <path d="M96 28 L95 38 L105 38 L104 28 Z" fill="#1e293b" opacity="0.9" />
 
           {viewSide === 'front' ? (
-            /* ── ANTERIOR / FRONT VIEW ── */
+            /* ── ANTERIOR / FRONT VIEW (Ultra-Aesthetic Men's Physique Golden Ratio) ── */
             <g className="transition-all duration-300">
-              {/* Shoulders / Anterior Delts */}
-              <path
-                d="M68 55 C60 58 54 70 56 82 C62 82 72 74 74 65 Z"
-                fill={getHeatFill('shoulders')}
-                opacity={getHeatOpacity('shoulders')}
-                onClick={() => onSelectMuscle('shoulders')}
+              {/* Upper Trapezius (Clavicular Slope) */}
+              <g
+                onClick={() => onSelectMuscle('traps')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M132 55 C140 58 146 70 144 82 C138 82 128 74 126 65 Z"
-                fill={getHeatFill('shoulders')}
-                opacity={getHeatOpacity('shoulders')}
-                onClick={() => onSelectMuscle('shoulders')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
+              >
+                <path
+                  d="M95 30 C91 35 83 39 71 43 L75 45 C85 41 93 37 96 32 Z"
+                  fill={getHeatFill('traps')}
+                  opacity={getHeatOpacity('traps')}
+                />
+                <path
+                  d="M105 30 C109 35 117 39 129 43 L125 45 C115 41 107 37 104 32 Z"
+                  fill={getHeatFill('traps')}
+                  opacity={getHeatOpacity('traps')}
+                />
+              </g>
 
-              {/* Chest / Pectorals */}
-              <path
-                d="M74 58 C85 57 97 60 99 76 C94 88 78 88 72 82 C68 74 70 64 74 58 Z"
-                fill={getHeatFill('chest')}
-                opacity={getHeatOpacity('chest')}
+              {/* Shoulders / Lateral & Anterior Deltoid Capping (Broad 3D Caps) */}
+              <g
+                onClick={() => onSelectMuscle('shoulders')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                {/* Left Deltoid */}
+                <path
+                  d="M71 42 C56 44 49 53 49 64 C49 74 57 80 62 80 C65 77 67 71 68 63 C68 55 69 47 71 42 Z"
+                  fill={getHeatFill('shoulders')}
+                  opacity={getHeatOpacity('shoulders')}
+                />
+                {/* Right Deltoid */}
+                <path
+                  d="M129 42 C144 44 151 53 151 64 C151 74 143 80 138 80 C135 77 133 71 132 63 C132 55 131 47 129 42 Z"
+                  fill={getHeatFill('shoulders')}
+                  opacity={getHeatOpacity('shoulders')}
+                />
+              </g>
+
+              {/* Chest / Sculpted Upper Pectoral Shelf */}
+              <g
                 onClick={() => onSelectMuscle('chest')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M126 58 C115 57 103 60 101 76 C106 88 122 88 128 82 C132 74 130 64 126 58 Z"
-                fill={getHeatFill('chest')}
-                opacity={getHeatOpacity('chest')}
-                onClick={() => onSelectMuscle('chest')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
+              >
+                {/* Left Pec */}
+                <path
+                  d="M99 43 C88 42 77 43 70 46 C66 56 66 66 67 72 C74 78 88 80 99 79 Z"
+                  fill={getHeatFill('chest')}
+                  opacity={getHeatOpacity('chest')}
+                />
+                {/* Right Pec */}
+                <path
+                  d="M101 43 C112 42 123 43 130 46 C134 56 134 66 133 72 C126 78 112 80 101 79 Z"
+                  fill={getHeatFill('chest')}
+                  opacity={getHeatOpacity('chest')}
+                />
+                <line x1="100" y1="41" x2="100" y2="80" stroke="#0f172a" strokeWidth="0.8" opacity="0.6" />
+              </g>
 
-              {/* Biceps */}
-              <path
-                d="M54 84 C50 94 52 108 56 116 C60 114 64 104 62 88 Z"
-                fill={getHeatFill('biceps')}
-                opacity={getHeatOpacity('biceps')}
-                onClick={() => onSelectMuscle('biceps')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M146 84 C150 94 148 108 144 116 C140 114 136 104 138 88 Z"
-                fill={getHeatFill('biceps')}
-                opacity={getHeatOpacity('biceps')}
-                onClick={() => onSelectMuscle('biceps')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-
-              {/* Forearms */}
-              <path d="M52 118 C46 130 44 145 42 154 C46 154 54 136 56 122 Z" fill="#64748b" opacity="0.4" />
-              <path d="M148 118 C154 130 156 145 158 154 C154 154 146 136 144 122 Z" fill="#64748b" opacity="0.4" />
-
-              {/* Core / Abdominals */}
-              <path
-                d="M84 92 C94 90 106 90 116 92 C118 114 114 136 108 144 C104 148 96 148 92 144 C86 136 82 114 84 92 Z"
-                fill={getHeatFill('core')}
-                opacity={getHeatOpacity('core')}
-                onClick={() => onSelectMuscle('core')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-
-              {/* Quadriceps (Upper Legs) */}
-              <path
-                d="M80 148 C72 165 70 190 75 208 C84 210 93 192 95 168 C94 155 88 150 80 148 Z"
-                fill={getHeatFill('quads')}
-                opacity={getHeatOpacity('quads')}
-                onClick={() => onSelectMuscle('quads')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M120 148 C128 165 130 190 125 208 C116 210 107 192 105 168 C106 155 112 150 120 148 Z"
-                fill={getHeatFill('quads')}
-                opacity={getHeatOpacity('quads')}
-                onClick={() => onSelectMuscle('quads')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-
-              {/* Calves (Anterior Lower Legs) */}
-              <path
-                d="M74 216 C70 230 72 255 76 268 C80 268 86 248 88 230 C88 220 82 216 74 216 Z"
-                fill={getHeatFill('calves')}
-                opacity={getHeatOpacity('calves')}
-                onClick={() => onSelectMuscle('calves')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M126 216 C130 230 128 255 124 268 C120 268 114 248 112 230 C112 220 118 216 126 216 Z"
-                fill={getHeatFill('calves')}
-                opacity={getHeatOpacity('calves')}
-                onClick={() => onSelectMuscle('calves')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-            </g>
-          ) : (
-            /* ── POSTERIOR / BACK VIEW ── */
-            <g className="transition-all duration-300">
-              {/* Rear Delts & Traps */}
-              <path
-                d="M82 48 C92 46 108 46 118 48 C126 56 138 65 142 74 C132 76 126 70 120 66 C108 64 92 64 80 66 C74 70 68 76 58 74 C62 65 74 56 82 48 Z"
-                fill={getHeatFill('shoulders')}
-                opacity={getHeatOpacity('shoulders')}
-                onClick={() => onSelectMuscle('shoulders')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
-
-              {/* Back & Lats */}
-              <path
-                d="M72 68 C84 66 116 66 128 68 C124 94 116 118 108 132 C104 135 96 135 92 132 C84 118 76 94 72 68 Z"
-                fill={getHeatFill('back')}
-                opacity={getHeatOpacity('back')}
+              {/* Lats (Sleek V-Taper visible from front) */}
+              <g
                 onClick={() => onSelectMuscle('back')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
+              >
+                {/* Left Lat Wing */}
+                <path
+                  d="M68 74 C65 82 66 92 70 104 C74 106 77 101 78 93 C77 86 73 78 68 74 Z"
+                  fill={getHeatFill('back')}
+                  opacity={getHeatOpacity('back')}
+                />
+                {/* Right Lat Wing */}
+                <path
+                  d="M132 74 C135 82 134 92 130 104 C126 106 123 101 122 93 C123 86 127 78 132 74 Z"
+                  fill={getHeatFill('back')}
+                  opacity={getHeatOpacity('back')}
+                />
+              </g>
 
-              {/* Triceps */}
-              <path
-                d="M55 80 C52 92 50 108 55 116 C60 114 64 104 63 86 Z"
-                fill={getHeatFill('triceps')}
-                opacity={getHeatOpacity('triceps')}
-                onClick={() => onSelectMuscle('triceps')}
+              {/* Biceps & Forearms (Athletic & Sculpted) */}
+              <g
+                onClick={() => onSelectMuscle('biceps')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M145 80 C148 92 150 108 145 116 C140 114 136 104 137 86 Z"
-                fill={getHeatFill('triceps')}
-                opacity={getHeatOpacity('triceps')}
-                onClick={() => onSelectMuscle('triceps')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
+              >
+                {/* Left Bicep */}
+                <path
+                  d="M62 80 C54 81 50 89 50 99 C52 105 56 107 59 107 C62 107 65 101 66 93 C66 88 65 82 62 80 Z"
+                  fill={getHeatFill('biceps')}
+                  opacity={getHeatOpacity('biceps')}
+                />
+                {/* Right Bicep */}
+                <path
+                  d="M138 80 C146 81 150 89 150 99 C148 105 144 107 141 107 C138 107 135 101 134 93 C134 88 135 82 138 80 Z"
+                  fill={getHeatFill('biceps')}
+                  opacity={getHeatOpacity('biceps')}
+                />
+                {/* Left Forearm */}
+                <path
+                  d="M59 107 C51 110 48 123 52 138 C54 146 57 149 59 149 C62 149 64 143 65 132 C65 121 62 112 59 107 Z"
+                  fill={getHeatFill('biceps')}
+                  opacity={getHeatOpacity('biceps')}
+                />
+                {/* Right Forearm */}
+                <path
+                  d="M141 107 C149 110 152 123 148 138 C146 146 143 149 141 149 C138 149 136 143 135 132 C135 121 138 112 141 107 Z"
+                  fill={getHeatFill('biceps')}
+                  opacity={getHeatOpacity('biceps')}
+                />
+                {/* Hands */}
+                <path d="M59 149 L57 156 C56 163 58 168 59 168 C60 168 62 163 61 156 Z" fill="#334155" opacity="0.6" />
+                <path d="M141 149 L143 156 C144 163 142 168 141 168 C140 168 138 163 139 156 Z" fill="#334155" opacity="0.6" />
+              </g>
 
-              {/* Hamstrings & Glutes (Posterior Thighs) */}
-              <path
-                d="M80 142 C72 165 70 192 76 210 C85 212 94 195 96 168 C96 150 90 144 80 142 Z"
-                fill={getHeatFill('hamstrings_glutes')}
-                opacity={getHeatOpacity('hamstrings_glutes')}
-                onClick={() => onSelectMuscle('hamstrings_glutes')}
+              {/* Core / Aesthetic Chiseled 8-Pack & Sculpted Waist */}
+              <g
+                onClick={() => onSelectMuscle('core')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M120 142 C128 165 130 192 124 210 C115 212 106 195 104 168 C104 150 110 144 120 142 Z"
-                fill={getHeatFill('hamstrings_glutes')}
-                opacity={getHeatOpacity('hamstrings_glutes')}
-                onClick={() => onSelectMuscle('hamstrings_glutes')}
-                className="cursor-pointer hover:brightness-125 transition-all"
-              />
+              >
+                {/* Left Abdominals (Proportional 4-Tier Aesthetic Column X: 81-98) */}
+                <path
+                  d="M98 80 C89 80 81 82 81 90 C87 91 93 91 98 90 Z M98 92 C89 92 81 94 81 102 C87 103 93 103 98 102 Z M98 104 C89 104 82 106 82 114 C87 115 93 115 98 114 Z M98 116 C89 116 83 119 83 129 C88 131 93 131 98 130 Z"
+                  fill={getHeatFill('core')}
+                  opacity={getHeatOpacity('core')}
+                />
+                {/* Right Abdominals (Proportional 4-Tier Aesthetic Column X: 102-119) */}
+                <path
+                  d="M102 80 C111 80 119 82 119 90 C113 91 107 91 102 90 Z M102 92 C111 92 119 94 119 102 C113 103 107 103 102 102 Z M102 104 C111 104 118 106 118 114 C113 115 107 115 102 114 Z M102 116 C111 116 117 119 117 129 C112 131 107 131 102 130 Z"
+                  fill={getHeatFill('core')}
+                  opacity={getHeatOpacity('core')}
+                />
+                {/* Serratus Anterior & Obliques Hugging Core Wall */}
+                <path
+                  d="M80 88 C74 88 72 95 72 106 C72 118 76 128 82 135 C83 136 84 132 83 126 C81 116 80 102 80 88 Z"
+                  fill={getHeatFill('core')}
+                  opacity={getHeatOpacity('core')}
+                />
+                <path
+                  d="M120 88 C126 88 128 95 128 106 C128 118 124 128 118 135 C117 136 116 132 117 126 C119 116 120 102 120 88 Z"
+                  fill={getHeatFill('core')}
+                  opacity={getHeatOpacity('core')}
+                />
+                {/* Linea Alba Center Split Line */}
+                <line x1="100" y1="80" x2="100" y2="132" stroke="#0f172a" strokeWidth="0.8" opacity="0.6" />
+                {/* Navel */}
+                <ellipse cx="100" cy="111" rx="1.2" ry="1.4" fill="#0f172a" opacity="0.85" />
+              </g>
 
-              {/* Calves (Gastrocnemius / Soleus) */}
-              <path
-                d="M74 216 C68 230 70 255 76 268 C82 268 88 248 88 230 C88 220 82 216 74 216 Z"
-                fill={getHeatFill('calves')}
-                opacity={getHeatOpacity('calves')}
+              {/* Quadriceps (Aesthetic Outer Quad Flare Sweep & Medialis Teardrop) */}
+              <g
+                onClick={() => onSelectMuscle('quads')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                {/* Left Quad Group */}
+                {/* Vastus Lateralis Outer Sweep */}
+                <path
+                  d="M85 135 C70 152 68 180 74 204 C78 206 81 195 82 176 C82 158 84 142 85 135 Z"
+                  fill={getHeatFill('quads')}
+                  opacity={getHeatOpacity('quads')}
+                />
+                {/* Rectus Femoris Center Column */}
+                <path
+                  d="M86 135 C90 135 94 144 94 172 C94 192 90 205 85 211 C82 207 81 195 82 174 C83 156 84 144 86 135 Z"
+                  fill={getHeatFill('quads')}
+                  opacity={getHeatOpacity('quads')}
+                />
+                {/* Vastus Medialis Teardrop */}
+                <path
+                  d="M93 180 C97 186 98 200 95 210 C92 212 88 211 87 208 C88 200 91 190 93 180 Z"
+                  fill={getHeatFill('quads')}
+                  opacity={getHeatOpacity('quads')}
+                />
+
+                {/* Right Quad Group */}
+                {/* Vastus Lateralis Outer Sweep */}
+                <path
+                  d="M115 135 C130 152 132 180 126 204 C122 206 119 195 118 176 C118 158 116 142 115 135 Z"
+                  fill={getHeatFill('quads')}
+                  opacity={getHeatOpacity('quads')}
+                />
+                {/* Rectus Femoris Center Column */}
+                <path
+                  d="M114 135 C110 135 106 144 106 172 C106 192 110 205 115 211 C118 207 119 195 118 174 C117 156 116 144 114 135 Z"
+                  fill={getHeatFill('quads')}
+                  opacity={getHeatOpacity('quads')}
+                />
+                {/* Vastus Medialis Teardrop */}
+                <path
+                  d="M107 180 C103 186 102 200 105 210 C108 212 112 211 113 208 C112 200 109 190 107 180 Z"
+                  fill={getHeatFill('quads')}
+                  opacity={getHeatOpacity('quads')}
+                />
+
+                {/* Patellar Knees (Compact Anatomical Joints) */}
+                <circle cx="84" cy="215" r="3" fill="#334155" opacity="0.8" />
+                <circle cx="116" cy="215" r="3" fill="#334155" opacity="0.8" />
+              </g>
+
+              {/* Calves (Diamond Gastrocnemius & Slender Achilles) */}
+              <g
                 onClick={() => onSelectMuscle('calves')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
-              <path
-                d="M126 216 C132 230 130 255 124 268 C118 268 112 248 112 230 C112 220 118 216 126 216 Z"
-                fill={getHeatFill('calves')}
-                opacity={getHeatOpacity('calves')}
+              >
+                {/* Left Calf */}
+                <path
+                  d="M77 220 C71 234 72 254 78 274 C82 274 85 260 86 244 C86 233 82 223 77 220 Z"
+                  fill={getHeatFill('calves')}
+                  opacity={getHeatOpacity('calves')}
+                />
+                {/* Right Calf */}
+                <path
+                  d="M123 220 C129 234 128 254 122 274 C118 274 115 260 114 244 C114 233 118 223 123 220 Z"
+                  fill={getHeatFill('calves')}
+                  opacity={getHeatOpacity('calves')}
+                />
+                {/* Feet */}
+                <ellipse cx="80" cy="285" rx="5" ry="2.8" fill="#334155" opacity="0.7" />
+                <ellipse cx="120" cy="285" rx="5" ry="2.8" fill="#334155" opacity="0.7" />
+              </g>
+            </g>
+          ) : (
+            /* ── POSTERIOR / BACK VIEW (Sculpted V-Taper & Posterior Chain) ── */
+            <g className="transition-all duration-300">
+              {/* Trapezius (Diamond Kite Back Formation) */}
+              <g
+                onClick={() => onSelectMuscle('traps')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                <path
+                  d="M99 30 L99 110 L87 82 L72 52 L95 32 Z"
+                  fill={getHeatFill('traps')}
+                  opacity={getHeatOpacity('traps')}
+                />
+                <path
+                  d="M101 30 L101 110 L113 82 L128 52 L105 32 Z"
+                  fill={getHeatFill('traps')}
+                  opacity={getHeatOpacity('traps')}
+                />
+              </g>
+
+              {/* Rear Deltoids (Rear Shoulder Caps) */}
+              <g
+                onClick={() => onSelectMuscle('shoulders')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                <path
+                  d="M72 52 C61 54 52 62 52 72 C52 79 58 84 63 86 C66 84 68 78 70 70 C70 64 71 56 72 52 Z"
+                  fill={getHeatFill('shoulders')}
+                  opacity={getHeatOpacity('shoulders')}
+                />
+                <path
+                  d="M128 52 C139 54 148 62 148 72 C148 79 142 84 137 86 C134 84 132 78 130 70 C130 64 129 56 128 52 Z"
+                  fill={getHeatFill('shoulders')}
+                  opacity={getHeatOpacity('shoulders')}
+                />
+              </g>
+
+              {/* Back / Latissimus Dorsi & Erector Spinae (Sleek V-Taper) */}
+              <g
+                onClick={() => onSelectMuscle('back')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                {/* Left Lat Wing */}
+                <path
+                  d="M72 68 C68 78 68 94 72 108 C78 116 84 122 99 124 L99 108 L86 80 Z"
+                  fill={getHeatFill('back')}
+                  opacity={getHeatOpacity('back')}
+                />
+                {/* Right Lat Wing */}
+                <path
+                  d="M128 68 C132 78 132 94 128 108 C122 116 116 122 101 124 L101 108 L114 80 Z"
+                  fill={getHeatFill('back')}
+                  opacity={getHeatOpacity('back')}
+                />
+                {/* Erector Spinae (Christmas Tree Lower Back - Tight & Sculpted) */}
+                <path
+                  d="M99 124 L91 124 C90 132 93 138 99 138 Z"
+                  fill={getHeatFill('back')}
+                  opacity={getHeatOpacity('back')}
+                />
+                <path
+                  d="M101 124 L109 124 C110 132 107 138 101 138 Z"
+                  fill={getHeatFill('back')}
+                  opacity={getHeatOpacity('back')}
+                />
+              </g>
+
+              {/* Triceps (Horseshoe Lateral & Long Heads) */}
+              <g
+                onClick={() => onSelectMuscle('triceps')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                <path
+                  d="M52 72 C46 83 45 98 48 111 C51 111 54 109 57 103 C58 92 57 81 56 74 Z"
+                  fill={getHeatFill('triceps')}
+                  opacity={getHeatOpacity('triceps')}
+                />
+                <path
+                  d="M148 72 C154 83 155 98 152 111 C149 111 146 109 143 103 C142 92 143 81 144 74 Z"
+                  fill={getHeatFill('triceps')}
+                  opacity={getHeatOpacity('triceps')}
+                />
+                {/* Forearms back view */}
+                <path d="M48 111 C43 121 44 137 47 148 C50 148 53 142 54 131 Z" fill="#334155" opacity="0.6" />
+                <path d="M152 111 C157 121 156 137 153 148 C150 148 147 142 146 131 Z" fill="#334155" opacity="0.6" />
+              </g>
+
+              {/* Hamstrings & Glutes (Athletic Glute Shelf & Posterior Thighs) */}
+              <g
+                onClick={() => onSelectMuscle('hamstrings_glutes')}
+                className="cursor-pointer hover:brightness-125 transition-all"
+              >
+                {/* Left Gluteus Maximus */}
+                <path
+                  d="M99 138 C89 138 85 144 85 156 C85 166 93 172 99 171 Z"
+                  fill={getHeatFill('hamstrings_glutes')}
+                  opacity={getHeatOpacity('hamstrings_glutes')}
+                />
+                {/* Right Gluteus Maximus */}
+                <path
+                  d="M101 138 C111 138 115 144 115 156 C115 166 107 172 101 171 Z"
+                  fill={getHeatFill('hamstrings_glutes')}
+                  opacity={getHeatOpacity('hamstrings_glutes')}
+                />
+                {/* Left Hamstring (Biceps Femoris & Semitendinosus) */}
+                <path
+                  d="M86 171 C78 183 77 199 80 215 C85 216 89 205 90 190 C90 180 88 172 86 171 Z"
+                  fill={getHeatFill('hamstrings_glutes')}
+                  opacity={getHeatOpacity('hamstrings_glutes')}
+                />
+                {/* Right Hamstring */}
+                <path
+                  d="M114 171 C122 183 123 199 120 215 C115 216 111 205 110 190 C110 180 112 172 114 171 Z"
+                  fill={getHeatFill('hamstrings_glutes')}
+                  opacity={getHeatOpacity('hamstrings_glutes')}
+                />
+              </g>
+
+              {/* Posterior Calves (Diamond Split Gastrocnemius & Achilles) */}
+              <g
                 onClick={() => onSelectMuscle('calves')}
                 className="cursor-pointer hover:brightness-125 transition-all"
-              />
+              >
+                {/* Left Calf */}
+                <path
+                  d="M75 220 C69 233 70 255 77 270 C83 270 87 255 87 241 C87 230 82 222 75 220 Z"
+                  fill={getHeatFill('calves')}
+                  opacity={getHeatOpacity('calves')}
+                />
+                {/* Right Calf */}
+                <path
+                  d="M125 220 C131 233 130 255 123 270 C117 270 113 255 113 241 C113 230 118 222 125 220 Z"
+                  fill={getHeatFill('calves')}
+                  opacity={getHeatOpacity('calves')}
+                />
+                {/* Heels */}
+                <ellipse cx="80" cy="285" rx="4.5" ry="2.5" fill="#334155" opacity="0.7" />
+                <ellipse cx="120" cy="285" rx="4.5" ry="2.5" fill="#334155" opacity="0.7" />
+              </g>
             </g>
           )}
         </svg>

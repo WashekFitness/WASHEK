@@ -5,7 +5,6 @@ import { Button } from '@/components/ui/button';
 import { Dumbbell, ChevronRight, Clock, Moon, ShieldCheck, Sparkles } from 'lucide-react';
 import { getDayOfWeekName, getUserTimeZone, getLocalDateKey } from '@/lib/dateUtils';
 import { isActualRestDay } from '@/lib/streakUtils';
-import { useAppSettings } from '@/lib/AppSettingsContext';
 import {
   getCachedActiveProgram,
   getCachedLastWorkout,
@@ -13,7 +12,6 @@ import {
 } from '@/lib/cacheStore';
 
 export default function DailyWorkoutCard({ program: propProgram, user, timeZone, isLoading = false }) {
-  const { settings, isRestDayMarked } = useAppSettings() || {};
   const userKey = user?.email || user?.id || 'athlete';
   const effectiveProgram = propProgram || getCachedActiveProgram(userKey);
   const program = effectiveProgram;
@@ -24,9 +22,6 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
   const todayKey = getLocalDateKey(new Date(), effectiveTz);
 
   const isActualRest = isActualRestDay(todayKey, program, user, effectiveTz);
-  const isMarkedRest = isRestDayMarked
-    ? isRestDayMarked(todayKey)
-    : Boolean(settings?.manualRestDays?.[todayKey]);
 
   const todayWorkout = currentWeekData?.days?.find(d =>
     d.day_name.toLowerCase().includes(today.toLowerCase())
@@ -64,82 +59,80 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
     );
   }
 
-  // If today is an actual rest day AND the athlete has marked it in settings ("show them")
-  if (program && isActualRest && isMarkedRest) {
+  // If today is a scheduled rest day, show the Rest & Regeneration protocol automatically
+  if (program && isActualRest) {
     return (
-      <Card className="p-5 sm:p-6 bg-gradient-to-br from-indigo-500/[0.14] via-card to-card border-indigo-500/30 shadow-[0_12px_36px_-6px_rgba(99,102,241,0.16)] dark:shadow-[0_12px_36px_-6px_rgba(0,0,0,0.5)] relative overflow-hidden group">
-        <div className="absolute top-0 right-0 w-56 h-56 bg-indigo-500/[0.12] rounded-full blur-3xl pointer-events-none -mr-16 -mt-16 group-hover:bg-indigo-500/[0.18] transition-all duration-700" />
+      <Card className="p-5 sm:p-6 bg-gradient-to-b from-card via-card to-card/95 border border-indigo-500/30 dark:border-indigo-500/40 shadow-[0_0_40px_rgba(99,102,241,0.15)] dark:shadow-[0_0_50px_rgba(99,102,241,0.2)] hover:border-indigo-500/50 transition-all duration-300 rounded-3xl relative overflow-hidden group">
+        {/* Athletic top ambient recovery glow */}
+        <div className="absolute top-0 right-0 w-72 h-40 bg-indigo-500/15 rounded-full blur-3xl pointer-events-none" />
 
         <div className="flex items-start justify-between mb-4 relative z-10">
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-indigo-500/25 to-indigo-500/10 border border-indigo-500/35 flex items-center justify-center shadow-sm shadow-indigo-500/25 shrink-0 group-hover:scale-105 transition-transform duration-300">
+            <div className="w-11 h-11 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center shrink-0 shadow-sm">
               <Moon className="w-5 h-5 text-indigo-400" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest block font-heading">
-                  Daily Protocol · {today}
-                </span>
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-              </div>
+              <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest block font-heading">
+                Daily Protocol · {today}
+              </span>
               <p className="font-heading font-extrabold text-xl sm:text-2xl tracking-tight text-foreground mt-0.5">
                 Rest &amp; Regeneration
               </p>
             </div>
           </div>
 
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/25 px-2.5 py-1 rounded-full shrink-0 shadow-xs">
+          <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-xl shrink-0">
             <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
             <span>Streak Protected</span>
           </div>
         </div>
 
         <div className="space-y-2 mb-5 relative z-10">
-          <div className="flex items-center justify-between py-2 px-3 rounded-xl bg-slate-100/90 dark:bg-background/60 border border-slate-200/80 dark:border-white/[0.05] text-sm">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <span className="w-5 h-5 rounded-md bg-indigo-500/10 text-indigo-400 text-[11px] font-bold font-heading flex items-center justify-center shrink-0">
+          <div className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-indigo-500/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200">
+            <div className="flex items-center gap-3 min-w-0 pr-2">
+              <span className="w-6 h-6 rounded-lg bg-indigo-500/15 text-indigo-400 text-xs font-bold font-heading flex items-center justify-center shrink-0">
                 1
               </span>
               <span className="text-foreground font-semibold truncate text-sm">
                 Neuromuscular &amp; CNS Recovery
               </span>
             </div>
-            <span className="text-xs font-bold text-muted-foreground bg-muted/80 px-2.5 py-0.5 rounded-md shrink-0">
-              Complete Rest
+            <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums border border-indigo-500/20">
+              Deep Rest
             </span>
           </div>
 
-          <div className="flex items-center justify-between py-2 px-3 rounded-xl bg-slate-100/90 dark:bg-background/60 border border-slate-200/80 dark:border-white/[0.05] text-sm">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <span className="w-5 h-5 rounded-md bg-indigo-500/10 text-indigo-400 text-[11px] font-bold font-heading flex items-center justify-center shrink-0">
+          <div className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-indigo-500/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200">
+            <div className="flex items-center gap-3 min-w-0 pr-2">
+              <span className="w-6 h-6 rounded-lg bg-indigo-500/15 text-indigo-400 text-xs font-bold font-heading flex items-center justify-center shrink-0">
                 2
               </span>
               <span className="text-foreground font-semibold truncate text-sm">
-                Connective Tissue &amp; Mobility
+                Connective Tissue &amp; Mobility Flow
               </span>
             </div>
-            <span className="text-xs font-bold text-muted-foreground bg-muted/80 px-2.5 py-0.5 rounded-md shrink-0">
+            <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums border border-indigo-500/20">
               Light Stretches
             </span>
           </div>
 
-          <div className="flex items-center justify-between py-2 px-3 rounded-xl bg-slate-100/90 dark:bg-background/60 border border-slate-200/80 dark:border-white/[0.05] text-sm">
-            <div className="flex items-center gap-2.5 min-w-0">
-              <span className="w-5 h-5 rounded-md bg-indigo-500/10 text-indigo-400 text-[11px] font-bold font-heading flex items-center justify-center shrink-0">
+          <div className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-indigo-500/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200">
+            <div className="flex items-center gap-3 min-w-0 pr-2">
+              <span className="w-6 h-6 rounded-lg bg-indigo-500/15 text-indigo-400 text-xs font-bold font-heading flex items-center justify-center shrink-0">
                 3
               </span>
               <span className="text-foreground font-semibold truncate text-sm">
-                Electrolyte &amp; Protein Synthesis
+                Electrolytes &amp; Protein Synthesis
               </span>
             </div>
-            <span className="text-xs font-bold text-muted-foreground bg-muted/80 px-2.5 py-0.5 rounded-md shrink-0">
-              Hydrate
+            <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums border border-indigo-500/20">
+              Optimal Macros
             </span>
           </div>
         </div>
 
         <Link to="/program" className="block relative z-10">
-          <Button variant="outline" className="w-full h-12 border-indigo-500/30 hover:bg-indigo-500/10 text-foreground font-heading font-bold text-sm tracking-wide rounded-xl group/btn flex items-center justify-center gap-2">
+          <Button variant="outline" className="w-full h-12 border-indigo-500/30 hover:bg-indigo-500/10 text-foreground font-heading font-bold text-sm tracking-wide rounded-2xl group/btn flex items-center justify-center gap-2">
             <span>View Full Program Schedule</span>
             <ChevronRight className="w-4 h-4 group-hover/btn:translate-x-1 transition-transform duration-200" />
           </Button>
@@ -150,21 +143,16 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
 
   if (!program || !todayWorkout) {
     return (
-      <Card className="p-5 sm:p-6 bg-gradient-to-br from-primary/[0.14] via-card to-card border-primary/30 shadow-[0_12px_36px_-6px_rgba(37,99,235,0.16)] dark:shadow-[0_12px_36px_-6px_rgba(0,0,0,0.5)] relative overflow-hidden group">
-        <div className="absolute top-0 right-0 w-56 h-56 bg-primary/[0.12] rounded-full blur-3xl pointer-events-none -mr-16 -mt-16 group-hover:bg-primary/[0.18] transition-all duration-700" />
-
+      <Card className="p-5 sm:p-6 bg-card border-border/80 shadow-xs relative overflow-hidden group">
         <div className="flex items-start justify-between mb-3 relative z-10">
           <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-primary/25 to-primary/10 border border-primary/35 flex items-center justify-center shadow-sm shadow-primary/25 shrink-0 group-hover:scale-105 transition-transform duration-300">
+            <div className="w-11 h-11 rounded-xl bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
               <Dumbbell className="w-5 h-5 text-primary" />
             </div>
             <div>
-              <div className="flex items-center gap-2">
-                <span className="text-[10px] font-bold text-primary uppercase tracking-widest block font-heading">
-                  Daily Protocol
-                </span>
-                <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-              </div>
+              <span className="text-[10px] font-bold text-primary uppercase tracking-widest block font-heading">
+                Daily Protocol
+              </span>
               <p className="font-heading font-extrabold text-xl sm:text-2xl tracking-tight text-foreground mt-0.5">
                 Training Program
               </p>
@@ -177,7 +165,7 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
         </p>
 
         <Link to="/onboarding" className="block relative z-10">
-          <Button className="w-full h-12 bg-gradient-to-r from-primary via-blue-600 to-primary hover:opacity-95 text-white font-heading font-bold text-sm tracking-wide shadow-[0_4px_24px_rgba(37,99,235,0.4)] active:scale-[0.99] transition-all rounded-xl group/btn flex items-center justify-center gap-2">
+          <Button className="w-full h-12 bg-primary hover:bg-primary/90 text-primary-foreground font-heading font-semibold text-sm tracking-wide shadow-xs active:scale-[0.99] transition-all rounded-xl group/btn flex items-center justify-center gap-2">
             <span>Set Up Workout Program</span>
             <ChevronRight className="w-4 h-4 group-hover/btn:translate-x-1 transition-transform duration-200" />
           </Button>
@@ -190,31 +178,28 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
   const estimatedTime = exerciseCount * 4;
 
   return (
-    <Card className="p-5 sm:p-6 bg-gradient-to-br from-primary/[0.14] via-card to-card border-primary/30 shadow-[0_12px_36px_-6px_rgba(37,99,235,0.16)] dark:shadow-[0_12px_36px_-6px_rgba(0,0,0,0.5)] relative overflow-hidden group">
-      {/* Subtle top corner ambient glow */}
-      <div className="absolute top-0 right-0 w-56 h-56 bg-primary/[0.12] rounded-full blur-3xl pointer-events-none -mr-16 -mt-16 group-hover:bg-primary/[0.18] transition-all duration-700" />
+    <Card className="p-5 sm:p-6 bg-gradient-to-b from-card via-card to-card/95 border border-primary/40 dark:border-primary/50 shadow-[0_0_40px_rgba(37,99,235,0.20)] dark:shadow-[0_0_50px_rgba(37,99,235,0.26)] hover:border-primary/60 transition-all duration-300 rounded-3xl relative overflow-hidden group">
+      {/* Athletic top ambient glow */}
+      <div className="absolute top-0 right-0 w-72 h-40 bg-primary/15 rounded-full blur-3xl pointer-events-none" />
 
       <div className="flex items-start justify-between mb-4 relative z-10">
         <div className="flex items-center gap-3">
-          <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-primary/25 to-primary/10 border border-primary/35 flex items-center justify-center shadow-sm shadow-primary/25 shrink-0 group-hover:scale-105 transition-transform duration-300">
+          <div className="w-11 h-11 rounded-2xl bg-primary/10 border border-primary/25 flex items-center justify-center shrink-0 shadow-sm">
             <Dumbbell className="w-5 h-5 text-primary" />
           </div>
           <div>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] font-bold text-primary uppercase tracking-widest block font-heading">
-                Today's Protocol
-              </span>
-              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-            </div>
+            <span className="text-[10px] font-bold text-primary uppercase tracking-widest block font-heading">
+              Today's Protocol
+            </span>
             <p className="font-heading font-extrabold text-xl sm:text-2xl tracking-tight text-foreground mt-0.5">
               {todayWorkout.workout_type}
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5 text-xs font-semibold text-primary/95 bg-primary/10 border border-primary/25 px-2.5 py-1 rounded-full shrink-0 shadow-xs">
+        <div className="flex items-center gap-1.5 text-xs font-semibold text-muted-foreground bg-muted/60 border border-border/60 dark:border-white/10 px-2.5 py-1 rounded-xl shrink-0">
           <Clock className="w-3.5 h-3.5 text-primary" />
-          <span className="tabular-nums">~{estimatedTime}m</span>
+          <span className="tabular-nums font-mono">~{estimatedTime}m</span>
         </div>
       </div>
 
@@ -222,30 +207,30 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
         {todayWorkout.exercises?.slice(0, 3).map((ex, i) => (
           <div
             key={i}
-            className="flex items-center justify-between py-2 px-3 rounded-xl bg-slate-100/90 dark:bg-background/60 border border-slate-200/80 dark:border-white/[0.05] text-sm hover:border-primary/40 dark:hover:border-primary/40 transition-all duration-200"
+            className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-primary/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200"
           >
-            <div className="flex items-center gap-2.5 min-w-0 pr-2">
-              <span className="w-5 h-5 rounded-md bg-primary/10 text-primary text-[11px] font-bold font-heading flex items-center justify-center shrink-0">
+            <div className="flex items-center gap-3 min-w-0 pr-2">
+              <span className="w-6 h-6 rounded-lg bg-primary/15 text-primary text-xs font-bold font-heading flex items-center justify-center shrink-0">
                 {i + 1}
               </span>
               <span className="text-foreground font-semibold truncate text-sm">
                 {ex.name}
               </span>
             </div>
-            <span className="text-xs font-bold text-slate-700 dark:text-muted-foreground bg-slate-200/80 dark:bg-muted/90 px-2.5 py-0.5 rounded-md shrink-0 tabular-nums">
+            <span className="text-xs font-bold text-foreground bg-muted dark:bg-white/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums font-mono border border-border/40 dark:border-white/5">
               {ex.sets} × {ex.reps}
             </span>
           </div>
         ))}
         {exerciseCount > 3 && (
-          <p className="text-xs font-medium text-muted-foreground text-center pt-0.5">
+          <p className="text-xs font-medium text-muted-foreground text-center pt-1">
             +{exerciseCount - 3} more exercises in today's routine
           </p>
         )}
       </div>
 
       <Link to="/program" className="block relative z-10">
-        <Button className="w-full h-12 bg-gradient-to-r from-primary via-blue-600 to-primary hover:opacity-95 text-white font-heading font-bold text-sm tracking-wide shadow-[0_4px_24px_rgba(37,99,235,0.4)] active:scale-[0.99] transition-all rounded-xl group/btn flex items-center justify-center gap-2">
+        <Button className="w-full h-12 bg-primary hover:bg-primary/95 text-primary-foreground font-heading font-bold text-sm tracking-wide shadow-[0_0_25px_rgba(37,99,235,0.45)] hover:shadow-[0_0_35px_rgba(37,99,235,0.65)] border border-primary/40 rounded-2xl active:scale-[0.99] transition-all group/btn flex items-center justify-center gap-2">
           <span>Start Workout</span>
           <ChevronRight className="w-4 h-4 group-hover/btn:translate-x-1 transition-transform duration-200" />
         </Button>

@@ -6,8 +6,6 @@ import React, {
   useState,
 } from 'react';
 
-import { auth, onAuthStateChanged, firebaseSignOut } from '@/lib/firebase';
-import { firebaseApi, getOrCreateUserProfile } from '@/lib/firebaseApi';
 import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { isLogo } from '@/lib/avatarUtils';
@@ -34,6 +32,7 @@ export const AuthProvider = ({ children }) => {
       return null;
     }
   });
+
   const [isAuthenticated, setIsAuthenticated] = useState(() => {
     try {
       return !!localStorage.getItem('washek_user');
@@ -41,6 +40,7 @@ export const AuthProvider = ({ children }) => {
       return false;
     }
   });
+
   const [isLoadingAuth, setIsLoadingAuth] = useState(() => {
     try {
       return !localStorage.getItem('washek_user');
@@ -48,6 +48,7 @@ export const AuthProvider = ({ children }) => {
       return true;
     }
   });
+
   const [isLoadingPublicSettings] = useState(false);
   const [authError, setAuthError] = useState(null);
   const [authChecked, setAuthChecked] = useState(() => {
@@ -69,11 +70,72 @@ export const AuthProvider = ({ children }) => {
     return () => clearTimeout(safetyTimer);
   }, []);
 
-  // Load user from Supabase session if Firebase user is not active
-  const loadFallbackSupabaseUser = useCallback(async () => {
+  // Format Supabase user into standard app athlete profile
+  const formatAthleteUser = useCallback((supaUser, profileData = {}) => {
+    if (!supaUser) return null;
+    const meta = supaUser.user_metadata || {};
+    const firstName = profileData.first_name || meta.first_name || '';
+    const lastName = profileData.last_name || meta.last_name || '';
+    const fullName =
+      profileData.full_name ||
+      meta.full_name ||
+      [firstName, lastName].filter(Boolean).join(' ') ||
+      supaUser.email?.split('@')[0] ||
+      'Athlete';
+
+    const cleansedAvatar =
+      profileData.avatar_url && !isLogo(profileData.avatar_url)
+        ? profileData.avatar_url
+        : null;
+
+    return {
+      id: supaUser.id,
+      email: supaUser.email || meta.email || '',
+      first_name: firstName,
+      last_name: lastName,
+      full_name: fullName,
+      role: profileData.role || meta.role || 'athlete',
+      plan: profileData.subscription_plan || profileData.plan || 'free',
+      tier: profileData.subscription_plan || profileData.tier || 'free',
+      subscription_plan: profileData.subscription_plan || 'free',
+      subscription_status: profileData.subscription_status || 'active',
+      subscription_tier: profileData.subscription_plan || 'free',
+      avatar_url: cleansedAvatar,
+      photo_url: cleansedAvatar,
+      onboarded: profileData.onboarded ?? true,
+      created_at: profileData.created_at || supaUser.created_at || new Date().toISOString(),
+      ...profileData,
+    };
+  }, []);
+
+  // Load user from Supabase session
+  const loadSupabaseSessionUser = useCallback(async () => {
     try {
-      const { data } = await supabase.auth.getSession();
-      const session = data?.session;
+      let session = null;
+      try {
+        const { data } = await supabase.auth.getSession();
+        session = data?.session;
+      } catch (_sErr) {
+        // session query note
+      }
+
+      // If no active session but tokens are in localStorage, attempt recovery
+      if (!session) {
+        const token = localStorage.getItem('washek_auth_token');
+        const refreshToken = localStorage.getItem('washek_refresh_token');
+        if (token && refreshToken) {
+          try {
+            const { data: recovered } = await supabase.auth.setSession({
+              access_token: token,
+              refresh_token: refreshToken,
+            });
+            session = recovered?.session;
+          } catch (_rErr) {
+            // recovery note
+          }
+        }
+      }
+
       if (session?.user) {
         try {
           const profileUser = await supabaseApi.auth.me();
@@ -88,20 +150,7 @@ export const AuthProvider = ({ children }) => {
             return profileUser;
           }
         } catch {
-          const fallbackUser = {
-            id: session.user.id,
-            email: session.user.email,
-            first_name: session.user.user_metadata?.first_name || '',
-            last_name: session.user.user_metadata?.last_name || '',
-            full_name:
-              session.user.user_metadata?.full_name ||
-              session.user.user_metadata?.first_name ||
-              session.user.email ||
-              'Athlete',
-            role: session.user.user_metadata?.role || 'athlete',
-            plan: 'pro',
-            tier: 'pro',
-          };
+          const fallbackUser = formatAthleteUser(session.user);
           setUser(fallbackUser);
           setIsAuthenticated(true);
           try {
@@ -112,53 +161,119 @@ export const AuthProvider = ({ children }) => {
           return fallbackUser;
         }
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      console.debug('[AUTH] Session load note:', err);
     }
     return null;
-  }, []);
+  }, [formatAthleteUser]);
 
   const checkUserAuth = useCallback(async () => {
     setIsLoadingAuth(true);
     setAuthError(null);
 
     try {
-      const currentFirebaseUser = auth.currentUser;
-      if (currentFirebaseUser) {
-        const profile = await getOrCreateUserProfile(currentFirebaseUser);
-        setUser(profile);
-        setIsAuthenticated(true);
-        try {
-          localStorage.setItem('washek_user', JSON.stringify(profile));
-        } catch (err) {
-          console.debug('[AUTH] Storage note:', err);
-        }
-        return profile;
+      const sessionUser = await loadSupabaseSessionUser();
+      if (sessionUser) {
+        return sessionUser;
       }
 
-      const fallback = await loadFallbackSupabaseUser();
-      if (!fallback) {
-        setUser(null);
-        setIsAuthenticated(false);
+      // Check if local storage has a cached user session - leave user logged in!
+      const stored = localStorage.getItem('washek_user');
+      if (stored) {
         try {
-          localStorage.removeItem('washek_user');
-        } catch (err) {
-          console.debug('[AUTH] Storage note:', err);
+          const parsed = JSON.parse(stored);
+          if (parsed?.email) {
+            setUser(parsed);
+            setIsAuthenticated(true);
+            return parsed;
+          }
+        } catch {
+          // ignore
         }
       }
-      return fallback;
-    } catch (error) {
-      console.warn('[AUTH] Auth check:', error?.message || error);
+
       setUser(null);
       setIsAuthenticated(false);
+      return null;
+    } catch (error) {
+      console.warn('[AUTH] Auth check error:', error?.message || error);
       return null;
     } finally {
       setIsLoadingAuth(false);
       setAuthChecked(true);
     }
-  }, [loadFallbackSupabaseUser]);
+  }, [loadSupabaseSessionUser]);
 
-  // Listen to Firebase & Supabase auth state changes
+  // Listen to Supabase auth state changes
+  useEffect(() => {
+    let mounted = true;
+
+    // Initial check
+    loadSupabaseSessionUser().then((loaded) => {
+      if (!mounted) return;
+      if (!loaded) {
+        const stored = localStorage.getItem('washek_user');
+        if (stored) {
+          try {
+            const parsed = JSON.parse(stored);
+            if (parsed?.email) {
+              setUser(parsed);
+              setIsAuthenticated(true);
+
+              // Background check - only log out if account was explicitly marked deleted
+              fetch('/api/auth/verify-account', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ email: parsed.email }),
+              })
+                .then((r) => r.json())
+                .then((d) => {
+                  if (mounted && d?.deleted === true) {
+                    localStorage.removeItem('washek_user');
+                    localStorage.removeItem('washek_auth_token');
+                    localStorage.removeItem('washek_refresh_token');
+                    setUser(null);
+                    setIsAuthenticated(false);
+                  }
+                })
+                .catch(() => {});
+            }
+          } catch {
+            // ignore
+          }
+        }
+      }
+      setAuthChecked(true);
+      setIsLoadingAuth(false);
+    });
+
+    const { data: supaListener } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (!mounted) return;
+        if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'TOKEN_REFRESHED') {
+          if (session?.user) {
+            await loadSupabaseSessionUser();
+          }
+        } else if (event === 'SIGNED_OUT') {
+          setUser(null);
+          setIsAuthenticated(false);
+          try {
+            localStorage.removeItem('washek_user');
+            localStorage.removeItem('washek_auth_token');
+          } catch (_e) {
+            // Ignore cleanup error
+          }
+        }
+      }
+    );
+
+    return () => {
+      mounted = false;
+      supaListener?.subscription?.unsubscribe?.();
+    };
+  }, [loadSupabaseSessionUser]);
+
+  // Listen to avatar changes
   useEffect(() => {
     const handleAvatarChanged = (e) => {
       const newAvatar = e.detail?.avatarUrl ?? null;
@@ -214,127 +329,10 @@ export const AuthProvider = ({ children }) => {
     };
 
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
     return () => {
       window.removeEventListener('washek_subscription_updated', handleSubUpdated);
-    };
-  }, []);
-
-  useEffect(() => {
-    let mounted = true;
-
-    const unsubscribeFirebase = onAuthStateChanged(auth, async (fbUser) => {
-      if (!mounted) return;
-
-      if (fbUser) {
-        try {
-          const profile = await getOrCreateUserProfile(fbUser);
-          if (mounted) {
-            setUser(profile);
-            setIsAuthenticated(true);
-            setAuthError(null);
-            try {
-              localStorage.setItem('washek_user', JSON.stringify(profile));
-            } catch (err) {
-              console.debug('[AUTH] Storage note:', err);
-            }
-          }
-        } catch (err) {
-          console.warn('[AUTH] Profile load warning:', err);
-        } finally {
-          if (mounted) {
-            setAuthChecked(true);
-            setIsLoadingAuth(false);
-          }
-        }
-      } else {
-        // Check if there is an active Supabase fallback session
-        const fallback = await loadFallbackSupabaseUser();
-        if (mounted && !fallback) {
-          let foundCached = false;
-          try {
-            const stored = localStorage.getItem('washek_user');
-            if (stored) {
-              const parsed = JSON.parse(stored);
-              if (parsed?.email) {
-                setUser(parsed);
-                setIsAuthenticated(true);
-                foundCached = true;
-              }
-            }
-          } catch (storageErr) {
-            console.debug('[AUTH] Storage read note:', storageErr);
-          }
-          if (!foundCached) {
-            setUser(null);
-            setIsAuthenticated(false);
-            try {
-              localStorage.removeItem('washek_user');
-            } catch (err) {
-              console.debug('[AUTH] Storage note:', err);
-            }
-          }
-        }
-        if (mounted) {
-          setAuthChecked(true);
-          setIsLoadingAuth(false);
-        }
-      }
-    });
-
-    const { data: supaListener } = supabase.auth.onAuthStateChange(
-      async (event, session) => {
-        if (!mounted) return;
-        if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'TOKEN_REFRESHED') {
-          if (session?.user && !auth.currentUser) {
-            await loadFallbackSupabaseUser();
-          }
-        } else if (event === 'SIGNED_OUT') {
-          if (!auth.currentUser) {
-            setUser(null);
-            setIsAuthenticated(false);
-          }
-        }
-      }
-    );
-
-    return () => {
-      mounted = false;
-      unsubscribeFirebase();
-      supaListener?.subscription?.unsubscribe?.();
-    };
-  }, [loadFallbackSupabaseUser]);
-
-  // Instantly reflect subscription updates into current user state
-  useEffect(() => {
-    const handleSubUpdate = (e) => {
-      const plan = e.detail?.plan || e.detail?.subscription_plan;
-      const status = e.detail?.status || e.detail?.subscription_status || 'active';
-      if (plan) {
-        setUser((prev) => {
-          if (!prev) return prev;
-          const updated = {
-            ...prev,
-            subscription_plan: plan,
-            subscription_status: status,
-            tier: plan,
-            plan: plan,
-            subscription_tier: plan,
-          };
-          try {
-            localStorage.setItem('washek_user', JSON.stringify(updated));
-          } catch (storageErr) {
-            console.debug('[AUTH] Storage write note:', storageErr);
-          }
-          return updated;
-        });
-      }
-    };
-
-    window.addEventListener('washek_subscription_updated', handleSubUpdate);
-    window.addEventListener('washek_user_changed', handleSubUpdate);
-    return () => {
-      window.removeEventListener('washek_subscription_updated', handleSubUpdate);
-      window.removeEventListener('washek_user_changed', handleSubUpdate);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
     };
   }, []);
 
@@ -342,15 +340,14 @@ export const AuthProvider = ({ children }) => {
     setIsLoadingAuth(true);
     setAuthError(null);
     try {
-      const { user: profile } = await firebaseApi.auth.signInWithGoogle();
-      setUser(profile);
-      setIsAuthenticated(true);
-      try {
-        localStorage.setItem('washek_user', JSON.stringify(profile));
-      } catch (err) {
-        console.debug('[AUTH] Storage note:', err);
-      }
-      return profile;
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: window.location.origin,
+        },
+      });
+      if (error) throw error;
+      return data;
     } catch (err) {
       setAuthError({ type: 'google_sign_in', message: err?.message || 'Google sign in failed' });
       throw err;
@@ -368,58 +365,68 @@ export const AuthProvider = ({ children }) => {
     let finalProfile = null;
     let lastError = null;
 
-    // 1. Authenticate with Supabase
     try {
-      const { data, error } = await supabase.auth.signInWithPassword({
-        email: cleanEmail,
-        password,
+      // Authenticate with Supabase via backend proxy
+      const response = await fetch('/api/auth/signin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail, password }),
       });
+      const data = await response.json();
 
-      if (error) {
-        lastError = error;
-      } else if (data?.user) {
+      if (response.ok && (data?.user || data?.profile)) {
         authSucceeded = true;
-        const supaUser = data.user;
+        const u = data.user || {};
+        const p = data.profile || {};
+        const meta = u.user_metadata || {};
+        const fullName =
+          p.full_name ||
+          meta.full_name ||
+          [p.first_name || meta.first_name, p.last_name || meta.last_name].filter(Boolean).join(' ') ||
+          cleanEmail.split('@')[0] ||
+          'Athlete';
 
-        try {
-          finalProfile = await supabaseApi.auth.me();
-        } catch (e) {
-          console.debug('[AUTH] me load note:', e);
-        }
-
-        if (!finalProfile) {
-          const fullName =
-            supaUser.user_metadata?.full_name ||
-            [supaUser.user_metadata?.first_name, supaUser.user_metadata?.last_name]
-              .filter(Boolean)
-              .join(' ') ||
-            cleanEmail.split('@')[0] ||
-            'Athlete';
-
-          finalProfile = {
-            id: supaUser.id,
-            email: supaUser.email,
-            first_name: supaUser.user_metadata?.first_name || '',
-            last_name: supaUser.user_metadata?.last_name || '',
-            full_name: fullName,
-            role: supaUser.user_metadata?.role || 'athlete',
-            plan: 'free',
-            tier: 'free',
-            subscription_tier: 'free',
-            subscription_plan: 'free',
-          };
-        }
+        finalProfile = {
+          id: u.id || p.id,
+          email: u.email || p.email || cleanEmail,
+          first_name: p.first_name || meta.first_name || '',
+          last_name: p.last_name || meta.last_name || '',
+          full_name: fullName,
+          role: p.role || meta.role || 'athlete',
+          plan: p.subscription_plan || p.plan || 'free',
+          tier: p.subscription_plan || p.tier || 'free',
+          subscription_tier: p.subscription_plan || 'free',
+          subscription_plan: p.subscription_plan || 'free',
+          subscription_status: p.subscription_status || 'active',
+          ...p,
+        };
 
         if (data.session?.access_token) {
           try {
             localStorage.setItem('washek_auth_token', data.session.access_token);
+            if (data.session.refresh_token) {
+              await supabase.auth.setSession({
+                access_token: data.session.access_token,
+                refresh_token: data.session.refresh_token,
+              }).catch(() => {});
+            }
           } catch (tokenErr) {
             console.debug('[AUTH] Token storage note:', tokenErr);
           }
         }
+      } else {
+        const srvErr = new Error(data?.error || 'Invalid email or password.');
+        srvErr.code = data?.code || 'auth/invalid-credential';
+        srvErr.reason = data?.reason;
+        srvErr.suggestion = data?.suggestion;
+        srvErr.targetEmail = data?.email || cleanEmail;
+        lastError = srvErr;
       }
     } catch (err) {
-      lastError = err;
+      console.debug('[AUTH] Signin error:', err);
+      const netErr = new Error('Invalid email or password. Please verify your credentials or create an athlete account.');
+      netErr.code = 'auth/invalid-credential';
+      lastError = netErr;
     }
 
     if (authSucceeded && finalProfile) {
@@ -436,11 +443,22 @@ export const AuthProvider = ({ children }) => {
 
     setIsLoadingAuth(false);
     const friendlyMsg =
-      lastError?.message && !lastError.message.toLowerCase().includes('invalid login')
-        ? lastError.message
-        : 'Invalid email or password. Please verify your credentials or create an athlete account.';
+      lastError?.message ||
+      'Invalid email or password. Please verify your credentials or create an athlete account.';
     const finalErr = new Error(friendlyMsg);
-    setAuthError({ type: 'email_sign_in', message: friendlyMsg });
+    if (lastError?.code) finalErr.code = lastError.code;
+    if (lastError?.reason) finalErr.reason = lastError.reason;
+    if (lastError?.suggestion) finalErr.suggestion = lastError.suggestion;
+    finalErr.targetEmail = lastError?.targetEmail || cleanEmail;
+
+    setAuthError({
+      type: 'email_sign_in',
+      message: friendlyMsg,
+      code: finalErr.code,
+      reason: finalErr.reason,
+      suggestion: finalErr.suggestion,
+      targetEmail: finalErr.targetEmail,
+    });
     throw finalErr;
   }, []);
 
@@ -451,131 +469,203 @@ export const AuthProvider = ({ children }) => {
     const cleanEmail = email.trim();
     const firstName = (metadata?.firstName || '').trim();
     const lastName = (metadata?.lastName || '').trim();
-    const fullName = [firstName, lastName].filter(Boolean).join(' ').trim() || cleanEmail.split('@')[0] || 'Athlete';
+    const fullName =
+      [firstName, lastName].filter(Boolean).join(' ').trim() || cleanEmail.split('@')[0] || 'Athlete';
 
     try {
-      // 1. Sign up with Supabase
-      const { data: supaData, error: supaError } = await supabase.auth.signUp({
-        email: cleanEmail,
-        password,
-        options: {
-          data: {
-            first_name: firstName,
-            last_name: lastName,
-            full_name: fullName,
-            role: 'athlete',
+      // Primary signup via server proxy (creates Supabase account, profile, & session)
+      const response = await fetch('/api/auth/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: cleanEmail,
+          password,
+          metadata: {
+            firstName,
+            lastName,
+            fullName,
           },
-        },
+        }),
       });
 
-      if (supaError) {
-        if (
-          supaError.message?.toLowerCase().includes('already registered') ||
-          supaError.message?.toLowerCase().includes('already exists')
-        ) {
-          throw new Error('An account with this email already exists. Please sign in instead.');
-        }
-        throw supaError;
-      }
+      const data = await response.json();
 
-      const supaUser = supaData?.user;
-      if (!supaUser) {
-        throw new Error('Could not create account. Please check your credentials and try again.');
-      }
+      if (response.ok && (data?.user || data?.profile)) {
+        const u = data.user || {};
+        const p = data.profile || {};
+        const meta = u.user_metadata || {};
+        const resolvedName =
+          p.full_name ||
+          fullName ||
+          meta.full_name ||
+          cleanEmail.split('@')[0] ||
+          'Athlete';
 
-      // If session was not immediately returned, log in to establish the session
-      let session = supaData.session;
-      if (!session) {
-        try {
-          const loginRes = await supabase.auth.signInWithPassword({
-            email: cleanEmail,
-            password,
-          });
-          if (loginRes.data?.session) {
-            session = loginRes.data.session;
+        const finalProfile = {
+          id: u.id || p.id,
+          email: u.email || cleanEmail,
+          first_name: firstName || p.first_name || meta.first_name || '',
+          last_name: lastName || p.last_name || meta.last_name || '',
+          full_name: resolvedName,
+          role: p.role || meta.role || 'athlete',
+          plan: 'free',
+          tier: 'free',
+          subscription_tier: 'free',
+          subscription_plan: 'free',
+          subscription_status: 'active',
+          ...p,
+        };
+
+        if (data.session?.access_token) {
+          try {
+            localStorage.setItem('washek_auth_token', data.session.access_token);
+            if (data.session.refresh_token) {
+              await supabase.auth.setSession({
+                access_token: data.session.access_token,
+                refresh_token: data.session.refresh_token,
+              }).catch(() => {});
+            }
+          } catch (tokenErr) {
+            console.debug('[AUTH] Token store note:', tokenErr);
           }
+        }
+
+        setUser(finalProfile);
+        setIsAuthenticated(true);
+        try {
+          localStorage.setItem('washek_user', JSON.stringify(finalProfile));
         } catch {
-          // non-critical
+          // ignore
         }
+        setIsLoadingAuth(false);
+        return finalProfile;
       }
 
-      // Build profile
-      const profile = {
-        id: supaUser.id,
-        email: supaUser.email || cleanEmail,
-        first_name: firstName,
-        last_name: lastName,
-        full_name: fullName,
-        avatar_url: null,
-        role: 'athlete',
-        plan: 'free',
-        tier: 'free',
-        subscription_tier: 'free',
-        subscription_plan: 'free',
-        target_calories: 2600,
-        target_protein: 190,
-        target_carbs: 260,
-        target_fat: 70,
-        created_at: new Date().toISOString(),
-      };
-
-      // Upsert profile in Supabase profiles table
-      try {
-        await supabase.from('profiles').upsert(
-          {
-            id: supaUser.id,
-            first_name: firstName,
-            last_name: lastName,
-            full_name: fullName,
-            role: 'athlete',
-            subscription_plan: 'free',
-            subscription_tier: 'free',
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: 'id' }
-        );
-      } catch (err) {
-        console.debug('[AUTH] Profile creation note:', err);
-      }
-
-      // Save to localStorage
-      try {
-        localStorage.setItem('washek_user', JSON.stringify(profile));
-        if (session?.access_token) {
-          localStorage.setItem('washek_auth_token', session.access_token);
-        }
-      } catch (err) {
-        console.debug('[AUTH] Storage note:', err);
-      }
-
-      setUser(profile);
-      setIsAuthenticated(true);
-      return profile;
+      const srvErr = new Error(data?.error || 'Registration failed.');
+      srvErr.code = data?.code || 'auth/signup-failed';
+      throw srvErr;
     } catch (err) {
-      setAuthError({ type: 'email_sign_up', message: err?.message || 'Registration failed' });
+      setIsLoadingAuth(false);
+      setAuthError({
+        type: 'email_sign_up',
+        message: err?.message || 'Failed to create athlete account.',
+        code: err?.code,
+      });
       throw err;
+    }
+  }, []);
+
+  const deleteAccount = useCallback(async () => {
+    setIsLoadingAuth(true);
+    try {
+      let uid = user?.id;
+      let email = user?.email;
+
+      try {
+        const { data } = await supabase.auth.getUser();
+        if (data?.user) {
+          uid = data.user.id;
+          email = data.user.email;
+        }
+      } catch (_authErr) {
+        // ignore
+      }
+
+      // Purge from backend database and credential vault
+      try {
+        await fetch('/api/user/delete-account', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId: uid, email }),
+        });
+      } catch (srvErr) {
+        console.debug('[AUTH] Server delete account note:', srvErr);
+      }
+
+      // Delete Supabase session if active
+      try {
+        await supabase.auth.signOut().catch(() => {});
+      } catch (supaErr) {
+        console.debug('[AUTH] Supabase cleanup note:', supaErr);
+      }
+
+      // Clear all cached data across storage
+      try {
+        localStorage.clear();
+        sessionStorage.clear();
+      } catch {
+        /* ignore storage error */
+      }
+
+      setUser(null);
+      setIsAuthenticated(false);
+      setAuthError(null);
+      return true;
     } finally {
       setIsLoadingAuth(false);
     }
-  }, []);
+  }, [user]);
+
+  const changePassword = useCallback(async ({ newPassword, currentPassword, email, recoveryCode }) => {
+    const cleanNewPass = (newPassword || '').trim();
+    if (!cleanNewPass || cleanNewPass.length < 6) {
+      throw new Error('New password must be at least 6 characters.');
+    }
+
+    const token = localStorage.getItem('washek_auth_token') || '';
+    const targetEmail = (email || user?.email || '').trim().toLowerCase();
+
+    const response = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify({
+        newPassword: cleanNewPass,
+        currentPassword: currentPassword ? String(currentPassword) : undefined,
+        email: targetEmail || undefined,
+        accessToken: token || undefined,
+        recoveryCode: recoveryCode ? String(recoveryCode).trim() : undefined,
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data?.success) {
+      throw new Error(data?.error || 'Unable to update password. Please check your credentials and try again.');
+    }
+
+    return data;
+  }, [user?.email]);
 
   const resetPassword = useCallback(async (email) => {
     const cleanEmail = (email || '').trim();
     if (!cleanEmail) {
       throw new Error('Please enter your email address.');
     }
-    const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
-      redirectTo: `${window.location.origin}/reset-password`,
-    });
-    if (error) {
-      throw error;
+
+    // Trigger password reset via Supabase and server proxy
+    try {
+      await supabase.auth.resetPasswordForEmail(cleanEmail).catch(() => {});
+    } catch (_supaErr) {
+      // non-blocking
     }
-    return true;
+
+    const response = await fetch('/api/auth/reset-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: cleanEmail }),
+    });
+    const data = await response.json();
+    if (response.ok && data?.success) {
+      return true;
+    }
+
+    throw new Error(data?.error || 'Password reset request failed.');
   }, []);
 
   const logout = useCallback(async () => {
     try {
-      await firebaseSignOut(auth).catch(() => {});
       await supabase.auth.signOut().catch(() => {});
     } catch (err) {
       console.warn('[AUTH] Sign out error:', err);
@@ -610,6 +700,8 @@ export const AuthProvider = ({ children }) => {
         signInWithGoogle,
         signInWithEmail,
         signUpWithEmail,
+        changePassword,
+        deleteAccount,
         resetPassword,
         logout,
         navigateToLogin,

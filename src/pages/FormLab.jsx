@@ -36,6 +36,7 @@ import VideoInput from '@/components/formlab/VideoInput';
 
 import AnalysisResults from '@/components/formlab/AnalysisResults';
 import PageHeader from '@/components/layout/PageHeader';
+import { hasPlan } from '@/lib/subscription';
 
 import {
   Input,
@@ -1165,9 +1166,7 @@ export default function FormLab() {
     return 'free';
   })();
 
-  const isElite =
-    plan ===
-    'elite';
+  const isElite = hasPlan(plan, 'elite');
 
   const selectedEx =
     FORM_EXERCISES.find(

@@ -15,16 +15,19 @@ export default function WeekProgress({ logs, user, timeZone }) {
   const completedCount = completedDays.filter(Boolean).length;
 
   return (
-    <Card className="p-4 sm:p-5">
-      <div className="flex items-center justify-between mb-3">
+    <Card className="p-4 sm:p-5 bg-card/95 border border-border/80 dark:border-white/10 dark:hover:border-primary/40 shadow-lg dark:shadow-[0_8px_32px_rgba(0,0,0,0.4)] rounded-3xl relative overflow-hidden group">
+      {/* Ambient rhythm glow */}
+      <div className="absolute top-0 right-0 w-44 h-32 bg-indigo-500/[0.08] rounded-full blur-2xl pointer-events-none" />
+
+      <div className="flex items-center justify-between mb-3 relative z-10">
         <div className="flex items-center gap-2.5">
-          <div className="w-8 h-8 rounded-lg bg-chart-3/15 border border-chart-3/25 flex items-center justify-center shadow-2xs">
+          <div className="w-8 h-8 rounded-xl bg-chart-3/15 border border-chart-3/30 shadow-[0_0_10px_rgba(168,85,247,0.25)] flex items-center justify-center">
             <CalendarCheck className="w-4 h-4 text-chart-3" />
           </div>
           <div>
             <div className="flex items-center gap-2">
               <p className="font-heading font-bold text-sm tracking-tight text-foreground">Weekly Rhythm</p>
-              <span className="text-[10px] font-bold text-primary bg-primary/10 px-1.5 py-0.2 rounded-full tabular-nums">
+              <span className="text-[10px] font-bold text-primary bg-primary/15 border border-primary/25 px-2 py-0.5 rounded-full tabular-nums shadow-[0_0_8px_rgba(37,99,235,0.25)]">
                 {Math.round((completedCount / 7) * 100)}%
               </span>
             </div>
@@ -40,9 +43,9 @@ export default function WeekProgress({ logs, user, timeZone }) {
       </div>
 
       {/* Precision Consistency Progress Track */}
-      <div className="w-full h-1 bg-slate-200/80 dark:bg-muted/80 rounded-full overflow-hidden mb-3.5 shadow-inner">
+      <div className="w-full h-1.5 bg-slate-200/80 dark:bg-muted/80 rounded-full overflow-hidden mb-3.5 shadow-inner relative z-10">
         <div
-          className="h-full bg-gradient-to-r from-chart-3 via-primary to-accent transition-all duration-700 rounded-full"
+          className="h-full bg-gradient-to-r from-chart-3 via-primary to-accent transition-all duration-700 rounded-full shadow-[0_0_10px_rgba(37,99,235,0.5)]"
           style={{ width: `${Math.round((completedCount / 7) * 100)}%` }}
         />
       </div>

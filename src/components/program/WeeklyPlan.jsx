@@ -27,6 +27,7 @@ import {
   TrendingUp,
   Shield,
   Lock,
+  Moon,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
@@ -1336,154 +1337,202 @@ export default function WeeklyPlan({
           DAYS
           ====================================================== */}
 
-      {currentMicrocycle && (
-        <div className="space-y-3">
+      {currentMicrocycle && (() => {
+        const rawDays = currentMicrocycle.days || [];
+        // Ensure standard 7-day microcycle structure so rest days are always prominently visible
+        let daysToRender = rawDays;
+        const hasExplicitRest = rawDays.some(
+          d => !d.exercises || d.exercises.length === 0 || d.is_rest_day ||
+               String(d.day_name || '').toLowerCase().includes('rest') ||
+               String(d.workout_type || '').toLowerCase().includes('rest')
+        );
 
-          {(currentMicrocycle.days || []).map(
-            (
-              day,
-              dayIndex
-            ) => {
+        if (!hasExplicitRest && rawDays.length > 0 && rawDays.length < 7) {
+          // Microcycle was saved with only workout days; weave in designated rest days to complete the 7-day week
+          daysToRender = [];
+          let w = 0;
+          for (let d = 1; d <= 7; d++) {
+            if (d === 3 && rawDays.length <= 5) {
+              daysToRender.push({
+                day_name: `Day 3 - Active Recovery & Mobility`,
+                workout_type: 'Rest & Active Recovery',
+                is_rest_day: true,
+                recovery_focus: 'Connective tissue mobility, hip openers & light cardio flush',
+                exercises: [],
+              });
+            } else if (d === 6 && w >= rawDays.length) {
+              daysToRender.push({
+                day_name: `Day 6 - Mobility & Core Regeneration`,
+                workout_type: 'Active Recovery',
+                is_rest_day: true,
+                recovery_focus: 'Thoracic extension, shoulder capsule decompression & hydration',
+                exercises: [],
+              });
+            } else if (d === 7) {
+              daysToRender.push({
+                day_name: `Day 7 - Complete Rest & CNS Regeneration`,
+                workout_type: 'Rest & Regeneration',
+                is_rest_day: true,
+                recovery_focus: 'Full body restoration, sleep optimization & muscle protein synthesis',
+                exercises: [],
+              });
+            } else if (w < rawDays.length) {
+              daysToRender.push(rawDays[w++]);
+            } else {
+              daysToRender.push({
+                day_name: `Day ${d} - Rest & Active Recovery`,
+                workout_type: 'Rest & Active Recovery',
+                is_rest_day: true,
+                recovery_focus: 'Neuromuscular recovery & parasympathetic restoration',
+                exercises: [],
+              });
+            }
+          }
+        }
 
-              const exercises =
-                getExercises(
-                  day
-                );
-
+        return (
+          <div className="space-y-3">
+            {daysToRender.map((day, dayIndex) => {
+              const exercises = getExercises(day);
               const isRestDay =
-                exercises.length ===
-                0;
+                day.is_rest_day ||
+                exercises.length === 0 ||
+                String(day?.workout_type || '').toLowerCase().includes('rest') ||
+                String(day?.day_name || '').toLowerCase().includes('rest');
 
-              const estimatedMinutes =
-                getEstimatedMinutes(
-                  exercises
+              const estimatedMinutes = getEstimatedMinutes(exercises);
+
+              if (isRestDay) {
+                return (
+                  <Card
+                    key={`${selectedWeek}-${dayIndex}`}
+                    className="overflow-hidden transition-all border border-indigo-500/25 dark:border-indigo-500/35 bg-gradient-to-b from-card via-card to-card/95 shadow-xs rounded-2xl relative"
+                  >
+                    <div className="p-4 sm:p-5">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="flex items-center gap-3 min-w-0 flex-1">
+                          <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center shrink-0">
+                            <Moon className="w-5 h-5 text-indigo-400" />
+                          </div>
+                          <div className="min-w-0">
+                            <p className="font-heading font-bold text-foreground text-base truncate">
+                              {day?.day_name || `Day ${dayIndex + 1} - Rest & Active Recovery`}
+                            </p>
+                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
+                                {day?.workout_type || 'Rest & Active Recovery'}
+                              </span>
+                              <span className="text-[10px] text-muted-foreground flex items-center gap-1 font-medium">
+                                <Shield className="w-3 h-3 text-emerald-400" />
+                                Streak Protected
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="text-right flex-shrink-0">
+                          <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-1 rounded-lg">
+                            Recovery Protocol
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Rest day recovery recommendations */}
+                      <div className="mt-4 pt-3 border-t border-border/60 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/30 border border-border/40 text-xs">
+                          <span className="w-5 h-5 rounded-md bg-indigo-500/15 text-indigo-400 text-[10px] font-bold flex items-center justify-center shrink-0">
+                            1
+                          </span>
+                          <span className="text-foreground font-medium truncate">
+                            7-9 hrs Restorative Sleep
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/30 border border-border/40 text-xs">
+                          <span className="w-5 h-5 rounded-md bg-indigo-500/15 text-indigo-400 text-[10px] font-bold flex items-center justify-center shrink-0">
+                            2
+                          </span>
+                          <span className="text-foreground font-medium truncate">
+                            15-20 min Mobility Flow / Walk
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/30 border border-border/40 text-xs">
+                          <span className="w-5 h-5 rounded-md bg-indigo-500/15 text-indigo-400 text-[10px] font-bold flex items-center justify-center shrink-0">
+                            3
+                          </span>
+                          <span className="text-foreground font-medium truncate">
+                            Optimal Hydration &amp; Macros
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </Card>
                 );
+              }
 
               return (
                 <Card
-                  key={
-                    `${selectedWeek}-${dayIndex}`
-                  }
-                  className={cn(
-                    'overflow-hidden transition-all',
-                    isRestDay
-                      ? 'opacity-60 border-dashed'
-                      : 'border-border hover:border-primary/40'
-                  )}
+                  key={`${selectedWeek}-${dayIndex}`}
+                  className="overflow-hidden transition-all border-border hover:border-primary/40 rounded-2xl"
                 >
-
                   {/* ==================================================
                       DAY HEADER
                       ================================================== */}
 
                   <div className="p-4">
-
                     <div className="flex items-start justify-between gap-3">
-
                       <div className="flex-1 min-w-0">
-
                         <p className="font-heading font-bold">
-                          {day?.day_name ||
-                            `Day ${dayIndex + 1}`}
+                          {day?.day_name || `Day ${dayIndex + 1}`}
                         </p>
-
                         <div className="flex items-center gap-2 mt-1 flex-wrap">
-
                           {day?.workout_type && (
-                            <WorkoutTypeTag
-                              workoutType={
-                                day.workout_type
-                              }
-                            />
+                            <WorkoutTypeTag workoutType={day.workout_type} />
                           )}
-
-                          {!isRestDay && (
-                            <span className="text-[10px] text-muted-foreground flex items-center gap-1">
-
-                              <Dumbbell className="w-3 h-3" />
-
-                              {exercises.length}{' '}
-
-                              {exercises.length ===
-                              1
-                                ? 'exercise'
-                                : 'exercises'}
-
-                            </span>
-                          )}
-
+                          <span className="text-[10px] text-muted-foreground flex items-center gap-1">
+                            <Dumbbell className="w-3 h-3" />
+                            {exercises.length}{' '}
+                            {exercises.length === 1 ? 'exercise' : 'exercises'}
+                          </span>
                         </div>
-
                       </div>
 
                       <div className="text-right flex-shrink-0">
-
-                        {isRestDay ? (
-
-                          <p className="text-xs text-muted-foreground font-medium">
-                            Rest
-                          </p>
-
-                        ) : (
-
-                          <p className="text-xs text-muted-foreground flex items-center gap-1">
-
-                            <Clock className="w-3 h-3" />
-
-                            ~{estimatedMinutes} min
-
-                          </p>
-
-                        )}
-
+                        <p className="text-xs text-muted-foreground flex items-center gap-1">
+                          <Clock className="w-3 h-3" />
+                          ~{estimatedMinutes} min
+                        </p>
                       </div>
-
                     </div>
-
 
                     {/* ==================================================
                         PROGRESS+ EDITING
                         ================================================== */}
 
-                    {!isRestDay &&
-                      canEditWorkouts && (
-                        <Button
-                          type="button"
-                          variant="outline"
-                          size="sm"
-                          className="w-full mt-3 gap-2"
-                          onClick={() =>
-                            openWorkoutEditor(
-                              dayIndex,
-                              day
-                            )
-                          }
-                        >
+                    {canEditWorkouts && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full mt-3 gap-2 rounded-xl"
+                        onClick={() => openWorkoutEditor(dayIndex, day)}
+                      >
+                        <Edit3 className="w-3.5 h-3.5" />
+                        Edit Workout
+                      </Button>
+                    )}
 
-                          <Edit3 className="w-3.5 h-3.5" />
-
-                          Edit Workout
-
-                        </Button>
-                      )}
-
-                    {!isRestDay &&
-                      !canEditWorkouts && (
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="w-full mt-3 gap-2 text-xs text-muted-foreground hover:text-foreground border border-dashed border-border/60"
-                          onClick={() => navigate('/profile')}
-                        >
-
-                          <Lock className="w-3.5 h-3.5 text-muted-foreground" />
-
-                          Custom Workout Edits (Progress+)
-
-                        </Button>
-                      )}
-
+                    {!canEditWorkouts && (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="w-full mt-3 gap-2 text-xs text-muted-foreground hover:text-foreground border border-dashed border-border/60 rounded-xl"
+                        onClick={() => navigate('/profile')}
+                      >
+                        <Lock className="w-3.5 h-3.5 text-muted-foreground" />
+                        Custom Workout Edits (Progress+)
+                      </Button>
+                    )}
                   </div>
 
 
@@ -1615,9 +1664,9 @@ export default function WeeklyPlan({
               );
             }
           )}
-
         </div>
-      )}
+      );
+    })()}
 
 
       {/* ======================================================

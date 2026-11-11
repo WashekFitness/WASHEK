@@ -1,14 +1,14 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/lib/AuthContext';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
-import { Sparkles, Shield, ArrowRight } from 'lucide-react';
+import { Shield, ArrowRight, KeyRound, CheckCircle2, Mail, AlertTriangle, UserX } from 'lucide-react';
 
 export default function Login() {
   const navigate = useNavigate();
-  const { signInWithGoogle, signInWithEmail, signUpWithEmail, resetPassword } = useAuth();
+  const { signInWithEmail, signUpWithEmail, resetPassword } = useAuth();
 
   const [mode, setMode] = useState('login');
   const [email, setEmail] = useState('');
@@ -16,22 +16,78 @@ export default function Login() {
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
   const [loading, setLoading] = useState(false);
-  const [googleLoading, setGoogleLoading] = useState(false);
   const [showForgotPassword, setShowForgotPassword] = useState(false);
   const [forgotEmail, setForgotEmail] = useState('');
   const [forgotLoading, setForgotLoading] = useState(false);
 
-  const handleGoogleSignIn = async () => {
-    setGoogleLoading(true);
+  // Granular diagnostic feedback banner
+  const [diagnosticNotice, setDiagnosticNotice] = useState(null);
+  const [existingAccountNotice, setExistingAccountNotice] = useState(null);
+  const [quickResetSent, setQuickResetSent] = useState(false);
+  const [quickResetLoading, setQuickResetLoading] = useState(false);
+  const [inlineResetOpen, setInlineResetOpen] = useState(false);
+  const [inlineNewPassword, setInlineNewPassword] = useState('');
+  const [inlineResetLoading, setInlineResetLoading] = useState(false);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('deleted') === 'true') {
+      toast.success('Your account has been permanently deleted.');
+    }
+  }, []);
+
+  const handleInstantReset = async (targetEmail) => {
+    const clean = (targetEmail || email || '').trim();
+    if (!clean) {
+      toast.error('Please enter your email address first.');
+      return;
+    }
+    if (!inlineNewPassword || inlineNewPassword.length < 6) {
+      toast.error('New password must be at least 6 characters.');
+      return;
+    }
+    setInlineResetLoading(true);
     try {
-      await signInWithGoogle();
-      toast.success('Welcome back, Athlete!');
+      const res = await fetch('/api/auth/instant-reset', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: clean, newPassword: inlineNewPassword }),
+      });
+      const data = await res.json();
+      if (!res.ok || !data?.success) {
+        throw new Error(data?.error || 'Unable to update password.');
+      }
+      toast.success('Password updated! Signing in to your account…');
+      if (data?.session?.access_token) {
+        localStorage.setItem('washek_auth_token', data.session.access_token);
+      }
+      if (data?.profile || data?.user) {
+        localStorage.setItem('washek_user', JSON.stringify(data.profile || data.user));
+      }
+      await signInWithEmail(clean, inlineNewPassword);
       navigate('/');
     } catch (err) {
-      console.error('[Google Sign In Error]', err);
-      toast.error(err?.message || 'Google sign-in could not be completed.');
+      toast.error(err?.message || 'Failed to update password.');
     } finally {
-      setGoogleLoading(false);
+      setInlineResetLoading(false);
+    }
+  };
+
+  const handleQuickReset = async (targetEmail) => {
+    const clean = (targetEmail || email || '').trim();
+    if (!clean) {
+      toast.error('Please enter your email address first.');
+      return;
+    }
+    setQuickResetLoading(true);
+    try {
+      await resetPassword(clean);
+      setQuickResetSent(true);
+      toast.success(`Password reset code generated and sent for ${clean}`);
+    } catch (err) {
+      toast.error(err?.message || 'Unable to send password reset email.');
+    } finally {
+      setQuickResetLoading(false);
     }
   };
 
@@ -59,23 +115,85 @@ export default function Login() {
           return;
         }
 
-        await signUpWithEmail(cleanEmail, password, {
-          firstName: firstName.trim(),
-          lastName: lastName.trim(),
-        });
-        toast.success('Account created! Welcome to WASHEK.');
-        navigate('/');
+        try {
+          await signUpWithEmail(cleanEmail, password, {
+            firstName: firstName.trim(),
+            lastName: lastName.trim(),
+          });
+          toast.success('Account created! Welcome to WASHEK.');
+          navigate('/');
+        } catch (signupErr) {
+          const errText = signupErr?.message || '';
+          const isEmailInUse =
+            signupErr?.code === 'auth/email-already-in-use' ||
+            errText.toLowerCase().includes('already exists') ||
+            errText.toLowerCase().includes('already in use') ||
+            errText.toLowerCase().includes('already registered');
+
+          if (isEmailInUse) {
+            // Attempt signing in immediately in case user entered existing password
+            try {
+              await signInWithEmail(cleanEmail, password);
+              toast.success('Welcome back to WASHEK!');
+              navigate('/');
+              return;
+            } catch {
+              // Seamlessly switch to login tab with clear resolution guidance
+              setMode('login');
+              setExistingAccountNotice(cleanEmail);
+              toast.info('Account already exists for this email. Please sign in below or reset your password.');
+              return;
+            }
+          }
+          throw signupErr;
+        }
       } else {
         await signInWithEmail(cleanEmail, password);
         toast.success('Welcome back!');
         navigate('/');
       }
     } catch (error) {
-      console.error('[Auth Error]', error);
-      const msg = error?.message || 'Authentication failed. Please verify your credentials.';
-      toast.error(msg);
-      if (mode === 'signup' && msg.toLowerCase().includes('already exists')) {
-        setMode('login');
+      console.debug('[Auth Note]', error?.message || error);
+      const rawMsg = error?.message || '';
+      const reason = error?.reason || (error?.code === 'auth/wrong-password' ? 'incorrect_password' : error?.code === 'auth/user-not-found' ? 'user_not_found' : null);
+      const targetEmail = error?.targetEmail || cleanEmail;
+
+      if (reason === 'incorrect_password' || error?.code === 'auth/wrong-password' || rawMsg.toLowerCase().includes('password you entered does not match')) {
+        setDiagnosticNotice({
+          type: 'incorrect_password',
+          email: targetEmail,
+          title: `Incorrect Password for ${targetEmail}`,
+          message: `An active athlete account exists for this email address, but the password entered did not match.`,
+          suggestion: 'reset_password',
+        });
+        toast.error(`Incorrect password for ${targetEmail}. Please check your password or reset it below.`);
+      } else if (reason === 'user_not_found' || error?.code === 'auth/user-not-found' || rawMsg.toLowerCase().includes('no athlete account found') || rawMsg.toLowerCase().includes('must create an account')) {
+        setDiagnosticNotice({
+          type: 'user_not_found',
+          email: targetEmail,
+          title: 'No Athlete Account Found',
+          message: `No active athlete account was found for ${targetEmail}. You must create an account first before signing in.`,
+          suggestion: 'create_account',
+        });
+        toast.error(`No athlete account found for ${targetEmail}. Please create an account first.`);
+      } else if (reason === 'email_not_confirmed' || error?.code === 'auth/email-not-confirmed') {
+        setDiagnosticNotice({
+          type: 'email_not_confirmed',
+          email: targetEmail,
+          title: 'Email Confirmation Required',
+          message: `Your account for ${targetEmail} requires email confirmation before signing in.`,
+          suggestion: 'resend_confirmation',
+        });
+        toast.error(`Email confirmation pending for ${targetEmail}.`);
+      } else {
+        setDiagnosticNotice({
+          type: 'error',
+          email: targetEmail,
+          title: 'Sign In Failed',
+          message: rawMsg || 'Authentication failed. Please verify your credentials.',
+          suggestion: 'retry',
+        });
+        toast.error(rawMsg || 'Authentication failed. Please verify your credentials.');
       }
     } finally {
       setLoading(false);
@@ -108,24 +226,25 @@ export default function Login() {
 
   return (
     <div className="min-h-screen bg-background relative flex items-center justify-center px-6 py-12 safe-top safe-bottom overflow-hidden selection:bg-primary/20">
-      {/* Ambient Luxury Atmospheric Glows */}
-      <div className="absolute top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[520px] h-[520px] bg-primary/10 rounded-full blur-[120px] pointer-events-none" />
-      <div className="absolute bottom-10 right-10 w-80 h-80 bg-blue-500/5 rounded-full blur-[100px] pointer-events-none" />
+      {/* Mega Glowing Ambient Atmosphere */}
+      <div className="fixed top-1/4 left-1/2 -translate-x-1/2 -translate-y-1/2 w-[580px] h-[580px] bg-primary/20 dark:bg-primary/25 rounded-full blur-[140px] pointer-events-none z-0" />
+      <div className="fixed bottom-10 right-10 w-96 h-96 bg-blue-600/15 dark:bg-blue-600/20 rounded-full blur-[120px] pointer-events-none z-0" />
+      <div className="fixed top-20 left-10 w-80 h-80 bg-emerald-500/10 dark:bg-emerald-500/15 rounded-full blur-[120px] pointer-events-none z-0" />
 
       <div className="w-full max-w-md relative z-10">
         {/* Brand Header */}
         <div className="text-center mb-8">
           <div className="inline-flex relative mb-5 group">
-            <div className="absolute -inset-1 rounded-3xl bg-gradient-to-r from-primary/50 to-primary/20 blur-md opacity-75 group-hover:opacity-100 transition duration-500" />
+            <div className="absolute -inset-1 rounded-3xl bg-gradient-to-r from-primary/60 via-blue-500/40 to-primary/30 blur-lg opacity-80 group-hover:opacity-100 transition duration-500" />
             <img
               src="/washek-fitness-logo.jpg"
               alt="WASHEK"
-              className="relative w-20 h-20 rounded-2xl object-cover shadow-2xl border border-white/10 dark:border-white/15"
+              className="relative w-20 h-20 rounded-2xl object-cover shadow-[0_0_30px_rgba(37,99,235,0.4)] border border-primary/40 dark:border-primary/50"
             />
           </div>
 
           <div className="flex items-center justify-center mb-2">
-            <h1 className="font-heading text-3xl font-extrabold tracking-tight text-foreground">
+            <h1 className="font-heading text-3xl font-extrabold tracking-tight text-foreground drop-shadow-sm">
               WASHEK
             </h1>
           </div>
@@ -136,48 +255,203 @@ export default function Login() {
         </div>
 
         {/* Card Form */}
-        <div className="bg-card/90 backdrop-blur-xl border border-border/80 dark:border-white/10 rounded-3xl p-7 shadow-2xl dark:shadow-[0_20px_50px_rgba(0,0,0,0.6)] shadow-[inset_0_1px_0_rgba(255,255,255,0.08)]">
-          {/* Google Sign In Button */}
-          <button
-            type="button"
-            onClick={handleGoogleSignIn}
-            disabled={googleLoading || loading}
-            className="w-full h-12 flex items-center justify-center gap-3 rounded-2xl bg-secondary/80 hover:bg-secondary text-foreground font-medium text-sm border border-border/80 dark:border-white/10 transition-all duration-200 active:scale-[0.98] shadow-sm hover:shadow"
-          >
-            {googleLoading ? (
-              <span className="inline-block w-4 h-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
-            ) : (
-              <svg className="w-4 h-4" viewBox="0 0 24 24">
-                <path
-                  fill="#4285F4"
-                  d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
-                />
-                <path
-                  fill="#34A853"
-                  d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"
-                />
-                <path
-                  fill="#FBBC05"
-                  d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"
-                />
-                <path
-                  fill="#EA4335"
-                  d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"
-                />
-              </svg>
-            )}
-            <span>Continue with Google</span>
-          </button>
+        <div className="bg-card/95 backdrop-blur-2xl border border-primary/30 dark:border-primary/40 rounded-3xl p-7 shadow-[0_0_55px_rgba(37,99,235,0.22)] dark:shadow-[0_0_65px_rgba(37,99,235,0.28)] shadow-[inset_0_1px_1px_rgba(255,255,255,0.12)]">
 
-          {/* Divider */}
-          <div className="relative my-6 text-center">
-            <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-border/60 dark:border-white/10" />
+
+          {/* Granular Diagnostic Authentication Feedback Banner */}
+          {diagnosticNotice && mode === 'login' && (
+            <div
+              className={`mb-5 p-4 rounded-2xl border shadow-[0_0_25px_rgba(37,99,235,0.22)] relative overflow-hidden ${
+                diagnosticNotice.type === 'incorrect_password'
+                  ? 'bg-amber-500/10 border-amber-500/40 text-amber-200'
+                  : diagnosticNotice.type === 'user_not_found'
+                    ? 'bg-blue-500/10 border-blue-500/40 text-blue-200'
+                    : 'bg-primary/10 border-primary/40 text-foreground'
+              }`}
+            >
+              <div className="relative z-10 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    {diagnosticNotice.type === 'incorrect_password' ? (
+                      <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0" />
+                    ) : diagnosticNotice.type === 'user_not_found' ? (
+                      <UserX className="w-4 h-4 text-blue-400 shrink-0" />
+                    ) : (
+                      <KeyRound className="w-4 h-4 text-primary shrink-0" />
+                    )}
+                    <span className="font-heading font-bold text-xs uppercase tracking-wider text-foreground">
+                      {diagnosticNotice.title}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setDiagnosticNotice(null)}
+                    className="text-xs text-muted-foreground hover:text-foreground"
+                    aria-label="Dismiss notice"
+                  >
+                    ✕
+                  </button>
+                </div>
+
+                <p className="text-xs text-muted-foreground leading-relaxed">
+                  {diagnosticNotice.message}
+                </p>
+
+                {diagnosticNotice.type === 'incorrect_password' && (
+                  <div className="pt-2 space-y-3">
+                    {inlineResetOpen ? (
+                      <div className="p-3 rounded-xl bg-background/80 border border-amber-500/30 space-y-2">
+                        <span className="text-[11px] font-semibold text-foreground block">
+                          Set New Password for {diagnosticNotice.email}
+                        </span>
+                        <div className="flex gap-2">
+                          <Input
+                            type="password"
+                            placeholder="Min 6 characters"
+                            value={inlineNewPassword}
+                            onChange={(e) => setInlineNewPassword(e.target.value)}
+                            minLength={6}
+                            autoComplete="new-password"
+                            className="rounded-lg h-9 bg-background/90 text-xs"
+                          />
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={inlineResetLoading || inlineNewPassword.length < 6}
+                            onClick={() => handleInstantReset(diagnosticNotice.email)}
+                            className="h-9 px-3 text-xs font-semibold rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 shrink-0"
+                          >
+                            {inlineResetLoading ? 'Updating…' : 'Save & Sign In'}
+                          </Button>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setInlineResetOpen(false)}
+                          className="text-[10px] text-muted-foreground hover:underline"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap items-center gap-2">
+                        <Button
+                          type="button"
+                          size="sm"
+                          onClick={() => setInlineResetOpen(true)}
+                          className="h-8 px-3 text-xs font-semibold rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 shadow-sm flex items-center gap-1.5"
+                        >
+                          <KeyRound className="w-3.5 h-3.5" />
+                          <span>Set New Password Now</span>
+                        </Button>
+
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          disabled={quickResetLoading || quickResetSent}
+                          onClick={() => handleQuickReset(diagnosticNotice.email)}
+                          className="h-8 px-3 text-xs font-semibold rounded-xl border-amber-500/40 bg-card hover:bg-amber-500/15 text-amber-400 shadow-sm flex items-center gap-1.5"
+                        >
+                          {quickResetLoading ? (
+                            <span className="inline-block w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+                          ) : quickResetSent ? (
+                            <>
+                              <CheckCircle2 className="w-3.5 h-3.5 text-accent" />
+                              <span>Code Generated</span>
+                            </>
+                          ) : (
+                            <>
+                              <Mail className="w-3.5 h-3.5" />
+                              <span>Email / Code Reset</span>
+                            </>
+                          )}
+                        </Button>
+
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          onClick={() => navigate(`/reset-password?email=${encodeURIComponent(diagnosticNotice.email)}`)}
+                          className="h-8 px-2.5 text-xs font-medium text-primary hover:text-primary hover:bg-primary/10"
+                        >
+                          <span>Reset Page</span>
+                          <ArrowRight className="w-3 h-3 ml-1" />
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {diagnosticNotice.type === 'user_not_found' && (
+                  <div className="pt-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={() => {
+                        setMode('signup');
+                        setDiagnosticNotice(null);
+                      }}
+                      className="h-8 px-3 text-xs font-semibold rounded-xl bg-blue-600 hover:bg-blue-500 text-white flex items-center gap-1.5"
+                    >
+                      <span>Create Account with this Email</span>
+                      <ArrowRight className="w-3 h-3" />
+                    </Button>
+                  </div>
+                )}
+              </div>
             </div>
-            <span className="relative bg-card px-3 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              or continue with email
-            </span>
-          </div>
+          )}
+
+          {/* Fallback Existing Account Banner */}
+          {!diagnosticNotice && existingAccountNotice && mode === 'login' && (
+            <div className="mb-5 p-4 rounded-2xl bg-primary/10 border border-primary/40 shadow-[0_0_25px_rgba(37,99,235,0.22)] relative overflow-hidden">
+              <div className="absolute top-0 right-0 w-32 h-32 bg-primary/15 rounded-full blur-xl pointer-events-none" />
+              <div className="relative z-10">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <KeyRound className="w-4 h-4 text-primary shrink-0" />
+                    <span className="font-heading font-bold text-xs text-foreground uppercase tracking-wider">
+                      Existing Account Found
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setExistingAccountNotice(null)}
+                    className="text-xs text-muted-foreground hover:text-foreground"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <p className="text-xs text-muted-foreground mt-1.5 leading-relaxed">
+                  An account is already registered for <span className="text-foreground font-semibold font-mono text-[11px]">{existingAccountNotice}</span>. Enter your password to sign in, or click below to send a password reset link.
+                </p>
+                <div className="mt-3 flex items-center gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    disabled={quickResetLoading || quickResetSent}
+                    onClick={() => handleQuickReset(existingAccountNotice)}
+                    className="h-8 px-3 text-xs font-semibold rounded-xl border-primary/40 bg-card hover:bg-primary/15 text-primary shadow-[0_0_15px_rgba(37,99,235,0.25)] flex items-center gap-1.5"
+                  >
+                    {quickResetLoading ? (
+                      <span className="inline-block w-3 h-3 border-2 border-primary border-t-transparent rounded-full animate-spin" />
+                    ) : quickResetSent ? (
+                      <>
+                        <CheckCircle2 className="w-3.5 h-3.5 text-accent" />
+                        <span>Reset Email Sent</span>
+                      </>
+                    ) : (
+                      <>
+                        <Mail className="w-3.5 h-3.5" />
+                        <span>Send Password Reset Link</span>
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </div>
+            </div>
+          )}
 
           <form onSubmit={submit} className="space-y-4">
             {mode === 'signup' && (
@@ -186,14 +460,14 @@ export default function Login() {
                   placeholder="First name"
                   value={firstName}
                   onChange={(e) => setFirstName(e.target.value)}
-                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary"
+                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
                   required
                 />
                 <Input
                   placeholder="Last name"
                   value={lastName}
                   onChange={(e) => setLastName(e.target.value)}
-                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary"
+                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
                 />
               </div>
             )}
@@ -203,7 +477,7 @@ export default function Login() {
               placeholder="athlete@washek.com"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary"
+              className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
               required
             />
 
@@ -213,7 +487,7 @@ export default function Login() {
               value={password}
               onChange={(e) => setPassword(e.target.value)}
               minLength={6}
-              className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary"
+              className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
               required
             />
 
@@ -234,8 +508,8 @@ export default function Login() {
 
             <Button
               type="submit"
-              className="w-full h-11 rounded-xl font-semibold text-sm bg-primary text-primary-foreground hover:bg-primary/90 transition-all duration-200 active:scale-[0.98] shadow-md shadow-primary/20 flex items-center justify-center gap-2"
-              disabled={loading || googleLoading}
+              className="w-full h-12 rounded-2xl font-bold font-heading text-sm bg-primary text-primary-foreground hover:bg-primary/95 transition-all duration-200 active:scale-[0.98] shadow-[0_0_24px_rgba(37,99,235,0.45)] hover:shadow-[0_0_35px_rgba(37,99,235,0.65)] border border-primary/40 flex items-center justify-center gap-2"
+              disabled={loading}
             >
               {loading ? (
                 'Processing…'
@@ -249,10 +523,11 @@ export default function Login() {
 
             <button
               type="button"
-              className="w-full pt-2 text-xs text-muted-foreground hover:text-foreground font-medium text-center transition-colors"
-              onClick={() =>
-                setMode(mode === 'login' ? 'signup' : 'login')
-              }
+              className="w-full pt-2 text-xs text-muted-foreground hover:text-primary font-medium text-center transition-colors"
+              onClick={() => {
+                setMode(mode === 'login' ? 'signup' : 'login');
+                setExistingAccountNotice(null);
+              }}
             >
               {mode === 'login'
                 ? "Don't have an account yet? Create one"

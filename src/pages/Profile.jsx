@@ -45,9 +45,9 @@ import PricingSection from '@/components/profile/PricingSection';
 
 import QuickAccess from '@/components/layout/QuickAccess';
 
-import { firebaseApi } from '@/lib/firebaseApi';
 import { useAuth } from '@/lib/AuthContext';
 import { isLogo, cleanseAvatarUrl } from '@/lib/avatarUtils';
+import { getCachedActiveProgram } from '@/lib/cacheStore';
 
 import {
   supabaseApi,
@@ -142,7 +142,7 @@ export default function Profile() {
           } catch (_err) {
             // Ignore storage cleanup error
           }
-          firebaseApi.firestore.saveAvatar(null).catch(() => {});
+
           if (user?.id) {
             supabase.from('profiles').update({ avatar_url: null, photo_url: null }).eq('id', user.id).then(() => {}).catch(() => {});
           }
@@ -197,10 +197,7 @@ export default function Profile() {
       console.warn('LocalStorage error storing avatar:', storageErr);
     }
 
-    // Sync with Firestore & Supabase
-    firebaseApi.firestore.saveAvatar(croppedDataUrl).catch((err) => {
-      console.warn('[Firebase] Avatar cloud sync note:', err);
-    });
+
     if (user?.id) {
       supabase.from('profiles').update({ avatar_url: croppedDataUrl, photo_url: croppedDataUrl }).eq('id', user.id).then(() => {}).catch(() => {});
     }
@@ -236,8 +233,7 @@ export default function Profile() {
       console.warn('LocalStorage remove error:', err);
     }
 
-    // Cloud removals
-    firebaseApi.firestore.saveAvatar(null).catch(() => {});
+
     if (user?.id) {
       supabase.from('profiles').update({ avatar_url: null, photo_url: null }).eq('id', user.id).then(() => {}).catch(() => {});
     }
@@ -296,28 +292,74 @@ export default function Profile() {
     };
   }, [authUser?.id]);
 
+  // Synchronize profile data and program state whenever a new program is generated or profile is saved
+  useEffect(() => {
+    const handleProgramOrProfileUpdate = () => {
+      try {
+        const stored = localStorage.getItem('washek_user');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          setUser((prev) => ({ ...(prev || {}), ...parsed }));
+        }
+      } catch (e) {
+        // ignore
+      }
+      queryClient.invalidateQueries({ queryKey: ['programs'] });
+      queryClient.invalidateQueries({ queryKey: ['profile'] });
+    };
+
+    window.addEventListener('washek-program-updated', handleProgramOrProfileUpdate);
+    window.addEventListener('washek-profile-updated', handleProgramOrProfileUpdate);
+    window.addEventListener('storage', handleProgramOrProfileUpdate);
+
+    return () => {
+      window.removeEventListener('washek-program-updated', handleProgramOrProfileUpdate);
+      window.removeEventListener('washek-profile-updated', handleProgramOrProfileUpdate);
+      window.removeEventListener('storage', handleProgramOrProfileUpdate);
+    };
+  }, [queryClient]);
+
+  const userKey = user?.id || user?.uid || user?.email || 'guest';
 
   const {
     data: programs = [],
   } = useQuery({
     queryKey: [
       'programs',
-      user?.email,
+      userKey,
     ],
 
-    queryFn: () =>
-      supabaseApi.entities.WorkoutProgram.filter(
-        {
-          status: 'active',
-          created_by: user.email,
-        },
-        '-created_date',
-        1
-      ),
+    queryFn: async () => {
+      try {
+        const remote = await supabaseApi.entities.WorkoutProgram.filter(
+          {
+            status: 'active',
+          },
+          '-created_at',
+          10
+        );
+        if (remote && remote.length > 0) {
+          const match = remote.find((p) =>
+            p.user_id === user?.id ||
+            p.user_id === user?.uid ||
+            p.created_by === user?.email ||
+            p.created_by === user?.id ||
+            !p.user_id
+          );
+          if (match) return [match];
+        }
+      } catch (err) {
+        console.debug('Failed to fetch remote workout programs:', err);
+      }
+      const cached = getCachedActiveProgram(userKey);
+      return cached ? [cached] : [];
+    },
 
-    enabled: !!user?.email,
+    initialData: () => {
+      const cached = getCachedActiveProgram(userKey);
+      return cached ? [cached] : [];
+    },
   });
-
 
   const {
     data: logs = [],
@@ -339,9 +381,7 @@ export default function Profile() {
     enabled: !!user?.email,
   });
 
-
-  const activeProgram =
-    programs[0];
+  const activeProgram = programs[0] || getCachedActiveProgram(userKey);
 
   // Resolve subscription status
   const currentSubStatus = String(
@@ -1198,7 +1238,7 @@ export default function Profile() {
         z-0
         pt-2
       ">
-        <PricingSection onPlanChange={handlePlanChange} />
+        <PricingSection onPlanChange={handlePlanChange} currentPlanProp={plan} />
       </div>
 
       {/* ====================================================

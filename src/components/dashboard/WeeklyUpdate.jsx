@@ -4,7 +4,6 @@ import { Button } from '@/components/ui/button';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { supabase } from '@/lib/supabase';
 import {
-  Sparkles,
   ChevronDown,
   ChevronUp,
   CheckCircle2,
@@ -322,7 +321,7 @@ export default function WeeklyUpdate({
           }
         }
 
-        // When authenticated via Firebase/Google or fallback without Supabase JWT,
+        // When authenticated via Supabase session or fallback profile,
         // availability is determined by whether the cycle has been claimed locally
         if (!cancelled) {
           setWeeklyUpdateAvailable(true);
@@ -1742,7 +1741,7 @@ Never diagnose a medical condition.
 
           <div className="w-8 h-8 rounded-lg bg-primary/20 flex items-center justify-center">
 
-            <Sparkles className="w-4 h-4 text-primary" />
+            <CalendarDays className="w-4 h-4 text-primary" />
 
           </div>
 
@@ -2069,7 +2068,7 @@ Never diagnose a medical condition.
                 onClick={generate}
               >
 
-                <Sparkles className="w-4 h-4 mr-2" />
+                <CalendarDays className="w-4 h-4 mr-2" />
 
                 Get This Week's Update
 
@@ -2184,7 +2183,7 @@ Never diagnose a medical condition.
 
                   <div className="flex items-center gap-2 mb-2">
 
-                    <Sparkles className="w-4 h-4 text-primary" />
+                    <Activity className="w-4 h-4 text-primary" />
 
                     <p className="text-xs font-bold text-primary uppercase tracking-wider">
                       Your Week

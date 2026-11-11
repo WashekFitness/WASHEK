@@ -10,10 +10,10 @@ export default function QuickAccess() {
       </h3>
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <Link to="/photos" className="group">
-          <Card className="p-4 h-full flex flex-col justify-between gap-3 bg-gradient-to-br from-primary/[0.06] via-card to-card hover:border-primary/50 hover:shadow-[0_8px_28px_-4px_rgba(37,99,235,0.2)] hover:-translate-y-0.5 transition-all duration-300 relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-24 h-24 bg-primary/[0.08] rounded-full blur-xl pointer-events-none -mr-6 -mt-6 group-hover:bg-primary/[0.14] transition-all" />
+          <Card className="p-4 h-full flex flex-col justify-between gap-3 bg-gradient-to-br from-primary/[0.08] via-card to-card border border-primary/25 hover:border-primary/60 hover:shadow-[0_0_30px_rgba(37,99,235,0.3)] hover:-translate-y-0.5 transition-all duration-300 rounded-3xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-28 h-28 bg-primary/15 rounded-full blur-xl pointer-events-none -mr-6 -mt-6 group-hover:bg-primary/25 transition-all" />
             <div className="flex items-start justify-between w-full relative z-10">
-              <div className="w-10 h-10 rounded-xl bg-primary/15 border border-primary/25 flex items-center justify-center text-primary group-hover:scale-110 group-hover:bg-primary/20 transition-all duration-300 shadow-2xs">
+              <div className="w-10 h-10 rounded-2xl bg-primary/15 border border-primary/30 flex items-center justify-center text-primary group-hover:scale-110 group-hover:bg-primary/25 transition-all duration-300 shadow-[0_0_12px_rgba(37,99,235,0.25)]">
                 <Camera className="w-5 h-5 text-primary" />
               </div>
               <ArrowUpRight className="w-4 h-4 text-muted-foreground/60 group-hover:text-primary group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-all" />
@@ -29,10 +29,10 @@ export default function QuickAccess() {
           </Card>
         </Link>
         <Link to="/formlab" className="group">
-          <Card className="p-4 h-full flex flex-col justify-between gap-3 bg-gradient-to-br from-chart-4/[0.06] via-card to-card hover:border-chart-4/50 hover:shadow-[0_8px_28px_-4px_rgba(245,158,11,0.2)] hover:-translate-y-0.5 transition-all duration-300 relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-24 h-24 bg-chart-4/[0.08] rounded-full blur-xl pointer-events-none -mr-6 -mt-6 group-hover:bg-chart-4/[0.14] transition-all" />
+          <Card className="p-4 h-full flex flex-col justify-between gap-3 bg-gradient-to-br from-chart-4/[0.08] via-card to-card border border-chart-4/25 hover:border-chart-4/60 hover:shadow-[0_0_30px_rgba(245,158,11,0.3)] hover:-translate-y-0.5 transition-all duration-300 rounded-3xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-28 h-28 bg-chart-4/15 rounded-full blur-xl pointer-events-none -mr-6 -mt-6 group-hover:bg-chart-4/25 transition-all" />
             <div className="flex items-start justify-between w-full relative z-10">
-              <div className="w-10 h-10 rounded-xl bg-chart-4/15 border border-chart-4/25 flex items-center justify-center text-chart-4 group-hover:scale-110 group-hover:bg-chart-4/20 transition-all duration-300 shadow-2xs">
+              <div className="w-10 h-10 rounded-2xl bg-chart-4/15 border border-chart-4/30 flex items-center justify-center text-chart-4 group-hover:scale-110 group-hover:bg-chart-4/25 transition-all duration-300 shadow-[0_0_12px_rgba(245,158,11,0.25)]">
                 <Eye className="w-5 h-5 text-chart-4" />
               </div>
               <ArrowUpRight className="w-4 h-4 text-muted-foreground/60 group-hover:text-chart-4 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-all" />
@@ -48,10 +48,10 @@ export default function QuickAccess() {
           </Card>
         </Link>
         <Link to="/muscle-heatmap" className="group">
-          <Card className="p-4 h-full flex flex-col justify-between gap-3 bg-gradient-to-br from-emerald-500/[0.06] via-card to-card hover:border-emerald-500/50 hover:shadow-[0_8px_28px_-4px_rgba(16,185,129,0.2)] hover:-translate-y-0.5 transition-all duration-300 relative overflow-hidden">
-            <div className="absolute top-0 right-0 w-24 h-24 bg-emerald-500/[0.08] rounded-full blur-xl pointer-events-none -mr-6 -mt-6 group-hover:bg-emerald-500/[0.14] transition-all" />
+          <Card className="p-4 h-full flex flex-col justify-between gap-3 bg-gradient-to-br from-emerald-500/[0.08] via-card to-card border border-emerald-500/25 hover:border-emerald-500/60 hover:shadow-[0_0_30px_rgba(16,185,129,0.3)] hover:-translate-y-0.5 transition-all duration-300 rounded-3xl relative overflow-hidden">
+            <div className="absolute top-0 right-0 w-28 h-28 bg-emerald-500/15 rounded-full blur-xl pointer-events-none -mr-6 -mt-6 group-hover:bg-emerald-500/25 transition-all" />
             <div className="flex items-start justify-between w-full relative z-10">
-              <div className="w-10 h-10 rounded-xl bg-emerald-500/15 border border-emerald-500/25 flex items-center justify-center text-emerald-500 group-hover:scale-110 group-hover:bg-emerald-500/20 transition-all duration-300 shadow-2xs">
+              <div className="w-10 h-10 rounded-2xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-500 group-hover:scale-110 group-hover:bg-emerald-500/25 transition-all duration-300 shadow-[0_0_12px_rgba(16,185,129,0.25)]">
                 <Activity className="w-5 h-5 text-emerald-500" />
               </div>
               <ArrowUpRight className="w-4 h-4 text-muted-foreground/60 group-hover:text-emerald-500 group-hover:translate-x-0.5 group-hover:-translate-y-0.5 transition-all" />

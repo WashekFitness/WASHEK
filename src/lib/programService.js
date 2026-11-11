@@ -12,6 +12,8 @@ import {
   checkProgramGenerationLock,
   recordProgramGenerated,
 } from '@/lib/programCooldown';
+import { calcNutritionGoals } from '@/lib/nutritionGoals';
+import { setCachedActiveProgram } from '@/lib/cacheStore';
 
 /**
  * Generates a fresh 12-week workout program for the user.
@@ -80,7 +82,7 @@ export async function generateNewProgram(options = {}) {
       .order('created_at', { ascending: false })
       .limit(1);
 
-    const lock = checkProgramGenerationLock(latestPrograms?.[0]?.created_at);
+    const lock = checkProgramGenerationLock(latestPrograms?.[0]?.created_at, user);
     if (lock.isLocked) {
       throw new Error(
         `Workout program generation is locked. You can generate a new program in ${lock.remainingDays} day${lock.remainingDays === 1 ? '' : 's'}.`
@@ -402,29 +404,86 @@ export async function generateNewProgram(options = {}) {
     };
   }
 
+  const nowIso = new Date().toISOString();
+
+  // Calculate individualized macros based on real athlete stats, training discipline, and goals
+  const personalizedNutrition = calcNutritionGoals(
+    {
+      ...user,
+      ...profile,
+      training_type: trainingType,
+      fitness_level: fitnessLevel,
+    },
+    {
+      userKey: validUserId,
+      program: savedProgram,
+    }
+  );
+
+  // Sync active program to localStorage for instant hydration on dashboard and profile
   try {
     localStorage.setItem('washek_active_program', JSON.stringify(savedProgram));
+    setCachedActiveProgram(savedProgram, validUserId);
+    if (user?.email) {
+      setCachedActiveProgram(savedProgram, user.email);
+    }
   } catch (cacheErr) {
     console.debug('[ProgramService] Local cache note:', cacheErr);
   }
 
-  // Stamp 7-day cooldown immediately
-  recordProgramGenerated();
+  // Stamp 7-day cooldown immediately with user ID to sync DB and local
+  recordProgramGenerated(validUserId);
 
-  // 8. If training type was changed by user, update profile training_type without wiping other fields
-  if (trainingTypeOverride && trainingTypeOverride !== profile?.training_type) {
-    try {
-      await supabase
-        .from('profiles')
-        .update({ training_type: trainingTypeOverride })
-        .eq('id', validUserId);
-    } catch (profErr) {
-      console.debug('[ProgramService] Profile training type sync note:', profErr);
-    }
+  // Sync profile active program and personalized nutrition targets
+  try {
+    await supabase
+      .from('profiles')
+      .update({
+        active_program_id: savedProgram.id,
+        training_type: trainingType,
+        fitness_level: fitnessLevel,
+        last_program_generated_at: nowIso,
+        calorie_target: personalizedNutrition.calories,
+        protein_target: personalizedNutrition.protein,
+        carbs_target: personalizedNutrition.carbs,
+        fat_target: personalizedNutrition.fat,
+        updated_at: nowIso,
+      })
+      .eq('id', validUserId);
+  } catch (profErr) {
+    console.debug('[ProgramService] Profile sync note:', profErr);
   }
 
-  // 9. Invalidate queries so Dashboard, Program, and Workout pages refresh immediately
+  // Sync updated profile with macros and active program into localStorage
   try {
+    const rawLocal = localStorage.getItem('washek_user');
+    const parsedLocal = rawLocal ? JSON.parse(rawLocal) : {};
+    localStorage.setItem(
+      'washek_user',
+      JSON.stringify({
+        ...parsedLocal,
+        id: validUserId,
+        active_program_id: savedProgram.id,
+        training_type: trainingType,
+        fitness_level: fitnessLevel,
+        last_program_generated_at: nowIso,
+        calorie_target: personalizedNutrition.calories,
+        protein_target: personalizedNutrition.protein,
+        carbs_target: personalizedNutrition.carbs,
+        fat_target: personalizedNutrition.fat,
+      })
+    );
+  } catch (uSyncErr) {
+    console.debug('[ProgramService] User localStorage sync note:', uSyncErr);
+  }
+
+  // Invalidate queries so Dashboard, Program, Profile, and Workout pages refresh immediately
+  try {
+    await queryClientInstance.invalidateQueries({ queryKey: ['active_program'] });
+    await queryClientInstance.invalidateQueries({ queryKey: ['programs'] });
+    await queryClientInstance.invalidateQueries({ queryKey: ['workout-program-cooldown'] });
+    await queryClientInstance.invalidateQueries({ queryKey: ['user_profile'] });
+    await queryClientInstance.invalidateQueries({ queryKey: ['profile'] });
     await queryClientInstance.invalidateQueries();
   } catch (qErr) {
     console.debug('[ProgramService] Query invalidation note:', qErr);
@@ -434,6 +493,9 @@ export async function generateNewProgram(options = {}) {
   try {
     window.dispatchEvent(
       new CustomEvent('washek-program-updated', { detail: { program: savedProgram } })
+    );
+    window.dispatchEvent(
+      new CustomEvent('washek-profile-updated', { detail: { program: savedProgram } })
     );
   } catch (eventErr) {
     console.debug('[ProgramService] Event dispatch note:', eventErr);

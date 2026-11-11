@@ -16,13 +16,6 @@ import {
   supabaseApi,
 } from '@/lib/supabaseApi';
 
-import {
-  firebaseApi,
-} from '@/lib/firebaseApi';
-
-import {
-  auth as firebaseAuth,
-} from '@/lib/firebase';
 
 import {
   Zap,
@@ -56,49 +49,75 @@ export default function SubscriptionReturn() {
   useEffect(() => {
     let cancelled = false;
 
-    // Detect plan from query parameters, with pending checkout storage fallback
-    const rawPlanParam = searchParams.get('plan') || '';
-    const rawStatusParam = searchParams.get('status') || '';
-    const resolvedStatus = rawStatusParam === 'active' ? 'active' : 'trialing';
-    setSubStatus(resolvedStatus);
+    const resolveAndUpgrade = async () => {
+      // 1. Detect plan from query params, cookies, localStorage, or backend endpoint
+      const rawPlanParam = searchParams.get('plan') || searchParams.get('tier') || '';
+      const rawStatusParam = searchParams.get('status') || '';
+      const trialParam = searchParams.get('trial');
+      const resolvedStatus = trialParam === 'false' ? 'active' : (rawStatusParam === 'active' ? 'active' : 'trialing');
+      setSubStatus(resolvedStatus);
 
-    const pendingPlan = (() => {
-      try {
-        return (
-          sessionStorage.getItem('washek_pending_checkout_plan') ||
-          localStorage.getItem('washek_pending_checkout_plan') ||
-          ''
-        );
-      } catch {
-        return '';
+      let pendingPlan = (() => {
+        try {
+          return (
+            sessionStorage.getItem('washek_pending_checkout_plan') ||
+            localStorage.getItem('washek_pending_checkout_plan') ||
+            ''
+          );
+        } catch {
+          return '';
+        }
+      })();
+
+      if (!pendingPlan) {
+        try {
+          const match = document.cookie.match(/washek_pending_checkout_plan=([^;]+)/);
+          if (match) pendingPlan = match[1];
+        } catch {
+          /* ignore cookie error */
+        }
       }
-    })();
 
-    const resolvedPlan = normalizePlan(rawPlanParam || pendingPlan);
-    const sessionId = searchParams.get('session_id') || searchParams.get('sessionId') || '';
+      if (!rawPlanParam && !pendingPlan) {
+        try {
+          const res = await fetch('/api/checkout/pending');
+          const data = await res.json();
+          if (data?.plan) pendingPlan = data.plan;
+        } catch {
+          /* ignore */
+        }
+      }
 
-    if (!resolvedPlan || resolvedPlan === 'free') {
-      setStatus('error');
-      setErrorMessage('No valid subscription plan was found in this return link.');
-      return;
-    }
+      const sessionId = searchParams.get('session_id') || searchParams.get('sessionId') || '';
+      // If Stripe returned with a session or confirmation, default to performance if plan unspecified
+      let resolvedPlan = normalizePlan(rawPlanParam || pendingPlan);
+      if ((!resolvedPlan || resolvedPlan === 'free') && (sessionId || rawStatusParam || window.location.href.includes('return'))) {
+        resolvedPlan = 'performance';
+      }
 
-    const friendlyName = (PLAN_LABELS && PLAN_LABELS[resolvedPlan]) ||
-      resolvedPlan.charAt(0).toUpperCase() + resolvedPlan.slice(1);
-    setPlanName(friendlyName);
+      if (!resolvedPlan || resolvedPlan === 'free') {
+        setStatus('error');
+        setErrorMessage('No valid subscription plan was detected. If you completed checkout on Stripe, click below to activate your plan.');
+        return;
+      }
 
-    // Apply upgrade instantly across all local storage & application state
-    applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { sessionId });
+      const friendlyName =
+        (PLAN_LABELS && PLAN_LABELS[resolvedPlan]) ||
+        resolvedPlan.charAt(0).toUpperCase() + resolvedPlan.slice(1);
+      setPlanName(friendlyName);
 
-    // Clean up temporary pending plan
-    try {
-      localStorage.removeItem('washek_pending_checkout_plan');
-      sessionStorage.removeItem('washek_pending_checkout_plan');
-    } catch (_err) {
-      // ignore
-    }
+      // Apply upgrade instantly across all local storage & application state
+      applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { sessionId });
 
-    const synchronizeAndComplete = async () => {
+      // Clean up temporary pending plan
+      try {
+        localStorage.removeItem('washek_pending_checkout_plan');
+        sessionStorage.removeItem('washek_pending_checkout_plan');
+        document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
+      } catch {
+        /* ignore */
+      }
+
       let authUser = null;
       try {
         const { data: authData } = await supabase.auth.getUser();
@@ -118,7 +137,7 @@ export default function SubscriptionReturn() {
       const uid = authUser?.id || storedUser?.id || storedUser?.uid;
       const email = authUser?.email || storedUser?.email;
 
-      // 1. Call backend server checkout sync endpoint
+      // 3. Call backend server checkout sync endpoint
       try {
         await fetch('/api/checkout/process', {
           method: 'POST',
@@ -135,22 +154,7 @@ export default function SubscriptionReturn() {
         console.debug('[SubscriptionReturn] Server process note:', err);
       }
 
-      // 2. Update Firebase / Firestore user profile if logged in
-      try {
-        if (firebaseAuth?.currentUser) {
-          await firebaseApi.auth.updateProfile({
-            subscription_plan: resolvedPlan,
-            subscription_status: resolvedStatus,
-            tier: resolvedPlan,
-            plan: resolvedPlan,
-            subscription_tier: resolvedPlan,
-          });
-        }
-      } catch (err) {
-        console.debug('[SubscriptionReturn] Firestore sync note:', err);
-      }
-
-      // 3. Query or update Supabase profile
+      // 4. Update Supabase profile if present
       try {
         if (uid) {
           await supabase
@@ -166,11 +170,40 @@ export default function SubscriptionReturn() {
         console.debug('[SubscriptionReturn] Supabase profile sync note:', err);
       }
 
-      // 4. Re-verify with auth.me
+      // 5. Notify the main app tab that subscription was verified
       try {
-        await supabaseApi.auth.me(true);
-      } catch (_err) {
-        // ignore
+        if (window.opener && !window.opener.closed) {
+          window.opener.postMessage({
+            type: 'WASHEK_SUBSCRIPTION_SUCCESS',
+            plan: resolvedPlan,
+            status: resolvedStatus,
+          }, '*');
+        }
+      } catch (_pmErr) {
+        // ignore cross-origin error
+      }
+
+      try {
+        const bc = new BroadcastChannel('washek_subscription_sync');
+        bc.postMessage({
+          type: 'WASHEK_SUBSCRIPTION_SUCCESS',
+          plan: resolvedPlan,
+          status: resolvedStatus,
+          timestamp: Date.now(),
+        });
+        bc.close();
+      } catch (_bcErr) {
+        // ignore BroadcastChannel error
+      }
+
+      try {
+        localStorage.setItem('washek_subscription_success_event', JSON.stringify({
+          plan: resolvedPlan,
+          status: resolvedStatus,
+          timestamp: Date.now(),
+        }));
+      } catch (_lsErr) {
+        // ignore storage error
       }
 
       if (cancelled) return;
@@ -178,17 +211,30 @@ export default function SubscriptionReturn() {
       // Mark success
       setStatus('success');
 
-      // Auto-redirect to home page after a brief confirmation moment
+      // Try closing the tab if opened from the app, or turn into the app directly
       const timer = window.setTimeout(() => {
         if (!cancelled) {
-          navigate('/', { replace: true });
+          let tabClosed = false;
+          if (window.opener && !window.opener.closed) {
+            try {
+              window.close();
+              tabClosed = true;
+            } catch (_err) {
+              // ignore popup close restriction
+            }
+          }
+          if (!tabClosed) {
+            window.location.replace('/?subscribed=' + encodeURIComponent(resolvedPlan));
+          }
         }
-      }, 3500);
+      }, 1400);
 
-      return () => clearTimeout(timer);
+      return () => {
+        clearTimeout(timer);
+      };
     };
 
-    synchronizeAndComplete();
+    resolveAndUpgrade();
 
     return () => {
       cancelled = true;
@@ -199,28 +245,29 @@ export default function SubscriptionReturn() {
 
   /*
    * ==========================================================
-   * LOADING
+   * LOADING & SYNCING
    * ==========================================================
    */
   if (status === 'loading') {
     return (
       <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
         <div className="space-y-4 max-w-sm">
-          <div className="w-14 h-14 rounded-2xl bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto shadow-sm">
-            <Loader2 className="w-7 h-7 text-primary animate-spin" />
+          <div className="w-16 h-16 rounded-3xl bg-primary/10 border border-primary/20 flex items-center justify-center mx-auto shadow-lg shadow-primary/15 relative">
+            <Loader2 className="w-8 h-8 text-primary animate-spin" />
+            <div className="absolute inset-0 rounded-3xl bg-primary/20 blur-xl animate-pulse -z-10" />
           </div>
 
-          <h1 className="font-heading font-bold text-2xl tracking-tight">
-            Confirming your 7-day free trial…
+          <h1 className="font-heading font-extrabold text-2xl tracking-tight text-foreground">
+            Syncing your plan…
           </h1>
 
           <p className="text-sm text-muted-foreground leading-relaxed">
-            Stripe checkout completed. WASHEK is unlocking all {planName || 'plan'} features for your 7-day free trial now ($0 charged today).
+            Stripe payment confirmed. WASHEK is unlocking all {planName || 'plan'} features and synchronizing your account…
           </p>
 
-          <div className="flex items-center justify-center gap-2 text-primary font-medium text-sm pt-2">
-            <Zap className="w-4 h-4 fill-primary/20" />
-            <span>WASHEK {planName}</span>
+          <div className="flex items-center justify-center gap-2 text-primary font-heading font-bold text-sm pt-2">
+            <Zap className="w-4 h-4 fill-primary/30" />
+            <span>WASHEK {planName || 'Tier'}</span>
           </div>
         </div>
       </div>
@@ -238,13 +285,14 @@ export default function SubscriptionReturn() {
     return (
       <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
         <div className="space-y-5 max-w-sm w-full">
-          <div className="w-16 h-16 rounded-3xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center mx-auto shadow-lg shadow-emerald-500/10">
-            <CheckCircle2 className="w-9 h-9 text-emerald-500" />
+          <div className="w-16 h-16 rounded-3xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center mx-auto shadow-lg shadow-emerald-500/15 relative">
+            <CheckCircle2 className="w-9 h-9 text-emerald-400" />
+            <div className="absolute inset-0 rounded-3xl bg-emerald-500/20 blur-xl -z-10" />
           </div>
 
           <div className="space-y-2">
-            <h1 className="font-heading font-bold text-2xl tracking-tight">
-              {isTrial ? `Your 7-Day Free Trial is Active!` : `You're on ${planName}!`}
+            <h1 className="font-heading font-extrabold text-2xl tracking-tight text-foreground">
+              {isTrial ? `7-Day Free Trial Activated!` : `Plan Synced · You're on ${planName}!`}
             </h1>
 
             <p className="text-sm text-muted-foreground leading-relaxed">
@@ -254,25 +302,34 @@ export default function SubscriptionReturn() {
             </p>
           </div>
 
-          <div className="p-3.5 rounded-xl bg-card border border-border/80 flex items-center justify-between text-left">
+          <div className="p-3.5 rounded-2xl bg-card border border-border/80 flex items-center justify-between text-left shadow-sm">
             <div className="flex items-center gap-2.5">
               <div className="w-8 h-8 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
                 <Zap className="w-4 h-4" />
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Current Plan</p>
-                <p className="text-sm font-semibold">{planName} Tier</p>
+                <p className="text-[11px] text-muted-foreground uppercase font-semibold">Current Plan</p>
+                <p className="text-sm font-heading font-bold text-foreground">{planName} Tier</p>
               </div>
             </div>
-            <span className="text-[11px] font-semibold text-emerald-500 bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
-              {isTrial ? '7-Day Trial Active' : 'Active'}
+            <span className="text-[11px] font-heading font-bold text-emerald-400 bg-emerald-500/10 px-2.5 py-0.5 rounded-full border border-emerald-500/20">
+              {isTrial ? '7-Day Trial Active' : 'Active & Unlocked'}
             </span>
           </div>
 
           <div className="pt-2">
             <Button
-              className="w-full font-heading font-semibold"
-              onClick={() => navigate('/', { replace: true })}
+              className="w-full font-heading font-bold h-11"
+              onClick={() => {
+                if (window.opener && !window.opener.closed) {
+                  try {
+                    window.close();
+                  } catch (_err) {
+                    /* ignore window close restriction */
+                  }
+                }
+                navigate('/', { replace: true });
+              }}
             >
               Enter WASHEK Dashboard
               <ArrowRight className="w-4 h-4 ml-1.5" />
@@ -281,7 +338,7 @@ export default function SubscriptionReturn() {
 
           <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground pt-1">
             <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
-            <span>Redirecting to your dashboard automatically…</span>
+            <span>Redirecting into WASHEK automatically…</span>
           </div>
         </div>
       </div>

@@ -57,7 +57,7 @@ export const WEIGHT_GOALS = [
   { value: 'lose_weight', label: 'Lose Weight', iconName: 'Scale' },
   { value: 'gain_strength', label: 'Gain Strength', iconName: 'Trophy' },
   { value: 'body_recomp', label: 'Body Recomp', iconName: 'PersonStanding' },
-  { value: 'aesthetics', label: 'Aesthetics', iconName: 'Sparkles' },
+  { value: 'aesthetics', label: 'Aesthetics', iconName: 'Flame' },
   { value: 'improve_endurance', label: 'Improve Endurance', iconName: 'Wind' },
   { value: 'general_health', label: 'General Health', iconName: 'Heart' },
 ];

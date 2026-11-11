@@ -54,7 +54,7 @@ export default function MobileHeader({ scrollRef }) {
   return (
     <header
       onClick={handleScrollToTop}
-      className="fixed top-0 left-0 right-0 z-40 sm:hidden bg-background/85 dark:bg-card/85 backdrop-blur-2xl border-b border-border/70 dark:border-white/[0.08] shadow-[0_2px_12px_rgba(0,0,0,0.04)] dark:shadow-[0_4px_24px_rgba(0,0,0,0.35)] select-none pointer-events-auto transition-colors cursor-pointer"
+      className="fixed top-0 left-0 right-0 z-40 sm:hidden bg-background/85 dark:bg-card/85 backdrop-blur-2xl border-b border-border/70 dark:border-primary/20 shadow-[0_4px_20px_rgba(37,99,235,0.08)] dark:shadow-[0_4px_25px_rgba(0,0,0,0.45)] select-none pointer-events-auto transition-colors cursor-pointer"
       style={{
         paddingTop: 'env(safe-area-inset-top, 0px)',
       }}

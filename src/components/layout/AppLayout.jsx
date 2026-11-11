@@ -149,6 +149,10 @@ export default function AppLayout() {
         overflow-hidden
       "
     >
+      {/* Mega Glowing Ambient Atmosphere */}
+      <div className="fixed -top-28 left-[18%] w-[580px] h-[580px] bg-primary/15 dark:bg-primary/20 rounded-full blur-[140px] pointer-events-none z-0" />
+      <div className="fixed top-1/2 -left-28 -translate-y-1/2 w-[440px] h-[440px] bg-indigo-500/10 dark:bg-indigo-500/15 rounded-full blur-[130px] pointer-events-none z-0" />
+      <div className="fixed -bottom-24 right-[8%] w-[500px] h-[500px] bg-emerald-500/10 dark:bg-emerald-500/15 rounded-full blur-[140px] pointer-events-none z-0" />
 
       {/* =====================================================
           DESKTOP SIDEBAR

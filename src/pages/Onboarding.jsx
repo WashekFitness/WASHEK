@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Sparkles, Dumbbell, Scale, Heart, Wind, PersonStanding, Globe, Loader2, Lock } from 'lucide-react';
+import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Dumbbell, Scale, Heart, Wind, PersonStanding, Globe, Loader2, Lock } from 'lucide-react';
 import { COUNTRIES, LANGUAGES, getCountryDefaults } from '@/lib/countries';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { useAuth } from '@/lib/AuthContext';
@@ -16,7 +16,9 @@ import TrainingTypeSelect from '@/components/onboarding/TrainingTypeSelect';
 import { CALISTHENICS_GOALS, WEIGHT_GOALS, buildWeekPrompt } from '@/lib/trainingTypes';
 import { build12WeekMicrocycles, buildSingleWeekMicrocycle, buildScientificBaselineWeekOne, WEEK_CONFIGS } from '@/lib/periodizationEngine';
 import { sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
-import { useProgramCooldown, recordProgramGenerated } from '@/lib/programCooldown';
+import { useProgramCooldown, recordProgramGenerated, checkProgramGenerationLock } from '@/lib/programCooldown';
+import { calcNutritionGoals } from '@/lib/nutritionGoals';
+import { setCachedActiveProgram } from '@/lib/cacheStore';
 import { toast } from 'sonner';
 
 const levels = [
@@ -33,7 +35,7 @@ const weightLevels = [
   { value: 'elite', label: 'Elite', desc: '5+ years weight training', icon: Trophy, placeholder: 'e.g. advanced strength/hypertrophy programming, highly experienced with compounds and specialized techniques...' },
 ];
 
-const GOAL_ICONS = { Dumbbell, Scale, Trophy, Wind, Target, Heart, PersonStanding, Sparkles };
+const GOAL_ICONS = { Dumbbell, Scale, Trophy, Wind, Target, Heart, PersonStanding, Flame, Zap };
 
 function SearchSelect({ value, onChange, options, placeholder }) {
   const [open, setOpen] = useState(false);
@@ -649,9 +651,12 @@ export default function Onboarding() {
         console.debug('[Onboarding] Prior program deactivation note:', deactErr);
       }
 
+      const nowIso = new Date().toISOString();
+
       const programPayload = {
         user_id: validUserId,
         created_by: user?.email || user?.id || validUserId,
+        created_at: nowIso,
         program_name:
           `${firstName.trim() || 'Athlete'}'s ${
             trainingType === 'weights'
@@ -703,7 +708,7 @@ export default function Onboarding() {
           console.warn('[ONBOARDING] direct insert fallback:', insertErr);
           savedProgram = {
             id: 'wp-' + Date.now(),
-            created_at: new Date().toISOString(),
+            created_at: nowIso,
             ...programPayload,
           };
         }
@@ -712,27 +717,101 @@ export default function Onboarding() {
       if (!savedProgram) {
         savedProgram = {
           id: 'wp-' + Date.now(),
-          created_at: new Date().toISOString(),
+          created_at: nowIso,
           ...programPayload,
         };
       }
 
-      // Sync active program to localStorage for instant hydration on dashboard
+      // Calculate individualized macros based on real athlete stats, training discipline, and goals
+      const personalizedNutrition = calcNutritionGoals(
+        {
+          ...user,
+          ...profileData,
+          training_type: trainingType,
+          fitness_level: level || 'intermediate',
+        },
+        {
+          userKey: validUserId,
+          program: savedProgram,
+        }
+      );
+
+      // Sync active program reference and personalized macros directly to profile
+      try {
+        await supabase
+          .from('profiles')
+          .update({
+            active_program_id: savedProgram.id,
+            training_type: programPayload.training_type,
+            fitness_level: programPayload.fitness_level,
+            primary_goal: programPayload.goal,
+            last_program_generated_at: nowIso,
+            calorie_target: personalizedNutrition.calories,
+            protein_target: personalizedNutrition.protein,
+            carbs_target: personalizedNutrition.carbs,
+            fat_target: personalizedNutrition.fat,
+            onboarded: true,
+            updated_at: nowIso,
+          })
+          .eq('id', validUserId);
+      } catch (profSyncErr) {
+        console.debug('[Onboarding] Profile sync note:', profSyncErr);
+      }
+
+      // Sync active program to localStorage for instant hydration on dashboard and profile
       try {
         localStorage.setItem('washek_active_program', JSON.stringify(savedProgram));
+        setCachedActiveProgram(savedProgram, validUserId);
+        if (user?.email) {
+          setCachedActiveProgram(savedProgram, user.email);
+        }
       } catch (cacheErr) {
         console.debug('[Onboarding] Active program cache note:', cacheErr);
+      }
+
+      // Sync updated profile with macros and active program into localStorage
+      try {
+        const rawLocal = localStorage.getItem('washek_user');
+        const parsedLocal = rawLocal ? JSON.parse(rawLocal) : {};
+        localStorage.setItem(
+          'washek_user',
+          JSON.stringify({
+            ...parsedLocal,
+            ...profileData,
+            id: validUserId,
+            active_program_id: savedProgram.id,
+            training_type: programPayload.training_type,
+            fitness_level: programPayload.fitness_level,
+            primary_goal: programPayload.goal,
+            last_program_generated_at: nowIso,
+            calorie_target: personalizedNutrition.calories,
+            protein_target: personalizedNutrition.protein,
+            carbs_target: personalizedNutrition.carbs,
+            fat_target: personalizedNutrition.fat,
+            onboarded: true,
+          })
+        );
+      } catch (uSyncErr) {
+        console.debug('[Onboarding] User localStorage sync note:', uSyncErr);
       }
 
       try {
         window.dispatchEvent(
           new CustomEvent('washek-program-updated', { detail: { program: savedProgram } })
         );
+        window.dispatchEvent(
+          new CustomEvent('washek-profile-updated', { detail: { profile: profileData } })
+        );
       } catch (evErr) {
         console.debug('[Onboarding] Event dispatch note:', evErr);
       }
 
-      recordProgramGenerated();
+      recordProgramGenerated(validUserId);
+      await queryClientInstance.invalidateQueries({ queryKey: ['active_program'] });
+      await queryClientInstance.invalidateQueries({ queryKey: ['programs'] });
+      await queryClientInstance.invalidateQueries({ queryKey: ['workout-program-cooldown'] });
+      await queryClientInstance.invalidateQueries({ queryKey: ['user_profile'] });
+      await queryClientInstance.invalidateQueries({ queryKey: ['profile'] });
       await queryClientInstance.invalidateQueries();
 
       // ALL 15 STEPS COMPLETE -> 100%
@@ -803,6 +882,18 @@ export default function Onboarding() {
             />
           ))}
         </div>
+
+        {isProgramLocked && (
+          <div className="mt-3 p-3.5 rounded-2xl bg-primary/10 border border-primary/20 flex items-center gap-3 text-xs text-foreground">
+            <Lock className="w-4 h-4 text-primary shrink-0" />
+            <div className="flex-1">
+              <p className="font-semibold text-primary">Program Generation Locked (7-Day Cooldown)</p>
+              <p className="text-muted-foreground mt-0.5 text-[11px]">
+                You generated a program recently. A new program can be built in {programRemainingDays} day{programRemainingDays === 1 ? '' : 's'} to protect your periodized fatigue management.
+              </p>
+            </div>
+          </div>
+        )}
       </div>
 
       <AnimatePresence mode="wait">
@@ -1494,7 +1585,7 @@ export default function Onboarding() {
             className="flex-1 flex flex-col px-6"
           >
             <div className="flex items-center gap-2 mb-1">
-              <Sparkles className="w-5 h-5 text-primary" />
+              <Target className="w-5 h-5 text-primary" />
 
               <h2 className="font-heading text-2xl font-bold">
                 {hasSkills
@@ -1686,7 +1777,7 @@ export default function Onboarding() {
                 ) : (
                   <>
                     Build My Program
-                    <Sparkles className="ml-2 w-5 h-5" />
+                    <ChevronRight className="ml-2 w-5 h-5" />
                   </>
                 )}
               </Button>
