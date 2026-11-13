@@ -56,8 +56,10 @@ import {
 
 import {
   getServerMessageStats,
-  computeStats,
+  getCachedMessageStats,
+  syncQuotaAcrossApp,
   getCurrentMonthKey,
+  getPlanLimit,
 } from '@/lib/messageLimit';
 import {
   kaelStore,
@@ -321,7 +323,12 @@ export default function Kael() {
       const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
       if (stored) {
         const u = JSON.parse(stored);
-        return computeStats(u, u?.subscription_plan || 'free');
+        const uStatus = String(u?.subscription_status || '').toLowerCase().trim();
+        const uPlan =
+          uStatus === 'canceled' || uStatus === 'cancelled' || uStatus === 'inactive'
+            ? 'free'
+            : (u?.subscription_plan || 'free');
+        return getCachedMessageStats(u, uPlan);
       }
     } catch (_initErr) {
       // Storage read fallback
@@ -547,19 +554,33 @@ export default function Kael() {
    * ==========================================================
    */
 
+  const effectiveSubStatus = String(effectiveUser?.subscription_status || '').toLowerCase().trim();
   const plan =
-    effectiveUser?.subscription_plan ||
-    'free';
+    effectiveSubStatus === 'canceled' ||
+    effectiveSubStatus === 'cancelled' ||
+    effectiveSubStatus === 'inactive'
+      ? 'free'
+      : (effectiveUser?.subscription_plan || 'free');
 
   const effectiveTz = timeZone || getUserTimeZone(effectiveUser);
+  const activeLimit = getPlanLimit(plan);
 
-  const displayStats =
+  const baseStats =
     stats ||
-    computeStats(
+    getCachedMessageStats(
       effectiveUser,
       plan,
       effectiveTz
     );
+
+  const displayStats = baseStats
+    ? {
+        ...baseStats,
+        plan,
+        limit: activeLimit,
+        remaining: Math.max(0, activeLimit - Number(baseStats.used || 0)),
+      }
+    : null;
 
   const atLimit =
     displayStats
@@ -969,17 +990,12 @@ export default function Kael() {
           monthKey: currentMonthKey,
           plan: plan || 'free',
           timezone: effectiveTz,
+          userId: user?.id || authUser?.id || null,
         };
 
-        // 1. Immediately update UI state so remaining count decrements as Kael responds
+        // 1. Immediately update UI state, React Query cache, localStorage & broadcast across Profile/app
         setStats(updatedQuota);
-
-        // 2. Broadcast quota change across the application (Profile, etc.)
-        if (typeof window !== 'undefined') {
-          window.dispatchEvent(
-            new CustomEvent('kael-quota-updated', { detail: updatedQuota })
-          );
-        }
+        syncQuotaAcrossApp(updatedQuota);
 
         // 3. Keep local and global user profiles in sync
         const syncProfile = (prev) => {

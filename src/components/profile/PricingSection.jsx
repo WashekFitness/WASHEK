@@ -18,10 +18,15 @@ import { supabase } from '@/lib/supabase';
 import {
   applySubscriptionUpgrade,
   applySubscriptionCancellation,
-  getRecentUpgradeGrace,
   clearRecentUpgradeGrace,
 } from '@/lib/subscription';
-import { createStripeCheckout, buildPaymentLinkUrl } from '@/lib/stripeCheckout';
+import {
+  createStripeCheckout,
+  buildPaymentLinkUrl,
+  resolveValidSupabaseSession,
+  extractInvokeErrorMessage,
+} from '@/lib/stripeCheckout';
+import { queryClientInstance } from '@/lib/query-client';
 import { toast } from 'sonner';
 import { useAuth } from '@/lib/AuthContext';
 
@@ -171,14 +176,25 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   const [cancelling, setCancelling] = useState(false);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [currentPlan, setCurrentPlan] = useState(() => {
-    if (currentPlanProp && currentPlanProp !== 'free') {
-      return normalizePlan(currentPlanProp);
-    }
     try {
+      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
+        return 'free';
+      }
+      if (currentPlanProp && currentPlanProp !== 'free') {
+        return normalizePlan(currentPlanProp);
+      }
       const stored = localStorage.getItem('washek_subscription_plan');
       if (stored && stored !== 'free') return normalizePlan(stored);
       const userObj = JSON.parse(localStorage.getItem('washek_user') || '{}');
-      if (userObj?.subscription_plan && userObj.subscription_plan !== 'free') {
+      const userStatus = String(userObj?.subscription_status || '').toLowerCase().trim();
+      if (
+        userStatus !== 'canceled' &&
+        userStatus !== 'cancelled' &&
+        userStatus !== 'inactive' &&
+        userObj?.subscription_plan &&
+        userObj.subscription_plan !== 'free'
+      ) {
         return normalizePlan(userObj.subscription_plan);
       }
     } catch {
@@ -186,6 +202,17 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }
     return 'free';
   });
+
+  useEffect(() => {
+    try {
+      if (sessionStorage.getItem('washek_just_canceled') === '1') {
+        sessionStorage.removeItem('washek_just_canceled');
+        toast.success('Your subscription has been canceled. Your account is now on the Free Plan.');
+      }
+    } catch {
+      // ignore sessionStorage error
+    }
+  }, []);
 
   useEffect(() => {
     if (currentPlanProp) {
@@ -223,10 +250,23 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     setLoadingSubscription(true);
 
     try {
-      const recentGrace = getRecentUpgradeGrace();
+      clearRecentUpgradeGrace();
 
-      // 1. Check LocalStorage plan as fallback only
+      // 1. Check LocalStorage plan as offline fallback only when status isn't canceled/inactive
+      const storedStatusRaw = (() => {
+        try {
+          return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+        } catch {
+          return '';
+        }
+      })();
+      const isLocallyInactive =
+        storedStatusRaw === 'canceled' ||
+        storedStatusRaw === 'cancelled' ||
+        storedStatusRaw === 'inactive';
+
       const localPlanRaw = (() => {
+        if (isLocallyInactive) return null;
         try {
           const p = localStorage.getItem('washek_subscription_plan');
           return p && p !== 'free' ? normalizePlan(p) : null;
@@ -265,40 +305,34 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
       // 3. Check stored user object fallback
       let userObjPlan = null;
-      try {
-        const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
-        if (u?.subscription_status !== 'canceled' && u?.subscription_status !== 'cancelled' && u?.subscription_plan) {
-          userObjPlan = normalizePlan(u.subscription_plan);
+      if (!isLocallyInactive) {
+        try {
+          const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
+          const uStatus = String(u?.subscription_status || '').toLowerCase().trim();
+          if (uStatus !== 'canceled' && uStatus !== 'cancelled' && uStatus !== 'inactive' && u?.subscription_plan) {
+            userObjPlan = normalizePlan(u.subscription_plan);
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
       }
 
-      // Resolve the true active plan (authoritative DB > recent checkout grace > offline cache)
+      // Resolve the true active plan (Postgres profiles is authoritative)
       let resolvedPlan = 'free';
       let resolvedStatus = 'inactive';
 
       if (hasRemoteProfile) {
         const dbActive = profilePlan !== 'free' && isActiveStatus(profileStatus);
-        if (recentGrace && (!dbActive || profilePlan !== recentGrace.plan)) {
-          resolvedPlan = normalizePlan(recentGrace.plan);
-          resolvedStatus = recentGrace.status || 'active';
-        } else if (dbActive) {
+        if (dbActive) {
           resolvedPlan = profilePlan;
           resolvedStatus = profileStatus || 'active';
-          if (recentGrace?.plan === resolvedPlan) {
-            clearRecentUpgradeGrace();
-          }
         } else {
           // DB authoritatively shows free / canceled / inactive
           resolvedPlan = 'free';
           resolvedStatus = profileStatus || 'inactive';
         }
-      } else {
-        if (recentGrace) {
-          resolvedPlan = normalizePlan(recentGrace.plan);
-          resolvedStatus = recentGrace.status || 'active';
-        } else if (localPlanRaw && localPlanRaw !== 'free') {
+      } else if (!isLocallyInactive) {
+        if (localPlanRaw && localPlanRaw !== 'free') {
           resolvedPlan = localPlanRaw;
           resolvedStatus = 'active';
         } else if (userObjPlan && userObjPlan !== 'free') {
@@ -323,10 +357,11 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       } else {
         setSubscription(null);
-        if (hasRemoteProfile && localPlanRaw) {
+        if (hasRemoteProfile) {
           try {
             localStorage.removeItem('washek_subscription_plan');
-            localStorage.setItem('washek_subscription_status', resolvedStatus);
+            localStorage.removeItem('washek_recent_upgrade');
+            localStorage.setItem('washek_subscription_status', resolvedStatus || 'inactive');
           } catch {
             /* ignore */
           }
@@ -341,53 +376,57 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       });
     } catch (loadError) {
       console.error('[PricingSection] Failed to load subscription:', loadError);
-      let fallbackLocal = 'free';
-      try {
-        fallbackLocal =
-          localStorage.getItem('washek_subscription_plan') ||
-          JSON.parse(localStorage.getItem('washek_user') || '{}')?.subscription_plan ||
-          'free';
-      } catch (_err) {
-        // ignore
-      }
-      const safePlan = normalizePlan(fallbackLocal);
-      setCurrentPlan(safePlan);
+      setCurrentPlan('free');
     } finally {
       setLoadingSubscription(false);
     }
   }, [currentPlanProp]);
 
-  // Listen for verified payment signals from the checkout return tab
+  // Listen for payment signals from checkout return tab and verify against Postgres before unlocking
   useEffect(() => {
-    const handlePlanVerified = (planKey, subStatus = 'active') => {
-      const safePlan = normalizePlan(planKey);
-      if (!safePlan || safePlan === 'free') return;
-
+    const handlePlanVerified = async () => {
       const now = Date.now();
       if (now - lastSyncEventRef.current < 1500) {
         return;
       }
       lastSyncEventRef.current = now;
 
-      if (checkoutPollTimerRef.current) {
-        clearInterval(checkoutPollTimerRef.current);
-        checkoutPollTimerRef.current = null;
-      }
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const uid = sessionData?.session?.user?.id;
+        if (!uid) return;
+        const { data: profile, error: profErr } = await supabase
+          .from('profiles')
+          .select('subscription_plan, subscription_status')
+          .eq('id', uid)
+          .maybeSingle();
 
-      applySubscriptionUpgrade(safePlan, subStatus, {
-        isNewUpgrade: true,
-        syncServer: false,
-      });
-      setCurrentPlan(safePlan);
-      onPlanChangeRef.current?.(safePlan);
-      checkUserAuth?.().catch(() => {});
-      loadSubscription();
-      toast.success(`Payment verified! Your ${safePlan.charAt(0).toUpperCase() + safePlan.slice(1)} plan is now active.`);
+        if (profErr || !profile) return;
+        const dbPlan = normalizePlan(profile.subscription_plan);
+        const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
+        if (dbPlan === 'free' || !isActiveStatus(dbStatus)) {
+          return;
+        }
+
+        if (checkoutPollTimerRef.current) {
+          clearInterval(checkoutPollTimerRef.current);
+          checkoutPollTimerRef.current = null;
+        }
+
+        applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
+        setCurrentPlan(dbPlan);
+        onPlanChangeRef.current?.(dbPlan);
+        await checkUserAuth?.().catch(() => {});
+        await loadSubscription();
+        toast.success(`Payment verified! Your ${dbPlan.charAt(0).toUpperCase() + dbPlan.slice(1)} plan is now active.`);
+      } catch {
+        // ignore transient verification errors
+      }
     };
 
     const handleWindowMsg = (event) => {
-      if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
-        handlePlanVerified(event.data.plan, event.data?.status || 'active');
+      if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS') {
+        handlePlanVerified();
       }
     };
     window.addEventListener('message', handleWindowMsg);
@@ -396,8 +435,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     try {
       bc = new BroadcastChannel('washek_subscription_sync');
       bc.onmessage = (event) => {
-        if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
-          handlePlanVerified(event.data.plan, event.data?.status || 'active');
+        if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS') {
+          handlePlanVerified();
         }
       };
     } catch {
@@ -406,14 +445,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
     const handleStorageEvent = (event) => {
       if (event.key === 'washek_subscription_success_event' && event.newValue) {
-        try {
-          const parsed = JSON.parse(event.newValue);
-          if (parsed?.plan && parsed.plan !== 'free') {
-            handlePlanVerified(parsed.plan, parsed?.status || 'active');
-          }
-        } catch {
-          /* ignore JSON parse errors on invalid storage events */
-        }
+        handlePlanVerified();
       }
     };
     window.addEventListener('storage', handleStorageEvent);
@@ -497,7 +529,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         if (dbPlan === expectedPlan && isActiveStatus(dbStatus)) {
           clearInterval(checkoutPollTimerRef.current);
           checkoutPollTimerRef.current = null;
-          applySubscriptionUpgrade(dbPlan, dbStatus, { isNewUpgrade: true, syncServer: false });
+          applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
           setCurrentPlan(dbPlan);
           onPlanChangeRef.current?.(dbPlan);
           checkUserAuth?.().catch(() => {});
@@ -590,7 +622,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           checkoutResult?.action === 'changed'
         ) {
           closeReservedWindow();
-          applySubscriptionUpgrade(plan.planKey, 'active', { isNewUpgrade: true, syncServer: false });
+          applySubscriptionUpgrade(plan.planKey, 'active', { syncServer: false });
           setCurrentPlan(plan.planKey);
           onPlanChangeRef.current?.(plan.planKey);
           await checkUserAuth?.().catch(() => {});
@@ -661,7 +693,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
               )
             ) {
               closeReservedWindow();
-              applySubscriptionUpgrade(plan.planKey, 'active', { isNewUpgrade: true, syncServer: false });
+              applySubscriptionUpgrade(plan.planKey, 'active', { syncServer: false });
               setCurrentPlan(plan.planKey);
               onPlanChangeRef.current?.(plan.planKey);
               await checkUserAuth?.().catch(() => {});
@@ -775,10 +807,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
 
   const executeCancel = async () => {
-    if (
-      cancelling ||
-      currentPlan === 'free'
-    ) {
+    if (cancelling || currentPlan === 'free') {
       return;
     }
 
@@ -786,73 +815,126 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     setError('');
 
     try {
-      // 1. Immediately apply local cancellation across all storage, UI state, and global events
-      applySubscriptionCancellation();
-      setCurrentPlan('free');
-      setSubscription(null);
-      setShowCancelConfirm(false);
-      onPlanChange?.('free');
-
-      // 2. Resolve current user identity for backend cancellation
-      let currentUserId = null;
-      let currentUserEmail = null;
+      // 1. Obtain a freshly validated Supabase JWT session so Edge Function auth succeeds
+      let session = null;
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        if (authData?.user) {
-          currentUserId = authData.user.id;
-          currentUserEmail = authData.user.email;
-        }
-      } catch (_authErr) {
-        // ignore
+        session = await resolveValidSupabaseSession(false);
+      } catch {
+        // Retry auth hydration once before failing
+        await checkUserAuth?.().catch(() => {});
+        session = await resolveValidSupabaseSession(true);
       }
 
-      if (!currentUserId && user?.id) {
-        currentUserId = user.id;
-        currentUserEmail = user.email;
-      }
-
+      const currentUserId = session?.user?.id || user?.id || storedUser?.id || null;
+      const currentUserEmail = session?.user?.email || user?.email || storedUser?.email || null;
       const cancelPayload = {
         userId: currentUserId,
         email: currentUserEmail,
       };
 
-      // 3. Invoke Supabase cancel-subscription Edge Function
-      try {
-        await supabase.functions.invoke(
-          'cancel-subscription',
-          {
-            body: cancelPayload,
-          }
-        );
-      } catch (invokeErr) {
-        console.debug('[PricingSection] cancel-subscription invoke note:', invokeErr);
-      }
-
-      // 4. Server-side proxy cancel endpoint
-      try {
-        await fetch('/api/cancel-subscription', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(cancelPayload),
+      const invokeCancelEdge = (activeSession) =>
+        supabase.functions.invoke('cancel-subscription', {
+          body: cancelPayload,
+          headers: {
+            Authorization: `Bearer ${activeSession.access_token}`,
+          },
         });
-      } catch (srvErr) {
-        console.debug('[PricingSection] Server cancel endpoint note:', srvErr);
+
+      // 2. Call Supabase cancel-subscription Edge Function with explicit Authorization header
+      let { data, error: invokeError } = await invokeCancelEdge(session);
+      let detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
+
+      const looksLikeAuthFailure = (msg) =>
+        /(^|\b)(401|unauthorized|jwt|missing authorization|invalid claim|invalid token|not authenticated|signed in)(\b|$)/i.test(
+          String(msg || '')
+        );
+
+      if (
+        (invokeError && (looksLikeAuthFailure(invokeError.message) || looksLikeAuthFailure(detailedMessage))) ||
+        (data?.success === false && looksLikeAuthFailure(data?.error))
+      ) {
+        session = await resolveValidSupabaseSession(true);
+        ({ data, error: invokeError } = await invokeCancelEdge(session));
+        detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
       }
 
+      let canceledConfirmed = Boolean(!invokeError && data?.success !== false);
 
+      // 3. Fallback through Express proxy forwarding the authenticated Supabase JWT if Edge invoke failed
+      if (!canceledConfirmed) {
+        try {
+          const proxyRes = await fetch('/api/cancel-subscription', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${session.access_token}`,
+            },
+            body: JSON.stringify(cancelPayload),
+          });
+          const proxyData = await proxyRes.json().catch(() => null);
+          if (proxyRes.ok && proxyData?.success) {
+            canceledConfirmed = true;
+          } else if (proxyData?.error) {
+            detailedMessage = proxyData.error;
+          }
+        } catch (proxyErr) {
+          console.debug('[PricingSection] Cancel proxy note:', proxyErr);
+        }
+      }
 
-      toast.success('Your subscription has been canceled. Your account is now on the Free Plan.');
+      if (!canceledConfirmed) {
+        throw new Error(
+          detailedMessage ||
+            data?.error ||
+            'Unable to cancel your subscription right now. Please try again.'
+        );
+      }
+
+      // 4. Verify Postgres profile no longer shows an active paid plan (when profile row exists)
+      if (currentUserId) {
+        try {
+          const { data: verifyProf } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status')
+            .eq('id', currentUserId)
+            .maybeSingle();
+
+          if (verifyProf) {
+            const dbPlan = normalizePlan(verifyProf.subscription_plan);
+            const dbStatus = String(verifyProf.subscription_status || '').toLowerCase().trim();
+            if (dbPlan !== 'free' && isActiveStatus(dbStatus)) {
+              throw new Error(
+                'Cancellation did not complete on billing database. Please retry.'
+              );
+            }
+          }
+        } catch (verifyErr) {
+          if (verifyErr?.message?.includes('billing database')) {
+            throw verifyErr;
+          }
+        }
+      }
+
+      // 5. Clear all local/session/query subscription caches and reload cleanly onto Free Plan
+      applySubscriptionCancellation();
+      setCurrentPlan('free');
+      setSubscription(null);
+      setShowCancelConfirm(false);
+      onPlanChange?.('free');
+      queryClientInstance.clear();
+
+      try {
+        sessionStorage.setItem('washek_just_canceled', '1');
+      } catch {
+        // ignore sessionStorage error
+      }
+
+      window.location.reload();
     } catch (cancelError) {
-      console.error(
-        '[PricingSection] Cancellation failed:',
-        cancelError
-      );
-
-      setError(
-        cancelError?.message ||
-          'Unable to cancel your subscription.'
-      );
-    } finally {
+      console.error('[PricingSection] Cancellation failed:', cancelError);
+      const errMsg = cancelError?.message || 'Unable to cancel your subscription.';
+      setError(errMsg);
+      toast.error(errMsg);
       setCancelling(false);
     }
   };

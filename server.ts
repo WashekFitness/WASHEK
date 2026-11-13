@@ -98,65 +98,56 @@ function getGeminiClient(): GoogleGenAI {
 
 app.post('/api/checkout/process', async (req, res) => {
   try {
-    const { userId, email, plan, paymentMethod, sessionId, status } = req.body || {};
-    const validPlans = ['progress', 'performance', 'elite'];
-    const cleanPlan = String(plan || '').toLowerCase().trim();
-
-    if (!validPlans.includes(cleanPlan)) {
-      return res.status(400).json({ success: false, error: 'Invalid subscription plan.' });
+    const token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
+    if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_') || token.split('.').length !== 3) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required to verify checkout.',
+      });
     }
 
-    const cleanStatus = status === 'active' ? 'active' : 'trialing';
-
-    console.log('[API] Processing checkout for:', { userId, email, plan: cleanPlan, status: cleanStatus, paymentMethod });
-
-    // Best-effort DB sync (Stripe webhook via service role is authoritative; RLS/triggers protect subscription fields on anon writes)
-    if (userId || email) {
-      try {
-        const updatePayload: Record<string, any> = {
-          subscription_plan: cleanPlan,
-          subscription_status: cleanStatus,
-          subscription_tier: cleanPlan,
-          has_used_trial: true,
-          trial_used: true,
-          stripe_price_id: cleanPlan === 'progress' ? 'price_1TTYrbRuQpZftYKRoSyLbQ0c' : cleanPlan === 'performance' ? 'price_1TTYs8RuQpZftYKR8ZzpNg7x' : 'price_1TTYsWRuQpZftYKRKIm8V10E',
-          subscription_updated_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        };
-
-        if (typeof sessionId === 'string' && sessionId.startsWith('sub_')) {
-          updatePayload.stripe_subscription_id = sessionId;
-        }
-
-        let updated = false;
-        if (userId && isValidUUID(userId)) {
-          const { error: dbError } = await supabase.from('profiles').update(updatePayload).eq('id', userId);
-          if (!dbError) updated = true;
-        }
-        if (!updated && email) {
-          const { error: emailErr } = await supabase.from('profiles').update(updatePayload).ilike('email', String(email).trim());
-          if (!emailErr) updated = true;
-        }
-      } catch (dbErr: any) {
-        console.debug('[API] checkout db error note:', dbErr?.message);
-      }
+    const userClient = createStatelessSupabase(token);
+    const { data: userData, error: userErr } = await userClient.auth.getUser(token);
+    if (userErr || !userData?.user?.id) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired session.',
+      });
     }
 
-    // Cache the activated plan in server memory
-    if (userId) pendingCheckouts.set(userId, { plan: cleanPlan, timestamp: Date.now() });
-    if (email) pendingCheckouts.set(email.toLowerCase(), { plan: cleanPlan, timestamp: Date.now() });
-    pendingCheckouts.set('latest', { plan: cleanPlan, timestamp: Date.now() });
+    const { data: profile } = await userClient
+      .from('profiles')
+      .select('subscription_plan, subscription_status, has_used_trial, trial_used')
+      .eq('id', userData.user.id)
+      .maybeSingle();
 
-    res.json({
+    const dbPlan = String(profile?.subscription_plan || 'free').toLowerCase().trim();
+    const dbStatus = String(profile?.subscription_status || 'inactive').toLowerCase().trim();
+    const isVerified =
+      ['progress', 'performance', 'elite'].includes(dbPlan) &&
+      ['active', 'trialing', 'past_due'].includes(dbStatus);
+
+    if (!isVerified) {
+      return res.status(402).json({
+        success: false,
+        verified: false,
+        plan: 'free',
+        status: dbStatus || 'inactive',
+        error: 'Payment has not been confirmed by Stripe yet.',
+      });
+    }
+
+    return res.json({
       success: true,
-      message: `Successfully activated ${cleanPlan.charAt(0).toUpperCase() + cleanPlan.slice(1)} plan!`,
-      plan: cleanPlan,
-      status: cleanStatus,
-      hasUsedTrial: true,
+      verified: true,
+      message: `Verified ${dbPlan.charAt(0).toUpperCase() + dbPlan.slice(1)} plan.`,
+      plan: dbPlan,
+      status: dbStatus,
+      hasUsedTrial: Boolean(profile?.has_used_trial || profile?.trial_used),
     });
   } catch (err: any) {
-    console.error('[API] checkout error:', err);
-    res.status(500).json({ success: false, error: err?.message || 'Failed to process payment' });
+    console.error('[API] checkout verify error:', err);
+    res.status(500).json({ success: false, error: err?.message || 'Failed to verify payment' });
   }
 });
 
@@ -339,45 +330,65 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/cancel-subscription', async (req, res) => {
   try {
-    const { userId, email } = req.body || {};
-    console.log('[API] Processing cancel-subscription for:', { userId, email });
+    const { userId, email, accessToken } = req.body || {};
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const token =
+      (authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '') ||
+      (typeof accessToken === 'string' ? accessToken.trim() : '');
 
-    if (userId || email) {
-      try {
-        let query = supabase.from('profiles').update({
-          subscription_plan: 'free',
-          subscription_status: 'canceled',
-          has_used_trial: true,
-          trial_used: true,
-          stripe_subscription_id: null,
-          stripe_price_id: null,
-          subscription_cancelled_at: new Date().toISOString(),
-          subscription_updated_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-
-        if (userId) {
-          query = query.eq('id', userId);
-          await query;
-        } else if (email) {
-          query = query.eq('email', email);
-          await query;
-        }
-      } catch (dbErr) {
-        console.debug('[API] cancel profile update note:', dbErr);
-      }
+    if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_') || token.split('.').length !== 3) {
+      return res.status(401).json({
+        success: false,
+        code: 'AUTH_SESSION_EXPIRED',
+        error: 'Your login session has expired. Please sign in again to cancel your subscription.',
+      });
     }
 
-    res.json({
+    console.log('[API] Forwarding cancel-subscription to Supabase Edge Function for:', { userId, email });
+
+    const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/cancel-subscription`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        userId: userId || undefined,
+        email: email || undefined,
+      }),
+    });
+
+    const edgeData = await edgeRes.json().catch(() => null);
+    if (!edgeRes.ok || edgeData?.success === false) {
+      const errMsg = edgeData?.error || edgeRes.statusText || 'Unable to cancel subscription with Stripe.';
+      const status = edgeRes.status >= 400 ? edgeRes.status : 400;
+      return res.status(status).json({
+        success: false,
+        error: errMsg,
+      });
+    }
+
+    // Clear any cached pending checkout markers so cancelled plan cannot linger
+    if (userId) pendingCheckouts.delete(String(userId));
+    if (email) pendingCheckouts.delete(String(email).toLowerCase());
+    pendingCheckouts.delete('latest');
+
+    return res.json({
       success: true,
-      message: 'Subscription canceled. Account is now on Free Plan.',
+      alreadyCanceled: Boolean(edgeData?.alreadyCanceled),
+      message: edgeData?.message || 'Subscription canceled. Account is now on Free Plan.',
       plan: 'free',
       status: 'canceled',
       hasUsedTrial: true,
+      user: edgeData?.user || null,
     });
   } catch (err: any) {
     console.error('[API] cancel-subscription error:', err);
-    res.status(500).json({ success: false, error: err?.message || 'Failed to cancel subscription' });
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Failed to cancel subscription',
+    });
   }
 });
 
@@ -1148,7 +1159,7 @@ app.post('/api/auth/instant-reset', async (req, res) => {
         email: cleanEmail,
         full_name: athleteUser.user_metadata.full_name,
         role: 'athlete',
-        subscription_plan: 'pro',
+        subscription_plan: 'free',
       },
     });
   } catch (err: any) {
@@ -2106,11 +2117,7 @@ app.post('/api/ai-stream', async (req, res) => {
             });
           }
 
-          const userScopedClient = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-            global: {
-              headers: { Authorization: `Bearer ${token}` },
-            },
-          });
+          const userScopedClient = createStatelessSupabase(token);
 
           kaelUserSession = {
             client: userScopedClient,

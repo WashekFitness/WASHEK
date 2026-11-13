@@ -1,5 +1,6 @@
 import { supabase } from '@/lib/supabase';
 import { getUserTimeZone } from '@/lib/dateUtils';
+import { syncQuotaAcrossApp } from '@/lib/messageLimit';
 import { isLogo } from '@/lib/avatarUtils';
 import {
   getCachedProgramsList,
@@ -243,29 +244,11 @@ function normalizeUser(authUser, profile = {}) {
  */
 
 async function currentUser(forceFresh = false) {
-  const recentUpgrade = (() => {
-    try {
-      const raw = localStorage.getItem('washek_recent_upgrade');
-      if (!raw) return null;
-      const parsed = JSON.parse(raw);
-      if (parsed?.plan && parsed.plan !== 'free' && typeof parsed.timestamp === 'number' && Date.now() - parsed.timestamp < 45000) {
-        return parsed;
-      }
-      localStorage.removeItem('washek_recent_upgrade');
-    } catch {
-      // ignore
-    }
-    return null;
-  })();
-
-  const rawLocalPlan = (() => {
-    try {
-      const p = localStorage.getItem('washek_subscription_plan');
-      return p && p !== 'free' ? p : null;
-    } catch {
-      return null;
-    }
-  })();
+  try {
+    localStorage.removeItem('washek_recent_upgrade');
+  } catch {
+    // ignore
+  }
 
   const storedStatus = (() => {
     try {
@@ -275,14 +258,26 @@ async function currentUser(forceFresh = false) {
     }
   })();
 
-  const isCanceled = !rawLocalPlan && (storedStatus === 'canceled' || storedStatus === 'cancelled');
-  const activeLocalPlan = rawLocalPlan || (isCanceled ? 'free' : null);
+  const isLocallyInactive =
+    storedStatus === 'canceled' ||
+    storedStatus === 'cancelled' ||
+    storedStatus === 'inactive';
 
-  if (rawLocalPlan && (storedStatus === 'canceled' || storedStatus === 'cancelled')) {
+  const rawLocalPlan = (() => {
+    if (isLocallyInactive) return null;
     try {
-      localStorage.setItem('washek_subscription_status', 'active');
+      const p = localStorage.getItem('washek_subscription_plan');
+      return p && p !== 'free' ? p : null;
     } catch {
-      /* ignore */
+      return null;
+    }
+  })();
+
+  if (isLocallyInactive) {
+    try {
+      localStorage.removeItem('washek_subscription_plan');
+    } catch {
+      // ignore
     }
   }
 
@@ -304,17 +299,28 @@ async function currentUser(forceFresh = false) {
           ) {
             parsed.onboarded = true;
           }
-          if (isCanceled) {
+          const parsedStatus = String(parsed.subscription_status || '').toLowerCase().trim();
+          const isParsedInactive =
+            isLocallyInactive ||
+            parsedStatus === 'canceled' ||
+            parsedStatus === 'cancelled' ||
+            parsedStatus === 'inactive' ||
+            parsed.subscription_plan === 'free';
+
+          if (isParsedInactive) {
             parsed.subscription_plan = 'free';
-            parsed.subscription_status = 'canceled';
+            parsed.subscription_status =
+              storedStatus === 'canceled' || storedStatus === 'cancelled'
+                ? 'canceled'
+                : (parsedStatus || storedStatus || 'inactive');
             parsed.tier = 'free';
             parsed.plan = 'free';
             parsed.subscription_tier = 'free';
-          } else if (activeLocalPlan && activeLocalPlan !== 'free' && parsed.subscription_plan !== activeLocalPlan) {
-            parsed.subscription_plan = activeLocalPlan;
-            parsed.tier = activeLocalPlan;
-            parsed.plan = activeLocalPlan;
-            parsed.subscription_tier = activeLocalPlan;
+          } else if (rawLocalPlan && rawLocalPlan !== 'free' && parsed.subscription_plan !== rawLocalPlan) {
+            parsed.subscription_plan = rawLocalPlan;
+            parsed.tier = rawLocalPlan;
+            parsed.plan = rawLocalPlan;
+            parsed.subscription_tier = rawLocalPlan;
             try {
               localStorage.setItem('washek_user', JSON.stringify(parsed));
             } catch (_err) {
@@ -348,8 +354,8 @@ async function currentUser(forceFresh = false) {
         role: user.user_metadata?.role || 'athlete',
         training_type: user.user_metadata?.training_type || 'calisthenics',
         fitness_level: user.user_metadata?.fitness_level || 'intermediate',
-        subscription_plan: recentUpgrade?.plan || (isCanceled ? 'free' : (activeLocalPlan || 'free')),
-        subscription_status: recentUpgrade?.status || (isCanceled ? 'canceled' : 'inactive'),
+        subscription_plan: 'free',
+        subscription_status: isLocallyInactive ? (storedStatus || 'inactive') : 'inactive',
       };
 
       supabase
@@ -364,14 +370,7 @@ async function currentUser(forceFresh = false) {
     const dbPlan = String(profile.subscription_plan || 'free').toLowerCase().trim();
     const dbActive = ['active', 'trialing', 'past_due', 'unpaid'].includes(dbStatus) && dbPlan !== 'free';
 
-    if (recentUpgrade && (!dbActive || dbPlan !== recentUpgrade.plan)) {
-      // Honor brand-new checkout return for up to 45s while Stripe webhook finishes writing to Postgres
-      normalized.subscription_plan = recentUpgrade.plan;
-      normalized.subscription_status = recentUpgrade.status || 'active';
-      normalized.tier = recentUpgrade.plan;
-      normalized.plan = recentUpgrade.plan;
-      normalized.subscription_tier = recentUpgrade.plan;
-    } else if (dbActive) {
+    if (dbActive) {
       normalized.subscription_plan = dbPlan;
       normalized.subscription_status = dbStatus;
       normalized.tier = dbPlan;
@@ -380,13 +379,10 @@ async function currentUser(forceFresh = false) {
       try {
         localStorage.setItem('washek_subscription_plan', dbPlan);
         localStorage.setItem('washek_subscription_status', dbStatus);
-        if (recentUpgrade?.plan === dbPlan) {
-          localStorage.removeItem('washek_recent_upgrade');
-        }
       } catch {
         // ignore
       }
-    } else if (profile.subscription_plan !== undefined) {
+    } else {
       // Authoritative DB shows free / canceled / inactive
       normalized.subscription_plan = 'free';
       normalized.subscription_status = dbStatus || 'inactive';
@@ -395,6 +391,7 @@ async function currentUser(forceFresh = false) {
       normalized.subscription_tier = 'free';
       try {
         localStorage.removeItem('washek_subscription_plan');
+        localStorage.removeItem('washek_recent_upgrade');
         localStorage.setItem('washek_subscription_status', dbStatus || 'inactive');
       } catch {
         // ignore
@@ -1434,9 +1431,7 @@ async function streamAI({
               }
               if (data.quota) {
                 quota = data.quota;
-                if (typeof window !== 'undefined') {
-                  window.dispatchEvent(new CustomEvent('kael-quota-updated', { detail: quota }));
-                }
+                syncQuotaAcrossApp(quota);
               }
             } catch (_parseErr) {
               // Ignore partial JSON chunks
@@ -1630,11 +1625,7 @@ async function invokeAI({
       const data = await res.json();
       if (data?.success) {
         if (data.quota) {
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(
-              new CustomEvent('kael-quota-updated', { detail: data.quota })
-            );
-          }
+          syncQuotaAcrossApp(data.quota);
           return {
             content:
               typeof data.result === 'string'

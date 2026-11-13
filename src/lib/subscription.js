@@ -48,6 +48,7 @@ export function hasPlan(
   requiredPlan
 ) {
   let resolvedUserPlan = userPlan;
+  const hasExplicitInput = userPlan !== undefined && userPlan !== null;
 
   // Handle object inputs gracefully (e.g. user object passed directly)
   if (resolvedUserPlan && typeof resolvedUserPlan === 'object') {
@@ -62,24 +63,38 @@ export function hasPlan(
         resolvedUserPlan.subscription_tier ||
         'free';
     }
+  } else if (typeof resolvedUserPlan === 'string' && resolvedUserPlan.trim() !== '') {
+    // Respect explicit string plan unless local status explicitly says canceled/inactive
+    try {
+      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
+        resolvedUserPlan = 'free';
+      }
+    } catch {
+      // ignore storage access failure
+    }
   }
 
-  // If missing or free, check localStorage fallback for active upgraded status
-  if (!resolvedUserPlan || resolvedUserPlan === 'free') {
+  // Only inspect localStorage fallback when caller omitted userPlan (undefined/null)
+  if (!hasExplicitInput || (typeof resolvedUserPlan === 'string' && resolvedUserPlan.trim() === '')) {
     try {
-      const storedPlan = localStorage.getItem('washek_subscription_plan');
       const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedPlan && storedPlan !== 'free' && storedStatus !== 'canceled' && storedStatus !== 'cancelled') {
-        resolvedUserPlan = storedPlan;
+      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
+        resolvedUserPlan = 'free';
       } else {
-        const storedUser = localStorage.getItem('washek_user');
-        if (storedUser) {
-          const parsed = JSON.parse(storedUser);
-          const userStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
-          if (userStatus !== 'canceled' && userStatus !== 'cancelled') {
-            const p = parsed?.subscription_plan || parsed?.plan || parsed?.tier || parsed?.subscription_tier;
-            if (p && p !== 'free') {
-              resolvedUserPlan = p;
+        const storedPlan = localStorage.getItem('washek_subscription_plan');
+        if (storedPlan && storedPlan !== 'free') {
+          resolvedUserPlan = storedPlan;
+        } else {
+          const storedUser = localStorage.getItem('washek_user');
+          if (storedUser) {
+            const parsed = JSON.parse(storedUser);
+            const userStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
+            if (userStatus !== 'canceled' && userStatus !== 'cancelled' && userStatus !== 'inactive') {
+              const p = parsed?.subscription_plan || parsed?.plan || parsed?.tier || parsed?.subscription_tier;
+              if (p && p !== 'free') {
+                resolvedUserPlan = p;
+              }
             }
           }
         }
@@ -401,26 +416,9 @@ export function getPlanLabel(
  * UI components unlock instantly.
  */
 const RECENT_UPGRADE_KEY = 'washek_recent_upgrade';
-const RECENT_UPGRADE_GRACE_MS = 45 * 1000;
 
 export function getRecentUpgradeGrace() {
-  if (typeof localStorage === 'undefined') return null;
-  try {
-    const raw = localStorage.getItem(RECENT_UPGRADE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    if (
-      parsed?.plan &&
-      parsed.plan !== 'free' &&
-      typeof parsed.timestamp === 'number' &&
-      Date.now() - parsed.timestamp < RECENT_UPGRADE_GRACE_MS
-    ) {
-      return parsed;
-    }
-    localStorage.removeItem(RECENT_UPGRADE_KEY);
-  } catch {
-    // ignore
-  }
+  clearRecentUpgradeGrace();
   return null;
 }
 
@@ -435,23 +433,15 @@ export function clearRecentUpgradeGrace() {
 
 export function applySubscriptionUpgrade(plan, status = 'active', details = {}) {
   const normPlan = normalizePlan(plan);
-  if (normPlan === 'free') return;
+  const normStatus = String(status || 'active').toLowerCase().trim();
+  const isActive = ['active', 'trialing', 'past_due'].includes(normStatus);
+  if (normPlan === 'free' || !isActive) return 'free';
 
   try {
     localStorage.setItem('washek_subscription_plan', normPlan);
-    localStorage.setItem('washek_subscription_status', status);
+    localStorage.setItem('washek_subscription_status', normStatus);
     localStorage.removeItem('washek_subscription_cancelled_at');
-
-    if (details?.isNewUpgrade) {
-      localStorage.setItem(
-        RECENT_UPGRADE_KEY,
-        JSON.stringify({
-          plan: normPlan,
-          status,
-          timestamp: Date.now(),
-        })
-      );
-    }
+    localStorage.removeItem(RECENT_UPGRADE_KEY);
 
     const storedUser = localStorage.getItem('washek_user');
     let userObj = {};
@@ -464,7 +454,7 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     }
 
     userObj.subscription_plan = normPlan;
-    userObj.subscription_status = status;
+    userObj.subscription_status = normStatus;
     userObj.tier = normPlan;
     userObj.plan = normPlan;
     userObj.subscription_tier = normPlan;
@@ -474,37 +464,13 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     console.debug('[subscription] LocalStorage upgrade sync note:', err);
   }
 
-  // Only invoke server checkout/process when finishing checkout return
-  if (details?.syncServer) {
-    try {
-      const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
-      const syncUid = stored?.id || stored?.uid;
-      const syncEmail = stored?.email;
-      if (syncUid || syncEmail) {
-        fetch('/api/checkout/process', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId: syncUid,
-            email: syncEmail,
-            plan: normPlan,
-            status,
-            sessionId: details?.sessionId || undefined,
-          }),
-        }).catch(() => {});
-      }
-    } catch (_e) {
-      // Non-blocking
-    }
-  }
-
   // Dispatch global events for instant reactive UI updates
   if (typeof window !== 'undefined') {
     window.dispatchEvent(
       new CustomEvent('washek_subscription_updated', {
         detail: {
           plan: normPlan,
-          status,
+          status: normStatus,
           ...details,
         },
       })
@@ -513,7 +479,7 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
       new CustomEvent('washek_user_changed', {
         detail: {
           subscription_plan: normPlan,
-          subscription_status: status,
+          subscription_status: normStatus,
         },
       })
     );
@@ -524,14 +490,29 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
 
 /**
  * Centrally applies a subscription cancellation across all client state,
- * cleans up local storage caches, and fires window notification events so all
+ * cleans up local storage/session/cookie caches, and fires window notification events so all
  * UI components update to Free plan immediately.
  */
 export function applySubscriptionCancellation(details = {}) {
+  const cancelledAt = new Date().toISOString();
   try {
     localStorage.removeItem('washek_subscription_plan');
+    localStorage.removeItem(RECENT_UPGRADE_KEY);
+    localStorage.removeItem('washek_pending_checkout_plan');
+    localStorage.removeItem('washek_subscription_success_event');
     localStorage.setItem('washek_subscription_status', 'canceled');
-    localStorage.setItem('washek_subscription_cancelled_at', new Date().toISOString());
+    localStorage.setItem('washek_subscription_cancelled_at', cancelledAt);
+    localStorage.setItem('washek_has_used_trial', 'true');
+
+    try {
+      sessionStorage.removeItem('washek_pending_checkout_plan');
+    } catch {
+      // ignore sessionStorage error
+    }
+
+    if (typeof document !== 'undefined') {
+      document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
+    }
 
     const storedUser = localStorage.getItem('washek_user');
     let userObj = {};
@@ -550,30 +531,13 @@ export function applySubscriptionCancellation(details = {}) {
     userObj.subscription_tier = 'free';
     userObj.stripe_subscription_id = null;
     userObj.stripe_price_id = null;
-    userObj.subscription_cancelled_at = new Date().toISOString();
+    userObj.has_used_trial = true;
+    userObj.trial_used = true;
+    userObj.subscription_cancelled_at = cancelledAt;
 
     localStorage.setItem('washek_user', JSON.stringify(userObj));
   } catch (err) {
     console.debug('[subscription] LocalStorage cancellation sync note:', err);
-  }
-
-  // Background server sync for cancellation
-  try {
-    const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
-    const syncUid = stored?.id || stored?.uid;
-    const syncEmail = stored?.email;
-    if (syncUid || syncEmail) {
-      fetch('/api/cancel-subscription', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: syncUid,
-          email: syncEmail,
-        }),
-      }).catch(() => {});
-    }
-  } catch (_e) {
-    // Non-blocking
   }
 
   // Dispatch global events for instant reactive UI updates

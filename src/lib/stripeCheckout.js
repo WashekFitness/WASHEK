@@ -55,7 +55,7 @@ async function isSessionTokenValid(token) {
   }
 }
 
-async function resolveValidSupabaseSession(forceRefresh = false) {
+export async function resolveValidSupabaseSession(forceRefresh = false) {
   let session = null;
 
   const storedAccess = (() => {
@@ -168,7 +168,7 @@ export function buildPaymentLinkUrl(plan, { userId = '', email = '' } = {}) {
   }
 }
 
-async function extractInvokeErrorMessage(error) {
+export async function extractInvokeErrorMessage(error) {
   let detailedMessage = error?.message || 'Unable to contact the Stripe checkout service.';
   try {
     if (error?.context && typeof error.context.json === 'function') {

@@ -1147,15 +1147,27 @@ export default function FormLab() {
   }, []);
 
   const plan = (() => {
-    if (user?.subscription_plan && user.subscription_plan !== 'free') {
+    const subStatus = String(user?.subscription_status || '').toLowerCase().trim();
+    if (subStatus === 'canceled' || subStatus === 'cancelled' || subStatus === 'inactive') {
+      return 'free';
+    }
+    if (user?.subscription_plan) {
       return user.subscription_plan.toLowerCase().trim();
     }
     try {
+      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
+        return 'free';
+      }
       const storedPlan = localStorage.getItem('washek_subscription_plan');
       if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
       const storedUser = localStorage.getItem('washek_user');
       if (storedUser) {
         const parsed = JSON.parse(storedUser);
+        const parsedStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
+        if (parsedStatus === 'canceled' || parsedStatus === 'cancelled' || parsedStatus === 'inactive') {
+          return 'free';
+        }
         if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
           return parsed.subscription_plan.toLowerCase().trim();
         }

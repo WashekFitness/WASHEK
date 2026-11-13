@@ -1249,16 +1249,18 @@ function getSmartDefaultMeal() {
                 )
             }
             onSaveToMeals={handleSaveToMeals}
-            userPlan={
-              user?.subscription_plan ||
-              (() => {
-                try {
-                  return localStorage.getItem('washek_subscription_plan') || 'free';
-                } catch {
-                  return 'free';
-                }
-              })()
-            }
+            userPlan={(() => {
+              const s = String(user?.subscription_status || '').toLowerCase().trim();
+              if (s === 'canceled' || s === 'cancelled' || s === 'inactive') return 'free';
+              if (user?.subscription_plan) return String(user.subscription_plan).toLowerCase().trim();
+              try {
+                const storedS = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+                if (storedS === 'canceled' || storedS === 'cancelled' || storedS === 'inactive') return 'free';
+                return localStorage.getItem('washek_subscription_plan') || 'free';
+              } catch {
+                return 'free';
+              }
+            })()}
           />
 
 

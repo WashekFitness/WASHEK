@@ -58,8 +58,9 @@ import {
 } from '@/lib/supabase';
 
 import {
-  computeStats,
+  getCachedMessageStats,
   getServerMessageStats,
+  getPlanLimit,
 } from '@/lib/messageLimit';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
 
@@ -79,13 +80,27 @@ export default function Profile() {
   useEffect(() => {
     if (authUser) {
       setUser((prev) => {
-        if (prev?.id === authUser.id && prev?.subscription_plan === authUser.subscription_plan && prev?.avatar_url === authUser.avatar_url) {
+        if (
+          prev?.id === authUser.id &&
+          prev?.subscription_plan === authUser.subscription_plan &&
+          prev?.subscription_status === authUser.subscription_status &&
+          prev?.avatar_url === authUser.avatar_url &&
+          prev?.kael_msg_count === authUser.kael_msg_count &&
+          prev?.kael_msg_month === authUser.kael_msg_month
+        ) {
           return prev;
         }
         return authUser;
       });
     }
-  }, [authUser?.id, authUser?.subscription_plan, authUser?.avatar_url]);
+  }, [
+    authUser?.id,
+    authUser?.subscription_plan,
+    authUser?.subscription_status,
+    authUser?.avatar_url,
+    authUser?.kael_msg_count,
+    authUser?.kael_msg_month,
+  ]);
 
   const fileInputRef = useRef(null);
 
@@ -395,21 +410,26 @@ export default function Profile() {
     })()
   ).toLowerCase().trim();
 
-  // Resolve plan with local storage and cloud overrides to ensure immediate reflection
+  // Resolve plan strictly respecting authoritative user subscription status
   const plan = (() => {
     if (currentSubStatus === 'canceled' || currentSubStatus === 'cancelled' || currentSubStatus === 'inactive') {
       return 'free';
     }
 
-    const fromUser = user?.subscription_plan;
-    if (fromUser && fromUser !== 'free') return fromUser.toLowerCase().trim();
+    if (user?.subscription_plan) {
+      return String(user.subscription_plan).toLowerCase().trim() || 'free';
+    }
+
     try {
       const storedPlan = localStorage.getItem('washek_subscription_plan');
       if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
       const storedUser = localStorage.getItem('washek_user');
       if (storedUser) {
         const parsed = JSON.parse(storedUser);
-        if (parsed?.subscription_status === 'canceled' || parsed?.subscription_status === 'cancelled') return 'free';
+        const parsedStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
+        if (parsedStatus === 'canceled' || parsedStatus === 'cancelled' || parsedStatus === 'inactive') {
+          return 'free';
+        }
         if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
           return parsed.subscription_plan.toLowerCase().trim();
         }
@@ -461,7 +481,9 @@ export default function Profile() {
     });
   }, []);
 
-  // Live server-authoritative Kael monthly quota stats
+  // Immediate local-cached stats + live server-authoritative Kael monthly quota stats
+  const immediateCachedStats = user ? getCachedMessageStats(user, plan, timeZone) : null;
+
   const {
     data: serverKaelStats,
   } = useQuery({
@@ -473,8 +495,9 @@ export default function Profile() {
       }
       return null;
     },
+    initialData: () => immediateCachedStats || undefined,
     enabled: !!user?.id,
-    staleTime: 1000 * 15,
+    staleTime: 0,
     refetchOnMount: 'always',
     refetchOnWindowFocus: true,
   });
@@ -493,15 +516,23 @@ export default function Profile() {
     };
   }, [user?.id, timeZone, queryClient]);
 
-  const stats =
-    serverKaelStats ||
-    (user
-      ? computeStats(
-          user,
-          plan,
-          timeZone
-        )
-      : null);
+  const stats = (() => {
+    const base = serverKaelStats || immediateCachedStats;
+    if (!base) return null;
+    const effectiveLimit = getPlanLimit(plan);
+    const cachedUsed = immediateCachedStats?.monthKey === base.monthKey
+      ? Number(immediateCachedStats.used || 0)
+      : 0;
+    const rawUsed = Number(base.used || 0);
+    const used = base.forceAuthoritative ? rawUsed : Math.max(rawUsed, cachedUsed);
+    return {
+      ...base,
+      plan,
+      used,
+      limit: effectiveLimit,
+      remaining: Math.max(0, effectiveLimit - used),
+    };
+  })();
 
 
   const planLabels = {

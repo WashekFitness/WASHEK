@@ -1,4 +1,5 @@
 import { supabase } from '@/lib/supabase';
+import { queryClientInstance } from '@/lib/query-client';
 import {
   getUserTimeZone,
   getLocalDateKey as getLocalDateKeyUtil,
@@ -13,6 +14,8 @@ export const PLAN_LIMITS = {
   elite: 2000,
 };
 
+const KAEL_QUOTA_CACHE_KEY = 'washek_kael_quota';
+
 export function getLocalDateKey(date = new Date(), timeZone = null) {
   return getLocalDateKeyUtil(date, timeZone);
 }
@@ -26,12 +29,121 @@ export function getCurrentMonthKey(date = new Date(), timeZone = null) {
 }
 
 export function getPlanLimit(plan = 'free') {
-  return PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;
+  const normalized = String(plan || 'free').toLowerCase().trim();
+  return PLAN_LIMITS[normalized] ?? PLAN_LIMITS.free;
 }
 
 function isValidUUID(val) {
   if (typeof val !== 'string') return false;
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val.trim());
+}
+
+/**
+ * Synchronize Kael message quota immediately across:
+ * - localStorage ('washek_user' + 'washek_kael_quota')
+ * - React Query cache (['kael-usage'])
+ * - Window custom event ('kael-quota-updated')
+ */
+export function syncQuotaAcrossApp(stats, { dispatch = true } = {}) {
+  if (!stats || typeof stats.used !== 'number') return stats;
+
+  let userId = stats.userId || null;
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const rawUser = localStorage.getItem('washek_user');
+      if (rawUser) {
+        const parsed = JSON.parse(rawUser);
+        if (parsed && typeof parsed === 'object') {
+          if (!userId && parsed.id) userId = parsed.id;
+          parsed.kael_msg_count = Number(stats.used);
+          if (stats.monthKey) parsed.kael_msg_month = stats.monthKey;
+          if (stats.timezone) parsed.timezone = stats.timezone;
+          localStorage.setItem('washek_user', JSON.stringify(parsed));
+        }
+      }
+      localStorage.setItem(
+        KAEL_QUOTA_CACHE_KEY,
+        JSON.stringify({
+          ...stats,
+          userId,
+          updatedAt: Date.now(),
+        })
+      );
+    } catch {
+      // ignore storage write failures
+    }
+  }
+
+  try {
+    queryClientInstance.setQueriesData({ queryKey: ['kael-usage'] }, (prev) => {
+      if (
+        prev &&
+        prev.monthKey === stats.monthKey &&
+        typeof prev.used === 'number' &&
+        prev.used > stats.used &&
+        !stats.forceAuthoritative
+      ) {
+        return {
+          ...stats,
+          used: prev.used,
+          remaining: Math.max(0, Number(stats.limit || getPlanLimit(stats.plan)) - prev.used),
+        };
+      }
+      return stats;
+    });
+  } catch {
+    // ignore React Query cache update error
+  }
+
+  if (dispatch && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('kael-quota-updated', { detail: stats }));
+  }
+
+  return stats;
+}
+
+export function getCachedMessageStats(user, plan = 'free', timeZone = null) {
+  const effectiveTz = timeZone || getUserTimeZone(user);
+  const monthKey = getCurrentMonthKey(new Date(), effectiveTz);
+  const effectivePlan = String(plan || user?.subscription_plan || 'free').toLowerCase().trim();
+  const limit = getPlanLimit(effectivePlan);
+
+  let used =
+    user?.kael_msg_month === monthKey
+      ? Number(user?.kael_msg_count || 0)
+      : 0;
+
+  if (typeof localStorage !== 'undefined') {
+    try {
+      const rawQuota = localStorage.getItem(KAEL_QUOTA_CACHE_KEY);
+      if (rawQuota) {
+        const cached = JSON.parse(rawQuota);
+        const sameUser = !user?.id || !cached?.userId || cached.userId === user.id;
+        if (sameUser && cached?.monthKey === monthKey && typeof cached.used === 'number') {
+          used = Math.max(used, cached.used);
+        }
+      }
+      const rawUser = localStorage.getItem('washek_user');
+      if (rawUser) {
+        const parsedUser = JSON.parse(rawUser);
+        const sameUser = !user?.id || !parsedUser?.id || parsedUser.id === user.id;
+        if (sameUser && parsedUser?.kael_msg_month === monthKey && typeof parsedUser.kael_msg_count === 'number') {
+          used = Math.max(used, Number(parsedUser.kael_msg_count));
+        }
+      }
+    } catch {
+      // ignore storage read error
+    }
+  }
+
+  return {
+    used,
+    limit,
+    remaining: Math.max(0, limit - used),
+    monthKey,
+    plan: effectivePlan || 'free',
+    timezone: effectiveTz,
+  };
 }
 
 export function computeStats(user, plan = 'free', timeZone = null) {
@@ -113,13 +225,9 @@ export async function getServerMessageStats(timeZone = null) {
             ? data.remaining
             : Math.max(0, (data.limit || 100) - data.used),
         timezone: effectiveTz,
+        forceAuthoritative: true,
       };
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('kael-quota-updated', { detail: stats })
-        );
-      }
-      return stats;
+      return syncQuotaAcrossApp(stats);
     }
 
     // Direct profile table fallback if RPC is ever unreachable or unauthenticated
@@ -127,25 +235,29 @@ export async function getServerMessageStats(timeZone = null) {
       try {
         let profile = null;
         if (effectiveUserId && isValidUUID(effectiveUserId)) {
-          const { data } = await supabase
+          const { data: pData } = await supabase
             .from('profiles')
             .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
             .eq('id', effectiveUserId)
             .maybeSingle();
-          profile = data;
+          profile = pData;
         }
         if (!profile && cachedUser?.email) {
-          const { data } = await supabase
+          const { data: pData } = await supabase
             .from('profiles')
             .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
             .ilike('email', String(cachedUser.email).trim())
             .maybeSingle();
-          profile = data;
+          profile = pData;
         }
 
         if (profile) {
-          // If cachedUser has a higher count for current month, use the higher count
           const monthKey = getCurrentMonthKey(new Date(), effectiveTz || profile.timezone);
+          const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
+          const isSubActive = ['active', 'trialing', 'past_due'].includes(dbStatus);
+          const effectivePlan = isSubActive ? (profile.subscription_plan || 'free') : 'free';
+          const effectiveLimit = getPlanLimit(effectivePlan);
+
           let effectiveCount = Number(profile.kael_msg_month === monthKey ? profile.kael_msg_count || 0 : 0);
           if (cachedUser?.kael_msg_month === monthKey && Number(cachedUser?.kael_msg_count || 0) > effectiveCount) {
             effectiveCount = Number(cachedUser.kael_msg_count);
@@ -153,19 +265,14 @@ export async function getServerMessageStats(timeZone = null) {
 
           const stats = {
             used: effectiveCount,
-            limit: getPlanLimit(profile.subscription_plan || cachedUser?.subscription_plan || 'free'),
-            remaining: Math.max(0, getPlanLimit(profile.subscription_plan || cachedUser?.subscription_plan || 'free') - effectiveCount),
+            limit: effectiveLimit,
+            remaining: Math.max(0, effectiveLimit - effectiveCount),
             monthKey,
-            plan: profile.subscription_plan || cachedUser?.subscription_plan || 'free',
+            plan: effectivePlan,
             timezone: effectiveTz || profile.timezone,
           };
 
-          if (typeof window !== 'undefined') {
-            window.dispatchEvent(
-              new CustomEvent('kael-quota-updated', { detail: stats })
-            );
-          }
-          return stats;
+          return syncQuotaAcrossApp(stats);
         }
       } catch (profileFetchErr) {
         console.warn('[messageLimit] profiles table query error:', profileFetchErr);
@@ -173,17 +280,13 @@ export async function getServerMessageStats(timeZone = null) {
     }
 
     if (cachedUser) {
-      const stats = computeStats(
-        cachedUser,
-        cachedUser.subscription_plan || 'free',
-        effectiveTz || cachedUser.timezone
-      );
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('kael-quota-updated', { detail: stats })
-        );
-      }
-      return stats;
+      const cachedStatus = String(cachedUser.subscription_status || '').toLowerCase().trim();
+      const cachedPlan =
+        cachedStatus === 'canceled' || cachedStatus === 'cancelled' || cachedStatus === 'inactive'
+          ? 'free'
+          : (cachedUser.subscription_plan || 'free');
+      const stats = getCachedMessageStats(cachedUser, cachedPlan, effectiveTz || cachedUser.timezone);
+      return syncQuotaAcrossApp(stats);
     }
 
     return null;
@@ -224,13 +327,9 @@ export async function claimMessage(timeZone = null) {
             ? data.remaining
             : Math.max(0, (data.limit || 100) - (data.used || 0)),
         timezone: effectiveTz,
+        forceAuthoritative: true,
       };
-      if (typeof window !== 'undefined') {
-        window.dispatchEvent(
-          new CustomEvent('kael-quota-updated', { detail: stats })
-        );
-      }
-      return stats;
+      return syncQuotaAcrossApp(stats);
     }
 
     // Resilient fallback when RPC is unavailable or permission denied
@@ -258,7 +357,11 @@ export async function claimMessage(timeZone = null) {
     }
 
     const currentMonthKey = getCurrentMonthKey(new Date(), effectiveTz);
-    const plan = localUser?.subscription_plan || 'free';
+    const localStatus = String(localUser?.subscription_status || '').toLowerCase().trim();
+    const plan =
+      localStatus === 'canceled' || localStatus === 'cancelled' || localStatus === 'inactive'
+        ? 'free'
+        : (localUser?.subscription_plan || 'free');
     const limit = getPlanLimit(plan);
 
     const prevCount =
@@ -295,19 +398,6 @@ export async function claimMessage(timeZone = null) {
       }
     }
 
-    // Update local storage
-    if (typeof localStorage !== 'undefined') {
-      try {
-        const raw = localStorage.getItem('washek_user');
-        const userObj = raw ? JSON.parse(raw) : (localUser || {});
-        userObj.kael_msg_count = newCount;
-        userObj.kael_msg_month = currentMonthKey;
-        localStorage.setItem('washek_user', JSON.stringify(userObj));
-      } catch (_saveErr) {
-        // LocalStorage write ignored
-      }
-    }
-
     const stats = {
       allowed: true,
       used: newCount,
@@ -318,30 +408,14 @@ export async function claimMessage(timeZone = null) {
       timezone: effectiveTz,
     };
 
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(
-        new CustomEvent('kael-quota-updated', { detail: stats })
-      );
-    }
-    return stats;
+    return syncQuotaAcrossApp(stats);
   } catch (err) {
     console.error('[messageLimit] claimMessage fallback error:', err);
     throw err;
   }
 }
 
-export async function incrementMessageCount(plan = 'free') {
-  /*
-   * Kept for backwards compatibility with any older page imports.
-   *
-   * IMPORTANT:
-   * The authoritative Kael usage counter is now server-side.
-   * New Kael code should use claimMessage() instead.
-   *
-   * This function intentionally does NOT update the user's
-   * profile usage fields anymore.
-   */
-
+export async function incrementMessageCount(_plan = 'free') {
   const serverStats = await getServerMessageStats();
 
   if (!serverStats) {

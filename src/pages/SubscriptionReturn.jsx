@@ -1,6 +1,8 @@
 import {
   useEffect,
   useState,
+  useCallback,
+  useRef,
 } from 'react';
 
 import {
@@ -11,6 +13,8 @@ import {
 import {
   supabase,
 } from '@/lib/supabase';
+import { resolveValidSupabaseSession } from '@/lib/stripeCheckout';
+import { queryClientInstance } from '@/lib/query-client';
 
 import {
   Zap,
@@ -18,6 +22,7 @@ import {
   AlertCircle,
   Loader2,
   ArrowRight,
+  RefreshCw,
 } from 'lucide-react';
 
 import {
@@ -27,151 +32,175 @@ import {
 import {
   PLAN_LABELS,
   applySubscriptionUpgrade,
+  clearRecentUpgradeGrace,
   normalizePlan,
 } from '@/lib/subscription';
+
+const ACTIVE_SUB_STATUSES = ['active', 'trialing', 'past_due'];
+
+function clearPendingCheckoutArtifacts() {
+  try {
+    localStorage.removeItem('washek_pending_checkout_plan');
+    sessionStorage.removeItem('washek_pending_checkout_plan');
+    document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
+  } catch {
+    // ignore storage cleanup errors
+  }
+}
 
 export default function SubscriptionReturn() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
 
   const [status, setStatus] = useState('loading');
-  const [subStatus, setSubStatus] = useState('trialing');
+  const [subStatus, setSubStatus] = useState('active');
   const [planName, setPlanName] = useState('');
   const [errorMessage, setErrorMessage] = useState('');
+  const [attemptCounter, setAttemptCounter] = useState(0);
+
+  const cancelledRef = useRef(false);
+
+  const handleRecheck = useCallback(() => {
+    setErrorMessage('');
+    setStatus('loading');
+    setAttemptCounter((c) => c + 1);
+  }, []);
 
   useEffect(() => {
-    let cancelled = false;
+    cancelledRef.current = false;
     let redirectTimer = null;
     let closeFallbackTimer = null;
 
-    const resolveAndUpgrade = async () => {
-      // 1. Detect plan from query params, cookies, localStorage, or backend endpoint
-      const rawPlanParam = searchParams.get('plan') || searchParams.get('tier') || '';
-      const rawStatusParam = searchParams.get('status') || '';
-      const trialParam = searchParams.get('trial');
-      let resolvedStatus =
-        trialParam === 'false'
-          ? 'active'
-          : rawStatusParam === 'active'
-            ? 'active'
-            : 'trialing';
+    const verifyPaymentWithDatabase = async () => {
+      clearRecentUpgradeGrace();
 
-      let pendingPlan = (() => {
-        try {
-          return (
-            sessionStorage.getItem('washek_pending_checkout_plan') ||
-            localStorage.getItem('washek_pending_checkout_plan') ||
-            ''
-          );
-        } catch {
-          return '';
-        }
-      })();
+      // Hint label only while verifying (never used to grant access)
+      const hintedPlanRaw =
+        searchParams.get('plan') ||
+        searchParams.get('tier') ||
+        (() => {
+          try {
+            return (
+              sessionStorage.getItem('washek_pending_checkout_plan') ||
+              localStorage.getItem('washek_pending_checkout_plan') ||
+              ''
+            );
+          } catch {
+            return '';
+          }
+        })();
+      const hintedPlan = normalizePlan(hintedPlanRaw);
+      if (hintedPlan !== 'free') {
+        setPlanName(PLAN_LABELS[hintedPlan] || hintedPlan);
+      }
 
-      if (!pendingPlan) {
+      // Recover authenticated Supabase session before reading profiles
+      let authUser = null;
+      try {
+        const session = await resolveValidSupabaseSession(false);
+        authUser = session?.user || null;
+      } catch {
+        // Fallback if token recovery returned no user object directly
+      }
+
+      if (!authUser?.id) {
         try {
-          const match = document.cookie.match(/washek_pending_checkout_plan=([^;]+)/);
-          if (match) pendingPlan = match[1];
-        } catch {
-          /* ignore cookie error */
+          const { data: sessionData } = await supabase.auth.getSession();
+          authUser = sessionData?.session?.user || null;
+          if (!authUser) {
+            const { data: authData } = await supabase.auth.getUser();
+            authUser = authData?.user || null;
+          }
+        } catch (authErr) {
+          console.debug('[SubscriptionReturn] Auth lookup note:', authErr);
         }
       }
 
-      if (!rawPlanParam && !pendingPlan) {
-        try {
-          const res = await fetch('/api/checkout/pending');
-          const data = await res.json();
-          if (data?.plan) pendingPlan = data.plan;
-        } catch {
-          /* ignore */
-        }
-      }
-
-      const sessionId = searchParams.get('session_id') || searchParams.get('sessionId') || '';
-      let resolvedPlan = normalizePlan(rawPlanParam || pendingPlan);
-      if ((!resolvedPlan || resolvedPlan === 'free') && (sessionId || rawStatusParam || window.location.href.includes('return'))) {
-        resolvedPlan = 'performance';
-      }
-
-      if (!resolvedPlan || resolvedPlan === 'free') {
+      if (!authUser?.id) {
+        if (cancelledRef.current) return;
+        clearPendingCheckoutArtifacts();
         setStatus('error');
-        setErrorMessage('No valid subscription plan was detected. If you completed checkout on Stripe, please return to your profile.');
+        setErrorMessage(
+          'Please sign in to your WASHEK account so we can verify your Stripe payment status.'
+        );
+        return;
+      }
+
+      // Poll authoritative Supabase profiles table until Stripe webhook writes an active/trialing paid plan
+      let confirmedPlan = 'free';
+      let confirmedStatus = 'inactive';
+
+      for (let attempt = 0; attempt < 12; attempt++) {
+        if (cancelledRef.current) return;
+        try {
+          const { data: dbProf, error: profErr } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status, stripe_subscription_id')
+            .eq('id', authUser.id)
+            .maybeSingle();
+
+          if (!profErr && dbProf) {
+            const dbPlan = normalizePlan(dbProf.subscription_plan);
+            const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
+            if (dbPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(dbStatus)) {
+              confirmedPlan = dbPlan;
+              confirmedStatus = dbStatus;
+              break;
+            }
+          }
+        } catch {
+          // continue polling
+        }
+
+        if (attempt < 11) {
+          await new Promise((r) => window.setTimeout(r, 1000));
+        }
+      }
+
+      if (cancelledRef.current) return;
+
+      clearPendingCheckoutArtifacts();
+
+      // Strict payment verification guard: do NOT upgrade unless Postgres profiles confirms paid active/trialing
+      if (confirmedPlan === 'free' || !ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+        try {
+          localStorage.removeItem('washek_subscription_plan');
+          localStorage.setItem('washek_subscription_status', confirmedStatus || 'inactive');
+        } catch {
+          // ignore
+        }
+        setStatus('error');
+        setErrorMessage(
+          'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
+        );
         return;
       }
 
       const friendlyName =
-        (PLAN_LABELS && PLAN_LABELS[resolvedPlan]) ||
-        resolvedPlan.charAt(0).toUpperCase() + resolvedPlan.slice(1);
+        (PLAN_LABELS && PLAN_LABELS[confirmedPlan]) ||
+        confirmedPlan.charAt(0).toUpperCase() + confirmedPlan.slice(1);
       setPlanName(friendlyName);
+      setSubStatus(confirmedStatus);
 
-      // 2. Check authenticated Supabase user & wait briefly for webhook to write to profiles
-      let authUser = null;
-      try {
-        const { data: sessionData } = await supabase.auth.getSession();
-        authUser = sessionData?.session?.user || null;
-        if (!authUser) {
-          const { data: authData } = await supabase.auth.getUser();
-          authUser = authData?.user || null;
-        }
-      } catch (authErr) {
-        console.debug('[SubscriptionReturn] Auth check note:', authErr);
-      }
-
-      if (authUser?.id) {
-        for (let attempt = 0; attempt < 4; attempt++) {
-          if (cancelled) return;
-          try {
-            const { data: dbProf } = await supabase
-              .from('profiles')
-              .select('subscription_plan, subscription_status')
-              .eq('id', authUser.id)
-              .maybeSingle();
-
-            if (
-              dbProf?.subscription_plan &&
-              normalizePlan(dbProf.subscription_plan) === resolvedPlan &&
-              ['active', 'trialing'].includes(String(dbProf.subscription_status || '').toLowerCase())
-            ) {
-              resolvedStatus = String(dbProf.subscription_status).toLowerCase();
-              break;
-            }
-          } catch {
-            // continue retry
-          }
-          await new Promise((r) => window.setTimeout(r, 400));
-        }
-      }
-
-      if (cancelled) return;
-
-      setSubStatus(resolvedStatus);
-
-      // 3. Apply upgrade across local storage & reactive state with recent-upgrade grace window
-      applySubscriptionUpgrade(resolvedPlan, resolvedStatus, {
-        sessionId,
-        syncServer: true,
-        isNewUpgrade: true,
+      // Sync verified DB subscription locally and invalidate queries
+      applySubscriptionUpgrade(confirmedPlan, confirmedStatus, {
+        syncServer: false,
       });
+      queryClientInstance.invalidateQueries();
 
-      // Clean up temporary pending plan
-      try {
-        localStorage.removeItem('washek_pending_checkout_plan');
-        sessionStorage.removeItem('washek_pending_checkout_plan');
-        document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
-      } catch {
-        /* ignore */
-      }
-
-      // 4. Notify any open main app tab via opener, BroadcastChannel, and storage event
+      // Notify open tabs to refresh from Postgres
       try {
         if (window.opener && !window.opener.closed) {
-          window.opener.postMessage({
-            type: 'WASHEK_SUBSCRIPTION_SUCCESS',
-            plan: resolvedPlan,
-            status: resolvedStatus,
-          }, '*');
+          window.opener.postMessage(
+            {
+              type: 'WASHEK_SUBSCRIPTION_SUCCESS',
+              plan: confirmedPlan,
+              status: confirmedStatus,
+            },
+            '*'
+          );
         }
-      } catch (_pmErr) {
+      } catch {
         // ignore cross-origin error
       }
 
@@ -179,42 +208,43 @@ export default function SubscriptionReturn() {
         const bc = new BroadcastChannel('washek_subscription_sync');
         bc.postMessage({
           type: 'WASHEK_SUBSCRIPTION_SUCCESS',
-          plan: resolvedPlan,
-          status: resolvedStatus,
+          plan: confirmedPlan,
+          status: confirmedStatus,
           timestamp: Date.now(),
         });
         bc.close();
-      } catch (_bcErr) {
+      } catch {
         // ignore BroadcastChannel error
       }
 
       try {
-        localStorage.setItem('washek_subscription_success_event', JSON.stringify({
-          plan: resolvedPlan,
-          status: resolvedStatus,
-          timestamp: Date.now(),
-        }));
-      } catch (_lsErr) {
+        localStorage.setItem(
+          'washek_subscription_success_event',
+          JSON.stringify({
+            plan: confirmedPlan,
+            status: confirmedStatus,
+            timestamp: Date.now(),
+          })
+        );
+      } catch {
         // ignore storage error
       }
 
-      if (cancelled) return;
+      if (cancelledRef.current) return;
 
-      // Mark success
       setStatus('success');
 
-      // Close checkout tab if opened from the app, otherwise turn this tab into the app
-      const redirectUrl = `/?subscribed=${encodeURIComponent(resolvedPlan)}&sub_status=${encodeURIComponent(resolvedStatus)}`;
+      const redirectUrl = '/';
       redirectTimer = window.setTimeout(() => {
-        if (cancelled) return;
+        if (cancelledRef.current) return;
         if (window.opener && !window.opener.closed) {
           try {
             window.close();
-          } catch (_err) {
+          } catch {
             // ignore popup close restriction
           }
           closeFallbackTimer = window.setTimeout(() => {
-            if (!cancelled && !window.closed) {
+            if (!cancelledRef.current && !window.closed) {
               window.location.replace(redirectUrl);
             }
           }, 300);
@@ -224,22 +254,15 @@ export default function SubscriptionReturn() {
       }, 1200);
     };
 
-    resolveAndUpgrade();
+    verifyPaymentWithDatabase();
 
     return () => {
-      cancelled = true;
+      cancelledRef.current = true;
       if (redirectTimer) clearTimeout(redirectTimer);
       if (closeFallbackTimer) clearTimeout(closeFallbackTimer);
     };
-  }, [navigate, searchParams]);
+  }, [searchParams, attemptCounter]);
 
-
-
-  /*
-   * ==========================================================
-   * LOADING & SYNCING
-   * ==========================================================
-   */
   if (status === 'loading') {
     return (
       <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
@@ -250,27 +273,22 @@ export default function SubscriptionReturn() {
           </div>
 
           <h1 className="font-heading font-extrabold text-2xl tracking-tight text-foreground">
-            Syncing your plan…
+            Verifying your payment…
           </h1>
 
           <p className="text-sm text-muted-foreground leading-relaxed">
-            Stripe payment confirmed. WASHEK is unlocking all {planName || 'plan'} features and synchronizing your account…
+            Checking Stripe payment confirmation with your WASHEK account{planName ? ` for ${planName}` : ''}…
           </p>
 
           <div className="flex items-center justify-center gap-2 text-primary font-heading font-bold text-sm pt-2">
             <Zap className="w-4 h-4 fill-primary/30" />
-            <span>WASHEK {planName || 'Tier'}</span>
+            <span>WASHEK {planName || 'Billing'}</span>
           </div>
         </div>
       </div>
     );
   }
 
-  /*
-   * ==========================================================
-   * SUCCESS
-   * ==========================================================
-   */
   if (status === 'success') {
     const isTrial = subStatus === 'trialing';
 
@@ -284,13 +302,13 @@ export default function SubscriptionReturn() {
 
           <div className="space-y-2">
             <h1 className="font-heading font-extrabold text-2xl tracking-tight text-foreground">
-              {isTrial ? `7-Day Free Trial Activated!` : `Plan Synced · You're on ${planName}!`}
+              {isTrial ? `7-Day Free Trial Activated!` : `Payment Confirmed · ${planName}`}
             </h1>
 
             <p className="text-sm text-muted-foreground leading-relaxed">
               {isTrial
-                ? `All ${planName} features are immediately unlocked for your 7-day trial ($0 today). Auto-renews after 7 days · Cancel anytime in your profile.`
-                : `Your subscription has been confirmed and all your ${planName} features are immediately unlocked.`}
+                ? `All ${planName} features are unlocked for your 7-day trial ($0 today). Auto-renews after 7 days · Cancel anytime in your profile.`
+                : `Your subscription has been confirmed and all your ${planName} features are unlocked.`}
             </p>
           </div>
 
@@ -316,7 +334,7 @@ export default function SubscriptionReturn() {
                 if (window.opener && !window.opener.closed) {
                   try {
                     window.close();
-                  } catch (_err) {
+                  } catch {
                     /* ignore window close restriction */
                   }
                 }
@@ -337,11 +355,6 @@ export default function SubscriptionReturn() {
     );
   }
 
-  /*
-   * ==========================================================
-   * ERROR OR INVALID SESSION
-   * ==========================================================
-   */
   return (
     <div className="min-h-screen bg-background flex flex-col items-center justify-center px-6 safe-top safe-bottom text-center">
       <div className="space-y-4 max-w-sm">
@@ -350,28 +363,39 @@ export default function SubscriptionReturn() {
         </div>
 
         <h1 className="font-heading font-bold text-2xl tracking-tight">
-          Subscription Verification
+          Payment Not Confirmed Yet
         </h1>
 
         <p className="text-muted-foreground text-sm leading-relaxed">
-          {errorMessage || 'No active payment session was detected. If you completed checkout on Stripe, please check your email confirmation or return to your profile.'}
+          {errorMessage || 'No active Stripe payment was confirmed for your account. Your current plan remains unchanged.'}
         </p>
 
-        <div className="pt-2 flex items-center gap-2">
-          <Button
-            variant="outline"
-            className="flex-1 text-xs"
-            onClick={() => navigate('/profile', { replace: true })}
-          >
-            Return to Profile
-          </Button>
+        <div className="pt-2 space-y-2">
           <Button
             variant="default"
-            className="flex-1 text-xs"
-            onClick={() => navigate('/', { replace: true })}
+            className="w-full text-xs font-semibold gap-1.5"
+            onClick={handleRecheck}
           >
-            Dashboard
+            <RefreshCw className="w-3.5 h-3.5" />
+            Re-check Payment Status
           </Button>
+
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              className="flex-1 text-xs"
+              onClick={() => navigate('/profile', { replace: true })}
+            >
+              Return to Profile
+            </Button>
+            <Button
+              variant="outline"
+              className="flex-1 text-xs"
+              onClick={() => navigate('/', { replace: true })}
+            >
+              Dashboard
+            </Button>
+          </div>
         </div>
       </div>
     </div>

@@ -42,6 +42,7 @@ import ProgramDay from '@/pages/ProgramDay';
 import LiveWorkout from '@/pages/LiveWorkout';
 import SubscriptionReturn from '@/pages/SubscriptionReturn';
 
+import { supabaseApi } from '@/lib/supabaseApi';
 import { applySubscriptionUpgrade, normalizePlan } from '@/lib/subscription';
 import { toast } from 'sonner';
 
@@ -65,37 +66,52 @@ function SubscriptionWatcher() {
   const lastAppliedRef = React.useRef(0);
 
   React.useEffect(() => {
-    const applyVerified = (plan, status = 'active', showToast = true) => {
-      const safe = normalizePlan(plan);
-      if (!safe || safe === 'free') return;
+    const verifyAndSyncFromServer = async (showToast = false) => {
+      try {
+        const freshUser = await supabaseApi.auth.me(true);
+        const verifiedPlan = normalizePlan(freshUser?.subscription_plan);
+        const verifiedStatus = String(freshUser?.subscription_status || '').toLowerCase().trim();
+        const isVerifiedActive =
+          verifiedPlan !== 'free' &&
+          ['active', 'trialing', 'past_due'].includes(verifiedStatus);
 
-      applySubscriptionUpgrade(safe, status, {
-        isNewUpgrade: true,
-        syncServer: false,
-      });
-      checkUserAuth?.().catch(() => {});
+        if (isVerifiedActive) {
+          applySubscriptionUpgrade(verifiedPlan, verifiedStatus, { syncServer: false });
+          queryClientInstance.invalidateQueries();
+          await checkUserAuth?.().catch(() => {});
 
-      const now = Date.now();
-      if (showToast && now - lastAppliedRef.current > 2000) {
-        lastAppliedRef.current = now;
-        toast.success(`Payment confirmed! You are now upgraded to the ${safe.charAt(0).toUpperCase() + safe.slice(1)} plan.`);
+          const now = Date.now();
+          if (showToast && now - lastAppliedRef.current > 2000) {
+            lastAppliedRef.current = now;
+            toast.success(
+              `Payment confirmed! You are now upgraded to the ${verifiedPlan.charAt(0).toUpperCase() + verifiedPlan.slice(1)} plan.`
+            );
+          }
+        }
+      } catch {
+        // ignore transient network lookup error
       }
     };
 
-    // 1. Check for query parameter return (?subscribed=... or ?plan=...)
+    // Strip any ?subscribed= / ?plan= query parameters without trusting client URL params to grant upgrades
     const params = new URLSearchParams(location.search);
-    const subPlan = params.get('subscribed') || params.get('plan');
-    const subStatusParam = params.get('sub_status') || 'active';
-    if (subPlan && subPlan !== 'free') {
-      applyVerified(subPlan, subStatusParam, true);
-      const cleanPath = location.pathname;
-      window.history.replaceState({}, document.title, cleanPath);
+    if (params.has('subscribed') || params.has('plan') || params.has('sub_status')) {
+      const hasSubHint = params.has('subscribed');
+      params.delete('subscribed');
+      params.delete('plan');
+      params.delete('sub_status');
+      const nextSearch = params.toString();
+      const cleanUrl = nextSearch ? `${location.pathname}?${nextSearch}` : location.pathname;
+      window.history.replaceState({}, document.title, cleanUrl);
+      if (hasSubHint) {
+        verifyAndSyncFromServer(true);
+      }
     }
 
-    // 2. Listen for cross-tab or return tab events (BroadcastChannel, storage, postMessage)
+    // Listen for cross-tab checkout return notifications and verify authoritatively against DB
     const onWindowMsg = (e) => {
-      if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && e.data?.plan) {
-        applyVerified(e.data.plan, e.data?.status || 'active', true);
+      if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS') {
+        verifyAndSyncFromServer(true);
       }
     };
     window.addEventListener('message', onWindowMsg);
@@ -104,8 +120,8 @@ function SubscriptionWatcher() {
     try {
       bc = new BroadcastChannel('washek_subscription_sync');
       bc.onmessage = (e) => {
-        if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && e.data?.plan) {
-          applyVerified(e.data.plan, e.data?.status || 'active', true);
+        if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS') {
+          verifyAndSyncFromServer(true);
         }
       };
     } catch {
@@ -114,14 +130,7 @@ function SubscriptionWatcher() {
 
     const onStorage = (e) => {
       if (e.key === 'washek_subscription_success_event' && e.newValue) {
-        try {
-          const parsed = JSON.parse(e.newValue);
-          if (parsed?.plan && parsed.plan !== 'free') {
-            applyVerified(parsed.plan, parsed?.status || 'active', true);
-          }
-        } catch {
-          /* ignore */
-        }
+        verifyAndSyncFromServer(true);
       }
     };
     window.addEventListener('storage', onStorage);

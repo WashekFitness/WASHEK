@@ -651,7 +651,7 @@ Deno.serve(
       console.log(
         '[CANCEL] Canceling verified Stripe subscription:',
         {
-          userId: user.id,
+          userId: user?.id || profile.id,
           customerId,
           subscriptionId,
           stripeStatus:
@@ -692,7 +692,7 @@ Deno.serve(
       console.log(
         '[CANCEL] SUCCESS:',
         {
-          userId: user.id,
+          userId: user?.id || profile.id,
           customerId,
           subscriptionId,
           stripeStatus:
