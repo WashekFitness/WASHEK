@@ -58,8 +58,12 @@ import {
   getServerMessageStats,
   computeStats,
   getCurrentMonthKey,
-  claimMessage,
 } from '@/lib/messageLimit';
+import {
+  kaelStore,
+  useKaelStore,
+  getMessageChatId,
+} from '@/lib/kaelStore';
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/lib/AuthContext';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
@@ -78,136 +82,6 @@ import MessageBubble from '@/components/kael/MessageBubble';
 
 const CONTEXT_MESSAGE_COUNT = 10;
 
-const STORAGE_CHATS_PREFIX = 'washek_kael_chats_';
-const STORAGE_ACTIVE_PREFIX = 'washek_kael_active_chat_';
-const STORAGE_DELETED_CHATS_PREFIX = 'washek_kael_deleted_chats_';
-
-function getDeletedChatIds(userId) {
-  if (!userId) return new Set();
-  try {
-    const raw = localStorage.getItem(STORAGE_DELETED_CHATS_PREFIX + userId);
-    if (raw) {
-      const arr = JSON.parse(raw);
-      if (Array.isArray(arr)) return new Set(arr);
-    }
-  } catch {
-    // fallback
-  }
-  return new Set();
-}
-
-function recordDeletedChatId(userId, chatId) {
-  if (!userId || !chatId) return;
-  try {
-    const set = getDeletedChatIds(userId);
-    set.add(chatId);
-    localStorage.setItem(STORAGE_DELETED_CHATS_PREFIX + userId, JSON.stringify(Array.from(set)));
-    // Also record in global deleted list
-    const globalSet = getDeletedChatIds('all');
-    globalSet.add(chatId);
-    localStorage.setItem(STORAGE_DELETED_CHATS_PREFIX + 'all', JSON.stringify(Array.from(globalSet)));
-  } catch {
-    // fallback
-  }
-}
-
-function getAllCachedChats(userId, deletedIds = new Set()) {
-  const chatMap = new Map();
-  const keysToScan = new Set([
-    STORAGE_CHATS_PREFIX + (userId || 'guest'),
-    STORAGE_CHATS_PREFIX + 'all',
-    STORAGE_CHATS_PREFIX + 'guest',
-    STORAGE_CHATS_PREFIX + 'athlete',
-  ]);
-  if (userId) {
-    keysToScan.add(STORAGE_CHATS_PREFIX + userId);
-  }
-
-  if (typeof localStorage !== 'undefined') {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith(STORAGE_CHATS_PREFIX)) {
-        keysToScan.add(k);
-      }
-    }
-  }
-
-  keysToScan.forEach((key) => {
-    try {
-      const raw = localStorage.getItem(key);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed)) {
-          parsed.forEach((c) => {
-            if (c && c.id && (!deletedIds || !deletedIds.has(c.id))) {
-              const existing = chatMap.get(c.id);
-              if (!existing) {
-                chatMap.set(c.id, { ...c });
-              } else {
-                const cTime = new Date(c.updated_at || c.created_at || 0).getTime();
-                const exTime = new Date(existing.updated_at || existing.created_at || 0).getTime();
-                if (cTime > exTime) {
-                  chatMap.set(c.id, { ...existing, ...c });
-                }
-              }
-            }
-          });
-        }
-      }
-    } catch (_e) {
-      // Ignore parse error
-    }
-  });
-
-  return Array.from(chatMap.values());
-}
-
-function persistConversations(chats, activeId, userId) {
-  if (!Array.isArray(chats)) return;
-  const targetKeys = new Set([
-    STORAGE_CHATS_PREFIX + 'all',
-    STORAGE_CHATS_PREFIX + (userId || 'guest'),
-    STORAGE_CHATS_PREFIX + 'guest',
-  ]);
-  if (userId) {
-    targetKeys.add(STORAGE_CHATS_PREFIX + userId);
-  }
-
-  targetKeys.forEach((key) => {
-    try {
-      localStorage.setItem(key, JSON.stringify(chats));
-    } catch (_e) {
-      // Ignore storage error
-    }
-  });
-
-  if (activeId) {
-    const activeKeys = new Set([
-      STORAGE_ACTIVE_PREFIX + 'all',
-      STORAGE_ACTIVE_PREFIX + (userId || 'guest'),
-    ]);
-    if (userId) {
-      activeKeys.add(STORAGE_ACTIVE_PREFIX + userId);
-    }
-    activeKeys.forEach((key) => {
-      try {
-        localStorage.setItem(key, activeId);
-      } catch (_e) {
-        // Ignore storage error
-      }
-    });
-  }
-}
-
-function getMessageChatId(message) {
-  if (!message) return 'chat_initial';
-  const val = message.created_by;
-  if (typeof val === 'string' && val.startsWith('chat_')) {
-    return val;
-  }
-  return 'chat_initial';
-}
-
 function formatRelativeTime(dateString) {
   if (!dateString) return '';
   const date = new Date(dateString);
@@ -224,16 +98,6 @@ function formatRelativeTime(dateString) {
   if (diffDays === 1) return 'Yesterday';
   if (diffDays < 7) return `${diffDays}d ago`;
   return date.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-}
-
-function generateChatTitle(content) {
-  if (!content) return 'New Chat';
-  const clean = content.replace(/[#*`_~]/g, '').trim().split('\n')[0].trim();
-  if (!clean) return 'New Chat';
-  if (clean.length > 34) {
-    return clean.slice(0, 33) + '…';
-  }
-  return clean;
 }
 
 
@@ -417,20 +281,12 @@ export default function Kael() {
     setUser,
   ] = useState(null);
 
-  const [
+  const {
     messages,
-    setMessages,
-  ] = useState([]);
-
-  const [
     conversations,
-    setConversations,
-  ] = useState([]);
-
-  const [
     activeChatId,
-    setActiveChatId,
-  ] = useState(null);
+    isSending: loading,
+  } = useKaelStore();
 
   const [
     isHistoryOpen,
@@ -456,11 +312,6 @@ export default function Kael() {
     input,
     setInput,
   ] = useState('');
-
-  const [
-    loading,
-    setLoading,
-  ] = useState(false);
 
   const [
     stats,
@@ -499,6 +350,9 @@ export default function Kael() {
    */
   const typingCancelledRef =
     useRef(false);
+
+  const lastScrolledChatRef =
+    useRef(null);
 
   /*
    * Current active conversation metadata
@@ -603,189 +457,18 @@ export default function Kael() {
 
   /*
    * ==========================================================
-   * LOAD CHAT HISTORY & CONVERSATION THREADS
+   * BACKGROUND REMOTE SYNC (NON-DESTRUCTIVE)
    * ==========================================================
    */
 
   useEffect(() => {
-    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
-    let active = true;
-
-    const deletedIds = getDeletedChatIds(currentUserId);
-    getDeletedChatIds('all').forEach((id) => deletedIds.add(id));
-
-    // 1. Read cached conversation threads across all storage keys
-    const cachedChats = getAllCachedChats(currentUserId, deletedIds);
-
-    const savedActiveId =
-      localStorage.getItem(STORAGE_ACTIVE_PREFIX + currentUserId) ||
-      localStorage.getItem(STORAGE_ACTIVE_PREFIX + 'all') ||
-      localStorage.getItem(STORAGE_ACTIVE_PREFIX + 'guest');
-
-    supabaseApi.entities.KaelMessage
-      .filter(
-        {},
-        'created_at',
-        1000
-      )
-      .then((msgs) => {
-        if (!active) {
-          return;
-        }
-
-        const normalizedMessages =
-          Array.isArray(msgs)
-            ? msgs
-                .map((message) => ({
-                  ...message,
-                  created_date:
-                    message.created_date ||
-                    message.created_at ||
-                    message.createdAt ||
-                    null,
-                  created_by: message.created_by || 'chat_initial',
-                }))
-                .sort(
-                  (a, b) =>
-                    new Date(
-                      a.created_date ||
-                        0
-                    ).getTime() -
-                    new Date(
-                      b.created_date ||
-                        0
-                    ).getTime()
-                )
-            : [];
-
-        // 2. Discover chats from messages and merge with cached threads
-        const chatMap = new Map();
-        cachedChats
-          .filter((c) => c && c.id && !deletedIds.has(c.id))
-          .forEach((c) => {
-            chatMap.set(c.id, { ...c });
-          });
-
-        // Filter out messages belonging to deleted chats
-        const validMessages = normalizedMessages.filter((m) => {
-          const k = getMessageChatId(m);
-          return !deletedIds.has(k);
-        });
-
-        // Group messages by chat
-        const messagesByChat = new Map();
-        validMessages.forEach((m) => {
-          const k = getMessageChatId(m);
-          if (!messagesByChat.has(k)) messagesByChat.set(k, []);
-          messagesByChat.get(k).push(m);
-        });
-
-        messagesByChat.forEach((chatMsgs, chatId) => {
-          const existing = chatMap.get(chatId);
-          const firstUserMsg = chatMsgs.find((m) => m.role === 'user');
-          const lastMsg = chatMsgs[chatMsgs.length - 1];
-          const inferredTitle =
-            chatId === 'chat_initial'
-              ? 'General Coaching'
-              : firstUserMsg
-                ? generateChatTitle(firstUserMsg.content)
-                : 'Chat';
-
-          if (!existing) {
-            chatMap.set(chatId, {
-              id: chatId,
-              title: inferredTitle,
-              created_at: chatMsgs[0]?.created_date || new Date().toISOString(),
-              updated_at: lastMsg?.created_date || new Date().toISOString(),
-              last_message: (lastMsg?.content || '').slice(0, 80),
-            });
-          } else {
-            if (!existing.last_message && lastMsg) {
-              existing.last_message = (lastMsg.content || '').slice(0, 80);
-            }
-            if ((!existing.title || existing.title === 'New Chat') && firstUserMsg) {
-              existing.title = generateChatTitle(firstUserMsg.content);
-            }
-          }
-        });
-
-        let mergedChats = Array.from(chatMap.values());
-
-        // If no conversations exist anywhere, initialize a fresh one
-        if (mergedChats.length === 0) {
-          const freshChat = {
-            id: `chat_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-            title: 'New Chat',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            last_message: '',
-          };
-          mergedChats = [freshChat];
-        }
-
-        // Sort chats by most recently updated
-        mergedChats.sort(
-          (a, b) =>
-            new Date(b.updated_at || b.created_at || 0).getTime() -
-            new Date(a.updated_at || a.created_at || 0).getTime()
-        );
-
-        // Pick active chat
-        let selectedChatId = mergedChats[0].id;
-        if (savedActiveId && mergedChats.some((c) => c.id === savedActiveId)) {
-          selectedChatId = savedActiveId;
-        }
-
-        setConversations(mergedChats);
-        setActiveChatId(selectedChatId);
-        setMessages(validMessages);
-
-        persistConversations(mergedChats, selectedChatId, currentUserId);
-      })
-      .catch((error) => {
-        console.error(
-          '[KAEL] Failed to load conversation:',
-          error
-        );
-
-        // Recover local messages so messages are never wiped out
-        let localMsgs = [];
-        try {
-          const raw = localStorage.getItem(`washek_kael_messages_${currentUserId}`) || localStorage.getItem('washek_kael_messages_all');
-          if (raw) localMsgs = JSON.parse(raw);
-        } catch (_err) {
-          // Ignore local storage error
-        }
-        if (localMsgs.length > 0) {
-          setMessages(localMsgs);
-        }
-
-        if (cachedChats.length > 0) {
-          setConversations(cachedChats);
-          const pick = savedActiveId && cachedChats.some((c) => c.id === savedActiveId)
-            ? savedActiveId
-            : cachedChats[0].id;
-          setActiveChatId(pick);
-        } else {
-          const freshChat = {
-            id: `chat_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-            title: 'New Chat',
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString(),
-            last_message: '',
-          };
-          setConversations([freshChat]);
-          setActiveChatId(freshChat.id);
-        }
-      });
-
-    return () => {
-      active = false;
-    };
+    const currentUserId = user?.id || authUser?.id || authUser?.uid || authUser?.email || 'guest';
+    kaelStore.syncWithRemote(currentUserId);
   }, [
     user?.id,
     authUser?.id,
     authUser?.uid,
+    authUser?.email,
   ]);
 
 
@@ -797,25 +480,7 @@ export default function Kael() {
 
   const handleNewChat = () => {
     typingCancelledRef.current = true;
-    setLoading(false);
-
-    const newChat = {
-      id: `chat_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-      title: 'New Chat',
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      last_message: '',
-    };
-
-    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
-
-    setConversations((prev) => {
-      const next = [newChat, ...prev];
-      persistConversations(next, newChat.id, currentUserId);
-      return next;
-    });
-
-    setActiveChatId(newChat.id);
+    kaelStore.createNewChat();
     setIsHistoryOpen(false);
     setInput('');
     window.requestAnimationFrame(() => {
@@ -828,11 +493,8 @@ export default function Kael() {
       setIsHistoryOpen(false);
       return;
     }
-    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
     typingCancelledRef.current = true;
-    setLoading(false);
-    setActiveChatId(chatId);
-    persistConversations(conversations, chatId, currentUserId);
+    kaelStore.selectChat(chatId);
     setIsHistoryOpen(false);
     setInput('');
     window.requestAnimationFrame(() => {
@@ -845,62 +507,12 @@ export default function Kael() {
       setDeleteConfirmChatId(null);
       return;
     }
-
-    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
-
-    // 1. Immediately record in deleted blacklist so it is never re-discovered
-    recordDeletedChatId(currentUserId, chatId);
-
-    // 2. Remove only messages belonging to this chat from in-memory state
-    setMessages((prev) => prev.filter((m) => getMessageChatId(m) !== chatId));
-
-    // 3. Atomically remove ONLY this chat from conversations
-    setConversations((prev) => {
-      const remaining = prev.filter((c) => c.id !== chatId);
-
-      if (remaining.length > 0) {
-        let nextActiveId = activeChatId;
-        if (activeChatId === chatId) {
-          nextActiveId = remaining[0].id;
-          setActiveChatId(nextActiveId);
-        }
-        persistConversations(remaining, nextActiveId, currentUserId);
-        return remaining;
-      }
-
-      // ONLY if there are no remaining chats at all, create a single new empty conversation
-      const freshChat = {
-        id: `chat_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        title: 'New Chat',
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-        last_message: '',
-      };
-      persistConversations([freshChat], freshChat.id, currentUserId);
-      setActiveChatId(freshChat.id);
-      return [freshChat];
-    });
-
-    // 4. Delete only this chat's messages from database
-    try {
-      await supabaseApi.entities.KaelMessage.deleteChat(chatId);
-    } catch (err) {
-      console.warn('[KAEL] Could not delete chat messages from database:', err);
-    }
-
     setDeleteConfirmChatId(null);
+    await kaelStore.deleteChat(chatId);
   };
 
   const handleRenameChat = (chatId, newTitle) => {
-    const cleanTitle = (newTitle || '').trim() || 'Chat';
-    const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
-    setConversations((prev) => {
-      const next = prev.map((c) =>
-        c.id === chatId ? { ...c, title: cleanTitle } : c
-      );
-      persistConversations(next, activeChatId, currentUserId);
-      return next;
-    });
+    kaelStore.renameChat(chatId, newTitle);
     setEditingChatId(null);
   };
 
@@ -912,8 +524,11 @@ export default function Kael() {
    */
 
   useEffect(() => {
+    const isInitialOrChatSwitch =
+      lastScrolledChatRef.current !== activeChatId;
+    lastScrolledChatRef.current = activeChatId;
     bottomRef.current?.scrollIntoView({
-      behavior: 'smooth',
+      behavior: isInitialOrChatSwitch ? 'auto' : 'smooth',
       block: 'end',
     });
   }, [
@@ -1184,19 +799,9 @@ export default function Kael() {
           chunk;
 
 
-        setMessages(
-          (current) =>
-            current.map(
-              (message) =>
-                message.id ===
-                temporaryId
-                  ? {
-                      ...message,
-                      content:
-                        visibleText,
-                    }
-                  : message
-            )
+        kaelStore.updateStreamingMessage(
+          temporaryId,
+          visibleText
         );
 
 
@@ -1254,66 +859,17 @@ export default function Kael() {
       typingCancelledRef.current =
         true;
 
-      let currentChatId = activeChatId;
-      if (!currentChatId) {
-        currentChatId = `chat_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-        setActiveChatId(currentChatId);
-        const newChat = {
-          id: currentChatId,
-          title: generateChatTitle(trimmed),
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-          last_message: '',
-        };
-        setConversations((prev) => [newChat, ...prev]);
-        if (user?.id) {
-          localStorage.setItem(STORAGE_ACTIVE_PREFIX + user.id, currentChatId);
-        }
-      }
-
       // Memory is strictly scoped to this active conversation thread
       const previousMessages =
         [...activeMessages];
 
-      const userMessage = {
-        id:
-          `_user_${Date.now()}`,
-        role:
-          'user',
-        content:
-          trimmed,
-        created_date:
-          new Date().toISOString(),
-        created_by:
-          currentChatId,
-      };
-
-      const temporaryId =
-        `_typing_${Date.now()}`;
-
-      const temporaryMessage = {
-        id:
-          temporaryId,
-        role:
-          'assistant',
-        content:
-          '',
-        created_date:
-          new Date().toISOString(),
-        created_by:
-          currentChatId,
-      };
-
-      setMessages(
-        [
-          ...messages,
-          userMessage,
-          temporaryMessage,
-        ]
-      );
+      const {
+        chatId: currentChatId,
+        userMessage,
+        assistantId: temporaryId,
+      } = kaelStore.startMessageExchange(trimmed);
 
       setInput('');
-      setLoading(true);
 
       try {
         const prompt =
@@ -1326,14 +882,6 @@ export default function Kael() {
 
         /*
          * SERVER-SIDE QUOTA ENFORCEMENT
-         *
-         * The ai-generate Edge Function itself claims the
-         * monthly Kael message slot (via the atomic
-         * claim_kael_message() database function) before it
-         * ever contacts the AI provider. This happens
-         * server-side regardless of what the browser sends, so
-         * it cannot be skipped or bypassed by calling the Edge
-         * Function directly.
          */
         let streamedSoFar = '';
         const result =
@@ -1347,11 +895,7 @@ export default function Kael() {
                 'free',
               onChunk: (_chunk, accumulated) => {
                 streamedSoFar = accumulated;
-                setMessages((prev) =>
-                  prev.map((m) =>
-                    m.id === temporaryId ? { ...m, content: accumulated } : m
-                  )
-                );
+                kaelStore.updateStreamingMessage(temporaryId, accumulated);
               },
             }
           );
@@ -1409,10 +953,6 @@ export default function Kael() {
 
         /*
          * COUNTDOWN & SYNC AS KAEL RESPONDS
-         *
-         * Deduct the message quota immediately as Coach Kael responds so
-         * the displayed remaining message count counts down in real-time.
-         * Keep stats, AuthContext, localStorage, and profiles in sync.
          */
         const currentLimit = displayStats?.limit || 100;
         const currentUsed = typeof displayStats?.used === 'number' ? displayStats.used : 0;
@@ -1471,52 +1011,44 @@ export default function Kael() {
           timezone: effectiveTz,
         };
 
-        if (isUUID) {
-          supabase
-            .from('profiles')
-            .update(countPayload)
-            .eq('id', userIdToSync)
-            .then(({ error: syncErr }) => {
+        ;(async () => {
+          try {
+            if (isUUID) {
+              const { error: syncErr } = await supabase
+                .from('profiles')
+                .update(countPayload)
+                .eq('id', userIdToSync);
               if (syncErr && userEmailToSync) {
-                supabase.from('profiles').update(countPayload).ilike('email', userEmailToSync).catch(() => {});
+                await supabase.from('profiles').update(countPayload).ilike('email', userEmailToSync);
               }
-            })
-            .catch(() => {
-              if (userEmailToSync) {
-                supabase.from('profiles').update(countPayload).ilike('email', userEmailToSync).catch(() => {});
-              }
-            });
-        } else if (userEmailToSync) {
-          supabase
-            .from('profiles')
-            .update(countPayload)
-            .ilike('email', userEmailToSync)
-            .catch((err) => {
-              console.warn('[KAEL] Background profile count sync by email note:', err);
-            });
-        }
+            } else if (userEmailToSync) {
+              await supabase
+                .from('profiles')
+                .update(countPayload)
+                .ilike('email', userEmailToSync);
+            }
+          } catch (err) {
+            console.warn('[KAEL] Background profile count sync note:', err);
+          }
+        })();
 
         if (!streamedSoFar) {
           await typeAssistantResponse(
             responseText,
             temporaryId
           );
-        } else {
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === temporaryId ? { ...msg, content: responseText } : msg
-            )
-          );
         }
 
         typingCancelledRef.current =
           false;
 
-        /*
-         * Refresh the displayed remaining-message count from
-         * the same server-authoritative source used to enforce
-         * it. The count is guarded from regressing to an older/lower used value.
-         */
+        await kaelStore.finalizeAssistantMessage(
+          currentChatId,
+          temporaryId,
+          responseText,
+          trimmed
+        );
+
         getServerMessageStats(timeZone)
           .then(
             (serverStats) => {
@@ -1546,77 +1078,11 @@ export default function Kael() {
             }
           );
 
-        // Update conversation title and last message preview
-        setConversations((prev) => {
-          const next = prev.map((c) => {
-            if (c.id === currentChatId) {
-              const needsTitle = !c.title || c.title === 'New Chat';
-              return {
-                ...c,
-                title: needsTitle ? generateChatTitle(trimmed) : c.title,
-                updated_at: new Date().toISOString(),
-                last_message: responseText.slice(0, 100),
-              };
-            }
-            return c;
-          });
-          next.sort(
-            (a, b) =>
-              new Date(b.updated_at || b.created_at || 0).getTime() -
-              new Date(a.updated_at || a.created_at || 0).getTime()
-          );
-          const currentUserId = user?.id || authUser?.id || authUser?.uid || 'guest';
-          persistConversations(next, currentChatId, currentUserId);
-          return next;
-        });
-
-        try {
-          await supabaseApi.entities.KaelMessage.create(
-            {
-              role:
-                'user',
-              content:
-                trimmed,
-              created_at:
-                userMessage.created_date,
-              created_by:
-                currentChatId,
-            }
-          );
-
-          await supabaseApi.entities.KaelMessage.create(
-            {
-              role:
-                'assistant',
-              content:
-                responseText,
-              created_at:
-                new Date().toISOString(),
-              created_by:
-                currentChatId,
-            }
-          );
-        } catch (saveError) {
-          console.warn(
-            '[KAEL] Conversation save note:',
-            saveError
-          );
-        }
-
       } catch (error) {
 
         console.error(
           '[KAEL] Failed to send message:',
           error
-        );
-
-        setMessages(
-          (current) =>
-            current.filter(
-              (message) =>
-                message.id !==
-                temporaryId
-            )
         );
 
         const isLimitError =
@@ -1628,23 +1094,7 @@ export default function Kael() {
           ? 'You have reached your monthly message limit for Coach Kael. Upgrade your plan to continue chatting with advanced guidance.'
           : 'Sorry — I had trouble generating that response. Please try again.';
 
-        setMessages(
-          (current) => [
-            ...current,
-            {
-              id:
-                `_error_${Date.now()}`,
-              role:
-                'assistant',
-              content:
-                errorMessageText,
-              created_date:
-                new Date().toISOString(),
-              created_by:
-                currentChatId,
-            },
-          ]
-        );
+        kaelStore.failAssistantMessage(temporaryId, errorMessageText);
 
         if (isLimitError) {
           getServerMessageStats(timeZone).then((serverStats) => {
@@ -1657,7 +1107,7 @@ export default function Kael() {
         typingCancelledRef.current =
           false;
 
-        setLoading(false);
+        kaelStore.setSending(false);
 
         window.requestAnimationFrame(() => {
           inputRef.current?.focus();
@@ -1716,6 +1166,9 @@ export default function Kael() {
     <div className="
       flex
       flex-col
+      w-full
+      min-w-0
+      overflow-x-hidden
       h-[calc(100vh-3rem)]
     ">
 
@@ -1904,7 +1357,9 @@ export default function Kael() {
 
       <div className="
         flex-1
+        min-w-0
         overflow-y-auto
+        overflow-x-hidden
         px-4
         py-4
         space-y-4
@@ -1928,6 +1383,7 @@ export default function Kael() {
           (message) => {
 
             const isTypingMessage =
+              Boolean(message.isStreaming) ||
               String(
                 message.id
               ).startsWith(
@@ -1940,11 +1396,10 @@ export default function Kael() {
                 key={
                   message.id
                 }
-                className={
-                  isTypingMessage
-                    ? 'kael-typing-message'
-                    : undefined
-                }
+                className={cn(
+                  'min-w-0 max-w-full',
+                  isTypingMessage ? 'kael-typing-message' : undefined
+                )}
               >
 
                 <MessageBubble
@@ -1961,97 +1416,6 @@ export default function Kael() {
             );
           }
         )}
-
-
-        {/* Waiting for the AI before text starts appearing */}
-
-        {loading &&
-          !activeMessages.some(
-            (message) =>
-              String(
-                message.id
-              ).startsWith(
-                '_typing_'
-              )
-          ) && (
-            <div className="
-              flex
-              justify-start
-            ">
-
-              <div className="
-                w-7
-                h-7
-                rounded-xl
-                bg-primary/15
-                flex
-                items-center
-                justify-center
-                mr-2
-                flex-shrink-0
-                mt-0.5
-              ">
-
-                <Zap className="
-                  w-3.5
-                  h-3.5
-                  text-primary
-                " />
-
-              </div>
-
-
-              <div className="
-                bg-card
-                border
-                border-border
-                rounded-2xl
-                rounded-tl-sm
-                px-4
-                py-3
-              ">
-
-                <div className="
-                  flex
-                  gap-1.5
-                  items-center
-                  h-5
-                ">
-
-                  <div className="
-                    w-1.5
-                    h-1.5
-                    bg-muted-foreground/60
-                    rounded-full
-                    animate-bounce
-                  " />
-
-
-                  <div className="
-                    w-1.5
-                    h-1.5
-                    bg-muted-foreground/60
-                    rounded-full
-                    animate-bounce
-                    [animation-delay:150ms]
-                  " />
-
-
-                  <div className="
-                    w-1.5
-                    h-1.5
-                    bg-muted-foreground/60
-                    rounded-full
-                    animate-bounce
-                    [animation-delay:300ms]
-                  " />
-
-                </div>
-
-              </div>
-
-            </div>
-          )}
 
 
         <div
@@ -2168,6 +1532,8 @@ export default function Kael() {
           flex
           gap-2
           items-end
+          w-full
+          min-w-0
         ">
 
           <Textarea
@@ -2197,6 +1563,8 @@ export default function Kael() {
             }
             className="
               flex-1
+              min-w-0
+              w-full
               min-h-[46px]
               max-h-32
               resize-none
@@ -2211,6 +1579,8 @@ export default function Kael() {
               py-3
               px-4
               shadow-inner
+              [overflow-wrap:anywhere]
+              [word-break:break-word]
             "
             rows={1}
           />

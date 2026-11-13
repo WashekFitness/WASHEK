@@ -10,7 +10,7 @@ import { COUNTRIES, LANGUAGES, getCountryDefaults } from '@/lib/countries';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { useAuth } from '@/lib/AuthContext';
 import { supabase } from '@/lib/supabase';
-import { supabaseApi, ensureValidUuid } from '@/lib/supabaseApi';
+import { supabaseApi, ensureValidUuid, markUserOnboarded } from '@/lib/supabaseApi';
 import { cn } from '@/lib/utils';
 import TrainingTypeSelect from '@/components/onboarding/TrainingTypeSelect';
 import { CALISTHENICS_GOALS, WEIGHT_GOALS, buildWeekPrompt } from '@/lib/trainingTypes';
@@ -388,9 +388,14 @@ export default function Onboarding() {
         await supabase
           .from('profiles')
           .upsert(profileData, { onConflict: 'id' });
+        await supabase
+          .from('profiles')
+          .update({ onboarded: true, updated_at: new Date().toISOString() })
+          .eq('id', validUserId);
       } catch (profileError) {
         console.warn('[Onboarding] Profile upsert notice:', profileError);
       }
+      markUserOnboarded(validUserId, user?.email);
 
       // Sync local storage so user and app immediately recognise onboarded state
       try {
@@ -736,27 +741,28 @@ export default function Onboarding() {
         }
       );
 
-      // Sync active program reference and personalized macros directly to profile
+      // Sync schema-safe profile fields & onboarded=true directly to Postgres
       try {
-        await supabase
+        const { error: syncErr } = await supabase
           .from('profiles')
           .update({
-            active_program_id: savedProgram.id,
             training_type: programPayload.training_type,
             fitness_level: programPayload.fitness_level,
             primary_goal: programPayload.goal,
-            last_program_generated_at: nowIso,
-            calorie_target: personalizedNutrition.calories,
-            protein_target: personalizedNutrition.protein,
-            carbs_target: personalizedNutrition.carbs,
-            fat_target: personalizedNutrition.fat,
             onboarded: true,
             updated_at: nowIso,
           })
           .eq('id', validUserId);
+        if (syncErr) {
+          await supabase
+            .from('profiles')
+            .update({ onboarded: true, updated_at: nowIso })
+            .eq('id', validUserId);
+        }
       } catch (profSyncErr) {
         console.debug('[Onboarding] Profile sync note:', profSyncErr);
       }
+      markUserOnboarded(validUserId, user?.email);
 
       // Sync active program to localStorage for instant hydration on dashboard and profile
       try {

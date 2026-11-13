@@ -5,6 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
 import { Shield, ArrowRight, KeyRound, CheckCircle2, Mail, AlertTriangle, UserX } from 'lucide-react';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 export default function Login() {
   const navigate = useNavigate();
@@ -237,7 +238,8 @@ export default function Login() {
           <div className="inline-flex relative mb-5 group">
             <div className="absolute -inset-1 rounded-3xl bg-gradient-to-r from-primary/60 via-blue-500/40 to-primary/30 blur-lg opacity-80 group-hover:opacity-100 transition duration-500" />
             <img
-              src="/washek-fitness-logo.jpg"
+              src={BRAND_LOGO_SRC}
+              onError={handleBrandLogoError}
               alt="WASHEK"
               className="relative w-20 h-20 rounded-2xl object-cover shadow-[0_0_30px_rgba(37,99,235,0.4)] border border-primary/40 dark:border-primary/50"
             />

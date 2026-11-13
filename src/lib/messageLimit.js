@@ -29,6 +29,11 @@ export function getPlanLimit(plan = 'free') {
   return PLAN_LIMITS[plan] ?? PLAN_LIMITS.free;
 }
 
+function isValidUUID(val) {
+  if (typeof val !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val.trim());
+}
+
 export function computeStats(user, plan = 'free', timeZone = null) {
   const limit = getPlanLimit(plan);
   const effectiveTz = timeZone || getUserTimeZone(user);
@@ -116,11 +121,6 @@ export async function getServerMessageStats(timeZone = null) {
       }
       return stats;
     }
-
-function isValidUUID(val) {
-  if (typeof val !== 'string') return false;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(val.trim());
-}
 
     // Direct profile table fallback if RPC is ever unreachable or unauthenticated
     if (effectiveUserId || cachedUser?.email) {

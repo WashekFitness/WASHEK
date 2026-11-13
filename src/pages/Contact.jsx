@@ -2,6 +2,7 @@ import { useState } from 'react';
 import {
   Link,
 } from 'react-router-dom';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 import {
   ArrowLeft,
@@ -262,7 +263,8 @@ export default function Contact() {
         >
 
           <img
-            src="/washek-fitness-logo.jpg"
+            src={BRAND_LOGO_SRC}
+            onError={handleBrandLogoError}
             alt="WASHEK"
             className="
               w-8

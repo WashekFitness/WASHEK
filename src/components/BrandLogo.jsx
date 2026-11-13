@@ -1,3 +1,5 @@
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
+
 export default function BrandLogo({
   size = 'md',
   showName = false,
@@ -16,7 +18,8 @@ export default function BrandLogo({
   return (
     <div className={`flex items-center gap-2.5 ${className}`}>
       <img
-        src="/washek-fitness-logo.jpg"
+        src={BRAND_LOGO_SRC}
+        onError={handleBrandLogoError}
         alt="WASHEK"
         className={`${sizes[size] || sizes.md} object-contain shrink-0 rounded-xl`}
       />

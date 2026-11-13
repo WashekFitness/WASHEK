@@ -13,17 +13,11 @@ import {
 } from '@/lib/supabase';
 
 import {
-  supabaseApi,
-} from '@/lib/supabaseApi';
-
-
-import {
   Zap,
   CheckCircle2,
   AlertCircle,
   Loader2,
   ArrowRight,
-  User,
 } from 'lucide-react';
 
 import {
@@ -31,7 +25,6 @@ import {
 } from '@/components/ui/button';
 
 import {
-  PLAN_HIERARCHY,
   PLAN_LABELS,
   applySubscriptionUpgrade,
   normalizePlan,
@@ -48,14 +41,20 @@ export default function SubscriptionReturn() {
 
   useEffect(() => {
     let cancelled = false;
+    let redirectTimer = null;
+    let closeFallbackTimer = null;
 
     const resolveAndUpgrade = async () => {
       // 1. Detect plan from query params, cookies, localStorage, or backend endpoint
       const rawPlanParam = searchParams.get('plan') || searchParams.get('tier') || '';
       const rawStatusParam = searchParams.get('status') || '';
       const trialParam = searchParams.get('trial');
-      const resolvedStatus = trialParam === 'false' ? 'active' : (rawStatusParam === 'active' ? 'active' : 'trialing');
-      setSubStatus(resolvedStatus);
+      let resolvedStatus =
+        trialParam === 'false'
+          ? 'active'
+          : rawStatusParam === 'active'
+            ? 'active'
+            : 'trialing';
 
       let pendingPlan = (() => {
         try {
@@ -89,7 +88,6 @@ export default function SubscriptionReturn() {
       }
 
       const sessionId = searchParams.get('session_id') || searchParams.get('sessionId') || '';
-      // If Stripe returned with a session or confirmation, default to performance if plan unspecified
       let resolvedPlan = normalizePlan(rawPlanParam || pendingPlan);
       if ((!resolvedPlan || resolvedPlan === 'free') && (sessionId || rawStatusParam || window.location.href.includes('return'))) {
         resolvedPlan = 'performance';
@@ -97,7 +95,7 @@ export default function SubscriptionReturn() {
 
       if (!resolvedPlan || resolvedPlan === 'free') {
         setStatus('error');
-        setErrorMessage('No valid subscription plan was detected. If you completed checkout on Stripe, click below to activate your plan.');
+        setErrorMessage('No valid subscription plan was detected. If you completed checkout on Stripe, please return to your profile.');
         return;
       }
 
@@ -106,8 +104,54 @@ export default function SubscriptionReturn() {
         resolvedPlan.charAt(0).toUpperCase() + resolvedPlan.slice(1);
       setPlanName(friendlyName);
 
-      // Apply upgrade instantly across all local storage & application state
-      applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { sessionId });
+      // 2. Check authenticated Supabase user & wait briefly for webhook to write to profiles
+      let authUser = null;
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        authUser = sessionData?.session?.user || null;
+        if (!authUser) {
+          const { data: authData } = await supabase.auth.getUser();
+          authUser = authData?.user || null;
+        }
+      } catch (authErr) {
+        console.debug('[SubscriptionReturn] Auth check note:', authErr);
+      }
+
+      if (authUser?.id) {
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (cancelled) return;
+          try {
+            const { data: dbProf } = await supabase
+              .from('profiles')
+              .select('subscription_plan, subscription_status')
+              .eq('id', authUser.id)
+              .maybeSingle();
+
+            if (
+              dbProf?.subscription_plan &&
+              normalizePlan(dbProf.subscription_plan) === resolvedPlan &&
+              ['active', 'trialing'].includes(String(dbProf.subscription_status || '').toLowerCase())
+            ) {
+              resolvedStatus = String(dbProf.subscription_status).toLowerCase();
+              break;
+            }
+          } catch {
+            // continue retry
+          }
+          await new Promise((r) => window.setTimeout(r, 400));
+        }
+      }
+
+      if (cancelled) return;
+
+      setSubStatus(resolvedStatus);
+
+      // 3. Apply upgrade across local storage & reactive state with recent-upgrade grace window
+      applySubscriptionUpgrade(resolvedPlan, resolvedStatus, {
+        sessionId,
+        syncServer: true,
+        isNewUpgrade: true,
+      });
 
       // Clean up temporary pending plan
       try {
@@ -118,63 +162,7 @@ export default function SubscriptionReturn() {
         /* ignore */
       }
 
-      let authUser = null;
-      try {
-        const { data: authData } = await supabase.auth.getUser();
-        authUser = authData?.user || null;
-      } catch (authErr) {
-        console.debug('[SubscriptionReturn] Auth check note:', authErr);
-      }
-
-      const storedUser = (() => {
-        try {
-          return JSON.parse(localStorage.getItem('washek_user') || '{}');
-        } catch {
-          return {};
-        }
-      })();
-
-      const uid = authUser?.id || storedUser?.id || storedUser?.uid;
-      const email = authUser?.email || storedUser?.email;
-
-      // 3. Call backend server checkout sync endpoint
-      try {
-        await fetch('/api/checkout/process', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId: uid,
-            email,
-            plan: resolvedPlan,
-            status: resolvedStatus,
-            sessionId: sessionId || `return_${Date.now()}`,
-          }),
-        }).catch(() => {});
-      } catch (err) {
-        console.debug('[SubscriptionReturn] Server process note:', err);
-      }
-
-      // 4. Update Supabase profile if present
-      try {
-        const profileUpdatePayload = {
-          subscription_plan: resolvedPlan,
-          subscription_status: resolvedStatus,
-          updated_at: new Date().toISOString(),
-        };
-        const isUUID = typeof uid === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uid.trim());
-        let updated = false;
-        if (isUUID) {
-          const { error: dbErr } = await supabase.from('profiles').update(profileUpdatePayload).eq('id', uid);
-          if (!dbErr) updated = true;
-        }
-        if (!updated && email) {
-          await supabase.from('profiles').update(profileUpdatePayload).ilike('email', email.trim());
-        }
-      } catch (err) {
-        console.debug('[SubscriptionReturn] Supabase profile sync note:', err);
-      }
-
-      // 5. Notify the main app tab that subscription was verified
+      // 4. Notify any open main app tab via opener, BroadcastChannel, and storage event
       try {
         if (window.opener && !window.opener.closed) {
           window.opener.postMessage({
@@ -215,33 +203,33 @@ export default function SubscriptionReturn() {
       // Mark success
       setStatus('success');
 
-      // Try closing the tab if opened from the app, or turn into the app directly
-      const timer = window.setTimeout(() => {
-        if (!cancelled) {
-          let tabClosed = false;
-          if (window.opener && !window.opener.closed) {
-            try {
-              window.close();
-              tabClosed = true;
-            } catch (_err) {
-              // ignore popup close restriction
+      // Close checkout tab if opened from the app, otherwise turn this tab into the app
+      const redirectUrl = `/?subscribed=${encodeURIComponent(resolvedPlan)}&sub_status=${encodeURIComponent(resolvedStatus)}`;
+      redirectTimer = window.setTimeout(() => {
+        if (cancelled) return;
+        if (window.opener && !window.opener.closed) {
+          try {
+            window.close();
+          } catch (_err) {
+            // ignore popup close restriction
+          }
+          closeFallbackTimer = window.setTimeout(() => {
+            if (!cancelled && !window.closed) {
+              window.location.replace(redirectUrl);
             }
-          }
-          if (!tabClosed) {
-            window.location.replace('/?subscribed=' + encodeURIComponent(resolvedPlan));
-          }
+          }, 300);
+        } else {
+          window.location.replace(redirectUrl);
         }
-      }, 1400);
-
-      return () => {
-        clearTimeout(timer);
-      };
+      }, 1200);
     };
 
     resolveAndUpgrade();
 
     return () => {
       cancelled = true;
+      if (redirectTimer) clearTimeout(redirectTimer);
+      if (closeFallbackTimer) clearTimeout(closeFallbackTimer);
     };
   }, [navigate, searchParams]);
 

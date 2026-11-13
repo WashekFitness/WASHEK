@@ -1,11 +1,29 @@
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
 const SUPABASE_URL = Deno.env.get('SUPABASE_URL') ?? ''
-const SERVICE_ROLE_KEY = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-const SUPABASE_ANON_KEY =
-  Deno.env.get('SUPABASE_ANON_KEY') ??
-  Deno.env.get('SUPABASE_PUBLISHABLE_KEY') ??
+const SERVICE_ROLE_KEY =
+  Deno.env.get('SERVICE_ROLE_KEY') ??
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ??
   ''
+
+function getSupabaseAnonKey(): string {
+  const publishableKeysRaw = Deno.env.get('SUPABASE_PUBLISHABLE_KEYS')
+  if (publishableKeysRaw) {
+    try {
+      const keys = JSON.parse(publishableKeysRaw)
+      if (keys?.default) return keys.default
+    } catch {
+      // fall through
+    }
+  }
+  return (
+    Deno.env.get('SUPABASE_ANON_KEY') ??
+    Deno.env.get('SUPABASE_PUBLISHABLE_KEY') ??
+    ''
+  )
+}
+
+const SUPABASE_ANON_KEY = getSupabaseAnonKey()
 
 const STRIPE_SECRET_KEY = Deno.env.get('STRIPE_SECRET_KEY') ?? ''
 const APP_URL =
@@ -15,7 +33,6 @@ const APP_URL =
 if (
   !SUPABASE_URL ||
   !SERVICE_ROLE_KEY ||
-  !SUPABASE_ANON_KEY ||
   !STRIPE_SECRET_KEY ||
   !APP_URL
 ) {
@@ -120,32 +137,43 @@ async function getAuthenticatedUser(
     throw new Error('Missing access token')
   }
 
-  const supabaseUserClient = createClient(
-    SUPABASE_URL,
-    SUPABASE_ANON_KEY,
-    {
-      global: {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-      },
-      auth: {
-        autoRefreshToken: false,
-        persistSession: false,
-      },
-    },
-  )
-
   const {
-    data: { user },
-    error,
-  } = await supabaseUserClient.auth.getUser(token)
+    data: { user: adminVerifiedUser },
+    error: adminError,
+  } = await supabaseAdmin.auth.getUser(token)
 
-  if (error || !user) {
-    throw new Error('Unauthorized')
+  if (!adminError && adminVerifiedUser) {
+    return adminVerifiedUser
   }
 
-  return user
+  if (SUPABASE_ANON_KEY) {
+    const supabaseUserClient = createClient(
+      SUPABASE_URL,
+      SUPABASE_ANON_KEY,
+      {
+        global: {
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+        },
+        auth: {
+          autoRefreshToken: false,
+          persistSession: false,
+        },
+      },
+    )
+
+    const {
+      data: { user },
+      error,
+    } = await supabaseUserClient.auth.getUser(token)
+
+    if (!error && user) {
+      return user
+    }
+  }
+
+  throw new Error('Unauthorized')
 }
 
 async function stripeRequest(
@@ -208,6 +236,8 @@ async function getProfile(userId: string) {
         'stripe_subscription_id',
         'stripe_customer_id',
         'stripe_price_id',
+        'has_used_trial',
+        'trial_used',
       ].join(','),
     )
     .eq('id', userId)
@@ -300,6 +330,7 @@ async function createCheckoutSession(params: {
   plan: Plan
   customerId: string | null
   oldSubscriptionId: string | null
+  hasUsedTrial?: boolean
   appUrl?: string
 }) {
   const {
@@ -308,6 +339,7 @@ async function createCheckoutSession(params: {
     plan,
     customerId,
     oldSubscriptionId,
+    hasUsedTrial = false,
     appUrl = APP_URL,
   } = params
 
@@ -327,7 +359,7 @@ async function createCheckoutSession(params: {
 
   body.set(
     'success_url',
-    `${baseUrl}/subscription-return?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}`,
+    `${baseUrl}/subscription-return?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}&trial=${!hasUsedTrial}`,
   )
 
   body.set(
@@ -356,6 +388,11 @@ async function createCheckoutSession(params: {
     plan,
   )
 
+  body.set(
+    'metadata[has_used_trial]',
+    String(hasUsedTrial),
+  )
+
   if (oldSubscriptionId) {
     body.set(
       'metadata[old_subscription_id]',
@@ -372,6 +409,13 @@ async function createCheckoutSession(params: {
     'subscription_data[metadata][plan]',
     plan,
   )
+
+  if (!hasUsedTrial) {
+    body.set(
+      'subscription_data[trial_period_days]',
+      '7',
+    )
+  }
 
   if (oldSubscriptionId) {
     body.set(
@@ -456,8 +500,21 @@ Deno.serve(async (req) => {
     const plan =
       requestedPlan as Plan
 
-    const profile =
+    let profile =
       await getProfile(user.id)
+
+    if (!profile) {
+      await supabaseAdmin
+        .from('profiles')
+        .upsert(
+          {
+            id: user.id,
+            email: user.email ?? null,
+          },
+          { onConflict: 'id', ignoreDuplicates: true },
+        )
+      profile = await getProfile(user.id)
+    }
 
     if (!profile) {
       return jsonResponse(
@@ -491,6 +548,13 @@ Deno.serve(async (req) => {
 
     let oldSubscriptionId: string | null = null
 
+    const hasUsedTrial = Boolean(
+      profile.has_used_trial ||
+        profile.trial_used ||
+        profile.subscription_status === 'canceled' ||
+        (profile.subscription_plan && profile.subscription_plan !== 'free'),
+    )
+
     /*
      * PAID -> PAID behavior:
      *
@@ -502,34 +566,44 @@ Deno.serve(async (req) => {
      *    after the new payment/subscription succeeds.
      */
     if (profile.stripe_subscription_id) {
-      const currentSubscription =
-        await getStripeSubscription(
-          profile.stripe_subscription_id,
+      try {
+        const currentSubscription =
+          await getStripeSubscription(
+            profile.stripe_subscription_id,
+          )
+
+        await verifySubscriptionOwnership(
+          currentSubscription,
+          user.id,
+          profile,
         )
 
-      await verifySubscriptionOwnership(
-        currentSubscription,
-        user.id,
-        profile,
-      )
+        const stripeCustomerId =
+          typeof currentSubscription.customer ===
+          'string'
+            ? currentSubscription.customer
+            : currentSubscription.customer?.id
 
-      const stripeCustomerId =
-        typeof currentSubscription.customer ===
-        'string'
-          ? currentSubscription.customer
-          : currentSubscription.customer?.id
+        if (stripeCustomerId) {
+          customerId = stripeCustomerId
+        }
 
-      if (stripeCustomerId) {
-        customerId = stripeCustomerId
-      }
-
-      if (
-        ACTIVE_STATUSES.has(
-          currentSubscription.status,
+        if (
+          ACTIVE_STATUSES.has(
+            currentSubscription.status,
+          )
+        ) {
+          oldSubscriptionId =
+            currentSubscription.id
+        }
+      } catch (subLookupErr) {
+        console.warn(
+          '[CHECKOUT] Ignoring stale/mismatched previous subscription:',
+          subLookupErr instanceof Error
+            ? subLookupErr.message
+            : String(subLookupErr),
         )
-      ) {
-        oldSubscriptionId =
-          currentSubscription.id
+        oldSubscriptionId = null
       }
     }
 
@@ -540,6 +614,7 @@ Deno.serve(async (req) => {
         plan,
         customerId,
         oldSubscriptionId,
+        hasUsedTrial,
         appUrl: requestedAppUrl,
       })
 
@@ -582,12 +657,17 @@ Deno.serve(async (req) => {
       message,
     )
 
+    const statusCode =
+      /unauthorized|missing authorization|missing access token/i.test(message)
+        ? 401
+        : 500
+
     return jsonResponse(
       {
         success: false,
         error: message,
       },
-      500,
+      statusCode,
     )
   }
 })

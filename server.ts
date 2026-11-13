@@ -44,8 +44,25 @@ const SUPABASE_ANON_KEY =
       ? process.env.VITE_SUPABASE_ANON_KEY
       : 'sb_publishable_hR5RWMT6qfPKbONf3G783A_Log5r61I';
 
-// Supabase client instance for storage & server-side operations
-const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+// Stateless Supabase client instance so Node never mutates or rotates browser auth sessions
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+  },
+});
+
+function createStatelessSupabase(accessToken?: string) {
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+    ...(accessToken
+      ? { global: { headers: { Authorization: `Bearer ${accessToken}` } } }
+      : {}),
+  });
+}
 
 function isValidUUID(val: any): boolean {
   return (
@@ -93,20 +110,23 @@ app.post('/api/checkout/process', async (req, res) => {
 
     console.log('[API] Processing checkout for:', { userId, email, plan: cleanPlan, status: cleanStatus, paymentMethod });
 
-    // Update Supabase profiles table, permanently recording trial usage to prevent trial looping
+    // Best-effort DB sync (Stripe webhook via service role is authoritative; RLS/triggers protect subscription fields on anon writes)
     if (userId || email) {
       try {
-        const updatePayload = {
+        const updatePayload: Record<string, any> = {
           subscription_plan: cleanPlan,
           subscription_status: cleanStatus,
           subscription_tier: cleanPlan,
           has_used_trial: true,
           trial_used: true,
           stripe_price_id: cleanPlan === 'progress' ? 'price_1TTYrbRuQpZftYKRoSyLbQ0c' : cleanPlan === 'performance' ? 'price_1TTYs8RuQpZftYKR8ZzpNg7x' : 'price_1TTYsWRuQpZftYKRKIm8V10E',
-          stripe_subscription_id: sessionId || `sub_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
           subscription_updated_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         };
+
+        if (typeof sessionId === 'string' && sessionId.startsWith('sub_')) {
+          updatePayload.stripe_subscription_id = sessionId;
+        }
 
         let updated = false;
         if (userId && isValidUUID(userId)) {
@@ -143,11 +163,6 @@ app.post('/api/checkout/process', async (req, res) => {
 app.post('/api/create-checkout-session', async (req, res) => {
   try {
     const { plan, userId, email, returnUrl, hasUsedTrial: clientHasUsedTrial } = req.body || {};
-    const validPlans: Record<string, string> = {
-      progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
-      performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
-      elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
-    };
 
     const priceIds: Record<string, string> = {
       progress: 'price_1TTYrbRuQpZftYKRoSyLbQ0c',
@@ -156,7 +171,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
     };
 
     const cleanPlan = String(plan || '').toLowerCase().trim();
-    if (!validPlans[cleanPlan]) {
+    if (!priceIds[cleanPlan]) {
       return res.status(400).json({ success: false, error: 'Invalid plan' });
     }
 
@@ -168,10 +183,10 @@ app.post('/api/create-checkout-session', async (req, res) => {
     if (cleanUserId || cleanEmail) {
       try {
         let q = supabase.from('profiles').select('has_used_trial, trial_used, subscription_status, subscription_plan');
-        if (cleanUserId) q = q.eq('id', cleanUserId);
+        if (cleanUserId && isValidUUID(cleanUserId)) q = q.eq('id', cleanUserId);
         else if (cleanEmail) q = q.eq('email', cleanEmail);
         const { data: profile } = await q.maybeSingle();
-        if (profile?.has_used_trial || profile?.trial_used || profile?.subscription_status === 'canceled' || profile?.subscription_plan !== 'free') {
+        if (profile?.has_used_trial || profile?.trial_used || profile?.subscription_status === 'canceled' || (profile?.subscription_plan && profile.subscription_plan !== 'free')) {
           hasUsedTrial = true;
         }
       } catch (dbErr) {
@@ -179,15 +194,15 @@ app.post('/api/create-checkout-session', async (req, res) => {
       }
     }
 
-    const sessionId = `cs_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
-    const baseUrl = returnUrl ? returnUrl.replace(/\/+$/, '') : `http://${req.headers.host || 'localhost:3000'}`;
-    const successUrl = `${baseUrl}/subscription-return?plan=${cleanPlan}&session_id=${sessionId}&trial=${!hasUsedTrial}`;
+    const baseUrl = returnUrl
+      ? String(returnUrl).replace(/\/+$/, '')
+      : `${req.headers['x-forwarded-proto'] || req.protocol || 'http'}://${req.headers.host || 'localhost:3000'}`;
+    const successUrl = `${baseUrl}/subscription-return?plan=${cleanPlan}&session_id={CHECKOUT_SESSION_ID}&trial=${!hasUsedTrial}`;
     const cancelUrl = `${baseUrl}/profile`;
 
     // Cache the pending checkout on the server
     if (cleanUserId) pendingCheckouts.set(cleanUserId, { plan: cleanPlan, timestamp: Date.now() });
     if (cleanEmail) pendingCheckouts.set(cleanEmail, { plan: cleanPlan, timestamp: Date.now() });
-    pendingCheckouts.set(sessionId, { plan: cleanPlan, timestamp: Date.now() });
     pendingCheckouts.set('latest', { plan: cleanPlan, timestamp: Date.now() });
 
     // If STRIPE_SECRET_KEY is configured in Node environment, create live Stripe Checkout Session directly
@@ -208,7 +223,6 @@ app.post('/api/create-checkout-session', async (req, res) => {
         if (cleanUserId) params.set('subscription_data[metadata][user_id]', cleanUserId);
         params.set('subscription_data[metadata][plan]', cleanPlan);
 
-        // If user hasn't used trial yet, grant 7 days free trial. If they have already used it, charge immediately!
         if (!hasUsedTrial) {
           params.set('subscription_data[trial_period_days]', '7');
         }
@@ -233,77 +247,80 @@ app.post('/api/create-checkout-session', async (req, res) => {
             hasUsedTrial,
           });
         } else {
-          console.warn('[API] Stripe session creation fallback note:', sessionData?.error?.message);
+          console.warn('[API] Stripe session creation note:', sessionData?.error?.message);
         }
       } catch (stripeErr: any) {
         console.warn('[API] Stripe API error:', stripeErr?.message);
       }
     }
 
-    // Invoke Supabase Edge Function create-checkout-session (which holds STRIPE_SECRET_KEY)
-    try {
-      let token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
-      if (!token || token.startsWith('vault_tok_')) {
-        // Authenticate with Supabase to get an authorized session for edge function invocation
-        const ephemeralEmail = `athlete_${Date.now()}_${Math.random().toString(36).substring(2, 7)}@example.com`;
-        const { data: signUpData } = await supabase.auth.signUp({
-          email: ephemeralEmail,
-          password: 'WashekCheckoutPass123!',
-        });
-        token = signUpData?.session?.access_token || '';
-      }
-
-      if (token) {
-        const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/create-checkout-session`, {
-          method: 'POST',
-          headers: {
-            'apikey': SUPABASE_ANON_KEY,
-            'Authorization': `Bearer ${token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({
-            plan: cleanPlan,
-            app_url: baseUrl,
-          }),
-        });
-
-        const edgeData = await edgeRes.json().catch(() => null);
-        if (edgeRes.ok && edgeData?.url) {
-          console.log('[API] Generated Stripe Checkout URL via Supabase Edge Function for plan:', cleanPlan);
-          return res.json({
-            success: true,
-            action: 'checkout',
-            url: edgeData.url,
-            sessionId: edgeData.session_id || sessionId,
-            plan: cleanPlan,
-            hasUsedTrial,
-          });
-        } else {
-          console.warn('[API] Edge function checkout note for plan', cleanPlan, ':', edgeData?.error || edgeRes.statusText);
-        }
-      }
-    } catch (edgeErr: any) {
-      console.warn('[API] Failed to invoke Supabase Edge checkout function:', edgeErr?.message);
+    // Invoke Supabase Edge Function create-checkout-session with the caller's real Supabase JWT
+    const token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
+    if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_')) {
+      return res.status(401).json({
+        success: false,
+        code: 'AUTH_SESSION_EXPIRED',
+        error: 'Your login session has expired. Please sign in again to upgrade.',
+      });
     }
 
-    // Hosted Payment Link fallback (with prefilled email and client_reference_id)
-    let paymentUrl = validPlans[cleanPlan];
-    try {
-      const urlObj = new URL(paymentUrl);
-      if (cleanEmail) urlObj.searchParams.set('prefilled_email', cleanEmail);
-      if (cleanUserId) urlObj.searchParams.set('client_reference_id', cleanUserId);
-      paymentUrl = urlObj.toString();
-    } catch {
-      // url fallback
+    const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/create-checkout-session`, {
+      method: 'POST',
+      headers: {
+        'apikey': SUPABASE_ANON_KEY,
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        plan: cleanPlan,
+        app_url: baseUrl,
+      }),
+    });
+
+    const edgeData = await edgeRes.json().catch(() => null);
+    if (edgeRes.ok && edgeData?.success) {
+      if (
+        edgeData.action === 'already_active' ||
+        edgeData.action === 'already_current' ||
+        edgeData.action === 'changed'
+      ) {
+        return res.json({
+          success: true,
+          action: edgeData.action,
+          plan: edgeData.plan || cleanPlan,
+          subscription_id: edgeData.subscription_id || null,
+          price_id: edgeData.price_id || null,
+          message: edgeData.message || null,
+        });
+      }
+
+      if (edgeData.url) {
+        console.log('[API] Generated Stripe Checkout URL via Supabase Edge Function for plan:', cleanPlan);
+        return res.json({
+          success: true,
+          action: 'checkout',
+          url: edgeData.url,
+          sessionId: edgeData.session_id || null,
+          plan: cleanPlan,
+          hasUsedTrial,
+        });
+      }
     }
 
-    return res.json({
-      success: true,
-      action: 'checkout',
-      url: paymentUrl,
-      sessionId,
-      plan: cleanPlan,
-      hasUsedTrial,
+    const edgeErrorMessage = edgeData?.error || edgeRes.statusText || 'Unable to create Stripe Checkout session.';
+    console.warn('[API] Edge function checkout failed for plan', cleanPlan, ':', edgeErrorMessage);
+
+    if (edgeRes.status === 401 || /unauthorized|jwt|expired|missing authorization/i.test(String(edgeErrorMessage))) {
+      return res.status(401).json({
+        success: false,
+        code: 'AUTH_SESSION_EXPIRED',
+        error: 'Your login session has expired. Please sign in again to upgrade.',
+      });
+    }
+
+    return res.status(edgeRes.status >= 400 ? edgeRes.status : 502).json({
+      success: false,
+      error: edgeErrorMessage,
     });
   } catch (err: any) {
     console.error('[API] create-checkout-session error:', err);
@@ -667,8 +684,9 @@ app.post('/api/auth/signin', async (req, res) => {
       });
     }
 
-    // 1. Try primary Supabase password authentication
-    const { data, error } = await supabase.auth.signInWithPassword({
+    // 1. Try primary Supabase password authentication with an isolated stateless client
+    const authClient = createStatelessSupabase();
+    const { data, error } = await authClient.auth.signInWithPassword({
       email: cleanEmail,
       password: cleanPassword,
     });
@@ -679,15 +697,39 @@ app.post('/api/auth/signin', async (req, res) => {
 
       let profile: any = null;
       if (data.user.id) {
+        const userClient = createStatelessSupabase(data.session?.access_token);
         try {
-          const { data: profData } = await supabase
+          const { data: profData } = await userClient
             .from('profiles')
             .select('*')
             .eq('id', data.user.id)
-            .single();
+            .maybeSingle();
           if (profData) profile = profData;
         } catch (pErr) {
           console.debug('[API Auth] profile fetch note:', pErr);
+        }
+
+        // Self-heal onboarded flag if the returning user already has programs/logs in Supabase
+        if (!profile || profile.onboarded !== true) {
+          try {
+            const [{ data: existingProgs }, { data: existingLogs }] = await Promise.all([
+              userClient.from('workout_programs').select('id').eq('user_id', data.user.id).limit(1),
+              userClient.from('workout_logs').select('id').eq('user_id', data.user.id).limit(1),
+            ]);
+            const hasHistory =
+              Boolean(profile?.active_program_id || profile?.last_program_generated_at) ||
+              (Array.isArray(existingProgs) && existingProgs.length > 0) ||
+              (Array.isArray(existingLogs) && existingLogs.length > 0);
+            if (hasHistory) {
+              profile = { ...(profile || { id: data.user.id, email: cleanEmail }), onboarded: true };
+              await userClient
+                .from('profiles')
+                .update({ onboarded: true, updated_at: new Date().toISOString() })
+                .eq('id', data.user.id);
+            }
+          } catch (progErr) {
+            console.debug('[API Auth] returning user program check note:', progErr);
+          }
         }
       }
 
@@ -718,6 +760,7 @@ app.post('/api/auth/signin', async (req, res) => {
         const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
         return res.json({
           success: true,
+          isVaultSession: true,
           user: athleteUser,
           session: {
             access_token: token,
@@ -730,8 +773,9 @@ app.post('/api/auth/signin', async (req, res) => {
             email: cleanEmail,
             full_name: athleteUser.user_metadata.full_name,
             role: 'athlete',
-            subscription_plan: 'pro',
-            subscription_tier: 'pro',
+            subscription_plan: 'free',
+            subscription_tier: 'free',
+            onboarded: true,
           },
         });
       } else {
@@ -815,7 +859,8 @@ app.post('/api/auth/signup', async (req, res) => {
     // Always securely save credentials into vault so athlete can log in
     saveAthleteCredential(cleanEmail, cleanPassword);
 
-    const { data, error } = await supabase.auth.signUp({
+    const signupClient = createStatelessSupabase();
+    const { data, error } = await signupClient.auth.signUp({
       email: cleanEmail,
       password: cleanPassword,
       options: {
@@ -838,7 +883,7 @@ app.post('/api/auth/signup', async (req, res) => {
         error.code === 'user_already_exists'
       ) {
         // Try signing in directly with the credentials provided
-        const { data: signData, error: signErr } = await supabase.auth.signInWithPassword({
+        const { data: signData, error: signErr } = await createStatelessSupabase().auth.signInWithPassword({
           email: cleanEmail,
           password: cleanPassword,
         });
@@ -922,12 +967,19 @@ app.post('/api/auth/signup', async (req, res) => {
       },
     };
 
-    const athleteSession = {
-      access_token: accessToken,
-      token_type: 'bearer',
-      expires_in: 604800,
-      user: athleteUser,
-    };
+    const athleteSession = data?.session?.access_token
+      ? {
+          ...data.session,
+          access_token: data.session.access_token,
+          refresh_token: data.session.refresh_token,
+          user: data.session.user || athleteUser,
+        }
+      : {
+          access_token: accessToken,
+          token_type: 'bearer',
+          expires_in: 604800,
+          user: athleteUser,
+        };
 
     const athleteProfile = {
       id: userId,
@@ -939,12 +991,10 @@ app.post('/api/auth/signup', async (req, res) => {
       subscription_tier: 'free',
     };
 
-    // Attempt profile persistence in Supabase using authenticated token if available
+    // Attempt profile persistence in Supabase using authenticated stateless client if available
     try {
       if (data?.session?.access_token) {
-        const userScoped = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-          global: { headers: { Authorization: `Bearer ${data.session.access_token}` } },
-        });
+        const userScoped = createStatelessSupabase(data.session.access_token);
         await userScoped.from('profiles').upsert(athleteProfile, { onConflict: 'id' });
       }
     } catch (upsertErr) {
@@ -953,7 +1003,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
     return res.json({
       success: true,
-      user: athleteUser,
+      user: data?.user || athleteUser,
       session: athleteSession,
       profile: athleteProfile,
     });
@@ -1007,7 +1057,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 
     // Also trigger Supabase email reset in the background
     try {
-      await supabase.auth.resetPasswordForEmail(cleanEmail, {
+      await createStatelessSupabase().auth.resetPasswordForEmail(cleanEmail, {
         redirectTo: `${origin}/reset-password`,
       });
     } catch (sbResetErr) {
@@ -1166,7 +1216,7 @@ app.post('/api/auth/change-password', async (req, res) => {
       }
 
       // Try Supabase OTP verification as well
-      const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+      const { data: verifyData, error: verifyErr } = await createStatelessSupabase().auth.verifyOtp({
         email: cleanEmail,
         token: cleanCode,
         type: 'recovery',
@@ -1206,7 +1256,7 @@ app.post('/api/auth/change-password', async (req, res) => {
       let passVerified = vaulted && vaulted === String(currentPassword);
 
       if (!passVerified) {
-        const { data: signData, error: signErr } = await supabase.auth.signInWithPassword({
+        const { data: signData, error: signErr } = await createStatelessSupabase().auth.signInWithPassword({
           email: cleanEmail,
           password: String(currentPassword),
         });

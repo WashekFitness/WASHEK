@@ -23,6 +23,7 @@ import Footer from '@/components/layout/Footer';
 import PullToRefresh from '@/components/layout/PullToRefresh';
 import MobileHeader from '@/components/layout/MobileHeader';
 import PWAInstallButton from '@/components/pwa/PWAInstallButton';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 
 const navItems = [
@@ -194,7 +195,8 @@ export default function AppLayout() {
 
           <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-transparent border border-primary/20 shrink-0 shadow-sm shadow-primary/10">
             <img
-              src="/washek-fitness-logo.jpg"
+              src={BRAND_LOGO_SRC}
+              onError={handleBrandLogoError}
               alt="WASHEK"
               className="
                 w-7

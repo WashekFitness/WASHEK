@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import { ArrowLeft } from 'lucide-react';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 export default function About() {
   return (
@@ -20,7 +21,8 @@ export default function About() {
             className="flex items-center gap-2.5 pointer-events-auto"
           >
             <img
-              src="/washek-fitness-logo.jpg"
+              src={BRAND_LOGO_SRC}
+              onError={handleBrandLogoError}
               alt="WASHEK"
               className="w-8 h-8 rounded-xl object-contain shadow-sm pointer-events-none"
             />

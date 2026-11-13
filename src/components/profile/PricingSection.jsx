@@ -18,7 +18,10 @@ import { supabase } from '@/lib/supabase';
 import {
   applySubscriptionUpgrade,
   applySubscriptionCancellation,
+  getRecentUpgradeGrace,
+  clearRecentUpgradeGrace,
 } from '@/lib/subscription';
+import { createStripeCheckout, buildPaymentLinkUrl } from '@/lib/stripeCheckout';
 import { toast } from 'sonner';
 import { useAuth } from '@/lib/AuthContext';
 
@@ -158,7 +161,7 @@ function isActiveStatus(status) {
 }
 
 export default function PricingSection({ onPlanChange, currentPlanProp }) {
-  const { user } = useAuth();
+  const { user, checkUserAuth, logout } = useAuth();
   const onPlanChangeRef = useRef(onPlanChange);
   useEffect(() => {
     onPlanChangeRef.current = onPlanChange;
@@ -193,8 +196,11 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
   const [subscription, setSubscription] = useState(null);
   const [error, setError] = useState('');
+  const [cardError, setCardError] = useState(null); // { planKey, message, needsReauth }
+  const [blockedCheckout, setBlockedCheckout] = useState(null); // { planKey, planName, url }
   const [loadingSubscription, setLoadingSubscription] = useState(true);
-  const isLaunchingRef = useRef(false);
+  const checkoutPollTimerRef = useRef(null);
+  const lastSyncEventRef = useRef(0);
 
   const storedUser = (() => {
     try {
@@ -213,73 +219,13 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     subscription?.status === 'canceled'
   );
 
-  // Listen for verified payment signals from the checkout return tab
-  useEffect(() => {
-    const handlePlanVerified = (planKey) => {
-      const safePlan = normalizePlan(planKey);
-      if (safePlan && safePlan !== 'free') {
-        applySubscriptionUpgrade(safePlan, 'active');
-        toast.success(`Payment verified! Reloading with your new ${safePlan} plan...`);
-        setTimeout(() => {
-          window.location.reload();
-        }, 600);
-      }
-    };
-
-    const handleWindowMsg = (event) => {
-      if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
-        handlePlanVerified(event.data.plan);
-      }
-    };
-    window.addEventListener('message', handleWindowMsg);
-
-    let bc = null;
-    try {
-      bc = new BroadcastChannel('washek_subscription_sync');
-      bc.onmessage = (event) => {
-        if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
-          handlePlanVerified(event.data.plan);
-        }
-      };
-    } catch {
-      /* BroadcastChannel not supported in this environment */
-    }
-
-    const handleStorageEvent = (event) => {
-      if (event.key === 'washek_subscription_success_event' && event.newValue) {
-        try {
-          const parsed = JSON.parse(event.newValue);
-          if (parsed?.plan && parsed.plan !== 'free') {
-            handlePlanVerified(parsed.plan);
-          }
-        } catch {
-          /* ignore JSON parse errors on invalid storage events */
-        }
-      }
-    };
-    window.addEventListener('storage', handleStorageEvent);
-
-    return () => {
-      window.removeEventListener('message', handleWindowMsg);
-      window.removeEventListener('storage', handleStorageEvent);
-      bc?.close();
-    };
-  }, []);
-
   const loadSubscription = useCallback(async () => {
     setLoadingSubscription(true);
 
     try {
-      const storedStatus = (() => {
-        try {
-          return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-        } catch {
-          return '';
-        }
-      })();
-      const isLocallyCanceled = storedStatus === 'canceled' || storedStatus === 'cancelled';
+      const recentGrace = getRecentUpgradeGrace();
 
-      // 1. Check LocalStorage plan directly
+      // 1. Check LocalStorage plan as fallback only
       const localPlanRaw = (() => {
         try {
           const p = localStorage.getItem('washek_subscription_plan');
@@ -289,23 +235,26 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       })();
 
-      // 2. Check Supabase profile
+      // 2. Query authoritative Supabase profile row
+      let hasRemoteProfile = false;
       let profilePlan = 'free';
       let profileStatus = '';
       let profileSubId = null;
       let profilePriceId = null;
       try {
-        const { data: authData } = await supabase.auth.getUser();
-        if (authData?.user) {
-          const { data: profile } = await supabase
+        const { data: sessionData } = await supabase.auth.getSession();
+        const authUid = sessionData?.session?.user?.id;
+        if (authUid) {
+          const { data: profile, error: profErr } = await supabase
             .from('profiles')
             .select('subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id')
-            .eq('id', authData.user.id)
+            .eq('id', authUid)
             .maybeSingle();
 
-          if (profile) {
+          if (!profErr && profile) {
+            hasRemoteProfile = true;
             profilePlan = normalizePlan(profile.subscription_plan);
-            profileStatus = String(profile.subscription_status || '').toLowerCase();
+            profileStatus = String(profile.subscription_status || '').toLowerCase().trim();
             profileSubId = profile.stripe_subscription_id;
             profilePriceId = profile.stripe_price_id;
           }
@@ -314,7 +263,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         console.debug('[PricingSection] Supabase profile lookup note:', sbErr);
       }
 
-      // 4. Check stored user object
+      // 3. Check stored user object fallback
       let userObjPlan = null;
       try {
         const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
@@ -325,36 +274,63 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         /* ignore */
       }
 
-      // Resolve the true active plan
+      // Resolve the true active plan (authoritative DB > recent checkout grace > offline cache)
       let resolvedPlan = 'free';
-      if (currentPlanProp && currentPlanProp !== 'free') {
-        resolvedPlan = normalizePlan(currentPlanProp);
-      } else if (localPlanRaw && localPlanRaw !== 'free') {
-        resolvedPlan = localPlanRaw;
-      } else if (userObjPlan && userObjPlan !== 'free') {
-        resolvedPlan = userObjPlan;
-      } else if (profilePlan && profilePlan !== 'free' && isActiveStatus(profileStatus)) {
-        resolvedPlan = profilePlan;
+      let resolvedStatus = 'inactive';
+
+      if (hasRemoteProfile) {
+        const dbActive = profilePlan !== 'free' && isActiveStatus(profileStatus);
+        if (recentGrace && (!dbActive || profilePlan !== recentGrace.plan)) {
+          resolvedPlan = normalizePlan(recentGrace.plan);
+          resolvedStatus = recentGrace.status || 'active';
+        } else if (dbActive) {
+          resolvedPlan = profilePlan;
+          resolvedStatus = profileStatus || 'active';
+          if (recentGrace?.plan === resolvedPlan) {
+            clearRecentUpgradeGrace();
+          }
+        } else {
+          // DB authoritatively shows free / canceled / inactive
+          resolvedPlan = 'free';
+          resolvedStatus = profileStatus || 'inactive';
+        }
+      } else {
+        if (recentGrace) {
+          resolvedPlan = normalizePlan(recentGrace.plan);
+          resolvedStatus = recentGrace.status || 'active';
+        } else if (localPlanRaw && localPlanRaw !== 'free') {
+          resolvedPlan = localPlanRaw;
+          resolvedStatus = 'active';
+        } else if (userObjPlan && userObjPlan !== 'free') {
+          resolvedPlan = userObjPlan;
+          resolvedStatus = 'active';
+        } else if (currentPlanProp && currentPlanProp !== 'free') {
+          resolvedPlan = normalizePlan(currentPlanProp);
+          resolvedStatus = 'active';
+        }
       }
 
       if (resolvedPlan !== 'free') {
-        // Clear any stale canceled marker since user has a paid tier
-        try {
-          localStorage.setItem('washek_subscription_status', profileStatus || 'active');
-          localStorage.setItem('washek_subscription_plan', resolvedPlan);
-        } catch {
-          /* ignore */
-        }
-
         setSubscription({
           id: profileSubId || `sub_${resolvedPlan}`,
           plan: resolvedPlan,
           plan_key: resolvedPlan,
-          status: profileStatus || 'active',
+          status: resolvedStatus,
           stripe_price_id: profilePriceId,
         });
+        if (localPlanRaw !== resolvedPlan) {
+          applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { syncServer: false });
+        }
       } else {
         setSubscription(null);
+        if (hasRemoteProfile && localPlanRaw) {
+          try {
+            localStorage.removeItem('washek_subscription_plan');
+            localStorage.setItem('washek_subscription_status', resolvedStatus);
+          } catch {
+            /* ignore */
+          }
+        }
       }
 
       setCurrentPlan((prev) => {
@@ -363,10 +339,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
         return resolvedPlan;
       });
-
-      if (resolvedPlan !== 'free') {
-        applySubscriptionUpgrade(resolvedPlan, profileStatus || 'active');
-      }
     } catch (loadError) {
       console.error('[PricingSection] Failed to load subscription:', loadError);
       let fallbackLocal = 'free';
@@ -383,6 +355,83 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     } finally {
       setLoadingSubscription(false);
     }
+  }, [currentPlanProp]);
+
+  // Listen for verified payment signals from the checkout return tab
+  useEffect(() => {
+    const handlePlanVerified = (planKey, subStatus = 'active') => {
+      const safePlan = normalizePlan(planKey);
+      if (!safePlan || safePlan === 'free') return;
+
+      const now = Date.now();
+      if (now - lastSyncEventRef.current < 1500) {
+        return;
+      }
+      lastSyncEventRef.current = now;
+
+      if (checkoutPollTimerRef.current) {
+        clearInterval(checkoutPollTimerRef.current);
+        checkoutPollTimerRef.current = null;
+      }
+
+      applySubscriptionUpgrade(safePlan, subStatus, {
+        isNewUpgrade: true,
+        syncServer: false,
+      });
+      setCurrentPlan(safePlan);
+      onPlanChangeRef.current?.(safePlan);
+      checkUserAuth?.().catch(() => {});
+      loadSubscription();
+      toast.success(`Payment verified! Your ${safePlan.charAt(0).toUpperCase() + safePlan.slice(1)} plan is now active.`);
+    };
+
+    const handleWindowMsg = (event) => {
+      if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
+        handlePlanVerified(event.data.plan, event.data?.status || 'active');
+      }
+    };
+    window.addEventListener('message', handleWindowMsg);
+
+    let bc = null;
+    try {
+      bc = new BroadcastChannel('washek_subscription_sync');
+      bc.onmessage = (event) => {
+        if (event.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && event.data?.plan) {
+          handlePlanVerified(event.data.plan, event.data?.status || 'active');
+        }
+      };
+    } catch {
+      /* BroadcastChannel not supported in this environment */
+    }
+
+    const handleStorageEvent = (event) => {
+      if (event.key === 'washek_subscription_success_event' && event.newValue) {
+        try {
+          const parsed = JSON.parse(event.newValue);
+          if (parsed?.plan && parsed.plan !== 'free') {
+            handlePlanVerified(parsed.plan, parsed?.status || 'active');
+          }
+        } catch {
+          /* ignore JSON parse errors on invalid storage events */
+        }
+      }
+    };
+    window.addEventListener('storage', handleStorageEvent);
+
+    return () => {
+      window.removeEventListener('message', handleWindowMsg);
+      window.removeEventListener('storage', handleStorageEvent);
+      bc?.close();
+    };
+  }, [checkUserAuth, loadSubscription]);
+
+  useEffect(() => {
+    return () => {
+      if (checkoutPollTimerRef.current) {
+        clearInterval(checkoutPollTimerRef.current);
+        checkoutPollTimerRef.current = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -395,6 +444,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     const handleFocus = () => {
       if (active) {
         loadSubscription();
+        checkUserAuth?.().catch(() => {});
       }
     };
 
@@ -418,7 +468,47 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       document.removeEventListener('visibilitychange', handleVisChange);
       authListener?.subscription?.unsubscribe();
     };
-  }, [loadSubscription]);
+  }, [loadSubscription, checkUserAuth]);
+
+  const startPostCheckoutPolling = useCallback((expectedPlan) => {
+    if (checkoutPollTimerRef.current) {
+      clearInterval(checkoutPollTimerRef.current);
+      checkoutPollTimerRef.current = null;
+    }
+    const startedAt = Date.now();
+    checkoutPollTimerRef.current = window.setInterval(async () => {
+      if (Date.now() - startedAt > 120000) {
+        clearInterval(checkoutPollTimerRef.current);
+        checkoutPollTimerRef.current = null;
+        return;
+      }
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const uid = sessionData?.session?.user?.id;
+        if (!uid) return;
+        const { data: profile } = await supabase
+          .from('profiles')
+          .select('subscription_plan, subscription_status')
+          .eq('id', uid)
+          .maybeSingle();
+
+        const dbPlan = normalizePlan(profile?.subscription_plan);
+        const dbStatus = String(profile?.subscription_status || '').toLowerCase();
+        if (dbPlan === expectedPlan && isActiveStatus(dbStatus)) {
+          clearInterval(checkoutPollTimerRef.current);
+          checkoutPollTimerRef.current = null;
+          applySubscriptionUpgrade(dbPlan, dbStatus, { isNewUpgrade: true, syncServer: false });
+          setCurrentPlan(dbPlan);
+          onPlanChangeRef.current?.(dbPlan);
+          checkUserAuth?.().catch(() => {});
+          loadSubscription();
+          toast.success(`Subscription synced! Welcome to ${dbPlan.charAt(0).toUpperCase() + dbPlan.slice(1)}.`);
+        }
+      } catch {
+        // ignore transient poll errors
+      }
+    }, 2500);
+  }, [checkUserAuth, loadSubscription]);
 
   const handleCheckout = async (plan) => {
     if (!plan?.planKey || loadingPlan) {
@@ -432,67 +522,252 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
     setLoadingPlan(plan.planKey);
     setError('');
+    setCardError(null);
+    setBlockedCheckout(null);
+
+    // Synchronously reserve a tab inside the user click gesture so async fetches never get popup-blocked.
+    // Omit 'noopener' so /subscription-return preserves window.opener to close & notify cleanly.
+    let checkoutWin = null;
+    try {
+      checkoutWin = window.open('about:blank', '_blank');
+      if (checkoutWin && !checkoutWin.closed) {
+        try {
+          checkoutWin.document.open();
+          checkoutWin.document.write(
+            '<!doctype html><html><head><title>Connecting to Stripe Checkout…</title></head>' +
+              '<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#090d16;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;">' +
+              '<div style="text-align:center;padding:24px;">' +
+              '<div style="font-weight:700;font-size:18px;margin-bottom:8px;">Connecting to Stripe Checkout…</div>' +
+              '<div style="font-size:13px;color:#94a3b8;">Preparing your ' +
+              String(plan.name || '').replace(/[<>&"]/g, '') +
+              ' plan. Redirecting in a moment…</div>' +
+              '</div></body></html>'
+          );
+          checkoutWin.document.close();
+        } catch {
+          // ignore document write error
+        }
+      }
+    } catch {
+      checkoutWin = null;
+    }
+
+    const closeReservedWindow = () => {
+      try {
+        if (checkoutWin && !checkoutWin.closed) {
+          checkoutWin.close();
+        }
+      } catch {
+        // ignore close error
+      }
+    };
 
     try {
-      const userEmail = user?.email || storedUser?.email;
-      const userId = user?.id || storedUser?.id || storedUser?.uid;
+      const latestStoredUser = (() => {
+        try {
+          return JSON.parse(localStorage.getItem('washek_user') || '{}');
+        } catch {
+          return storedUser || {};
+        }
+      })();
+      const userEmail = user?.email || latestStoredUser?.email || '';
+      const userId = user?.id || latestStoredUser?.id || latestStoredUser?.uid || '';
 
       localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
       sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
       document.cookie = `washek_pending_checkout_plan=${plan.planKey}; path=/; max-age=86400; SameSite=Lax`;
 
-      // 1. Request Stripe Checkout Session from server
-      let destinationUrl = plan.paymentUrl;
+      let destinationUrl = null;
+      let checkoutErrorMessage = '';
+      let needsReauth = false;
+
+      // 1. Primary: create real Stripe Checkout Session via Supabase Edge Function
       try {
-        const token = localStorage.getItem('washek_auth_token') || '';
-        const sessionRes = await fetch('/api/create-checkout-session', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(token ? { Authorization: `Bearer ${token}` } : {}),
-          },
-          body: JSON.stringify({
-            plan: plan.planKey,
-            userId,
-            email: userEmail,
-            returnUrl: window.location.origin,
-            hasUsedTrial,
-          }),
-        });
-        const sessionData = await sessionRes.json();
-        if (sessionData?.url) {
-          destinationUrl = sessionData.url;
+        const checkoutResult = await createStripeCheckout(plan.planKey);
+        if (
+          checkoutResult?.action === 'already_active' ||
+          checkoutResult?.action === 'already_current' ||
+          checkoutResult?.action === 'changed'
+        ) {
+          closeReservedWindow();
+          applySubscriptionUpgrade(plan.planKey, 'active', { isNewUpgrade: true, syncServer: false });
+          setCurrentPlan(plan.planKey);
+          onPlanChangeRef.current?.(plan.planKey);
+          await checkUserAuth?.().catch(() => {});
+          await loadSubscription();
+          toast.success(`Your ${plan.name} subscription is active and synced!`);
+          return;
         }
-      } catch (err) {
-        console.debug('[PricingSection] create-checkout-session fetch note:', err);
+        if (checkoutResult?.url) {
+          destinationUrl = checkoutResult.url;
+        }
+      } catch (edgeErr) {
+        checkoutErrorMessage = edgeErr?.message || '';
+        if (edgeErr?.code === 'AUTH_SESSION_EXPIRED') {
+          needsReauth = true;
+        }
+        console.warn('[PricingSection] createStripeCheckout note:', checkoutErrorMessage || edgeErr);
       }
 
-      // 2. Open Stripe Checkout in new tab reliably with anchor click fallback
-      let tabOpened = false;
-      try {
-        const win = window.open(destinationUrl, '_blank', 'noopener,noreferrer');
-        if (win && !win.closed && typeof win.closed !== 'undefined') {
-          tabOpened = true;
+      // 1b. If JWT wasn't ready yet, re-hydrate auth state once and retry createStripeCheckout
+      if (!destinationUrl && needsReauth && userEmail) {
+        try {
+          await checkUserAuth?.().catch(() => {});
+          const { data: refreshedSessionData } = await supabase.auth.getSession();
+          const candidateToken = refreshedSessionData?.session?.access_token || '';
+          if (candidateToken && !candidateToken.startsWith('vault_tok_') && candidateToken.split('.').length === 3) {
+            const retryResult = await createStripeCheckout(plan.planKey);
+            if (retryResult?.url) {
+              destinationUrl = retryResult.url;
+              needsReauth = false;
+              checkoutErrorMessage = '';
+            }
+          }
+        } catch (retryErr) {
+          console.debug('[PricingSection] Session retry checkout note:', retryErr?.message || retryErr);
         }
-      } catch (_e) {
-        // window.open blocked
+      }
+
+      // 2. Fallback: Express checkout endpoint passing fresh Supabase session token
+      if (!destinationUrl) {
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          const freshToken =
+            sessionData?.session?.access_token ||
+            localStorage.getItem('washek_auth_token') ||
+            '';
+          if (freshToken && !freshToken.startsWith('vault_tok_') && !freshToken.startsWith('washek_sess_') && freshToken.split('.').length === 3) {
+            const sessionRes = await fetch('/api/create-checkout-session', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${freshToken}`,
+              },
+              body: JSON.stringify({
+                plan: plan.planKey,
+                userId: sessionData?.session?.user?.id || userId,
+                email: sessionData?.session?.user?.email || userEmail,
+                returnUrl: window.location.origin,
+                hasUsedTrial,
+              }),
+            });
+            const sessionDataJson = await sessionRes.json().catch(() => null);
+            if (
+              sessionRes.ok &&
+              (
+                sessionDataJson?.action === 'already_active' ||
+                sessionDataJson?.action === 'already_current' ||
+                sessionDataJson?.action === 'changed'
+              )
+            ) {
+              closeReservedWindow();
+              applySubscriptionUpgrade(plan.planKey, 'active', { isNewUpgrade: true, syncServer: false });
+              setCurrentPlan(plan.planKey);
+              onPlanChangeRef.current?.(plan.planKey);
+              await checkUserAuth?.().catch(() => {});
+              await loadSubscription();
+              toast.success(`Your ${plan.name} subscription is active and synced!`);
+              return;
+            }
+            if (sessionRes.ok && sessionDataJson?.url) {
+              destinationUrl = sessionDataJson.url;
+              needsReauth = false;
+            } else if (sessionDataJson?.error) {
+              checkoutErrorMessage = sessionDataJson.error;
+              if (sessionRes.status === 401 || sessionDataJson?.code === 'AUTH_SESSION_EXPIRED') {
+                needsReauth = true;
+              }
+            }
+          }
+        } catch (err) {
+          console.debug('[PricingSection] create-checkout-session fetch note:', err);
+        }
+      }
+
+      // 3. Fallback for active authenticated app sessions (e.g. credential vault) without a Supabase JWT:
+      // never show a false "session timed out" error when the athlete is actively signed in.
+      if (!destinationUrl && userEmail) {
+        const paymentLinkUrl =
+          buildPaymentLinkUrl(plan.planKey, { userId, email: userEmail }) ||
+          plan.paymentUrl;
+        if (paymentLinkUrl) {
+          destinationUrl = paymentLinkUrl;
+          needsReauth = false;
+        }
+      }
+
+      if (!destinationUrl) {
+        closeReservedWindow();
+        const err = new Error(
+          checkoutErrorMessage ||
+            (userEmail
+              ? 'Unable to connect to Stripe Checkout right now. Please try again.'
+              : 'Please sign in to upgrade your plan.')
+        );
+        if (!userEmail && needsReauth) err.code = 'AUTH_SESSION_EXPIRED';
+        throw err;
+      }
+
+      // Start watching DB/events for checkout completion
+      startPostCheckoutPolling(plan.planKey);
+
+      // 3. Navigate the synchronously reserved tab, or fall back to direct navigation / user-clickable link
+      let tabOpened = false;
+      if (checkoutWin && !checkoutWin.closed) {
+        try {
+          checkoutWin.location.href = destinationUrl;
+          tabOpened = true;
+        } catch {
+          tabOpened = false;
+        }
       }
 
       if (!tabOpened) {
-        const link = document.createElement('a');
-        link.href = destinationUrl;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
+        try {
+          const win = window.open(destinationUrl, '_blank');
+          if (win && !win.closed && typeof win.closed !== 'undefined') {
+            tabOpened = true;
+          }
+        } catch {
+          // window.open blocked
+        }
+      }
+
+      if (!tabOpened) {
+        const inIframe = (() => {
+          try {
+            return window.self !== window.top;
+          } catch {
+            return true;
+          }
+        })();
+
+        if (!inIframe) {
+          window.location.assign(destinationUrl);
+          return;
+        }
+
+        // If inside an iframe and browser blocked popups, show a native <a> button inside this plan card
+        setBlockedCheckout({
+          planKey: plan.planKey,
+          planName: plan.name,
+          url: destinationUrl,
+        });
+        toast.info(`Click "Continue to ${plan.name} Checkout" below to open Stripe.`);
+        return;
       }
 
       toast.info(`Stripe Checkout opened in new tab. Complete checkout to unlock ${plan.name}.`);
     } catch (checkoutError) {
+      closeReservedWindow();
+      const isAuthErr = checkoutError?.code === 'AUTH_SESSION_EXPIRED';
+      const msg = isAuthErr
+        ? 'Please sign in to upgrade your plan.'
+        : checkoutError?.message || 'Unable to start checkout.';
       console.error('[PricingSection] Stripe redirect failed:', checkoutError);
-      setError(checkoutError?.message || 'Unable to start checkout.');
-      toast.error(checkoutError?.message || 'Unable to start checkout.');
+      setError(msg);
+      setCardError({ planKey: plan.planKey, message: msg, needsReauth: isAuthErr });
+      toast.error(msg);
     } finally {
       setLoadingPlan(null);
     }
@@ -741,21 +1016,54 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                 Included with your {currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} plan
               </div>
             ) : (
-              <div className="space-y-1.5">
-                <Button
-                  className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide ${plan.buttonClass}`}
-                  onClick={() => handleCheckout(plan)}
-                  disabled={!!loadingPlan || loadingSubscription}
-                >
-                  {loadingPlan === plan.planKey ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Opening Stripe Checkout…
-                    </>
-                  ) : (
-                    `Upgrade to ${plan.name}`
-                  )}
-                </Button>
+              <div className="space-y-2">
+                {blockedCheckout?.planKey === plan.planKey && blockedCheckout?.url ? (
+                  <a
+                    href={blockedCheckout.url}
+                    target="_blank"
+                    rel="opener"
+                    onClick={() => startPostCheckoutPolling(plan.planKey)}
+                    className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide flex items-center justify-center ${plan.buttonClass}`}
+                  >
+                    Continue to {plan.name} Checkout →
+                  </a>
+                ) : (
+                  <Button
+                    className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide ${plan.buttonClass}`}
+                    onClick={() => handleCheckout(plan)}
+                    disabled={!!loadingPlan}
+                  >
+                    {loadingPlan === plan.planKey ? (
+                      <>
+                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                        Opening Stripe Checkout…
+                      </>
+                    ) : (
+                      `Upgrade to ${plan.name}`
+                    )}
+                  </Button>
+                )}
+                {cardError?.planKey === plan.planKey && cardError?.message && (
+                  <div className="space-y-2 text-center">
+                    <p className="text-[11px] text-destructive font-medium">
+                      {cardError.message}
+                    </p>
+                    {cardError.needsReauth && (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="w-full text-xs font-semibold"
+                        onClick={async () => {
+                          await logout?.().catch(() => {});
+                          window.location.assign('/login');
+                        }}
+                      >
+                        Sign In to Continue Upgrade
+                      </Button>
+                    )}
+                  </div>
+                )}
                 <p className="text-[11px] text-center text-muted-foreground font-medium">
                   {hasUsedTrial
                     ? `Billed today: ${plan.price}/mo · Cancel anytime`

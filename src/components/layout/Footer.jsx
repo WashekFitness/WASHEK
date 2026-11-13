@@ -1,4 +1,5 @@
 import { Link } from 'react-router-dom';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 
 function Footer() {
@@ -31,7 +32,8 @@ function Footer() {
         <div className="flex items-center gap-2">
 
           <img
-            src="/washek-fitness-logo.jpg"
+            src={BRAND_LOGO_SRC}
+            onError={handleBrandLogoError}
             alt="WASHEK"
             className="
               w-6

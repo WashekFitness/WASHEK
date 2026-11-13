@@ -7,7 +7,7 @@ import React, {
 } from 'react';
 
 import { supabase } from '@/lib/supabase';
-import { supabaseApi } from '@/lib/supabaseApi';
+import { supabaseApi, isUserMarkedOnboarded, markUserOnboarded } from '@/lib/supabaseApi';
 import { isLogo } from '@/lib/avatarUtils';
 
 const AuthContext = createContext(null);
@@ -119,26 +119,66 @@ export const AuthProvider = ({ children }) => {
         // session query note
       }
 
-      // If no active session but tokens are in localStorage, attempt recovery
+      // If no active session but tokens are in localStorage, attempt recovery or refresh
       if (!session) {
         const token = localStorage.getItem('washek_auth_token');
         const refreshToken = localStorage.getItem('washek_refresh_token');
-        if (token && refreshToken) {
-          try {
-            const { data: recovered } = await supabase.auth.setSession({
-              access_token: token,
-              refresh_token: refreshToken,
-            });
-            session = recovered?.session;
-          } catch (_rErr) {
-            // recovery note
+        if (refreshToken) {
+          if (token && !token.startsWith('vault_tok_') && !token.startsWith('washek_sess_')) {
+            try {
+              const { data: recovered } = await supabase.auth.setSession({
+                access_token: token,
+                refresh_token: refreshToken,
+              });
+              session = recovered?.session;
+            } catch (_rErr) {
+              // recovery note
+            }
           }
+          if (!session?.access_token) {
+            try {
+              const { data: refreshed } = await supabase.auth.refreshSession({
+                refresh_token: refreshToken,
+              });
+              if (refreshed?.session?.access_token) {
+                session = refreshed.session;
+              }
+            } catch (_rfErr) {
+              // ignore refresh recovery note
+            }
+          }
+        }
+      }
+
+      // Refresh proactively if token is expired or within 60s of expiry
+      if (session?.access_token && session.expires_at && session.expires_at * 1000 < Date.now() + 60000) {
+        try {
+          const refreshToken = session.refresh_token || localStorage.getItem('washek_refresh_token') || undefined;
+          const { data: refreshed } = await supabase.auth.refreshSession(
+            refreshToken ? { refresh_token: refreshToken } : undefined
+          );
+          if (refreshed?.session?.access_token) {
+            session = refreshed.session;
+          }
+        } catch (_rfErr) {
+          // ignore refresh error
+        }
+      }
+
+      if (session?.access_token) {
+        try {
+          localStorage.setItem('washek_auth_token', session.access_token);
+          if (session.refresh_token) {
+            localStorage.setItem('washek_refresh_token', session.refresh_token);
+          }
+        } catch {
+          // ignore
         }
       }
 
       if (session?.user) {
         try {
-          const profileUser = await supabaseApi.auth.me();
+          const profileUser = await supabaseApi.auth.me(true);
           if (profileUser) {
             setUser(profileUser);
             setIsAuthenticated(true);
@@ -251,15 +291,36 @@ export const AuthProvider = ({ children }) => {
       async (event, session) => {
         if (!mounted) return;
         if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'TOKEN_REFRESHED') {
+          if (session?.access_token) {
+            try {
+              localStorage.setItem('washek_auth_token', session.access_token);
+              if (session.refresh_token) {
+                localStorage.setItem('washek_refresh_token', session.refresh_token);
+              }
+            } catch {
+              // ignore
+            }
+          }
           if (session?.user) {
             await loadSupabaseSessionUser();
           }
         } else if (event === 'SIGNED_OUT') {
+          const activeToken = (() => {
+            try {
+              return localStorage.getItem('washek_auth_token') || '';
+            } catch {
+              return '';
+            }
+          })();
+          if (activeToken.startsWith('vault_tok_') || activeToken.startsWith('washek_sess_')) {
+            return;
+          }
           setUser(null);
           setIsAuthenticated(false);
           try {
             localStorage.removeItem('washek_user');
             localStorage.removeItem('washek_auth_token');
+            localStorage.removeItem('washek_refresh_token');
           } catch (_e) {
             // Ignore cleanup error
           }
@@ -405,14 +466,45 @@ export const AuthProvider = ({ children }) => {
           try {
             localStorage.setItem('washek_auth_token', data.session.access_token);
             if (data.session.refresh_token) {
+              localStorage.setItem('washek_refresh_token', data.session.refresh_token);
               await supabase.auth.setSession({
                 access_token: data.session.access_token,
                 refresh_token: data.session.refresh_token,
               }).catch(() => {});
+            } else {
+              localStorage.removeItem('washek_refresh_token');
+              // Attempt direct browser signInWithPassword so a genuine Supabase JWT is acquired if possible
+              try {
+                const { data: directData } = await supabase.auth.signInWithPassword({
+                  email: cleanEmail,
+                  password,
+                });
+                if (directData?.session?.access_token) {
+                  localStorage.setItem('washek_auth_token', directData.session.access_token);
+                  if (directData.session.refresh_token) {
+                    localStorage.setItem('washek_refresh_token', directData.session.refresh_token);
+                  }
+                  if (directData.user?.id) {
+                    finalProfile.id = directData.user.id;
+                  }
+                }
+              } catch {
+                // keep vault session without triggering a destructive SIGNED_OUT event
+              }
             }
           } catch (tokenErr) {
             console.debug('[AUTH] Token storage note:', tokenErr);
           }
+        }
+
+        if (finalProfile.onboarded === true) {
+          markUserOnboarded(finalProfile.id, cleanEmail);
+        } else if (
+          finalProfile.onboarded === false &&
+          (isUserMarkedOnboarded(finalProfile.id, cleanEmail) ||
+            Boolean(finalProfile.active_program_id || finalProfile.last_program_generated_at))
+        ) {
+          finalProfile.onboarded = true;
         }
       } else {
         const srvErr = new Error(data?.error || 'Invalid email or password.');
@@ -520,10 +612,13 @@ export const AuthProvider = ({ children }) => {
           try {
             localStorage.setItem('washek_auth_token', data.session.access_token);
             if (data.session.refresh_token) {
+              localStorage.setItem('washek_refresh_token', data.session.refresh_token);
               await supabase.auth.setSession({
                 access_token: data.session.access_token,
                 refresh_token: data.session.refresh_token,
               }).catch(() => {});
+            } else {
+              localStorage.removeItem('washek_refresh_token');
             }
           } catch (tokenErr) {
             console.debug('[AUTH] Token store note:', tokenErr);
@@ -675,7 +770,11 @@ export const AuthProvider = ({ children }) => {
       setAuthError(null);
       try {
         localStorage.removeItem('washek_auth_token');
+        localStorage.removeItem('washek_refresh_token');
         localStorage.removeItem('washek_user');
+        localStorage.removeItem('washek_subscription_plan');
+        localStorage.removeItem('washek_subscription_status');
+        localStorage.removeItem('washek_recent_upgrade');
       } catch (err) {
         console.debug('[AUTH] Storage cleanup error:', err);
       }

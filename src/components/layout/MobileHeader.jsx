@@ -5,6 +5,7 @@ import {
 import { useAuth } from '@/lib/AuthContext';
 import AppSettingsModal from '@/components/AppSettingsModal';
 import PWAInstallButton from '@/components/pwa/PWAInstallButton';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 const ROOT_PATHS = ['/', '/program', '/nutrition', '/profile', '/kael'];
 
@@ -85,7 +86,8 @@ export default function MobileHeader({ scrollRef }) {
           >
             <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-primary/5 border border-primary/25 shadow-xs shadow-primary/15 shrink-0 group-hover:scale-105 transition-transform">
               <img
-                src="/washek-fitness-logo.jpg"
+                src={BRAND_LOGO_SRC}
+                onError={handleBrandLogoError}
                 alt="WASHEK"
                 className="w-7 h-7 rounded-[10px] object-contain shrink-0 pointer-events-none"
               />

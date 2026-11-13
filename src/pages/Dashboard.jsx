@@ -2,8 +2,9 @@ import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 
-import { supabaseApi } from '@/lib/supabaseApi';
+import { supabaseApi, isUserMarkedOnboarded, markUserOnboarded } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 import DailyWorkoutCard from '@/components/dashboard/DailyWorkoutCard';
 import NutritionSummary from '@/components/dashboard/NutritionSummary';
@@ -47,16 +48,54 @@ export default function Dashboard() {
     let mounted = true;
 
     supabaseApi.auth
-      .me()
-      .then((u) => {
+      .me(true)
+      .then(async (u) => {
         if (!mounted || !u) {
           return;
         }
 
-        setUser(u);
-
         if (u.onboarded === false) {
-          navigate('/onboarding');
+          const userCacheKey = u.email || u.id || 'athlete';
+          const cachedPrograms = getCachedProgramsList(userCacheKey);
+          let hasExistingData =
+            isUserMarkedOnboarded(u.id, u.email) ||
+            Boolean(u.active_program_id || u.last_program_generated_at) ||
+            (Array.isArray(cachedPrograms) && cachedPrograms.length > 0);
+
+          if (!hasExistingData) {
+            try {
+              const existingPrograms = await supabaseApi.entities.WorkoutProgram.filter(
+                {},
+                '-created_at',
+                1
+              );
+              if (Array.isArray(existingPrograms) && existingPrograms.length > 0) {
+                hasExistingData = true;
+              }
+            } catch {
+              // ignore program verification note
+            }
+          }
+
+          if (hasExistingData) {
+            const healedUser = { ...u, onboarded: true };
+            markUserOnboarded(u.id, u.email);
+            if (mounted) {
+              setUser(healedUser);
+            }
+            supabaseApi.auth.updateMe({ onboarded: true }).catch(() => {});
+            return;
+          }
+
+          if (mounted) {
+            setUser(u);
+            navigate('/onboarding');
+          }
+          return;
+        }
+
+        if (mounted) {
+          setUser(u);
         }
       })
       .catch((error) => {
@@ -210,7 +249,8 @@ export default function Dashboard() {
 
             <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-transparent border border-primary/20 shrink-0">
               <img
-                src="/washek-fitness-logo.jpg"
+                src={BRAND_LOGO_SRC}
+                onError={handleBrandLogoError}
                 alt="WASHEK"
                 className="
                   w-7

@@ -400,6 +400,39 @@ export function getPlanLabel(
  * local storage caches, and fires window notification events so all
  * UI components unlock instantly.
  */
+const RECENT_UPGRADE_KEY = 'washek_recent_upgrade';
+const RECENT_UPGRADE_GRACE_MS = 45 * 1000;
+
+export function getRecentUpgradeGrace() {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(RECENT_UPGRADE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (
+      parsed?.plan &&
+      parsed.plan !== 'free' &&
+      typeof parsed.timestamp === 'number' &&
+      Date.now() - parsed.timestamp < RECENT_UPGRADE_GRACE_MS
+    ) {
+      return parsed;
+    }
+    localStorage.removeItem(RECENT_UPGRADE_KEY);
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+export function clearRecentUpgradeGrace() {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(RECENT_UPGRADE_KEY);
+  } catch {
+    // ignore
+  }
+}
+
 export function applySubscriptionUpgrade(plan, status = 'active', details = {}) {
   const normPlan = normalizePlan(plan);
   if (normPlan === 'free') return;
@@ -408,6 +441,17 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     localStorage.setItem('washek_subscription_plan', normPlan);
     localStorage.setItem('washek_subscription_status', status);
     localStorage.removeItem('washek_subscription_cancelled_at');
+
+    if (details?.isNewUpgrade) {
+      localStorage.setItem(
+        RECENT_UPGRADE_KEY,
+        JSON.stringify({
+          plan: normPlan,
+          status,
+          timestamp: Date.now(),
+        })
+      );
+    }
 
     const storedUser = localStorage.getItem('washek_user');
     let userObj = {};
@@ -430,26 +474,28 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     console.debug('[subscription] LocalStorage upgrade sync note:', err);
   }
 
-  // Background server sync to keep Supabase profiles table in sync
-  try {
-    const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
-    const syncUid = stored?.id || stored?.uid;
-    const syncEmail = stored?.email;
-    if (syncUid || syncEmail) {
-      fetch('/api/checkout/process', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          userId: syncUid,
-          email: syncEmail,
-          plan: normPlan,
-          status,
-          sessionId: details?.sessionId || `upgrade_${Date.now()}`,
-        }),
-      }).catch(() => {});
+  // Only invoke server checkout/process when finishing checkout return
+  if (details?.syncServer) {
+    try {
+      const stored = JSON.parse(localStorage.getItem('washek_user') || '{}');
+      const syncUid = stored?.id || stored?.uid;
+      const syncEmail = stored?.email;
+      if (syncUid || syncEmail) {
+        fetch('/api/checkout/process', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: syncUid,
+            email: syncEmail,
+            plan: normPlan,
+            status,
+            sessionId: details?.sessionId || undefined,
+          }),
+        }).catch(() => {});
+      }
+    } catch (_e) {
+      // Non-blocking
     }
-  } catch (_e) {
-    // Non-blocking
   }
 
   // Dispatch global events for instant reactive UI updates

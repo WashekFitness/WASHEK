@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { usePWAInstall } from '@/hooks/usePWAInstall';
 import { Download, Share2, X, Smartphone, MoreVertical } from 'lucide-react';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 export default function PWAInstallButton({ className = '', compact = false }) {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
@@ -57,7 +58,8 @@ export default function PWAInstallButton({ className = '', compact = false }) {
               <div className="flex items-center gap-2.5">
                 <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-primary/5 border border-primary/25 shadow-xs shrink-0">
                   <img
-                    src="/washek-fitness-logo.jpg"
+                    src={BRAND_LOGO_SRC}
+                    onError={handleBrandLogoError}
                     alt="WASHEK"
                     className="w-7 h-7 rounded-[9px] object-contain shrink-0"
                   />

@@ -2,6 +2,7 @@ import { supabase } from '@/lib/supabase';
 import { getUserTimeZone } from '@/lib/dateUtils';
 import { isLogo } from '@/lib/avatarUtils';
 import {
+  getCachedProgramsList,
   setCachedLogs,
   setCachedLastWorkout,
   setCachedNutrition,
@@ -61,6 +62,35 @@ export function ensureValidUuid(str) {
   const hex2 = Math.abs(hash2).toString(16).padStart(8, '0');
   const combined = (hex1 + hex2 + hex1 + hex2).slice(0, 32);
   return `${combined.slice(0, 8)}-${combined.slice(8, 12)}-4${combined.slice(13, 16)}-a${combined.slice(17, 20)}-${combined.slice(20, 32)}`;
+}
+
+const ONBOARDED_ACCOUNTS_KEY = 'washek_onboarded_accounts';
+
+export function markUserOnboarded(userId, email) {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    const raw = localStorage.getItem(ONBOARDED_ACCOUNTS_KEY);
+    const map = raw ? JSON.parse(raw) : {};
+    if (userId) map[`id:${String(userId).trim()}`] = true;
+    if (email) map[`email:${String(email).trim().toLowerCase()}`] = true;
+    localStorage.setItem(ONBOARDED_ACCOUNTS_KEY, JSON.stringify(map));
+  } catch {
+    // ignore storage write error
+  }
+}
+
+export function isUserMarkedOnboarded(userId, email) {
+  if (typeof localStorage === 'undefined') return false;
+  try {
+    const raw = localStorage.getItem(ONBOARDED_ACCOUNTS_KEY);
+    if (!raw) return false;
+    const map = JSON.parse(raw);
+    if (userId && map[`id:${String(userId).trim()}`]) return true;
+    if (email && map[`email:${String(email).trim().toLowerCase()}`]) return true;
+  } catch {
+    // ignore parse error
+  }
+  return false;
 }
 
 /*
@@ -213,6 +243,21 @@ function normalizeUser(authUser, profile = {}) {
  */
 
 async function currentUser(forceFresh = false) {
+  const recentUpgrade = (() => {
+    try {
+      const raw = localStorage.getItem('washek_recent_upgrade');
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (parsed?.plan && parsed.plan !== 'free' && typeof parsed.timestamp === 'number' && Date.now() - parsed.timestamp < 45000) {
+        return parsed;
+      }
+      localStorage.removeItem('washek_recent_upgrade');
+    } catch {
+      // ignore
+    }
+    return null;
+  })();
+
   const rawLocalPlan = (() => {
     try {
       const p = localStorage.getItem('washek_subscription_plan');
@@ -230,7 +275,6 @@ async function currentUser(forceFresh = false) {
     }
   })();
 
-  // If a paid plan is stored locally, the user is active, NOT canceled
   const isCanceled = !rawLocalPlan && (storedStatus === 'canceled' || storedStatus === 'cancelled');
   const activeLocalPlan = rawLocalPlan || (isCanceled ? 'free' : null);
 
@@ -242,7 +286,7 @@ async function currentUser(forceFresh = false) {
     }
   }
 
-  // 2. If stored in localStorage and not forceFresh, return cached washek_user
+  // If stored in localStorage and not forceFresh, return cached washek_user quickly
   if (!forceFresh) {
     try {
       const stored = localStorage.getItem('washek_user');
@@ -252,6 +296,13 @@ async function currentUser(forceFresh = false) {
           if (isLogo(parsed.avatar_url) || isLogo(parsed.photo_url)) {
             parsed.avatar_url = null;
             parsed.photo_url = null;
+          }
+          if (
+            parsed.onboarded === false &&
+            (isUserMarkedOnboarded(parsed.id, parsed.email) ||
+              Boolean(parsed.active_program_id || parsed.last_program_generated_at))
+          ) {
+            parsed.onboarded = true;
           }
           if (isCanceled) {
             parsed.subscription_plan = 'free';
@@ -278,13 +329,12 @@ async function currentUser(forceFresh = false) {
     }
   }
 
-  // 3. Fallback to Supabase auth user and profile
+  // Query live Supabase auth user and profile
   try {
     const user = await requireUser();
     let profile = await getProfile(user.id);
 
     if (!profile) {
-      // Generate graceful fallback profile from auth user metadata
       profile = {
         id: user.id,
         email: user.email,
@@ -298,11 +348,10 @@ async function currentUser(forceFresh = false) {
         role: user.user_metadata?.role || 'athlete',
         training_type: user.user_metadata?.training_type || 'calisthenics',
         fitness_level: user.user_metadata?.fitness_level || 'intermediate',
-        subscription_plan: isCanceled ? 'free' : (activeLocalPlan || 'free'),
-        subscription_status: isCanceled ? 'canceled' : 'active',
+        subscription_plan: recentUpgrade?.plan || (isCanceled ? 'free' : (activeLocalPlan || 'free')),
+        subscription_status: recentUpgrade?.status || (isCanceled ? 'canceled' : 'inactive'),
       };
 
-      // Auto-create missing profile row asynchronously if possible
       supabase
         .from('profiles')
         .upsert(profile, { onConflict: 'id' })
@@ -311,16 +360,83 @@ async function currentUser(forceFresh = false) {
     }
 
     const normalized = normalizeUser(user, profile);
-    if (isCanceled) {
+    const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
+    const dbPlan = String(profile.subscription_plan || 'free').toLowerCase().trim();
+    const dbActive = ['active', 'trialing', 'past_due', 'unpaid'].includes(dbStatus) && dbPlan !== 'free';
+
+    if (recentUpgrade && (!dbActive || dbPlan !== recentUpgrade.plan)) {
+      // Honor brand-new checkout return for up to 45s while Stripe webhook finishes writing to Postgres
+      normalized.subscription_plan = recentUpgrade.plan;
+      normalized.subscription_status = recentUpgrade.status || 'active';
+      normalized.tier = recentUpgrade.plan;
+      normalized.plan = recentUpgrade.plan;
+      normalized.subscription_tier = recentUpgrade.plan;
+    } else if (dbActive) {
+      normalized.subscription_plan = dbPlan;
+      normalized.subscription_status = dbStatus;
+      normalized.tier = dbPlan;
+      normalized.plan = dbPlan;
+      normalized.subscription_tier = dbPlan;
+      try {
+        localStorage.setItem('washek_subscription_plan', dbPlan);
+        localStorage.setItem('washek_subscription_status', dbStatus);
+        if (recentUpgrade?.plan === dbPlan) {
+          localStorage.removeItem('washek_recent_upgrade');
+        }
+      } catch {
+        // ignore
+      }
+    } else if (profile.subscription_plan !== undefined) {
+      // Authoritative DB shows free / canceled / inactive
       normalized.subscription_plan = 'free';
-      normalized.subscription_status = 'canceled';
+      normalized.subscription_status = dbStatus || 'inactive';
       normalized.tier = 'free';
       normalized.plan = 'free';
-    } else if (activeLocalPlan && activeLocalPlan !== 'free' && normalized.subscription_plan === 'free') {
-      normalized.subscription_plan = activeLocalPlan;
-      normalized.tier = activeLocalPlan;
-      normalized.plan = activeLocalPlan;
+      normalized.subscription_tier = 'free';
+      try {
+        localStorage.removeItem('washek_subscription_plan');
+        localStorage.setItem('washek_subscription_status', dbStatus || 'inactive');
+      } catch {
+        // ignore
+      }
     }
+
+    // Prevent returning athletes from being misclassified as onboarded=false
+    if (normalized.onboarded === true) {
+      markUserOnboarded(user.id, user.email);
+    } else {
+      let hasExistingHistory =
+        isUserMarkedOnboarded(user.id, user.email) ||
+        Boolean(normalized.active_program_id || normalized.last_program_generated_at) ||
+        getLocalEntityRecords('workout_programs', user.id).length > 0 ||
+        getCachedProgramsList(user.email || user.id).length > 0;
+
+      if (!hasExistingHistory && user.id) {
+        try {
+          const [{ data: progRows }, { data: logRows }] = await Promise.all([
+            supabase.from('workout_programs').select('id').eq('user_id', user.id).limit(1),
+            supabase.from('workout_logs').select('id').eq('user_id', user.id).limit(1),
+          ]);
+          if ((Array.isArray(progRows) && progRows.length > 0) || (Array.isArray(logRows) && logRows.length > 0)) {
+            hasExistingHistory = true;
+          }
+        } catch {
+          // ignore returning user lookup note
+        }
+      }
+
+      if (hasExistingHistory) {
+        normalized.onboarded = true;
+        markUserOnboarded(user.id, user.email);
+        supabase
+          .from('profiles')
+          .update({ onboarded: true, updated_at: new Date().toISOString() })
+          .eq('id', user.id)
+          .then(() => {})
+          .catch(() => {});
+      }
+    }
+
     try {
       localStorage.setItem('washek_user', JSON.stringify(normalized));
     } catch (_err) {
@@ -1750,7 +1866,16 @@ export const supabaseApi = {
       const { data, error } = await supabase.from('profiles').update(safePatch).eq('id', user.id).select().single();
       if (error) throw errorFrom(error, 'Unable to update your profile.');
       if (!data) throw new Error('Your profile could not be found.');
-      return normalizeUser(user, data);
+      const updatedUser = normalizeUser(user, data);
+      if (updatedUser.onboarded) {
+        markUserOnboarded(user.id, user.email);
+      }
+      try {
+        localStorage.setItem('washek_user', JSON.stringify(updatedUser));
+      } catch {
+        // ignore storage error
+      }
+      return updatedUser;
     },
     logout: async () => {
       const { error } = await supabase.auth.signOut();
@@ -1946,9 +2071,41 @@ export const supabaseApi = {
           // Guest or non-logged-in session
         }
 
+        const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        const hashSeedToUuid = (seed) => {
+          const str = String(seed || '');
+          const hashes = [0x811c9dc5, 0x9e3779b1, 0x85ebca77, 0xc2b2ae3d];
+          for (let h = 0; h < 4; h++) {
+            let hash = hashes[h];
+            for (let i = 0; i < str.length; i++) {
+              hash ^= str.charCodeAt(i) + h * 31;
+              hash = Math.imul(hash, 0x01000193);
+            }
+            hashes[h] = hash >>> 0;
+          }
+          const hex = hashes.map((n) => n.toString(16).padStart(8, '0')).join('');
+          const variant = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+          return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-${variant}${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+        };
+        const generatedId =
+          typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+            ? crypto.randomUUID()
+            : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+                const r = (Math.random() * 16) | 0;
+                const v = c === 'x' ? r : (r & 0x3) | 0x8;
+                return v.toString(16);
+              });
+
+        const safeId =
+          typeof payload.id === 'string' && uuidRegex.test(payload.id.trim())
+            ? payload.id.trim().toLowerCase()
+            : payload.id
+              ? hashSeedToUuid(payload.id)
+              : generatedId;
+
         const row = {
-          id: payload.id || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
           ...payload,
+          id: safeId,
           user_id: validUserId,
           created_at: payload.created_at || new Date().toISOString(),
         };
@@ -1981,25 +2138,30 @@ export const supabaseApi = {
         // Sync to Firestore in background
         syncToFirestore('kael_messages', row, 'set').catch(() => {});
 
-        // Attempt Supabase insert if a valid Supabase auth session exists
+        // Attempt Supabase upsert if a valid Supabase auth session exists
         try {
           const { data: sessionData } = await supabase.auth.getSession();
-          if (sessionData?.session?.user && validUserId) {
+          const authUid = ensureValidUuid(sessionData?.session?.user?.id) || validUserId;
+          if (sessionData?.session?.user && authUid) {
+            const dbRow = sanitizeForSupabase('kael_messages', {
+              ...row,
+              user_id: authUid,
+            });
             const { data, error } = await supabase
               .from('kael_messages')
-              .insert(row)
+              .upsert(dbRow, { onConflict: 'id' })
               .select()
               .maybeSingle();
 
             if (!error && data) {
-              return data;
+              return { ...data, _synced: true };
             }
           }
         } catch (_dbErr) {
           // If RLS policy or network blocks insert, locally cached row is returned
         }
 
-        return row;
+        return { ...row, _synced: false };
       },
 
       async filter(filters = {}, sort = 'created_at', limit = 1000) {
@@ -2010,17 +2172,18 @@ export const supabaseApi = {
           const user = await requireUser();
           validUserId = ensureValidUuid(user.id);
           const { data: sessionData } = await supabase.auth.getSession();
-          if (sessionData?.session?.user && validUserId) {
+          const authUid = ensureValidUuid(sessionData?.session?.user?.id) || validUserId;
+          if (sessionData?.session?.user && authUid) {
             const rawColumn = sort.replace(/^-/, '');
             const column = ORDER_ALIASES[rawColumn] || rawColumn;
             const ascending = !sort.startsWith('-');
 
-            let q = applyFilters(supabase.from('kael_messages').select('*'), filters, validUserId).order(column, { ascending });
+            let q = applyFilters(supabase.from('kael_messages').select('*'), filters, authUid).order(column, { ascending });
             if (Number.isFinite(limit)) q = q.limit(limit);
 
             const { data, error } = await q;
             if (!error && Array.isArray(data)) {
-              dbMessages = data;
+              dbMessages = data.map((m) => ({ ...m, _synced: true }));
             }
           }
         } catch (_err) {
@@ -2079,13 +2242,13 @@ export const supabaseApi = {
 
         const map = new Map();
         localMessages.forEach((m) => {
-          if (m?.id) map.set(m.id, m);
+          if (m?.id) map.set(m.id, { ...m, _synced: Boolean(m._synced) });
         });
         firestoreMessages.forEach((m) => {
           if (m?.id) map.set(m.id, { ...(map.get(m.id) || {}), ...m });
         });
         dbMessages.forEach((m) => {
-          if (m?.id) map.set(m.id, { ...(map.get(m.id) || {}), ...m });
+          if (m?.id) map.set(m.id, { ...(map.get(m.id) || {}), ...m, _synced: true });
         });
 
         let merged = Array.from(map.values());
@@ -2155,18 +2318,19 @@ export const supabaseApi = {
 
         try {
           const { data: sessionData } = await supabase.auth.getSession();
-          if (sessionData?.session?.user && validUserId) {
+          const authUid = ensureValidUuid(sessionData?.session?.user?.id) || validUserId;
+          if (sessionData?.session?.user && authUid) {
             if (chatId === 'chat_initial') {
               await supabase
                 .from('kael_messages')
                 .delete()
-                .eq('user_id', validUserId)
+                .eq('user_id', authUid)
                 .or('created_by.eq.chat_initial,created_by.is.null');
             } else {
               await supabase
                 .from('kael_messages')
                 .delete()
-                .eq('user_id', validUserId)
+                .eq('user_id', authUid)
                 .eq('created_by', chatId);
             }
           }
@@ -2174,6 +2338,24 @@ export const supabaseApi = {
           // Ignore remote delete errors
         }
 
+        return true;
+      },
+
+      async deleteDuplicateIds(ids = []) {
+        if (!Array.isArray(ids) || ids.length === 0) return true;
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          const authUid = ensureValidUuid(sessionData?.session?.user?.id);
+          if (sessionData?.session?.user && authUid) {
+            await supabase
+              .from('kael_messages')
+              .delete()
+              .eq('user_id', authUid)
+              .in('id', ids.slice(0, 100));
+          }
+        } catch (_dbErr) {
+          // Ignore duplicate prune error
+        }
         return true;
       },
     },

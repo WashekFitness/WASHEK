@@ -12,6 +12,7 @@ import {
 } from '@/components/ui/button';
 
 import { cn } from '@/lib/utils';
+import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 
 const ROOT_PAGES = [
@@ -68,7 +69,8 @@ export default function PageHeader({
 
           <div className="relative p-0.5 rounded-xl bg-gradient-to-br from-primary/30 to-primary/5 border border-primary/25 shadow-sm shadow-primary/15 shrink-0">
             <img
-              src="/washek-fitness-logo.jpg"
+              src={BRAND_LOGO_SRC}
+              onError={handleBrandLogoError}
               alt="WASHEK"
               className="
                 w-7

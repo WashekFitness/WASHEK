@@ -254,7 +254,7 @@ export default function Profile() {
     let active = true;
 
     supabaseApi.auth
-      .me()
+      .me(true)
       .then((currentUser) => {
         if (active && currentUser) {
           if (isLogo(currentUser.avatar_url) || isLogo(currentUser.photo_url)) {

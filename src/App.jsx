@@ -1,4 +1,4 @@
-import React, { Suspense, lazy } from 'react';
+import React, { Suspense } from 'react';
 import {
   BrowserRouter as Router,
   Route,
@@ -9,6 +9,7 @@ import {
 import { QueryClientProvider } from '@tanstack/react-query';
 
 import { Toaster } from '@/components/ui/toaster';
+import { Toaster as SonnerToaster } from '@/components/ui/sonner';
 import { queryClientInstance } from '@/lib/query-client';
 import { AppSettingsProvider } from '@/lib/AppSettingsContext';
 import { AuthProvider, useAuth } from '@/lib/AuthContext';
@@ -30,47 +31,16 @@ import ResetPassword from '@/pages/ResetPassword';
 import Terms from '@/pages/Terms';
 import Privacy from '@/pages/Privacy';
 import Profile from '@/pages/Profile';
-
-function lazyWithRetry(componentImport, retries = 3, interval = 350) {
-  return lazy(() =>
-    new Promise((resolve, reject) => {
-      const attempt = (remaining) => {
-        componentImport()
-          .then(resolve)
-          .catch((error) => {
-            if (remaining > 0) {
-              setTimeout(() => attempt(remaining - 1), interval);
-            } else {
-              console.warn('[App] Dynamic chunk import failed after retries, attempting reload...', error);
-              const lastReload = sessionStorage.getItem('chunk_reload_timestamp');
-              const now = Date.now();
-              if (!lastReload || now - parseInt(lastReload, 10) > 10000) {
-                sessionStorage.setItem('chunk_reload_timestamp', String(now));
-                window.location.reload();
-              }
-              reject(error);
-            }
-          });
-      };
-      attempt(retries);
-    })
-  );
-}
-
-const Program = lazyWithRetry(() => import('@/pages/Program'));
-const Nutrition = lazyWithRetry(() => import('@/pages/Nutrition'));
-const Progress = lazyWithRetry(() => import('@/pages/Progress'));
-const Kael = lazyWithRetry(() => import('@/pages/Kael'));
-const ProgressPhotos = lazyWithRetry(() => import('@/pages/ProgressPhotos'));
-const FormLab = lazyWithRetry(() => import('@/pages/FormLab'));
-const MuscleHeatmapPage = lazyWithRetry(
-  () => import('@/pages/MuscleHeatmapPage')
-);
-const ProgramDay = lazyWithRetry(() => import('@/pages/ProgramDay'));
-const LiveWorkout = lazyWithRetry(() => import('@/pages/LiveWorkout'));
-const SubscriptionReturn = lazyWithRetry(
-  () => import('@/pages/SubscriptionReturn')
-);
+import Program from '@/pages/Program';
+import Nutrition from '@/pages/Nutrition';
+import Progress from '@/pages/Progress';
+import Kael from '@/pages/Kael';
+import ProgressPhotos from '@/pages/ProgressPhotos';
+import FormLab from '@/pages/FormLab';
+import MuscleHeatmapPage from '@/pages/MuscleHeatmapPage';
+import ProgramDay from '@/pages/ProgramDay';
+import LiveWorkout from '@/pages/LiveWorkout';
+import SubscriptionReturn from '@/pages/SubscriptionReturn';
 
 import { applySubscriptionUpgrade, normalizePlan } from '@/lib/subscription';
 import { toast } from 'sonner';
@@ -91,34 +61,41 @@ function GlobalMidnightWatcher() {
 
 function SubscriptionWatcher() {
   const location = useLocation();
+  const { checkUserAuth } = useAuth();
+  const lastAppliedRef = React.useRef(0);
 
   React.useEffect(() => {
-    // 1. Check for query parameter return (?subscribed=... or ?plan=...)
-    const params = new URLSearchParams(location.search);
-    const subPlan = params.get('subscribed') || params.get('plan');
-    if (subPlan && subPlan !== 'free') {
-      const normalized = normalizePlan(subPlan);
-      if (normalized && normalized !== 'free') {
-        applySubscriptionUpgrade(normalized, 'active');
-        toast.success(`Welcome to the ${normalized.charAt(0).toUpperCase() + normalized.slice(1)} plan! Your features are now active.`);
-        // Clean URL so query params do not linger
-        const cleanPath = location.pathname;
-        window.history.replaceState({}, document.title, cleanPath);
-      }
-    }
-
-    // 2. Listen for cross-tab or return tab events (BroadcastChannel, storage, postMessage)
-    const handleUpgradeMessage = (plan) => {
+    const applyVerified = (plan, status = 'active', showToast = true) => {
       const safe = normalizePlan(plan);
-      if (safe && safe !== 'free') {
-        applySubscriptionUpgrade(safe, 'active');
+      if (!safe || safe === 'free') return;
+
+      applySubscriptionUpgrade(safe, status, {
+        isNewUpgrade: true,
+        syncServer: false,
+      });
+      checkUserAuth?.().catch(() => {});
+
+      const now = Date.now();
+      if (showToast && now - lastAppliedRef.current > 2000) {
+        lastAppliedRef.current = now;
         toast.success(`Payment confirmed! You are now upgraded to the ${safe.charAt(0).toUpperCase() + safe.slice(1)} plan.`);
       }
     };
 
+    // 1. Check for query parameter return (?subscribed=... or ?plan=...)
+    const params = new URLSearchParams(location.search);
+    const subPlan = params.get('subscribed') || params.get('plan');
+    const subStatusParam = params.get('sub_status') || 'active';
+    if (subPlan && subPlan !== 'free') {
+      applyVerified(subPlan, subStatusParam, true);
+      const cleanPath = location.pathname;
+      window.history.replaceState({}, document.title, cleanPath);
+    }
+
+    // 2. Listen for cross-tab or return tab events (BroadcastChannel, storage, postMessage)
     const onWindowMsg = (e) => {
       if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && e.data?.plan) {
-        handleUpgradeMessage(e.data.plan);
+        applyVerified(e.data.plan, e.data?.status || 'active', true);
       }
     };
     window.addEventListener('message', onWindowMsg);
@@ -128,7 +105,7 @@ function SubscriptionWatcher() {
       bc = new BroadcastChannel('washek_subscription_sync');
       bc.onmessage = (e) => {
         if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS' && e.data?.plan) {
-          handleUpgradeMessage(e.data.plan);
+          applyVerified(e.data.plan, e.data?.status || 'active', true);
         }
       };
     } catch {
@@ -140,7 +117,7 @@ function SubscriptionWatcher() {
         try {
           const parsed = JSON.parse(e.newValue);
           if (parsed?.plan && parsed.plan !== 'free') {
-            handleUpgradeMessage(parsed.plan);
+            applyVerified(parsed.plan, parsed?.status || 'active', true);
           }
         } catch {
           /* ignore */
@@ -154,7 +131,7 @@ function SubscriptionWatcher() {
       window.removeEventListener('storage', onStorage);
       bc?.close();
     };
-  }, [location.search, location.pathname]);
+  }, [location.search, location.pathname, checkUserAuth]);
 
   return null;
 }
@@ -263,6 +240,7 @@ function App() {
           </Router>
 
           <Toaster />
+          <SonnerToaster />
         </QueryClientProvider>
       </AuthProvider>
     </AppSettingsProvider>

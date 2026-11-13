@@ -477,7 +477,7 @@ export default function RealisticAnatomyMap({
               <ellipse cx="135" cy="236" rx="1.5" ry="2" fill="#0f172a" opacity="0.8" />
             </g>
 
-            {/* QUADRICEPS (Vastus Lateralis Sweep, Rectus Femoris & Medialis Teardrop) */}
+            {/* QUADRICEPS (Proportional Wide Sweep: Vastus Lateralis, Rectus Femoris, Vastus Medialis) */}
             <g
               onMouseEnter={() => setHoveredMuscle('quads')}
               onMouseLeave={() => setHoveredMuscle(null)}
@@ -485,17 +485,25 @@ export default function RealisticAnatomyMap({
               className="cursor-pointer transition-all hover:brightness-125"
             >
               {/* Left Quad Group */}
-              {/* Vastus Lateralis Outer Sweep (Narrow Pelvis, Athletic Curve) */}
+              {/* Vastus Lateralis Outer Sweep (Hip flare matching chest/shoulder X-frame) */}
               <path
-                d="M115 282 C98 306 94 348 101 394 C108 396 112 378 114 350 C114 322 115 296 115 282 Z"
+                d="M108 278 C98 275 91 281 85 296 C74 324 74 360 82 394 C85 405 90 411 96 411 C100 404 101 382 101 354 C101 322 104 294 108 278 Z"
                 fill={getHeatFill('quads')}
                 opacity={getOpacity('quads')}
                 stroke={getStroke('quads')}
                 strokeWidth={getStrokeWidth('quads')}
               />
-              {/* Rectus Femoris Center Bell */}
+              {/* Rectus Femoris Center Belly */}
               <path
-                d="M116 282 C124 282 129 298 129 344 C129 378 123 400 117 410 C112 404 112 384 114 350 C114 320 115 298 116 282 Z"
+                d="M109 278 C117 278 124 288 125 318 C125 352 121 388 114 414 C106 414 101 404 102 368 C102 332 104 298 109 278 Z"
+                fill={getHeatFill('quads')}
+                opacity={getOpacity('quads')}
+                stroke={getStroke('quads')}
+                strokeWidth={getStrokeWidth('quads')}
+              />
+              {/* Upper Adductor / Sartorius Hip Bridge */}
+              <path
+                d="M122 280 C128 282 133 288 133 302 C133 318 130 342 126 364 C124 342 124 310 122 280 Z"
                 fill={getHeatFill('quads')}
                 opacity={getOpacity('quads')}
                 stroke={getStroke('quads')}
@@ -503,7 +511,7 @@ export default function RealisticAnatomyMap({
               />
               {/* Vastus Medialis Teardrop */}
               <path
-                d="M126 364 C134 374 135 394 131 412 C126 416 121 414 119 410 C121 396 123 378 126 364 Z"
+                d="M125 328 C131 344 133 376 128 408 C124 415 117 415 115 411 C118 392 122 360 125 328 Z"
                 fill={getHeatFill('quads')}
                 opacity={getOpacity('quads')}
                 stroke={getStroke('quads')}
@@ -513,15 +521,23 @@ export default function RealisticAnatomyMap({
               {/* Right Quad Group */}
               {/* Vastus Lateralis Outer Sweep */}
               <path
-                d="M155 282 C172 306 176 348 169 394 C162 396 158 378 156 350 C156 322 155 296 155 282 Z"
+                d="M162 278 C172 275 179 281 185 296 C196 324 196 360 188 394 C185 405 180 411 174 411 C170 404 169 382 169 354 C169 322 166 294 162 278 Z"
                 fill={getHeatFill('quads')}
                 opacity={getOpacity('quads')}
                 stroke={getStroke('quads')}
                 strokeWidth={getStrokeWidth('quads')}
               />
-              {/* Rectus Femoris Center Bell */}
+              {/* Rectus Femoris Center Belly */}
               <path
-                d="M154 282 C146 282 141 298 141 344 C141 378 147 400 153 410 C158 404 158 384 156 350 C156 320 155 298 154 282 Z"
+                d="M161 278 C153 278 146 288 145 318 C145 352 149 388 156 414 C164 414 169 404 168 368 C168 332 166 298 161 278 Z"
+                fill={getHeatFill('quads')}
+                opacity={getOpacity('quads')}
+                stroke={getStroke('quads')}
+                strokeWidth={getStrokeWidth('quads')}
+              />
+              {/* Upper Adductor / Sartorius Hip Bridge */}
+              <path
+                d="M148 280 C142 282 137 288 137 302 C137 318 140 342 144 364 C146 342 146 310 148 280 Z"
                 fill={getHeatFill('quads')}
                 opacity={getOpacity('quads')}
                 stroke={getStroke('quads')}
@@ -529,7 +545,7 @@ export default function RealisticAnatomyMap({
               />
               {/* Vastus Medialis Teardrop */}
               <path
-                d="M144 364 C136 374 135 394 139 412 C144 416 149 414 151 410 C149 396 147 378 144 364 Z"
+                d="M145 328 C139 344 137 376 142 408 C146 415 153 415 155 411 C152 392 148 360 145 328 Z"
                 fill={getHeatFill('quads')}
                 opacity={getOpacity('quads')}
                 stroke={getStroke('quads')}
@@ -538,10 +554,10 @@ export default function RealisticAnatomyMap({
             </g>
 
             {/* Patellar Knees */}
-            <circle cx="118" cy="418" r="4" fill="#1e293b" stroke="#475569" strokeWidth="0.8" />
-            <circle cx="152" cy="418" r="4" fill="#1e293b" stroke="#475569" strokeWidth="0.8" />
+            <circle cx="107" cy="420" r="5.5" fill="#1e293b" stroke="#475569" strokeWidth="0.9" />
+            <circle cx="163" cy="420" r="5.5" fill="#1e293b" stroke="#475569" strokeWidth="0.9" />
 
-            {/* CALVES (Tibialis Anterior & Extensors) */}
+            {/* CALVES (Proportional Gastrocnemius Sweep, Tibialis Anterior & Ankles) */}
             <g
               onMouseEnter={() => setHoveredMuscle('calves')}
               onMouseLeave={() => setHoveredMuscle(null)}
@@ -550,7 +566,7 @@ export default function RealisticAnatomyMap({
             >
               {/* Left Calf / Shin */}
               <path
-                d="M108 424 C98 448 100 482 110 514 C116 514 121 494 122 468 C122 450 115 430 108 424 Z"
+                d="M97 426 C85 446 84 474 96 518 C100 521 108 521 112 518 C119 490 123 462 121 440 C120 431 115 426 107 425 Z"
                 fill={getHeatFill('calves')}
                 opacity={getOpacity('calves')}
                 stroke={getStroke('calves')}
@@ -558,7 +574,7 @@ export default function RealisticAnatomyMap({
               />
               {/* Right Calf / Shin */}
               <path
-                d="M162 424 C172 448 170 482 160 514 C154 514 149 494 148 468 C148 450 155 430 162 424 Z"
+                d="M173 426 C185 446 186 474 174 518 C170 521 162 521 158 518 C151 490 147 462 149 440 C150 431 155 426 163 425 Z"
                 fill={getHeatFill('calves')}
                 opacity={getOpacity('calves')}
                 stroke={getStroke('calves')}
@@ -567,8 +583,8 @@ export default function RealisticAnatomyMap({
             </g>
 
             {/* Feet Accents */}
-            <ellipse cx="112" cy="528" rx="6.5" ry="3.5" fill="#1e293b" stroke="#475569" strokeWidth="0.8" />
-            <ellipse cx="158" cy="528" rx="6.5" ry="3.5" fill="#1e293b" stroke="#475569" strokeWidth="0.8" />
+            <ellipse cx="105" cy="532" rx="11" ry="4.5" fill="#1e293b" stroke="#475569" strokeWidth="0.9" />
+            <ellipse cx="165" cy="532" rx="11" ry="4.5" fill="#1e293b" stroke="#475569" strokeWidth="0.9" />
           </g>
 
           {/* ════════════════════════════════════════════════════════════════════════
@@ -755,16 +771,16 @@ export default function RealisticAnatomyMap({
               <path d="M216 288 L220 300 C222 314 218 330 216 330 C214 330 210 314 212 300 Z" fill="#1e293b" opacity="0.65" />
             </g>
 
-            {/* GLUTEUS MAXIMUS & HAMSTRINGS (Sculpted Glute Shelf & Posterior Thighs) */}
+            {/* GLUTEUS MAXIMUS & HAMSTRINGS (Proportional Glute Shelf & Full Posterior Thighs) */}
             <g
               onMouseEnter={() => setHoveredMuscle('hamstrings_glutes')}
               onMouseLeave={() => setHoveredMuscle(null)}
               onClick={() => onSelectMuscle('hamstrings_glutes')}
               className="cursor-pointer transition-all hover:brightness-125"
             >
-              {/* Left Gluteus Maximus (Compact Athletic Shelf) */}
+              {/* Left Gluteus Maximus */}
               <path
-                d="M133 280 C116 280 108 288 108 308 C108 326 120 336 132 335 C134 335 134 315 133 280 Z"
+                d="M133 278 C118 274 102 273 94 282 C84 294 82 316 90 332 C102 340 120 340 132 336 C134 334 134 308 133 278 Z"
                 fill={getHeatFill('hamstrings_glutes')}
                 opacity={getOpacity('hamstrings_glutes')}
                 stroke={getStroke('hamstrings_glutes')}
@@ -772,24 +788,39 @@ export default function RealisticAnatomyMap({
               />
               {/* Right Gluteus Maximus */}
               <path
-                d="M137 280 C154 280 162 288 162 308 C162 326 150 336 138 335 C136 335 136 315 137 280 Z"
+                d="M137 278 C152 274 168 273 176 282 C186 294 188 316 180 332 C168 340 150 340 138 336 C136 334 136 308 137 278 Z"
                 fill={getHeatFill('hamstrings_glutes')}
                 opacity={getOpacity('hamstrings_glutes')}
                 stroke={getStroke('hamstrings_glutes')}
                 strokeWidth={getStrokeWidth('hamstrings_glutes')}
               />
 
-              {/* Left Hamstrings (Biceps Femoris & Semitendinosus) */}
+              {/* Left Hamstrings (Lateral Biceps Femoris + Medial Semitendinosus) */}
               <path
-                d="M109 336 C99 354 98 384 104 414 C112 416 118 398 120 368 C120 350 115 338 109 336 Z"
+                d="M90 332 C77 350 75 382 86 414 C94 417 104 414 106 396 C108 370 105 344 100 336 Z"
                 fill={getHeatFill('hamstrings_glutes')}
                 opacity={getOpacity('hamstrings_glutes')}
                 stroke={getStroke('hamstrings_glutes')}
                 strokeWidth={getStrokeWidth('hamstrings_glutes')}
               />
-              {/* Right Hamstrings (Biceps Femoris & Semitendinosus) */}
               <path
-                d="M161 336 C171 354 172 384 166 414 C158 416 152 398 150 368 C150 350 155 338 161 336 Z"
+                d="M102 337 C106 364 106 394 104 415 C115 416 124 410 127 386 C131 360 132 340 131 336 C120 340 109 340 102 337 Z"
+                fill={getHeatFill('hamstrings_glutes')}
+                opacity={getOpacity('hamstrings_glutes')}
+                stroke={getStroke('hamstrings_glutes')}
+                strokeWidth={getStrokeWidth('hamstrings_glutes')}
+              />
+
+              {/* Right Hamstrings (Lateral Biceps Femoris + Medial Semitendinosus) */}
+              <path
+                d="M180 332 C193 350 195 382 184 414 C176 417 166 414 164 396 C162 370 165 344 170 336 Z"
+                fill={getHeatFill('hamstrings_glutes')}
+                opacity={getOpacity('hamstrings_glutes')}
+                stroke={getStroke('hamstrings_glutes')}
+                strokeWidth={getStrokeWidth('hamstrings_glutes')}
+              />
+              <path
+                d="M168 337 C164 364 164 394 166 415 C155 416 146 410 143 386 C139 360 138 340 139 336 C150 340 161 340 168 337 Z"
                 fill={getHeatFill('hamstrings_glutes')}
                 opacity={getOpacity('hamstrings_glutes')}
                 stroke={getStroke('hamstrings_glutes')}
@@ -798,41 +829,58 @@ export default function RealisticAnatomyMap({
             </g>
 
             {/* Back of Knee Fossa */}
-            <circle cx="110" cy="420" r="3.5" fill="#1e293b" opacity="0.6" />
-            <circle cx="160" cy="420" r="3.5" fill="#1e293b" opacity="0.6" />
+            <circle cx="105" cy="420" r="4.5" fill="#1e293b" opacity="0.6" />
+            <circle cx="165" cy="420" r="4.5" fill="#1e293b" opacity="0.6" />
 
-            {/* CALVES (Diamond Gastrocnemius Heads & Achilles Tendon) */}
+            {/* CALVES (Proportional Diamond Gastrocnemius Heads & Achilles Tendon) */}
             <g
               onMouseEnter={() => setHoveredMuscle('calves')}
               onMouseLeave={() => setHoveredMuscle(null)}
               onClick={() => onSelectMuscle('calves')}
               className="cursor-pointer transition-all hover:brightness-125"
             >
-              {/* Left Calf (Medial & Lateral Heads) */}
+              {/* Left Calf (Lateral & Medial Heads) */}
               <path
-                d="M96 426 C84 446 84 472 96 488 C100 488 106 486 110 478 C114 462 114 442 104 426 Z"
+                d="M96 426 C84 446 84 474 96 496 C101 496 104 490 105 476 C105 456 104 438 102 426 Z"
                 fill={getHeatFill('calves')}
                 opacity={getOpacity('calves')}
                 stroke={getStroke('calves')}
                 strokeWidth={getStrokeWidth('calves')}
               />
-              {/* Right Calf (Medial & Lateral Heads) */}
               <path
-                d="M174 426 C186 446 186 472 174 488 C170 488 164 486 160 478 C156 462 156 442 166 426 Z"
+                d="M105 426 C105 446 105 474 106 494 C112 496 119 488 122 472 C124 452 120 434 112 426 Z"
                 fill={getHeatFill('calves')}
                 opacity={getOpacity('calves')}
                 stroke={getStroke('calves')}
                 strokeWidth={getStrokeWidth('calves')}
               />
 
-              {/* Achilles Tendon Columns */}
-              <line x1="104" y1="488" x2="104" y2="524" stroke="#475569" strokeWidth="1.6" opacity="0.65" />
-              <line x1="166" y1="488" x2="166" y2="524" stroke="#475569" strokeWidth="1.6" opacity="0.65" />
+              {/* Right Calf (Lateral & Medial Heads) */}
+              <path
+                d="M174 426 C186 446 186 474 174 496 C169 496 166 490 165 476 C165 456 166 438 168 426 Z"
+                fill={getHeatFill('calves')}
+                opacity={getOpacity('calves')}
+                stroke={getStroke('calves')}
+                strokeWidth={getStrokeWidth('calves')}
+              />
+              <path
+                d="M165 426 C165 446 165 474 164 494 C158 496 151 488 148 472 C146 452 150 434 158 426 Z"
+                fill={getHeatFill('calves')}
+                opacity={getOpacity('calves')}
+                stroke={getStroke('calves')}
+                strokeWidth={getStrokeWidth('calves')}
+              />
+
+              {/* Lower Soleus & Achilles Tendon Columns */}
+              <path d="M97 495 L100 524 L110 524 L113 495 Z" fill="#1e293b" stroke="#475569" strokeWidth="0.7" opacity="0.7" />
+              <path d="M173 495 L170 524 L160 524 L157 495 Z" fill="#1e293b" stroke="#475569" strokeWidth="0.7" opacity="0.7" />
+              <line x1="105" y1="490" x2="105" y2="525" stroke="#475569" strokeWidth="1.8" opacity="0.75" />
+              <line x1="165" y1="490" x2="165" y2="525" stroke="#475569" strokeWidth="1.8" opacity="0.75" />
             </g>
 
             {/* Calcaneus (Heel) Accents */}
-            <ellipse cx="104" cy="530" rx="7" ry="4" fill="#1e293b" stroke="#475569" strokeWidth="0.8" />
-            <ellipse cx="166" cy="530" rx="7" ry="4" fill="#1e293b" stroke="#475569" strokeWidth="0.8" />
+            <ellipse cx="105" cy="532" rx="10" ry="5" fill="#1e293b" stroke="#475569" strokeWidth="0.9" />
+            <ellipse cx="165" cy="532" rx="10" ry="5" fill="#1e293b" stroke="#475569" strokeWidth="0.9" />
           </g>
 
           {/* Striation Texture Overlay */}
