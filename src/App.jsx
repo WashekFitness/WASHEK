@@ -42,6 +42,8 @@ import ProgramDay from '@/pages/ProgramDay';
 import LiveWorkout from '@/pages/LiveWorkout';
 import SubscriptionReturn from '@/pages/SubscriptionReturn';
 
+import { supabase } from '@/lib/supabase';
+import { resolveValidSupabaseSession } from '@/lib/stripeCheckout';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { applySubscriptionUpgrade, normalizePlan } from '@/lib/subscription';
 import { toast } from 'sonner';
@@ -93,9 +95,10 @@ function SubscriptionWatcher() {
       }
     };
 
-    // Strip any ?subscribed= / ?plan= query parameters without trusting client URL params to grant upgrades
+    // Strip any ?subscribed= / ?plan= query parameters on non-return routes without trusting URL params
+    const isReturnRoute = location.pathname.startsWith('/subscription');
     const params = new URLSearchParams(location.search);
-    if (params.has('subscribed') || params.has('plan') || params.has('sub_status')) {
+    if (!isReturnRoute && (params.has('subscribed') || params.has('plan') || params.has('sub_status'))) {
       const hasSubHint = params.has('subscribed');
       params.delete('subscribed');
       params.delete('plan');
@@ -108,10 +111,93 @@ function SubscriptionWatcher() {
       }
     }
 
+    const handleOpenerCheckoutReturn = async (sourceWindow) => {
+      try {
+        let uid = null;
+        try {
+          const validSession = await resolveValidSupabaseSession(false);
+          uid = validSession?.user?.id || null;
+        } catch {
+          const { data: sessionData } = await supabase.auth.getSession();
+          uid = sessionData?.session?.user?.id || null;
+        }
+
+        if (!uid) {
+          sourceWindow?.postMessage(
+            { type: 'WASHEK_CHECKOUT_NOT_CONFIRMED' },
+            window.location.origin
+          );
+          return;
+        }
+
+        let confirmedPlan = 'free';
+        let confirmedStatus = 'inactive';
+
+        for (let attempt = 0; attempt < 25; attempt++) {
+          try {
+            const { data: dbProf, error: profErr } = await supabase
+              .from('profiles')
+              .select('subscription_plan, subscription_status')
+              .eq('id', uid)
+              .maybeSingle();
+
+            if (!profErr && dbProf) {
+              const dbPlan = normalizePlan(dbProf.subscription_plan);
+              const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
+              if (dbPlan !== 'free' && ['active', 'trialing', 'past_due'].includes(dbStatus)) {
+                confirmedPlan = dbPlan;
+                confirmedStatus = dbStatus;
+                break;
+              }
+            }
+          } catch {
+            // continue polling
+          }
+
+          if (attempt < 24) {
+            await new Promise((r) => window.setTimeout(r, 900));
+          }
+        }
+
+        if (confirmedPlan !== 'free' && ['active', 'trialing', 'past_due'].includes(confirmedStatus)) {
+          applySubscriptionUpgrade(confirmedPlan, confirmedStatus, { syncServer: false });
+          queryClientInstance.invalidateQueries();
+          await checkUserAuth?.().catch(() => {});
+
+          const now = Date.now();
+          if (now - lastAppliedRef.current > 2000) {
+            lastAppliedRef.current = now;
+            toast.success(
+              `Payment confirmed! You are now upgraded to the ${confirmedPlan.charAt(0).toUpperCase() + confirmedPlan.slice(1)} plan.`
+            );
+          }
+
+          sourceWindow?.postMessage(
+            {
+              type: 'WASHEK_CHECKOUT_CONFIRMED',
+              plan: confirmedPlan,
+              status: confirmedStatus,
+            },
+            window.location.origin
+          );
+          return;
+        }
+      } catch {
+        // fall through to not confirmed
+      }
+
+      sourceWindow?.postMessage(
+        { type: 'WASHEK_CHECKOUT_NOT_CONFIRMED' },
+        window.location.origin
+      );
+    };
+
     // Listen for cross-tab checkout return notifications and verify authoritatively against DB
     const onWindowMsg = (e) => {
       if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS') {
         verifyAndSyncFromServer(true);
+      } else if (e.data?.type === 'WASHEK_CHECKOUT_RETURN' && e.origin === window.location.origin) {
+        handleOpenerCheckoutReturn(e.source);
       }
     };
     window.addEventListener('message', onWindowMsg);

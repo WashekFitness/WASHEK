@@ -5,5 +5,12 @@
   "verify_1794589346063@gmail.com",
   "verify2_1794589410988@gmail.com",
   "canceltest_1794592440088@gmail.com",
-  "verify_cancel_1794592769669@example.com"
+  "verify_cancel_1794592769669@example.com",
+  "test_checkout_1794660595198@example.com",
+  "test_diag_1794660626649@example.com",
+  "test_redir_1794660698869@example.com",
+  "test_hdr_1794660722936@example.com",
+  "test_flow_1794660797342@example.com",
+  "test_verify_1794660974950@example.com",
+  "e2e_auth_fix_1794672036105@gmail.com"
 ]

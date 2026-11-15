@@ -8,11 +8,14 @@ import {
   Loader2,
   XCircle,
   ShieldCheck,
+  Lock,
+  Mail,
+  KeyRound,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 
 import { supabase } from '@/lib/supabase';
 import {
@@ -22,7 +25,6 @@ import {
 } from '@/lib/subscription';
 import {
   createStripeCheckout,
-  buildPaymentLinkUrl,
   resolveValidSupabaseSession,
   extractInvokeErrorMessage,
 } from '@/lib/stripeCheckout';
@@ -55,7 +57,6 @@ const plans = [
     planKey: 'progress',
     price: '$9.99',
     period: '/mo',
-    paymentUrl: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
     icon: Flame,
     color: 'text-emerald-400',
     borderColor: 'border-emerald-500/40 hover:border-emerald-500/70',
@@ -79,7 +80,6 @@ const plans = [
     planKey: 'performance',
     price: '$17.99',
     period: '/mo',
-    paymentUrl: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
     icon: Zap,
     color: 'text-primary',
     borderColor: 'border-primary/60 hover:border-primary/90',
@@ -105,7 +105,6 @@ const plans = [
     planKey: 'elite',
     price: '$34.99',
     period: '/mo',
-    paymentUrl: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
     icon: Crown,
     color: 'text-amber-400',
     borderColor: 'border-amber-500/50 hover:border-amber-500/80',
@@ -166,7 +165,7 @@ function isActiveStatus(status) {
 }
 
 export default function PricingSection({ onPlanChange, currentPlanProp }) {
-  const { user, checkUserAuth, logout } = useAuth();
+  const { user, checkUserAuth, logout, syncSupabaseSession } = useAuth();
   const onPlanChangeRef = useRef(onPlanChange);
   useEffect(() => {
     onPlanChangeRef.current = onPlanChange;
@@ -225,6 +224,14 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   const [error, setError] = useState('');
   const [cardError, setCardError] = useState(null); // { planKey, message, needsReauth }
   const [blockedCheckout, setBlockedCheckout] = useState(null); // { planKey, planName, url }
+  const [billingSyncModal, setBillingSyncModal] = useState(null); // { mode: 'checkout' | 'cancel', plan?, email }
+  const [billingSyncStep, setBillingSyncStep] = useState('password'); // 'password' | 'otp'
+  const [billingPassword, setBillingPassword] = useState('');
+  const [billingOtpSent, setBillingOtpSent] = useState(false);
+  const [billingOtpCode, setBillingOtpCode] = useState('');
+  const [billingNewPassword, setBillingNewPassword] = useState('');
+  const [billingSyncBusy, setBillingSyncBusy] = useState(false);
+  const [billingSyncError, setBillingSyncError] = useState('');
   const [loadingSubscription, setLoadingSubscription] = useState(true);
   const checkoutPollTimerRef = useRef(null);
   const lastSyncEventRef = useRef(0);
@@ -414,6 +421,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
 
         applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
+        setBlockedCheckout(null);
         setCurrentPlan(dbPlan);
         onPlanChangeRef.current?.(dbPlan);
         await checkUserAuth?.().catch(() => {});
@@ -516,7 +524,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       }
       try {
         const { data: sessionData } = await supabase.auth.getSession();
-        const uid = sessionData?.session?.user?.id;
+        const uid = sessionData?.session?.user?.id || user?.id;
         if (!uid) return;
         const { data: profile } = await supabase
           .from('profiles')
@@ -525,11 +533,12 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           .maybeSingle();
 
         const dbPlan = normalizePlan(profile?.subscription_plan);
-        const dbStatus = String(profile?.subscription_status || '').toLowerCase();
+        const dbStatus = String(profile?.subscription_status || '').toLowerCase().trim();
         if (dbPlan === expectedPlan && isActiveStatus(dbStatus)) {
           clearInterval(checkoutPollTimerRef.current);
           checkoutPollTimerRef.current = null;
           applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
+          setBlockedCheckout(null);
           setCurrentPlan(dbPlan);
           onPlanChangeRef.current?.(dbPlan);
           checkUserAuth?.().catch(() => {});
@@ -540,7 +549,68 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         // ignore transient poll errors
       }
     }, 2500);
-  }, [checkUserAuth, loadSubscription]);
+  }, [checkUserAuth, loadSubscription, user?.id]);
+
+  const openCheckoutTab = useCallback((destinationUrl, plan, reservedWin) => {
+    startPostCheckoutPolling(plan.planKey);
+
+    let tabOpened = false;
+    if (reservedWin && !reservedWin.closed) {
+      try {
+        reservedWin.location.href = destinationUrl;
+        tabOpened = true;
+      } catch {
+        tabOpened = false;
+      }
+    }
+
+    if (!tabOpened) {
+      try {
+        const win = window.open(destinationUrl, '_blank');
+        if (win && !win.closed && typeof win.closed !== 'undefined') {
+          tabOpened = true;
+        }
+      } catch {
+        // window.open blocked
+      }
+    }
+
+    if (!tabOpened) {
+      const inIframe = (() => {
+        try {
+          return window.self !== window.top;
+        } catch {
+          return true;
+        }
+      })();
+
+      if (!inIframe) {
+        window.location.assign(destinationUrl);
+        return true;
+      }
+
+      setBlockedCheckout({
+        planKey: plan.planKey,
+        planName: plan.name,
+        url: destinationUrl,
+      });
+      toast.info(`Click "Continue to ${plan.name} Checkout" below to open Stripe.`);
+      return true;
+    }
+
+    toast.info(`Stripe Checkout opened in new tab. Complete checkout to unlock ${plan.name}.`);
+    return true;
+  }, [startPostCheckoutPolling]);
+
+  const openBillingSyncModalFor = useCallback((mode, email, plan = null) => {
+    setBillingSyncStep('password');
+    setBillingPassword('');
+    setBillingOtpSent(false);
+    setBillingOtpCode('');
+    setBillingNewPassword('');
+    setBillingSyncError('');
+    setBillingSyncModal({ mode, email, plan });
+  }, []);
 
   const handleCheckout = async (plan) => {
     if (!plan?.planKey || loadingPlan) {
@@ -612,6 +682,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       let destinationUrl = null;
       let checkoutErrorMessage = '';
       let needsReauth = false;
+      let needsBillingSync = false;
 
       // 1. Primary: create real Stripe Checkout Session via Supabase Edge Function
       try {
@@ -635,55 +706,62 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       } catch (edgeErr) {
         checkoutErrorMessage = edgeErr?.message || '';
-        if (edgeErr?.code === 'AUTH_SESSION_EXPIRED') {
+        if (edgeErr?.code === 'BILLING_SYNC_REQUIRED') {
+          needsBillingSync = true;
+        } else if (edgeErr?.code === 'AUTH_SESSION_EXPIRED') {
           needsReauth = true;
         }
         console.warn('[PricingSection] createStripeCheckout note:', checkoutErrorMessage || edgeErr);
       }
 
-      // 1b. If JWT wasn't ready yet, re-hydrate auth state once and retry createStripeCheckout
-      if (!destinationUrl && needsReauth && userEmail) {
-        try {
-          await checkUserAuth?.().catch(() => {});
-          const { data: refreshedSessionData } = await supabase.auth.getSession();
-          const candidateToken = refreshedSessionData?.session?.access_token || '';
-          if (candidateToken && !candidateToken.startsWith('vault_tok_') && candidateToken.split('.').length === 3) {
-            const retryResult = await createStripeCheckout(plan.planKey);
-            if (retryResult?.url) {
-              destinationUrl = retryResult.url;
-              needsReauth = false;
-              checkoutErrorMessage = '';
-            }
-          }
-        } catch (retryErr) {
-          console.debug('[PricingSection] Session retry checkout note:', retryErr?.message || retryErr);
-        }
-      }
-
-      // 2. Fallback: Express checkout endpoint passing fresh Supabase session token
+      // 2. Fallback: Express checkout endpoint (also runs server JWKS/HMAC vault session recovery automatically)
       if (!destinationUrl) {
         try {
-          const { data: sessionData } = await supabase.auth.getSession();
-          const freshToken =
-            sessionData?.session?.access_token ||
-            localStorage.getItem('washek_auth_token') ||
-            '';
-          if (freshToken && !freshToken.startsWith('vault_tok_') && !freshToken.startsWith('washek_sess_') && freshToken.split('.').length === 3) {
+          let freshToken = '';
+          let sessionUserId = userId;
+          let sessionUserEmail = userEmail;
+          try {
+            const validSession = await resolveValidSupabaseSession(false);
+            freshToken = validSession?.access_token || '';
+            sessionUserId = validSession?.user?.id || userId;
+            sessionUserEmail = validSession?.user?.email || userEmail;
+          } catch {
+            const { data: sessionData } = await supabase.auth.getSession();
+            freshToken =
+              sessionData?.session?.access_token ||
+              localStorage.getItem('washek_auth_token') ||
+              '';
+            sessionUserId = sessionData?.session?.user?.id || userId;
+            sessionUserEmail = sessionData?.session?.user?.email || userEmail;
+          }
+
+          const refreshTok = localStorage.getItem('washek_refresh_token') || '';
+          const srvTok = localStorage.getItem('washek_srv_session') || '';
+
+          if (freshToken || srvTok || sessionUserEmail) {
             const sessionRes = await fetch('/api/create-checkout-session', {
               method: 'POST',
+              credentials: 'include',
               headers: {
                 'Content-Type': 'application/json',
-                Authorization: `Bearer ${freshToken}`,
+                ...(freshToken ? { Authorization: `Bearer ${freshToken}` } : {}),
+                ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
               },
               body: JSON.stringify({
                 plan: plan.planKey,
-                userId: sessionData?.session?.user?.id || userId,
-                email: sessionData?.session?.user?.email || userEmail,
+                userId: sessionUserId,
+                email: sessionUserEmail,
                 returnUrl: window.location.origin,
                 hasUsedTrial,
+                refreshToken: refreshTok || undefined,
               }),
             });
             const sessionDataJson = await sessionRes.json().catch(() => null);
+
+            if (sessionDataJson?.refreshedSession?.access_token) {
+              await syncSupabaseSession?.(sessionDataJson.refreshedSession).catch(() => {});
+            }
+
             if (
               sessionRes.ok &&
               (
@@ -704,10 +782,19 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
             if (sessionRes.ok && sessionDataJson?.url) {
               destinationUrl = sessionDataJson.url;
               needsReauth = false;
+              needsBillingSync = false;
+            } else if (
+              sessionRes.status === 409 ||
+              sessionDataJson?.code === 'VAULT_SUPABASE_SYNC_NEEDED' ||
+              sessionDataJson?.needsBillingPasswordSync
+            ) {
+              needsBillingSync = true;
+              needsReauth = false;
             } else if (sessionDataJson?.error) {
               checkoutErrorMessage = sessionDataJson.error;
               if (sessionRes.status === 401 || sessionDataJson?.code === 'AUTH_SESSION_EXPIRED') {
-                needsReauth = true;
+                if (sessionUserEmail) needsBillingSync = true;
+                else needsReauth = true;
               }
             }
           }
@@ -716,80 +803,23 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       }
 
-      // 3. Fallback for active authenticated app sessions (e.g. credential vault) without a Supabase JWT:
-      // never show a false "session timed out" error when the athlete is actively signed in.
-      if (!destinationUrl && userEmail) {
-        const paymentLinkUrl =
-          buildPaymentLinkUrl(plan.planKey, { userId, email: userEmail }) ||
-          plan.paymentUrl;
-        if (paymentLinkUrl) {
-          destinationUrl = paymentLinkUrl;
-          needsReauth = false;
-        }
+      if (!destinationUrl && (needsBillingSync || (needsReauth && userEmail)) && userEmail) {
+        closeReservedWindow();
+        openBillingSyncModalFor('checkout', userEmail, plan);
+        return;
       }
 
       if (!destinationUrl) {
         closeReservedWindow();
         const err = new Error(
           checkoutErrorMessage ||
-            (userEmail
-              ? 'Unable to connect to Stripe Checkout right now. Please try again.'
-              : 'Please sign in to upgrade your plan.')
+            'Please sign in to connect your account with Stripe Checkout.'
         );
-        if (!userEmail && needsReauth) err.code = 'AUTH_SESSION_EXPIRED';
+        if (needsReauth || !userEmail) err.code = 'AUTH_SESSION_EXPIRED';
         throw err;
       }
 
-      // Start watching DB/events for checkout completion
-      startPostCheckoutPolling(plan.planKey);
-
-      // 3. Navigate the synchronously reserved tab, or fall back to direct navigation / user-clickable link
-      let tabOpened = false;
-      if (checkoutWin && !checkoutWin.closed) {
-        try {
-          checkoutWin.location.href = destinationUrl;
-          tabOpened = true;
-        } catch {
-          tabOpened = false;
-        }
-      }
-
-      if (!tabOpened) {
-        try {
-          const win = window.open(destinationUrl, '_blank');
-          if (win && !win.closed && typeof win.closed !== 'undefined') {
-            tabOpened = true;
-          }
-        } catch {
-          // window.open blocked
-        }
-      }
-
-      if (!tabOpened) {
-        const inIframe = (() => {
-          try {
-            return window.self !== window.top;
-          } catch {
-            return true;
-          }
-        })();
-
-        if (!inIframe) {
-          window.location.assign(destinationUrl);
-          return;
-        }
-
-        // If inside an iframe and browser blocked popups, show a native <a> button inside this plan card
-        setBlockedCheckout({
-          planKey: plan.planKey,
-          planName: plan.name,
-          url: destinationUrl,
-        });
-        toast.info(`Click "Continue to ${plan.name} Checkout" below to open Stripe.`);
-        return;
-      }
-
-      toast.info(`Stripe Checkout opened in new tab. Complete checkout to unlock ${plan.name}.`);
+      openCheckoutTab(destinationUrl, plan, checkoutWin);
     } catch (checkoutError) {
       closeReservedWindow();
       const isAuthErr = checkoutError?.code === 'AUTH_SESSION_EXPIRED';
@@ -819,10 +849,23 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       let session = null;
       try {
         session = await resolveValidSupabaseSession(false);
-      } catch {
-        // Retry auth hydration once before failing
+      } catch (sessionErr) {
+        if (sessionErr?.code === 'BILLING_SYNC_REQUIRED' && (user?.email || storedUser?.email)) {
+          setCancelling(false);
+          openBillingSyncModalFor('cancel', user?.email || storedUser?.email);
+          return;
+        }
         await checkUserAuth?.().catch(() => {});
-        session = await resolveValidSupabaseSession(true);
+        try {
+          session = await resolveValidSupabaseSession(true);
+        } catch (retryErr) {
+          if (retryErr?.code === 'BILLING_SYNC_REQUIRED' && (user?.email || storedUser?.email)) {
+            setCancelling(false);
+            openBillingSyncModalFor('cancel', user?.email || storedUser?.email);
+            return;
+          }
+          throw retryErr;
+        }
       }
 
       const currentUserId = session?.user?.id || user?.id || storedUser?.id || null;
@@ -936,6 +979,195 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       setError(errMsg);
       toast.error(errMsg);
       setCancelling(false);
+    }
+  };
+
+  const finishAfterBillingSync = async (reservedWin) => {
+    const targetMode = billingSyncModal?.mode;
+    const targetPlan = billingSyncModal?.plan;
+    setBillingSyncModal(null);
+
+    if (targetMode === 'cancel') {
+      if (reservedWin && !reservedWin.closed) {
+        try {
+          reservedWin.close();
+        } catch {
+          // ignore
+        }
+      }
+      await executeCancel();
+      return;
+    }
+
+    if (targetPlan) {
+      try {
+        const result = await createStripeCheckout(targetPlan.planKey);
+        if (
+          result?.action === 'already_active' ||
+          result?.action === 'already_current' ||
+          result?.action === 'changed'
+        ) {
+          if (reservedWin && !reservedWin.closed) {
+            try {
+              reservedWin.close();
+            } catch {
+              // ignore
+            }
+          }
+          applySubscriptionUpgrade(targetPlan.planKey, 'active', { syncServer: false });
+          setCurrentPlan(targetPlan.planKey);
+          onPlanChangeRef.current?.(targetPlan.planKey);
+          await checkUserAuth?.().catch(() => {});
+          await loadSubscription();
+          toast.success(`Your ${targetPlan.name} subscription is active and synced!`);
+          return;
+        }
+        if (result?.url) {
+          openCheckoutTab(result.url, targetPlan, reservedWin);
+          return;
+        }
+      } catch (err) {
+        if (reservedWin && !reservedWin.closed) {
+          try {
+            reservedWin.close();
+          } catch {
+            // ignore
+          }
+        }
+        toast.error(err?.message || 'Unable to launch Stripe Checkout.');
+      }
+    }
+  };
+
+  const handleBillingPasswordSubmit = async (e) => {
+    e.preventDefault();
+    if (!billingSyncModal?.email || !billingPassword || billingSyncBusy) return;
+
+    setBillingSyncBusy(true);
+    setBillingSyncError('');
+
+    let reservedWin = null;
+    if (billingSyncModal.mode === 'checkout') {
+      try {
+        reservedWin = window.open('about:blank', '_blank');
+      } catch {
+        reservedWin = null;
+      }
+    }
+
+    try {
+      const res = await fetch('/api/auth/sync-supabase-session', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: billingSyncModal.email,
+          password: billingPassword,
+        }),
+      });
+      const data = await res.json().catch(() => null);
+      if (!res.ok || !data?.success || !data?.session?.access_token) {
+        throw new Error(
+          data?.error ||
+            'That password did not match your cloud billing password. Try your original password or verify with a 6-digit email code below.'
+        );
+      }
+
+      await syncSupabaseSession?.(data.session, data.profile || null, data.serverSessionToken || '');
+      await finishAfterBillingSync(reservedWin);
+    } catch (err) {
+      if (reservedWin && !reservedWin.closed) {
+        try {
+          reservedWin.close();
+        } catch {
+          // ignore
+        }
+      }
+      setBillingSyncError(err?.message || 'Unable to verify password.');
+    } finally {
+      setBillingSyncBusy(false);
+    }
+  };
+
+  const handleSendBillingOtp = async () => {
+    if (!billingSyncModal?.email || billingSyncBusy) return;
+    setBillingSyncBusy(true);
+    setBillingSyncError('');
+    try {
+      const { error: resetErr } = await supabase.auth.resetPasswordForEmail(billingSyncModal.email, {
+        redirectTo: `${window.location.origin}/profile`,
+      });
+      if (resetErr) throw resetErr;
+      setBillingOtpSent(true);
+      toast.success(`Verification email sent to ${billingSyncModal.email}. Enter the 6-digit code below.`);
+    } catch (err) {
+      setBillingSyncError(err?.message || 'Unable to send verification code email.');
+    } finally {
+      setBillingSyncBusy(false);
+    }
+  };
+
+  const handleVerifyBillingOtp = async (e) => {
+    e.preventDefault();
+    if (!billingSyncModal?.email || !billingOtpCode.trim() || billingNewPassword.length < 6 || billingSyncBusy) return;
+
+    setBillingSyncBusy(true);
+    setBillingSyncError('');
+
+    let reservedWin = null;
+    if (billingSyncModal.mode === 'checkout') {
+      try {
+        reservedWin = window.open('about:blank', '_blank');
+      } catch {
+        reservedWin = null;
+      }
+    }
+
+    try {
+      const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
+        email: billingSyncModal.email,
+        token: billingOtpCode.trim(),
+        type: 'recovery',
+      });
+      if (otpErr || !otpData?.session?.access_token) {
+        throw new Error(otpErr?.message || 'Invalid or expired 6-digit verification code.');
+      }
+
+      const { data: updatedUser, error: updErr } = await supabase.auth.updateUser({
+        password: billingNewPassword,
+      });
+      if (updErr) {
+        throw new Error(updErr.message || 'Unable to set updated password.');
+      }
+
+      const vaultSyncRes = await fetch('/api/auth/sync-vault-after-otp', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${otpData.session.access_token}`,
+        },
+        body: JSON.stringify({ newPassword: billingNewPassword }),
+      });
+      const vaultSyncData = await vaultSyncRes.json().catch(() => null);
+
+      const finalSession = {
+        ...otpData.session,
+        user: updatedUser?.user || otpData.session.user,
+      };
+      await syncSupabaseSession?.(finalSession, null, vaultSyncData?.serverSessionToken || '');
+      await finishAfterBillingSync(reservedWin);
+    } catch (err) {
+      if (reservedWin && !reservedWin.closed) {
+        try {
+          reservedWin.close();
+        } catch {
+          // ignore
+        }
+      }
+      setBillingSyncError(err?.message || 'Unable to verify email code.');
+    } finally {
+      setBillingSyncBusy(false);
     }
   };
 
@@ -1217,6 +1449,160 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       <p className="text-[10px] text-muted-foreground text-center">
         Cancel anytime. Billed monthly.
       </p>
+
+      {billingSyncModal && (
+        <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/75 backdrop-blur-sm px-4">
+          <div className="w-full max-w-md rounded-3xl border border-primary/35 bg-card p-6 shadow-2xl space-y-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div className="w-10 h-10 rounded-2xl bg-primary/15 border border-primary/30 flex items-center justify-center text-primary shrink-0">
+                  <Lock className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="font-heading font-bold text-base text-foreground">
+                    {billingSyncModal.mode === 'cancel'
+                      ? 'Confirm Password to Cancel Plan'
+                      : 'Authorize Stripe Checkout'}
+                  </h3>
+                  <p className="text-xs text-muted-foreground">
+                    Signed in as <span className="font-semibold text-foreground">{billingSyncModal.email}</span>
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setBillingSyncModal(null)}
+                disabled={billingSyncBusy}
+                className="text-xs text-muted-foreground hover:text-foreground"
+                aria-label="Close billing authorization"
+              >
+                ✕
+              </button>
+            </div>
+
+            <p className="text-xs text-muted-foreground leading-relaxed">
+              Your account is signed in locally, and Stripe Checkout needs to verify your cloud billing password once to connect your subscription.
+            </p>
+
+            {billingSyncError && (
+              <div className="rounded-xl border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+                {billingSyncError}
+              </div>
+            )}
+
+            {billingSyncStep === 'password' ? (
+              <form onSubmit={handleBillingPasswordSubmit} className="space-y-3">
+                <Input
+                  type="password"
+                  placeholder="Enter your cloud account password"
+                  value={billingPassword}
+                  onChange={(e) => setBillingPassword(e.target.value)}
+                  minLength={6}
+                  required
+                  autoFocus
+                  className="h-11 rounded-xl bg-background/60"
+                />
+                <Button
+                  type="submit"
+                  disabled={billingSyncBusy || !billingPassword}
+                  className="w-full h-11 rounded-xl font-heading font-semibold text-sm"
+                >
+                  {billingSyncBusy ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Verifying & Connecting…
+                    </>
+                  ) : billingSyncModal.mode === 'cancel' ? (
+                    'Verify & Cancel Subscription'
+                  ) : (
+                    `Verify & Open ${billingSyncModal.plan?.name || ''} Checkout`
+                  )}
+                </Button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBillingSyncStep('otp');
+                    setBillingSyncError('');
+                  }}
+                  className="w-full text-xs text-primary hover:underline text-center pt-1 font-medium"
+                >
+                  Used a local recovery password or forgot original password? Verify with email code
+                </button>
+              </form>
+            ) : (
+              <div className="space-y-3">
+                {!billingOtpSent ? (
+                  <div className="space-y-3">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      onClick={handleSendBillingOtp}
+                      disabled={billingSyncBusy}
+                      className="w-full h-11 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 border-primary/40"
+                    >
+                      {billingSyncBusy ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Mail className="h-4 w-4 text-primary" />
+                      )}
+                      <span>Send 6-Digit Verification Code to {billingSyncModal.email}</span>
+                    </Button>
+                  </div>
+                ) : (
+                  <form onSubmit={handleVerifyBillingOtp} className="space-y-3">
+                    <Input
+                      type="text"
+                      placeholder="6-digit verification code from email"
+                      value={billingOtpCode}
+                      onChange={(e) => setBillingOtpCode(e.target.value)}
+                      required
+                      autoFocus
+                      className="h-11 rounded-xl bg-background/60"
+                    />
+                    <Input
+                      type="password"
+                      placeholder="Set synced password (min 6 characters)"
+                      value={billingNewPassword}
+                      onChange={(e) => setBillingNewPassword(e.target.value)}
+                      minLength={6}
+                      required
+                      className="h-11 rounded-xl bg-background/60"
+                    />
+                    <Button
+                      type="submit"
+                      disabled={billingSyncBusy || !billingOtpCode.trim() || billingNewPassword.length < 6}
+                      className="w-full h-11 rounded-xl font-heading font-semibold text-sm flex items-center justify-center gap-2"
+                    >
+                      {billingSyncBusy ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          Syncing & Opening Stripe…
+                        </>
+                      ) : (
+                        <>
+                          <KeyRound className="h-4 w-4" />
+                          <span>Verify Code & Open Stripe Checkout</span>
+                        </>
+                      )}
+                    </Button>
+                  </form>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBillingSyncStep('password');
+                    setBillingSyncError('');
+                  }}
+                  className="w-full text-xs text-muted-foreground hover:text-foreground text-center pt-1"
+                >
+                  Back to password verification
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

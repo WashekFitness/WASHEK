@@ -71,111 +71,10 @@ export default function SubscriptionReturn() {
     let redirectTimer = null;
     let closeFallbackTimer = null;
 
-    const verifyPaymentWithDatabase = async () => {
-      clearRecentUpgradeGrace();
+    let openerCleanup = null;
 
-      // Hint label only while verifying (never used to grant access)
-      const hintedPlanRaw =
-        searchParams.get('plan') ||
-        searchParams.get('tier') ||
-        (() => {
-          try {
-            return (
-              sessionStorage.getItem('washek_pending_checkout_plan') ||
-              localStorage.getItem('washek_pending_checkout_plan') ||
-              ''
-            );
-          } catch {
-            return '';
-          }
-        })();
-      const hintedPlan = normalizePlan(hintedPlanRaw);
-      if (hintedPlan !== 'free') {
-        setPlanName(PLAN_LABELS[hintedPlan] || hintedPlan);
-      }
-
-      // Recover authenticated Supabase session before reading profiles
-      let authUser = null;
-      try {
-        const session = await resolveValidSupabaseSession(false);
-        authUser = session?.user || null;
-      } catch {
-        // Fallback if token recovery returned no user object directly
-      }
-
-      if (!authUser?.id) {
-        try {
-          const { data: sessionData } = await supabase.auth.getSession();
-          authUser = sessionData?.session?.user || null;
-          if (!authUser) {
-            const { data: authData } = await supabase.auth.getUser();
-            authUser = authData?.user || null;
-          }
-        } catch (authErr) {
-          console.debug('[SubscriptionReturn] Auth lookup note:', authErr);
-        }
-      }
-
-      if (!authUser?.id) {
-        if (cancelledRef.current) return;
-        clearPendingCheckoutArtifacts();
-        setStatus('error');
-        setErrorMessage(
-          'Please sign in to your WASHEK account so we can verify your Stripe payment status.'
-        );
-        return;
-      }
-
-      // Poll authoritative Supabase profiles table until Stripe webhook writes an active/trialing paid plan
-      let confirmedPlan = 'free';
-      let confirmedStatus = 'inactive';
-
-      for (let attempt = 0; attempt < 12; attempt++) {
-        if (cancelledRef.current) return;
-        try {
-          const { data: dbProf, error: profErr } = await supabase
-            .from('profiles')
-            .select('subscription_plan, subscription_status, stripe_subscription_id')
-            .eq('id', authUser.id)
-            .maybeSingle();
-
-          if (!profErr && dbProf) {
-            const dbPlan = normalizePlan(dbProf.subscription_plan);
-            const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
-            if (dbPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(dbStatus)) {
-              confirmedPlan = dbPlan;
-              confirmedStatus = dbStatus;
-              break;
-            }
-          }
-        } catch {
-          // continue polling
-        }
-
-        if (attempt < 11) {
-          await new Promise((r) => window.setTimeout(r, 1000));
-        }
-      }
-
+    const completeSuccessFlow = (confirmedPlan, confirmedStatus) => {
       if (cancelledRef.current) return;
-
-      clearPendingCheckoutArtifacts();
-
-      // Strict payment verification guard: do NOT upgrade unless Postgres profiles confirms paid active/trialing
-      if (confirmedPlan === 'free' || !ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
-        try {
-          localStorage.removeItem('washek_subscription_plan');
-          localStorage.setItem('washek_subscription_status', confirmedStatus || 'inactive');
-        } catch {
-          // ignore
-        }
-        setStatus('error');
-        setErrorMessage(
-          'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
-        );
-        return;
-      }
-
       const friendlyName =
         (PLAN_LABELS && PLAN_LABELS[confirmedPlan]) ||
         confirmedPlan.charAt(0).toUpperCase() + confirmedPlan.slice(1);
@@ -254,10 +153,190 @@ export default function SubscriptionReturn() {
       }, 1200);
     };
 
+    const verifyPaymentWithDatabase = async () => {
+      clearRecentUpgradeGrace();
+
+      // Hint label only while verifying (never used to grant access)
+      const hintedPlanRaw =
+        searchParams.get('plan') ||
+        searchParams.get('tier') ||
+        (() => {
+          try {
+            return (
+              sessionStorage.getItem('washek_pending_checkout_plan') ||
+              localStorage.getItem('washek_pending_checkout_plan') ||
+              ''
+            );
+          } catch {
+            return '';
+          }
+        })();
+      const hintedPlan = normalizePlan(hintedPlanRaw);
+      if (hintedPlan !== 'free') {
+        setPlanName(PLAN_LABELS[hintedPlan] || hintedPlan);
+      }
+
+      // Recover authenticated Supabase session before reading profiles
+      let authUser = null;
+      try {
+        const session = await resolveValidSupabaseSession(false);
+        authUser = session?.user || null;
+      } catch {
+        // Fallback if token recovery returned no user object directly
+      }
+
+      if (!authUser?.id) {
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          authUser = sessionData?.session?.user || null;
+          if (!authUser) {
+            const { data: authData } = await supabase.auth.getUser();
+            authUser = authData?.user || null;
+          }
+        } catch (authErr) {
+          console.debug('[SubscriptionReturn] Auth lookup note:', authErr);
+        }
+      }
+
+      // If this return tab has no local session (e.g. Chrome storage partitioning when opened from AI Studio iframe),
+      // delegate authoritative Postgres verification to window.opener (which holds the authenticated session).
+      if (!authUser?.id && window.opener && !window.opener.closed) {
+        const sessionId = searchParams.get('session_id') || '';
+        let settled = false;
+
+        const onOpenerReply = (event) => {
+          if (event.origin !== window.location.origin) return;
+          if (event.data?.type === 'WASHEK_CHECKOUT_CONFIRMED') {
+            settled = true;
+            openerCleanup?.();
+            clearPendingCheckoutArtifacts();
+            const confirmedPlan = normalizePlan(event.data?.plan || hintedPlan);
+            const confirmedStatus = String(event.data?.status || 'active').toLowerCase().trim();
+            if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+              completeSuccessFlow(confirmedPlan, confirmedStatus);
+            } else {
+              setStatus('error');
+              setErrorMessage(
+                'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment.'
+              );
+            }
+          } else if (event.data?.type === 'WASHEK_CHECKOUT_NOT_CONFIRMED') {
+            settled = true;
+            openerCleanup?.();
+            clearPendingCheckoutArtifacts();
+            setStatus('error');
+            setErrorMessage(
+              'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
+            );
+          }
+        };
+
+        window.addEventListener('message', onOpenerReply);
+        const safetyTimeout = window.setTimeout(() => {
+          if (!settled && !cancelledRef.current) {
+            settled = true;
+            openerCleanup?.();
+            setStatus('error');
+            setErrorMessage(
+              'Still waiting for Stripe payment confirmation. Tap Re-check Payment Status or return to the WASHEK tab.'
+            );
+          }
+        }, 26000);
+
+        const pingOpener = () => {
+          if (settled || cancelledRef.current) return;
+          try {
+            window.opener.postMessage(
+              {
+                type: 'WASHEK_CHECKOUT_RETURN',
+                plan: hintedPlan,
+                sessionId,
+              },
+              window.location.origin
+            );
+          } catch {
+            // ignore postMessage error
+          }
+        };
+
+        openerCleanup = () => {
+          window.removeEventListener('message', onOpenerReply);
+          clearTimeout(safetyTimeout);
+        };
+
+        pingOpener();
+        window.setTimeout(pingOpener, 600);
+        return;
+      }
+
+      if (!authUser?.id) {
+        if (cancelledRef.current) return;
+        clearPendingCheckoutArtifacts();
+        setStatus('error');
+        setErrorMessage(
+          'Please sign in to your WASHEK account so we can verify your Stripe payment status.'
+        );
+        return;
+      }
+
+      // Poll authoritative Supabase profiles table until Stripe webhook writes an active/trialing paid plan
+      let confirmedPlan = 'free';
+      let confirmedStatus = 'inactive';
+
+      for (let attempt = 0; attempt < 25; attempt++) {
+        if (cancelledRef.current) return;
+        try {
+          const { data: dbProf, error: profErr } = await supabase
+            .from('profiles')
+            .select('subscription_plan, subscription_status, stripe_subscription_id')
+            .eq('id', authUser.id)
+            .maybeSingle();
+
+          if (!profErr && dbProf) {
+            const dbPlan = normalizePlan(dbProf.subscription_plan);
+            const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
+            if (dbPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(dbStatus)) {
+              confirmedPlan = dbPlan;
+              confirmedStatus = dbStatus;
+              break;
+            }
+          }
+        } catch {
+          // continue polling
+        }
+
+        if (attempt < 24) {
+          await new Promise((r) => window.setTimeout(r, 1000));
+        }
+      }
+
+      if (cancelledRef.current) return;
+
+      clearPendingCheckoutArtifacts();
+
+      // Strict payment verification guard: do NOT upgrade unless Postgres profiles confirms paid active/trialing
+      if (confirmedPlan === 'free' || !ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+        try {
+          localStorage.removeItem('washek_subscription_plan');
+          localStorage.setItem('washek_subscription_status', confirmedStatus || 'inactive');
+        } catch {
+          // ignore
+        }
+        setStatus('error');
+        setErrorMessage(
+          'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
+        );
+        return;
+      }
+
+      completeSuccessFlow(confirmedPlan, confirmedStatus);
+    };
+
     verifyPaymentWithDatabase();
 
     return () => {
       cancelledRef.current = true;
+      openerCleanup?.();
       if (redirectTimer) clearTimeout(redirectTimer);
       if (closeFallbackTimer) clearTimeout(closeFallbackTimer);
     };

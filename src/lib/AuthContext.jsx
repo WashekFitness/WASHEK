@@ -6,7 +6,11 @@ import React, {
   useState,
 } from 'react';
 
-import { supabase } from '@/lib/supabase';
+import {
+  supabase,
+  readNativeSupabaseStorageSession,
+  refreshSupabaseSessionLocked,
+} from '@/lib/supabase';
 import { supabaseApi, isUserMarkedOnboarded, markUserOnboarded } from '@/lib/supabaseApi';
 import { isLogo } from '@/lib/avatarUtils';
 
@@ -121,8 +125,17 @@ export const AuthProvider = ({ children }) => {
 
       // If no active session but tokens are in localStorage, attempt recovery or refresh
       if (!session) {
-        const token = localStorage.getItem('washek_auth_token');
-        const refreshToken = localStorage.getItem('washek_refresh_token');
+        const nativeSession = readNativeSupabaseStorageSession();
+        const storedToken = localStorage.getItem('washek_auth_token') || '';
+        const token =
+          storedToken && !storedToken.startsWith('vault_tok_') && !storedToken.startsWith('washek_sess_')
+            ? storedToken
+            : nativeSession?.access_token || '';
+        const refreshToken =
+          localStorage.getItem('washek_refresh_token') ||
+          nativeSession?.refresh_token ||
+          '';
+
         if (refreshToken) {
           if (token && !token.startsWith('vault_tok_') && !token.startsWith('washek_sess_')) {
             try {
@@ -136,32 +149,18 @@ export const AuthProvider = ({ children }) => {
             }
           }
           if (!session?.access_token) {
-            try {
-              const { data: refreshed } = await supabase.auth.refreshSession({
-                refresh_token: refreshToken,
-              });
-              if (refreshed?.session?.access_token) {
-                session = refreshed.session;
-              }
-            } catch (_rfErr) {
-              // ignore refresh recovery note
-            }
+            session = await refreshSupabaseSessionLocked(refreshToken);
           }
         }
       }
 
       // Refresh proactively if token is expired or within 60s of expiry
       if (session?.access_token && session.expires_at && session.expires_at * 1000 < Date.now() + 60000) {
-        try {
-          const refreshToken = session.refresh_token || localStorage.getItem('washek_refresh_token') || undefined;
-          const { data: refreshed } = await supabase.auth.refreshSession(
-            refreshToken ? { refresh_token: refreshToken } : undefined
-          );
-          if (refreshed?.session?.access_token) {
-            session = refreshed.session;
-          }
-        } catch (_rfErr) {
-          // ignore refresh error
+        const refreshed = await refreshSupabaseSessionLocked(
+          session.refresh_token || localStorage.getItem('washek_refresh_token') || ''
+        );
+        if (refreshed?.access_token) {
+          session = refreshed;
         }
       }
 
@@ -391,9 +390,35 @@ export const AuthProvider = ({ children }) => {
 
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
     window.addEventListener('washek_user_changed', handleSubUpdated);
+
+    const handleSessionRecovered = (e) => {
+      const recoveredUser = e.detail?.session?.user;
+      const profileData = e.detail?.profile;
+      if (recoveredUser?.id || profileData?.id) {
+        setUser((prev) => {
+          const updated = {
+            ...(prev || {}),
+            ...(profileData || {}),
+            id: recoveredUser?.id || profileData?.id || prev?.id,
+            email: recoveredUser?.email || profileData?.email || prev?.email || '',
+            onboarded: prev?.onboarded ?? profileData?.onboarded ?? true,
+          };
+          try {
+            localStorage.setItem('washek_user', JSON.stringify(updated));
+          } catch {
+            // ignore
+          }
+          return updated;
+        });
+        setIsAuthenticated(true);
+      }
+    };
+    window.addEventListener('washek_session_recovered', handleSessionRecovered);
+
     return () => {
       window.removeEventListener('washek_subscription_updated', handleSubUpdated);
       window.removeEventListener('washek_user_changed', handleSubUpdated);
+      window.removeEventListener('washek_session_recovered', handleSessionRecovered);
     };
   }, []);
 
@@ -462,6 +487,14 @@ export const AuthProvider = ({ children }) => {
           ...p,
         };
 
+        if (data.serverSessionToken) {
+          try {
+            localStorage.setItem('washek_srv_session', data.serverSessionToken);
+          } catch {
+            // ignore
+          }
+        }
+
         if (data.session?.access_token) {
           try {
             localStorage.setItem('washek_auth_token', data.session.access_token);
@@ -472,7 +505,9 @@ export const AuthProvider = ({ children }) => {
                 refresh_token: data.session.refresh_token,
               }).catch(() => {});
             } else {
-              localStorage.removeItem('washek_refresh_token');
+              if (data.isVaultSession) {
+                localStorage.removeItem('washek_refresh_token');
+              }
               // Attempt direct browser signInWithPassword so a genuine Supabase JWT is acquired if possible
               try {
                 const { data: directData } = await supabase.auth.signInWithPassword({
@@ -608,6 +643,14 @@ export const AuthProvider = ({ children }) => {
           ...p,
         };
 
+        if (data.serverSessionToken) {
+          try {
+            localStorage.setItem('washek_srv_session', data.serverSessionToken);
+          } catch {
+            // ignore
+          }
+        }
+
         if (data.session?.access_token) {
           try {
             localStorage.setItem('washek_auth_token', data.session.access_token);
@@ -617,7 +660,7 @@ export const AuthProvider = ({ children }) => {
                 access_token: data.session.access_token,
                 refresh_token: data.session.refresh_token,
               }).catch(() => {});
-            } else {
+            } else if (data.isVaultSession) {
               localStorage.removeItem('washek_refresh_token');
             }
           } catch (tokenErr) {
@@ -771,6 +814,7 @@ export const AuthProvider = ({ children }) => {
       try {
         localStorage.removeItem('washek_auth_token');
         localStorage.removeItem('washek_refresh_token');
+        localStorage.removeItem('washek_srv_session');
         localStorage.removeItem('washek_user');
         localStorage.removeItem('washek_subscription_plan');
         localStorage.removeItem('washek_subscription_status');
@@ -780,6 +824,41 @@ export const AuthProvider = ({ children }) => {
       }
     }
   }, []);
+
+  const syncSupabaseSession = useCallback(async (session, profileData = null, serverSessionToken = '') => {
+    if (!session?.access_token) return null;
+    try {
+      localStorage.setItem('washek_auth_token', session.access_token);
+      if (session.refresh_token) {
+        localStorage.setItem('washek_refresh_token', session.refresh_token);
+      }
+      if (serverSessionToken) {
+        localStorage.setItem('washek_srv_session', serverSessionToken);
+      }
+      await supabase.auth.setSession({
+        access_token: session.access_token,
+        refresh_token: session.refresh_token || localStorage.getItem('washek_refresh_token') || '',
+      }).catch(() => {});
+    } catch {
+      // ignore storage/session errors
+    }
+
+    const updatedUser = formatAthleteUser(
+      session.user || { id: profileData?.id, email: profileData?.email || user?.email },
+      profileData || {}
+    );
+    if (updatedUser) {
+      updatedUser.onboarded = user?.onboarded ?? profileData?.onboarded ?? true;
+      setUser(updatedUser);
+      setIsAuthenticated(true);
+      try {
+        localStorage.setItem('washek_user', JSON.stringify(updatedUser));
+      } catch {
+        // ignore
+      }
+    }
+    return updatedUser;
+  }, [formatAthleteUser, user]);
 
   const navigateToLogin = useCallback(() => {
     window.location.assign('/login');
@@ -803,6 +882,7 @@ export const AuthProvider = ({ children }) => {
         deleteAccount,
         resetPassword,
         logout,
+        syncSupabaseSession,
         navigateToLogin,
         checkUserAuth,
         checkAppState: checkUserAuth,

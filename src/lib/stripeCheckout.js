@@ -1,4 +1,8 @@
-import { supabase } from '@/lib/supabase';
+import {
+  supabase,
+  readNativeSupabaseStorageSession,
+  refreshSupabaseSessionLocked,
+} from '@/lib/supabase';
 
 const CHECKOUT_FUNCTION = 'create-checkout-session';
 
@@ -13,6 +17,12 @@ const VALID_PLANS = ['progress', 'performance', 'elite'];
 function makeAuthExpiredError(message = 'Your login session has expired. Please sign in again to upgrade.') {
   const err = new Error(message);
   err.code = 'AUTH_SESSION_EXPIRED';
+  return err;
+}
+
+function makeBillingSyncRequiredError(message = 'Verify your account password to connect Stripe Checkout.') {
+  const err = new Error(message);
+  err.code = 'BILLING_SYNC_REQUIRED';
   return err;
 }
 
@@ -33,34 +43,124 @@ function parseJwtExpMs(token) {
   }
 }
 
-function syncTokensToStorage(session) {
+export function getStoredUserEmail() {
+  try {
+    const raw = localStorage.getItem('washek_user');
+    if (!raw) return '';
+    const parsed = JSON.parse(raw);
+    return parsed?.email ? String(parsed.email).trim().toLowerCase() : '';
+  } catch {
+    return '';
+  }
+}
+
+export function applyRecoveredSessionToStorage(session, profileData = null, serverSessionToken = '') {
   if (!session?.access_token) return;
   try {
     localStorage.setItem('washek_auth_token', session.access_token);
     if (session.refresh_token) {
       localStorage.setItem('washek_refresh_token', session.refresh_token);
     }
+    if (serverSessionToken) {
+      localStorage.setItem('washek_srv_session', serverSessionToken);
+    }
+    const rawUser = localStorage.getItem('washek_user');
+    const prevUser = rawUser ? JSON.parse(rawUser) : {};
+    if (session.user?.id || profileData?.id) {
+      const mergedUser = {
+        ...prevUser,
+        ...(profileData || {}),
+        id: session.user?.id || profileData?.id || prevUser?.id,
+        email: session.user?.email || profileData?.email || prevUser?.email || '',
+        onboarded: prevUser?.onboarded ?? profileData?.onboarded ?? true,
+      };
+      localStorage.setItem('washek_user', JSON.stringify(mergedUser));
+    }
+    window.dispatchEvent(
+      new CustomEvent('washek_session_recovered', {
+        detail: { session, profile: profileData },
+      })
+    );
   } catch {
-    // ignore storage error
+    // ignore storage write errors
   }
 }
 
-async function isSessionTokenValid(token) {
-  if (isNonJwtToken(token)) return false;
+async function getSessionTokenUser(token) {
+  if (isNonJwtToken(token)) return null;
   try {
     const { data, error } = await supabase.auth.getUser(token);
-    return Boolean(!error && data?.user?.id);
+    return !error && data?.user?.id ? data.user : null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+async function tryServerSessionRecovery(storedAccess = '', storedRefresh = '') {
+  const email = getStoredUserEmail();
+  const srvToken = (() => {
+    try {
+      return localStorage.getItem('washek_srv_session') || '';
+    } catch {
+      return '';
+    }
+  })();
+
+  if (!email && !storedAccess && !storedRefresh && !srvToken) {
+    return { session: null, syncNeeded: false };
+  }
+
+  try {
+    const res = await fetch('/api/auth/refresh-supabase-session', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(storedAccess ? { Authorization: `Bearer ${storedAccess}` } : {}),
+        ...(srvToken ? { 'x-washek-server-session': srvToken } : {}),
+      },
+      body: JSON.stringify({
+        email: email || undefined,
+        refreshToken: storedRefresh || undefined,
+      }),
+    });
+
+    const data = await res.json().catch(() => null);
+    if (res.ok && data?.success && data?.session?.access_token) {
+      try {
+        await supabase.auth.setSession({
+          access_token: data.session.access_token,
+          refresh_token: data.session.refresh_token,
+        });
+      } catch {
+        // ignore setSession error
+      }
+      applyRecoveredSessionToStorage(data.session, data.profile || null, data.serverSessionToken || '');
+      return { session: data.session, syncNeeded: false };
+    }
+
+    if (res.status === 409 || data?.code === 'VAULT_SUPABASE_SYNC_NEEDED') {
+      return { session: null, syncNeeded: true };
+    }
+  } catch {
+    // ignore network failure
+  }
+
+  return { session: null, syncNeeded: Boolean(email) };
 }
 
 export async function resolveValidSupabaseSession(forceRefresh = false) {
   let session = null;
+  const nativeSession = readNativeSupabaseStorageSession();
 
   const storedAccess = (() => {
     try {
-      return localStorage.getItem('washek_auth_token') || '';
+      const direct = localStorage.getItem('washek_auth_token') || '';
+      if (!isNonJwtToken(direct)) return direct;
+      if (nativeSession?.access_token && !isNonJwtToken(nativeSession.access_token)) {
+        return nativeSession.access_token;
+      }
+      return direct;
     } catch {
       return '';
     }
@@ -68,7 +168,10 @@ export async function resolveValidSupabaseSession(forceRefresh = false) {
 
   const storedRefresh = (() => {
     try {
-      return localStorage.getItem('washek_refresh_token') || '';
+      const direct = localStorage.getItem('washek_refresh_token') || '';
+      if (direct) return direct;
+      if (nativeSession?.refresh_token) return nativeSession.refresh_token;
+      return '';
     } catch {
       return '';
     }
@@ -82,7 +185,6 @@ export async function resolveValidSupabaseSession(forceRefresh = false) {
       session = null;
     }
 
-    // Attempt recovery from backup tokens in localStorage if Supabase session is absent
     if (!session?.access_token && !isNonJwtToken(storedAccess) && storedRefresh) {
       try {
         const { data: recovered } = await supabase.auth.setSession({
@@ -102,55 +204,64 @@ export async function resolveValidSupabaseSession(forceRefresh = false) {
     parseJwtExpMs(session?.access_token || storedAccess);
   const nearExpiry = !expiresAtMs || expiresAtMs < Date.now() + 60_000;
 
-  // Refresh when forced, missing, or expiring soon
   if (forceRefresh || !session?.access_token || isNonJwtToken(session.access_token) || nearExpiry) {
-    try {
-      const { data: refreshed, error: refreshErr } = await supabase.auth.refreshSession(
-        refreshToken ? { refresh_token: refreshToken } : undefined
-      );
-      if (!refreshErr && refreshed?.session?.access_token) {
-        session = refreshed.session;
-      }
-    } catch {
-      // ignore refresh failure
+    const refreshed = await refreshSupabaseSessionLocked(refreshToken);
+    if (refreshed?.access_token) {
+      session = refreshed;
     }
   }
 
-  // Fallback: if refresh failed, but we have a non-expired stored JWT, verify and use it
   if ((!session?.access_token || isNonJwtToken(session.access_token)) && !isNonJwtToken(storedAccess)) {
-    const storedValid = await isSessionTokenValid(storedAccess);
-    if (storedValid) {
+    const tokenUser = await getSessionTokenUser(storedAccess);
+    if (tokenUser) {
       session = {
         access_token: storedAccess,
         refresh_token: storedRefresh || undefined,
+        user: tokenUser,
       };
     }
   }
 
   if (!session?.access_token || isNonJwtToken(session.access_token)) {
-    throw makeAuthExpiredError();
-  }
-
-  let valid = await isSessionTokenValid(session.access_token);
-  if (!valid && refreshToken) {
-    try {
-      const { data: refreshed, error: refreshErr } = await supabase.auth.refreshSession({
-        refresh_token: refreshToken,
-      });
-      if (!refreshErr && refreshed?.session?.access_token) {
-        session = refreshed.session;
-        valid = await isSessionTokenValid(session.access_token);
-      }
-    } catch {
-      valid = false;
+    const serverRecovery = await tryServerSessionRecovery(storedAccess, storedRefresh);
+    if (serverRecovery.session?.access_token) {
+      session = serverRecovery.session;
+    } else if (serverRecovery.syncNeeded || getStoredUserEmail()) {
+      throw makeBillingSyncRequiredError();
+    } else {
+      throw makeAuthExpiredError();
     }
   }
 
-  if (!valid || !session?.access_token) {
+  let verifiedUser = await getSessionTokenUser(session.access_token);
+  if (!verifiedUser && refreshToken) {
+    const refreshed = await refreshSupabaseSessionLocked(refreshToken);
+    if (refreshed?.access_token) {
+      session = refreshed;
+      verifiedUser = await getSessionTokenUser(session.access_token);
+    }
+  }
+
+  if (!verifiedUser) {
+    const serverRecovery = await tryServerSessionRecovery(session.access_token, refreshToken);
+    if (serverRecovery.session?.access_token) {
+      session = serverRecovery.session;
+      verifiedUser = await getSessionTokenUser(session.access_token);
+    }
+  }
+
+  if (!verifiedUser || !session?.access_token) {
+    if (getStoredUserEmail()) {
+      throw makeBillingSyncRequiredError();
+    }
     throw makeAuthExpiredError();
   }
 
-  syncTokensToStorage(session);
+  if (!session.user) {
+    session = { ...session, user: verifiedUser };
+  }
+
+  applyRecoveredSessionToStorage(session);
   return session;
 }
 
@@ -245,7 +356,6 @@ export async function createStripeCheckout(plan) {
   let { data, error } = await invokeWithSession(session);
   let detailedMessage = error ? await extractInvokeErrorMessage(error) : '';
 
-  // Refresh session and retry once if Edge Function reported any auth failure
   if (
     (error && (isAuthErrorText(error.message) || isAuthErrorText(detailedMessage))) ||
     (data?.success === false && isAuthErrorText(data?.error))
@@ -260,7 +370,7 @@ export async function createStripeCheckout(plan) {
   if (error) {
     console.error('[Washek Stripe] Edge Function invocation error:', detailedMessage, error);
     if (isAuthErrorText(detailedMessage)) {
-      throw makeAuthExpiredError();
+      throw getStoredUserEmail() ? makeBillingSyncRequiredError() : makeAuthExpiredError();
     }
     throw new Error(detailedMessage);
   }
@@ -271,7 +381,7 @@ export async function createStripeCheckout(plan) {
 
   if (data.success === false) {
     if (isAuthErrorText(data.error)) {
-      throw makeAuthExpiredError();
+      throw getStoredUserEmail() ? makeBillingSyncRequiredError() : makeAuthExpiredError();
     }
     throw new Error(data.error || 'Unable to create Stripe Checkout.');
   }

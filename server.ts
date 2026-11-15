@@ -1,6 +1,7 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
@@ -185,9 +186,14 @@ app.post('/api/create-checkout-session', async (req, res) => {
       }
     }
 
+    const reqHost = req.headers.host || 'localhost:3000';
+    const reqProto =
+      req.headers['x-forwarded-proto'] === 'https' || reqHost.includes('run.app')
+        ? 'https'
+        : req.protocol || 'http';
     const baseUrl = returnUrl
       ? String(returnUrl).replace(/\/+$/, '')
-      : `${req.headers['x-forwarded-proto'] || req.protocol || 'http'}://${req.headers.host || 'localhost:3000'}`;
+      : `${reqProto}://${reqHost}`;
     const successUrl = `${baseUrl}/subscription-return?plan=${cleanPlan}&session_id={CHECKOUT_SESSION_ID}&trial=${!hasUsedTrial}`;
     const cancelUrl = `${baseUrl}/profile`;
 
@@ -245,9 +251,86 @@ app.post('/api/create-checkout-session', async (req, res) => {
       }
     }
 
-    // Invoke Supabase Edge Function create-checkout-session with the caller's real Supabase JWT
-    const token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
-    if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_')) {
+    // Helper to invoke Supabase Edge Function create-checkout-session with a genuine Supabase JWT
+    const invokeCheckoutEdge = async (jwt: string) => {
+      const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/create-checkout-session`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${jwt}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          plan: cleanPlan,
+          app_url: baseUrl,
+        }),
+      });
+      const edgeData = await edgeRes.json().catch(() => null);
+      return { edgeRes, edgeData };
+    };
+
+    let token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
+    const clientRefreshToken =
+      typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : '';
+    const clientSrvToken =
+      typeof req.headers['x-washek-server-session'] === 'string'
+        ? req.headers['x-washek-server-session'].trim()
+        : '';
+
+    let recoveredSession: any = null;
+    let recoveredSyncNeeded = false;
+
+    const isJwtShape = Boolean(
+      token &&
+        !token.startsWith('vault_tok_') &&
+        !token.startsWith('washek_sess_') &&
+        token.split('.').length === 3
+    );
+
+    if (!isJwtShape) {
+      const recovery = await tryRecoverSupabaseSession({
+        authToken: token,
+        refreshToken: clientRefreshToken,
+        serverSessionToken: clientSrvToken,
+        cookieHeader: req.headers.cookie,
+        targetEmail: cleanEmail,
+      });
+      if (recovery?.session?.access_token) {
+        token = recovery.session.access_token;
+        recoveredSession = recovery.session;
+        setServerSessionCookie(
+          res,
+          createServerSessionToken(
+            recovery.session.user?.email || cleanEmail,
+            recovery.session.user?.id || cleanUserId
+          ),
+          req
+        );
+      } else if (recovery?.syncNeeded) {
+        recoveredSyncNeeded = true;
+      }
+    }
+
+    if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_') || token.split('.').length !== 3) {
+      if (recoveredSyncNeeded || cleanEmail) {
+        const hasProof = Boolean(
+          verifyServerSessionFromRequest(req, cleanEmail) ||
+            (await verifyExpiredSupabaseJwt(
+              req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '',
+              cleanEmail
+            )) ||
+            (cleanEmail && athleteCredentials.has(cleanEmail) && (req.headers.authorization || '').includes(Buffer.from(cleanEmail).toString('base64')))
+        );
+        if (hasProof || cleanEmail) {
+          return res.status(409).json({
+            success: false,
+            code: 'VAULT_SUPABASE_SYNC_NEEDED',
+            needsBillingPasswordSync: true,
+            email: cleanEmail || undefined,
+            error: 'Confirm your Washek account password to authorize Stripe Checkout.',
+          });
+        }
+      }
       return res.status(401).json({
         success: false,
         code: 'AUTH_SESSION_EXPIRED',
@@ -255,20 +338,40 @@ app.post('/api/create-checkout-session', async (req, res) => {
       });
     }
 
-    const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/create-checkout-session`, {
-      method: 'POST',
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        plan: cleanPlan,
-        app_url: baseUrl,
-      }),
-    });
+    let { edgeRes, edgeData } = await invokeCheckoutEdge(token);
 
-    const edgeData = await edgeRes.json().catch(() => null);
+    // If Edge Function rejected the JWT (e.g. just expired), attempt silent server recovery once
+    if (edgeRes.status === 401 || /unauthorized|jwt|expired|missing authorization/i.test(String(edgeData?.error || ''))) {
+      const recovery = await tryRecoverSupabaseSession({
+        authToken: token,
+        refreshToken: clientRefreshToken,
+        serverSessionToken: clientSrvToken,
+        cookieHeader: req.headers.cookie,
+        targetEmail: cleanEmail,
+      });
+      if (recovery?.session?.access_token) {
+        token = recovery.session.access_token;
+        recoveredSession = recovery.session;
+        setServerSessionCookie(
+          res,
+          createServerSessionToken(
+            recovery.session.user?.email || cleanEmail,
+            recovery.session.user?.id || cleanUserId
+          ),
+          req
+        );
+        ({ edgeRes, edgeData } = await invokeCheckoutEdge(token));
+      } else if (recovery?.syncNeeded) {
+        return res.status(409).json({
+          success: false,
+          code: 'VAULT_SUPABASE_SYNC_NEEDED',
+          needsBillingPasswordSync: true,
+          email: cleanEmail || undefined,
+          error: 'Confirm your Washek account password to authorize Stripe Checkout.',
+        });
+      }
+    }
+
     if (edgeRes.ok && edgeData?.success) {
       if (
         edgeData.action === 'already_active' ||
@@ -282,6 +385,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
           subscription_id: edgeData.subscription_id || null,
           price_id: edgeData.price_id || null,
           message: edgeData.message || null,
+          ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
         });
       }
 
@@ -294,6 +398,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
           sessionId: edgeData.session_id || null,
           plan: cleanPlan,
           hasUsedTrial,
+          ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
         });
       }
     }
@@ -624,6 +729,252 @@ function deleteAthleteCredential(email: string) {
 }
 
 // ------------------------------------------------------------
+// CRYPTOGRAPHIC SERVER SESSION & SUPABASE JWKS RECOVERY HELPERS
+// ------------------------------------------------------------
+const SESSION_SECRET_FILE = path.join(process.cwd(), '.washek_session_secret');
+let cachedSessionSecret: string | null = null;
+function getSessionSecret(): string {
+  if (cachedSessionSecret) return cachedSessionSecret;
+  if (process.env.SESSION_SECRET && process.env.SESSION_SECRET.length >= 16) {
+    cachedSessionSecret = process.env.SESSION_SECRET;
+    return cachedSessionSecret;
+  }
+  try {
+    if (fs.existsSync(SESSION_SECRET_FILE)) {
+      const existing = fs.readFileSync(SESSION_SECRET_FILE, 'utf-8').trim();
+      if (existing.length >= 32) {
+        cachedSessionSecret = existing;
+        return cachedSessionSecret;
+      }
+    }
+    const generated = crypto.randomBytes(32).toString('hex');
+    fs.writeFileSync(SESSION_SECRET_FILE, generated, { encoding: 'utf-8', mode: 0o600 });
+    cachedSessionSecret = generated;
+    return cachedSessionSecret;
+  } catch {
+    cachedSessionSecret = crypto.randomBytes(32).toString('hex');
+    return cachedSessionSecret;
+  }
+}
+
+function createServerSessionToken(email: string, userId?: string): string {
+  const cleanEmail = String(email || '').toLowerCase().trim();
+  if (!cleanEmail) return '';
+  const payload = {
+    email: cleanEmail,
+    userId: userId ? String(userId) : undefined,
+    iat: Date.now(),
+    exp: Date.now() + 30 * 24 * 60 * 60 * 1000,
+  };
+  const encoded = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+  const sig = crypto
+    .createHmac('sha256', getSessionSecret())
+    .update(encoded)
+    .digest('base64url');
+  return `${encoded}.${sig}`;
+}
+
+function verifyServerSessionToken(token: string, expectedEmail?: string): { email: string; userId?: string } | null {
+  try {
+    const parts = String(token || '').trim().split('.');
+    if (parts.length !== 2) return null;
+    const [encoded, providedSig] = parts;
+    const expectedSig = crypto
+      .createHmac('sha256', getSessionSecret())
+      .update(encoded)
+      .digest('base64url');
+    const bufA = Buffer.from(providedSig, 'utf-8');
+    const bufB = Buffer.from(expectedSig, 'utf-8');
+    if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
+      return null;
+    }
+    const parsed = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf-8'));
+    if (!parsed?.email || Number(parsed?.exp || 0) < Date.now()) {
+      return null;
+    }
+    const cleanEmail = String(parsed.email).toLowerCase().trim();
+    if (expectedEmail && cleanEmail !== expectedEmail.toLowerCase().trim()) {
+      return null;
+    }
+    return { email: cleanEmail, userId: parsed.userId };
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(cookieHeader?: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  if (!cookieHeader) return map;
+  for (const part of String(cookieHeader).split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const key = part.slice(0, idx).trim();
+      const val = part.slice(idx + 1).trim();
+      try {
+        map[key] = decodeURIComponent(val);
+      } catch {
+        map[key] = val;
+      }
+    }
+  }
+  return map;
+}
+
+function setServerSessionCookie(res: express.Response, token: string, req?: express.Request) {
+  if (!token) return;
+  const host = String(req?.headers?.host || '');
+  const isHttps =
+    req?.headers?.['x-forwarded-proto'] === 'https' ||
+    req?.protocol === 'https' ||
+    host.includes('run.app');
+  const attrs = [
+    `washek_srv_sess=${encodeURIComponent(token)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    `Max-Age=${30 * 24 * 60 * 60}`,
+  ];
+  if (isHttps) attrs.push('Secure');
+  res.setHeader('Set-Cookie', attrs.join('; '));
+}
+
+function verifyServerSessionFromRequest(req: express.Request, expectedEmail?: string) {
+  const headerToken =
+    typeof req.headers['x-washek-server-session'] === 'string'
+      ? req.headers['x-washek-server-session'].trim()
+      : '';
+  const cookies = parseCookies(req.headers.cookie);
+  const cookieToken = cookies['washek_srv_sess'] || '';
+  return (
+    verifyServerSessionToken(headerToken, expectedEmail) ||
+    verifyServerSessionToken(cookieToken, expectedEmail)
+  );
+}
+
+let cachedJwks: { keys: any[]; fetchedAt: number } | null = null;
+async function getSupabasePublicJwks(): Promise<any[]> {
+  if (cachedJwks && Date.now() - cachedJwks.fetchedAt < 1000 * 60 * 60) {
+    return cachedJwks.keys;
+  }
+  try {
+    const r = await fetch(`${SUPABASE_URL}/auth/v1/.well-known/jwks.json`);
+    if (r.ok) {
+      const json = await r.json();
+      if (Array.isArray(json?.keys)) {
+        cachedJwks = { keys: json.keys, fetchedAt: Date.now() };
+        return json.keys;
+      }
+    }
+  } catch {
+    // ignore JWKS fetch error
+  }
+  return cachedJwks?.keys || [];
+}
+
+async function verifyExpiredSupabaseJwt(token: string, expectedEmail?: string): Promise<{ userId: string; email: string } | null> {
+  try {
+    const parts = String(token || '').trim().split('.');
+    if (parts.length !== 3) return null;
+    const [headerB64, payloadB64, sigB64] = parts;
+    const header = JSON.parse(Buffer.from(headerB64, 'base64url').toString('utf-8'));
+    const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf-8'));
+
+    if (!payload?.sub || !payload?.email) return null;
+    const expectedIss = `${SUPABASE_URL.replace(/\/+$/, '')}/auth/v1`;
+    if (payload.iss !== expectedIss) return null;
+
+    const cleanPayloadEmail = String(payload.email).toLowerCase().trim();
+    if (expectedEmail && cleanPayloadEmail !== expectedEmail.toLowerCase().trim()) {
+      return null;
+    }
+
+    // Reject ancient tokens expired more than 30 days ago
+    if (payload.exp && Date.now() - Number(payload.exp) * 1000 > 30 * 24 * 60 * 60 * 1000) {
+      return null;
+    }
+
+    const keys = await getSupabasePublicJwks();
+    const matchingKey = keys.find((k) => (!header.kid || k.kid === header.kid) && k.alg === 'ES256') || keys[0];
+    if (!matchingKey) return null;
+
+    const pubKey = crypto.createPublicKey({ key: matchingKey, format: 'jwk' });
+    const signingInput = Buffer.from(`${headerB64}.${payloadB64}`, 'utf-8');
+    const rawSig = Buffer.from(sigB64, 'base64url');
+
+    const ok = crypto.verify(
+      'sha256',
+      signingInput,
+      { key: pubKey, dsaEncoding: 'ieee-p1363' },
+      rawSig
+    );
+    if (!ok) return null;
+
+    return { userId: String(payload.sub), email: cleanPayloadEmail };
+  } catch {
+    return null;
+  }
+}
+
+async function tryRecoverSupabaseSession(opts: {
+  authToken?: string;
+  refreshToken?: string;
+  serverSessionToken?: string;
+  cookieHeader?: string;
+  targetEmail?: string;
+}): Promise<{ session: any | null; syncNeeded: boolean }> {
+  const cleanTargetEmail = opts.targetEmail ? opts.targetEmail.toLowerCase().trim() : '';
+
+  // 1. Try explicit refresh_token first (works for any Supabase Auth / OAuth account)
+  if (opts.refreshToken) {
+    try {
+      const { data: refreshed, error: refreshErr } = await createStatelessSupabase().auth.refreshSession({
+        refresh_token: opts.refreshToken,
+      });
+      if (!refreshErr && refreshed?.session?.access_token) {
+        return { session: refreshed.session, syncNeeded: false };
+      }
+    } catch {
+      // fall through
+    }
+  }
+
+  // 2. Verify cryptographic proof of caller identity before touching vault credentials
+  const cookies = parseCookies(opts.cookieHeader);
+  const srvProof =
+    verifyServerSessionToken(opts.serverSessionToken || '', cleanTargetEmail) ||
+    verifyServerSessionToken(cookies['washek_srv_sess'] || '', cleanTargetEmail);
+  const jwtProof =
+    opts.authToken && opts.authToken.split('.').length === 3
+      ? await verifyExpiredSupabaseJwt(opts.authToken, cleanTargetEmail)
+      : null;
+
+  const verifiedEmail = srvProof?.email || jwtProof?.email || '';
+  if (verifiedEmail) {
+    const vaultedPassword = athleteCredentials.get(verifiedEmail);
+    if (vaultedPassword) {
+      const { data, error } = await createStatelessSupabase().auth.signInWithPassword({
+        email: verifiedEmail,
+        password: vaultedPassword,
+      });
+      if (!error && data?.session?.access_token) {
+        return { session: data.session, syncNeeded: false };
+      }
+      return { session: null, syncNeeded: true };
+    }
+  }
+
+  // Detect pre-update vault token / signed-in vault email needing interactive password sync
+  if (
+    (opts.authToken && (opts.authToken.startsWith('vault_tok_') || opts.authToken.startsWith('washek_sess_'))) ||
+    (cleanTargetEmail && athleteCredentials.has(cleanTargetEmail))
+  ) {
+    return { session: null, syncNeeded: true };
+  }
+
+  return { session: null, syncNeeded: false };
+}
+
+// ------------------------------------------------------------
 // AUTH PROXY ROUTES (Seamless Server-Side Supabase Auth)
 // ------------------------------------------------------------
 
@@ -744,11 +1095,14 @@ app.post('/api/auth/signin', async (req, res) => {
         }
       }
 
+      const srvToken = createServerSessionToken(cleanEmail, data.user.id);
+      setServerSessionCookie(res, srvToken, req);
       return res.json({
         success: true,
         user: data.user,
         session: data.session,
         profile,
+        serverSessionToken: srvToken,
       });
     }
 
@@ -769,6 +1123,8 @@ app.post('/api/auth/signin', async (req, res) => {
           },
         };
         const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
+        const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
+        setServerSessionCookie(res, srvToken, req);
         return res.json({
           success: true,
           isVaultSession: true,
@@ -788,6 +1144,7 @@ app.post('/api/auth/signin', async (req, res) => {
             subscription_tier: 'free',
             onboarded: true,
           },
+          serverSessionToken: srvToken,
         });
       } else {
         // Vault exists but password did not match
@@ -901,6 +1258,8 @@ app.post('/api/auth/signup', async (req, res) => {
 
         if (!signErr && signData?.user) {
           console.log('[API Auth] User exists in Supabase, successfully signed in via signup credentials:', cleanEmail);
+          const srvToken = createServerSessionToken(cleanEmail, signData.user.id);
+          setServerSessionCookie(res, srvToken, req);
           return res.json({
             success: true,
             user: signData.user,
@@ -914,6 +1273,7 @@ app.post('/api/auth/signup', async (req, res) => {
               role: 'athlete',
               subscription_plan: 'free',
             },
+            serverSessionToken: srvToken,
           });
         }
 
@@ -933,8 +1293,11 @@ app.post('/api/auth/signup', async (req, res) => {
           },
         };
         const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
+        const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
+        setServerSessionCookie(res, srvToken, req);
         return res.json({
           success: true,
+          isVaultSession: true,
           user: athleteUser,
           session: {
             access_token: token,
@@ -952,6 +1315,7 @@ app.post('/api/auth/signup', async (req, res) => {
             subscription_plan: 'free',
             subscription_tier: 'free',
           },
+          serverSessionToken: srvToken,
         });
       }
 
@@ -1012,11 +1376,14 @@ app.post('/api/auth/signup', async (req, res) => {
       console.debug('[API Auth] profile upsert note:', upsertErr);
     }
 
+    const srvToken = createServerSessionToken(cleanEmail, userId);
+    setServerSessionCookie(res, srvToken, req);
     return res.json({
       success: true,
       user: data?.user || athleteUser,
       session: athleteSession,
       profile: athleteProfile,
+      serverSessionToken: srvToken,
     });
   } catch (err: any) {
     console.error('[API Auth] signup error:', err);
@@ -1149,8 +1516,11 @@ app.post('/api/auth/instant-reset', async (req, res) => {
       user: athleteUser,
     };
 
+    const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
+    setServerSessionCookie(res, srvToken, req);
     return res.json({
       success: true,
+      isVaultSession: true,
       message: 'Password successfully updated! You are now signed in.',
       user: athleteUser,
       session,
@@ -1161,6 +1531,7 @@ app.post('/api/auth/instant-reset', async (req, res) => {
         role: 'athlete',
         subscription_plan: 'free',
       },
+      serverSessionToken: srvToken,
     });
   } catch (err: any) {
     console.error('[API Auth] instant-reset error:', err);
@@ -1264,16 +1635,16 @@ app.post('/api/auth/change-password', async (req, res) => {
     if (cleanEmail && currentPassword) {
       console.log('[API Auth] Changing password via current password verification for', cleanEmail);
       const vaulted = athleteCredentials.get(cleanEmail);
-      let passVerified = vaulted && vaulted === String(currentPassword);
+      let passVerified = Boolean(vaulted && vaulted === String(currentPassword));
+      let verifiedSupabaseToken = '';
 
-      if (!passVerified) {
-        const { data: signData, error: signErr } = await createStatelessSupabase().auth.signInWithPassword({
-          email: cleanEmail,
-          password: String(currentPassword),
-        });
-        if (!signErr && signData?.session?.access_token) {
-          passVerified = true;
-        }
+      const { data: signData, error: signErr } = await createStatelessSupabase().auth.signInWithPassword({
+        email: cleanEmail,
+        password: String(currentPassword),
+      });
+      if (!signErr && signData?.session?.access_token) {
+        passVerified = true;
+        verifiedSupabaseToken = signData.session.access_token;
       }
 
       if (!passVerified) {
@@ -1282,6 +1653,18 @@ app.post('/api/auth/change-password', async (req, res) => {
           code: 'auth/wrong-current-password',
           error: 'Your current password was incorrect. Please check your existing password and try again.',
         });
+      }
+
+      if (verifiedSupabaseToken) {
+        await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+          method: 'PUT',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${verifiedSupabaseToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ password: cleanNewPass }),
+        }).catch(() => {});
       }
 
       saveAthleteCredential(cleanEmail, cleanNewPass);
@@ -1325,6 +1708,170 @@ app.post('/api/auth/change-password', async (req, res) => {
       code: 'auth/server-error',
       error: err?.message || 'Password update service error.',
     });
+  }
+});
+
+// Silent Supabase session recovery for active signed-in users whose JWT expired or refresh token raced
+app.post('/api/auth/refresh-supabase-session', async (req, res) => {
+  try {
+    const { email, refreshToken } = req.body || {};
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const srvToken =
+      typeof req.headers['x-washek-server-session'] === 'string'
+        ? req.headers['x-washek-server-session'].trim()
+        : '';
+
+    const recovery = await tryRecoverSupabaseSession({
+      authToken: token,
+      refreshToken: typeof refreshToken === 'string' ? refreshToken.trim() : '',
+      serverSessionToken: srvToken,
+      cookieHeader: req.headers.cookie,
+      targetEmail: typeof email === 'string' ? email.trim().toLowerCase() : '',
+    });
+
+    if (recovery?.session?.access_token) {
+      const resolvedEmail = (recovery.session.user?.email || email || '').toLowerCase().trim();
+      const newSrvToken = createServerSessionToken(resolvedEmail, recovery.session.user?.id);
+      setServerSessionCookie(res, newSrvToken, req);
+
+      let profile: any = null;
+      if (recovery.session.user?.id) {
+        try {
+          const userClient = createStatelessSupabase(recovery.session.access_token);
+          const { data: profData } = await userClient
+            .from('profiles')
+            .select('*')
+            .eq('id', recovery.session.user.id)
+            .maybeSingle();
+          if (profData) profile = profData;
+        } catch {
+          // ignore
+        }
+      }
+
+      return res.json({
+        success: true,
+        session: recovery.session,
+        user: recovery.session.user,
+        profile,
+        serverSessionToken: newSrvToken,
+      });
+    }
+
+    if (recovery?.syncNeeded) {
+      return res.status(409).json({
+        success: false,
+        code: 'VAULT_SUPABASE_SYNC_NEEDED',
+        error: 'Cloud billing authorization requires confirming your account password.',
+      });
+    }
+
+    return res.status(401).json({
+      success: false,
+      code: 'AUTH_SESSION_EXPIRED',
+      error: 'Unable to refresh Supabase session automatically.',
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Session recovery failed' });
+  }
+});
+
+// Inline billing connection: allows an already signed-in Vault user to authenticate with their Supabase Auth password without logging out
+app.post('/api/auth/sync-supabase-session', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+    const cleanPassword = password ? String(password) : '';
+
+    if (!cleanEmail || !cleanPassword) {
+      return res.status(400).json({
+        success: false,
+        error: 'Email and password are required.',
+      });
+    }
+
+    const { data, error } = await createStatelessSupabase().auth.signInWithPassword({
+      email: cleanEmail,
+      password: cleanPassword,
+    });
+
+    if (error || !data?.session?.access_token || !data?.user) {
+      return res.status(401).json({
+        success: false,
+        code: 'SUPABASE_PASSWORD_MISMATCH',
+        error:
+          error?.message === 'Invalid login credentials'
+            ? 'That password does not match your cloud billing password. Enter your original password or verify via 6-digit email code below.'
+            : error?.message || 'Unable to verify password with Supabase.',
+      });
+    }
+
+    saveAthleteCredential(cleanEmail, cleanPassword);
+    const srvToken = createServerSessionToken(cleanEmail, data.user.id);
+    setServerSessionCookie(res, srvToken, req);
+
+    let profile: any = null;
+    try {
+      const userClient = createStatelessSupabase(data.session.access_token);
+      const { data: profData } = await userClient
+        .from('profiles')
+        .select('*')
+        .eq('id', data.user.id)
+        .maybeSingle();
+      if (profData) profile = profData;
+    } catch {
+      // ignore
+    }
+
+    return res.json({
+      success: true,
+      session: data.session,
+      user: data.user,
+      profile,
+      serverSessionToken: srvToken,
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Unable to verify cloud session.',
+    });
+  }
+});
+
+// Synchronizes credential vault after user completes Supabase email recovery OTP + password update
+app.post('/api/auth/sync-vault-after-otp', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const { newPassword } = req.body || {};
+
+    if (!token) {
+      return res.status(401).json({ success: false, error: 'Missing Supabase access token.' });
+    }
+
+    const userClient = createStatelessSupabase(token);
+    const { data, error } = await userClient.auth.getUser(token);
+    if (error || !data?.user?.email) {
+      return res.status(401).json({ success: false, error: 'Invalid Supabase recovery token.' });
+    }
+
+    const cleanEmail = data.user.email.toLowerCase().trim();
+    if (typeof newPassword === 'string' && newPassword.length >= 6) {
+      saveAthleteCredential(cleanEmail, newPassword);
+    }
+
+    const srvToken = createServerSessionToken(cleanEmail, data.user.id);
+    setServerSessionCookie(res, srvToken, req);
+
+    return res.json({
+      success: true,
+      email: cleanEmail,
+      userId: data.user.id,
+      serverSessionToken: srvToken,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to sync credentials.' });
   }
 });
 
