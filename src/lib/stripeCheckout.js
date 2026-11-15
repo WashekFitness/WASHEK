@@ -2,6 +2,7 @@ import {
   supabase,
   readNativeSupabaseStorageSession,
   refreshSupabaseSessionLocked,
+  syncClientSessionSafely,
 } from '@/lib/supabase';
 
 const CHECKOUT_FUNCTION = 'create-checkout-session';
@@ -127,14 +128,7 @@ async function tryServerSessionRecovery(storedAccess = '', storedRefresh = '') {
 
     const data = await res.json().catch(() => null);
     if (res.ok && data?.success && data?.session?.access_token) {
-      try {
-        await supabase.auth.setSession({
-          access_token: data.session.access_token,
-          refresh_token: data.session.refresh_token,
-        });
-      } catch {
-        // ignore setSession error
-      }
+      await syncClientSessionSafely(data.session);
       applyRecoveredSessionToStorage(data.session, data.profile || null, data.serverSessionToken || '');
       return { session: data.session, syncNeeded: false };
     }
@@ -186,15 +180,10 @@ export async function resolveValidSupabaseSession(forceRefresh = false) {
     }
 
     if (!session?.access_token && !isNonJwtToken(storedAccess) && storedRefresh) {
-      try {
-        const { data: recovered } = await supabase.auth.setSession({
-          access_token: storedAccess,
-          refresh_token: storedRefresh,
-        });
-        session = recovered?.session || null;
-      } catch {
-        // ignore recovery failure
-      }
+      session = await syncClientSessionSafely({
+        access_token: storedAccess,
+        refresh_token: storedRefresh,
+      });
     }
   }
 
@@ -314,6 +303,84 @@ function isAuthErrorText(msg) {
   );
 }
 
+export function extractStripeSessionId(explicitId = '', checkoutUrl = '') {
+  const direct = typeof explicitId === 'string' ? explicitId.trim() : '';
+  if (direct && /^cs_(test|live)_[A-Za-z0-9_]+$/.test(direct)) return direct;
+  if (typeof checkoutUrl === 'string') {
+    const match = checkoutUrl.match(/cs_(?:test|live)_[A-Za-z0-9_]+/);
+    if (match?.[0]) return match[0];
+  }
+  return '';
+}
+
+export async function registerCheckoutReturnHandoff({
+  sessionId = '',
+  url = '',
+  plan = '',
+  session = null,
+} = {}) {
+  const cleanSessionId = extractStripeSessionId(sessionId, url);
+  if (!cleanSessionId) return false;
+  try {
+    const accessToken =
+      session?.access_token ||
+      (() => {
+        try {
+          return localStorage.getItem('washek_auth_token') || '';
+        } catch {
+          return '';
+        }
+      })();
+    const refreshToken =
+      session?.refresh_token ||
+      (() => {
+        try {
+          return localStorage.getItem('washek_refresh_token') || '';
+        } catch {
+          return '';
+        }
+      })();
+    const srvToken = (() => {
+      try {
+        return localStorage.getItem('washek_srv_session') || '';
+      } catch {
+        return '';
+      }
+    })();
+    const email = session?.user?.email || getStoredUserEmail() || '';
+    const userId = session?.user?.id || '';
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    const timer = controller ? setTimeout(() => controller.abort(), 1200) : null;
+    try {
+      await fetch('/api/checkout/register-return-session', {
+        method: 'POST',
+        credentials: 'include',
+        keepalive: true,
+        signal: controller?.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+          ...(srvToken ? { 'x-washek-server-session': srvToken } : {}),
+        },
+        body: JSON.stringify({
+          session_id: cleanSessionId,
+          plan,
+          userId: userId || undefined,
+          email: email || undefined,
+          accessToken: accessToken || undefined,
+          refreshToken: refreshToken || undefined,
+        }),
+      });
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function createStripeCheckout(plan) {
   if (!VALID_PLANS.includes(plan)) {
     throw new Error('Invalid subscription plan.');
@@ -386,17 +453,6 @@ export async function createStripeCheckout(plan) {
     throw new Error(data.error || 'Unable to create Stripe Checkout.');
   }
 
-  if (data.success === true && data.url && typeof data.url === 'string') {
-    return {
-      success: true,
-      action: 'checkout',
-      url: data.url,
-      session_id: data.session_id || null,
-      plan: data.plan || plan,
-      price_id: data.price_id || null,
-    };
-  }
-
   if (
     data.success === true &&
     (data.action === 'changed' ||
@@ -414,11 +470,18 @@ export async function createStripeCheckout(plan) {
   }
 
   if (typeof data.url === 'string' && data.url.trim()) {
+    const resolvedSessionId = extractStripeSessionId(data.session_id || data.sessionId, data.url);
+    await registerCheckoutReturnHandoff({
+      sessionId: resolvedSessionId,
+      url: data.url,
+      plan: data.plan || plan,
+      session,
+    });
     return {
       success: true,
       action: 'checkout',
       url: data.url,
-      session_id: data.session_id || null,
+      session_id: resolvedSessionId || null,
       plan: data.plan || plan,
       price_id: data.price_id || null,
     };

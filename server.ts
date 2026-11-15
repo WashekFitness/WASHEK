@@ -235,11 +235,26 @@ app.post('/api/create-checkout-session', async (req, res) => {
 
         const sessionData = await stripeRes.json();
         if (stripeRes.ok && sessionData?.url) {
+          const resolvedSid = extractStripeSessionId(sessionData.id, sessionData.url);
+          if (resolvedSid) {
+            storeCheckoutReturnHandoff({
+              sessionId: resolvedSid,
+              plan: cleanPlan,
+              userId: cleanUserId || undefined,
+              email: cleanEmail || undefined,
+              refreshToken: typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : undefined,
+              serverSessionToken:
+                typeof req.headers['x-washek-server-session'] === 'string'
+                  ? req.headers['x-washek-server-session'].trim()
+                  : undefined,
+            });
+          }
           return res.json({
             success: true,
             action: 'checkout',
             url: sessionData.url,
-            sessionId: sessionData.id,
+            sessionId: resolvedSid || sessionData.id,
+            session_id: resolvedSid || sessionData.id,
             plan: cleanPlan,
             hasUsedTrial,
           });
@@ -390,12 +405,31 @@ app.post('/api/create-checkout-session', async (req, res) => {
       }
 
       if (edgeData.url) {
+        const resolvedSid = extractStripeSessionId(edgeData.session_id || edgeData.sessionId, edgeData.url);
+        const resolvedEmail = (recoveredSession?.user?.email || cleanEmail || '').toLowerCase().trim();
+        const resolvedUserId = recoveredSession?.user?.id || cleanUserId || undefined;
+        const resolvedSrvToken =
+          resolvedEmail
+            ? createServerSessionToken(resolvedEmail, resolvedUserId)
+            : clientSrvToken || undefined;
+        if (resolvedSid) {
+          storeCheckoutReturnHandoff({
+            sessionId: resolvedSid,
+            plan: cleanPlan,
+            userId: resolvedUserId,
+            email: resolvedEmail || undefined,
+            accessToken: recoveredSession?.access_token || token,
+            refreshToken: recoveredSession?.refresh_token || clientRefreshToken || undefined,
+            serverSessionToken: resolvedSrvToken,
+          });
+        }
         console.log('[API] Generated Stripe Checkout URL via Supabase Edge Function for plan:', cleanPlan);
         return res.json({
           success: true,
           action: 'checkout',
           url: edgeData.url,
-          sessionId: edgeData.session_id || null,
+          sessionId: resolvedSid || edgeData.session_id || null,
+          session_id: resolvedSid || edgeData.session_id || null,
           plan: cleanPlan,
           hasUsedTrial,
           ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
@@ -499,6 +533,237 @@ app.post('/api/cancel-subscription', async (req, res) => {
 
 // Pending checkout cache to ensure plan upgrades resolve even when query params are stripped by Stripe
 const pendingCheckouts = new Map<string, { plan: string; timestamp: number }>();
+
+interface CheckoutReturnHandoff {
+  sessionId: string;
+  plan: string;
+  userId?: string;
+  email?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  serverSessionToken?: string;
+  createdAt: number;
+  claimedAt?: number;
+}
+
+const checkoutReturnHandoffs = new Map<string, CheckoutReturnHandoff>();
+
+function extractStripeSessionId(explicitId?: any, url?: any): string {
+  const direct = typeof explicitId === 'string' ? explicitId.trim() : '';
+  if (direct && /^cs_(test|live)_[A-Za-z0-9_]+$/.test(direct)) return direct;
+  if (typeof url === 'string') {
+    const match = url.match(/cs_(?:test|live)_[A-Za-z0-9_]+/);
+    if (match?.[0]) return match[0];
+  }
+  return '';
+}
+
+function pruneCheckoutReturnHandoffs() {
+  const now = Date.now();
+  for (const [sid, entry] of checkoutReturnHandoffs.entries()) {
+    const expiredByAge = now - entry.createdAt > 2 * 60 * 60 * 1000;
+    const expiredByClaim = entry.claimedAt ? now - entry.claimedAt > 15 * 60 * 1000 : false;
+    if (expiredByAge || expiredByClaim) {
+      checkoutReturnHandoffs.delete(sid);
+    }
+  }
+}
+
+function storeCheckoutReturnHandoff(handoff: Omit<CheckoutReturnHandoff, 'createdAt'>) {
+  if (!handoff.sessionId) return;
+  pruneCheckoutReturnHandoffs();
+  checkoutReturnHandoffs.set(handoff.sessionId, {
+    ...handoff,
+    createdAt: Date.now(),
+  });
+}
+
+app.post('/api/checkout/register-return-session', async (req, res) => {
+  try {
+    const {
+      session_id,
+      sessionId,
+      plan,
+      userId,
+      email,
+      accessToken,
+      refreshToken,
+    } = req.body || {};
+    const resolvedSid = extractStripeSessionId(session_id || sessionId);
+    if (!resolvedSid) {
+      return res.status(400).json({ success: false, error: 'Valid Stripe session_id is required.' });
+    }
+
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const bearerTok = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const candidateAccess = bearerTok || (typeof accessToken === 'string' ? accessToken.trim() : '');
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+
+    // Require caller proof (valid Supabase JWT, valid JWKS-verified JWT, or valid server session token/cookie)
+    let verifiedEmail = cleanEmail;
+    let verifiedUserId = userId ? String(userId).trim() : '';
+    let isAuthorized = false;
+
+    const srvProof = verifyServerSessionFromRequest(req, cleanEmail || undefined);
+    if (srvProof?.email) {
+      isAuthorized = true;
+      verifiedEmail = srvProof.email;
+      if (srvProof.userId) verifiedUserId = srvProof.userId;
+    }
+
+    if (!isAuthorized && candidateAccess && candidateAccess.split('.').length === 3) {
+      try {
+        const { data: uData } = await createStatelessSupabase(candidateAccess).auth.getUser(candidateAccess);
+        if (uData?.user?.id) {
+          isAuthorized = true;
+          verifiedUserId = uData.user.id;
+          verifiedEmail = (uData.user.email || verifiedEmail).toLowerCase().trim();
+        }
+      } catch {
+        // fallback to JWKS check
+      }
+      if (!isAuthorized) {
+        const jwksProof = await verifyExpiredSupabaseJwt(candidateAccess, cleanEmail || undefined);
+        if (jwksProof?.userId) {
+          isAuthorized = true;
+          verifiedUserId = jwksProof.userId;
+          verifiedEmail = jwksProof.email;
+        }
+      }
+    }
+
+    if (!isAuthorized) {
+      return res.status(401).json({ success: false, error: 'Unauthorized session handoff registration.' });
+    }
+
+    const headerSrvTok =
+      typeof req.headers['x-washek-server-session'] === 'string'
+        ? req.headers['x-washek-server-session'].trim()
+        : '';
+
+    storeCheckoutReturnHandoff({
+      sessionId: resolvedSid,
+      plan: String(plan || '').toLowerCase().trim(),
+      userId: verifiedUserId || undefined,
+      email: verifiedEmail || undefined,
+      accessToken: candidateAccess || undefined,
+      refreshToken: typeof refreshToken === 'string' ? refreshToken.trim() : undefined,
+      serverSessionToken: headerSrvTok || createServerSessionToken(verifiedEmail, verifiedUserId),
+    });
+
+    return res.json({ success: true, session_id: resolvedSid });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to register checkout handoff.' });
+  }
+});
+
+app.post('/api/checkout/claim-return-session', async (req, res) => {
+  try {
+    pruneCheckoutReturnHandoffs();
+    const { session_id, sessionId } = req.body || {};
+    const resolvedSid = extractStripeSessionId(session_id || sessionId);
+    if (!resolvedSid) {
+      return res.status(400).json({ success: false, error: 'Valid Stripe session_id is required.' });
+    }
+
+    const entry = checkoutReturnHandoffs.get(resolvedSid);
+    if (!entry) {
+      return res.status(404).json({ success: false, error: 'Checkout return session not found or expired.' });
+    }
+
+    let recoveredSession: any = null;
+
+    if (entry.refreshToken) {
+      try {
+        const { data: refreshed, error: refreshErr } = await createStatelessSupabase().auth.refreshSession({
+          refresh_token: entry.refreshToken,
+        });
+        if (!refreshErr && refreshed?.session?.access_token) {
+          recoveredSession = refreshed.session;
+          entry.accessToken = refreshed.session.access_token;
+          if (refreshed.session.refresh_token) {
+            entry.refreshToken = refreshed.session.refresh_token;
+          }
+        }
+      } catch {
+        // fall through to accessToken / recovery
+      }
+    }
+
+    if (!recoveredSession && entry.accessToken && entry.accessToken.split('.').length === 3) {
+      try {
+        const { data: uData, error: uErr } = await createStatelessSupabase(entry.accessToken).auth.getUser(
+          entry.accessToken
+        );
+        if (!uErr && uData?.user?.id) {
+          recoveredSession = {
+            access_token: entry.accessToken,
+            refresh_token: entry.refreshToken || undefined,
+            user: uData.user,
+          };
+        }
+      } catch {
+        // fall through
+      }
+    }
+
+    if (!recoveredSession) {
+      const recovery = await tryRecoverSupabaseSession({
+        authToken: entry.accessToken,
+        refreshToken: entry.refreshToken,
+        serverSessionToken: entry.serverSessionToken,
+        cookieHeader: req.headers.cookie,
+        targetEmail: entry.email,
+      });
+      if (recovery?.session?.access_token) {
+        recoveredSession = recovery.session;
+        entry.accessToken = recovery.session.access_token;
+        if (recovery.session.refresh_token) {
+          entry.refreshToken = recovery.session.refresh_token;
+        }
+      }
+    }
+
+    if (!recoveredSession?.access_token || !recoveredSession?.user?.id) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unable to restore session for checkout return.',
+      });
+    }
+
+    if (!entry.claimedAt) {
+      entry.claimedAt = Date.now();
+    }
+
+    const resolvedEmail = (recoveredSession.user.email || entry.email || '').toLowerCase().trim();
+    const newSrvToken = createServerSessionToken(resolvedEmail, recoveredSession.user.id);
+    setServerSessionCookie(res, newSrvToken, req);
+
+    let profile: any = null;
+    try {
+      const userClient = createStatelessSupabase(recoveredSession.access_token);
+      const { data: profData } = await userClient
+        .from('profiles')
+        .select('*')
+        .eq('id', recoveredSession.user.id)
+        .maybeSingle();
+      if (profData) profile = profData;
+    } catch {
+      // ignore profile read error
+    }
+
+    return res.json({
+      success: true,
+      plan: entry.plan || null,
+      session: recoveredSession,
+      user: recoveredSession.user,
+      profile,
+      serverSessionToken: newSrvToken,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Failed to claim checkout return session.' });
+  }
+});
 
 app.post('/api/checkout/pending', (req, res) => {
   try {

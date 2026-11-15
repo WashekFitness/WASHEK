@@ -93,3 +93,48 @@ export async function refreshSupabaseSessionLocked(explicitRefreshToken = '') {
 
   return await inFlightRefreshPromise;
 }
+
+/**
+ * Persists Supabase session tokens and synchronizes the client SDK without risking lock deadlocks.
+ */
+export async function syncClientSessionSafely(session, timeoutMs = 1500) {
+  if (!session?.access_token) return null;
+  try {
+    localStorage.setItem('washek_auth_token', session.access_token);
+    if (session.refresh_token) {
+      localStorage.setItem('washek_refresh_token', session.refresh_token);
+    }
+  } catch {
+    // ignore storage write errors
+  }
+
+  const refreshTok =
+    session.refresh_token ||
+    (() => {
+      try {
+        return localStorage.getItem('washek_refresh_token') || '';
+      } catch {
+        return '';
+      }
+    })();
+
+  if (!refreshTok) {
+    return session;
+  }
+
+  try {
+    const result = await Promise.race([
+      supabase.auth.setSession({
+        access_token: session.access_token,
+        refresh_token: refreshTok,
+      }),
+      new Promise((resolve) =>
+        setTimeout(() => resolve({ data: { session }, error: null, timedOut: true }), timeoutMs)
+      ),
+    ]);
+    return result?.data?.session || session;
+  } catch {
+    return session;
+  }
+}
+

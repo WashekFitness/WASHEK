@@ -27,6 +27,8 @@ import {
   createStripeCheckout,
   resolveValidSupabaseSession,
   extractInvokeErrorMessage,
+  extractStripeSessionId,
+  registerCheckoutReturnHandoff,
 } from '@/lib/stripeCheckout';
 import { queryClientInstance } from '@/lib/query-client';
 import { toast } from 'sonner';
@@ -498,7 +500,11 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
     const { data: authListener } = supabase.auth.onAuthStateChange(() => {
       if (active) {
-        loadSubscription();
+        window.setTimeout(() => {
+          if (active) {
+            loadSubscription();
+          }
+        }, 0);
       }
     });
 
@@ -551,54 +557,56 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }, 2500);
   }, [checkUserAuth, loadSubscription, user?.id]);
 
-  const openCheckoutTab = useCallback((destinationUrl, plan, reservedWin) => {
+  const navigateSingleTabToCheckout = useCallback(async (destinationUrl, plan, sessionId = '') => {
+    const resolvedSid = extractStripeSessionId(sessionId, destinationUrl);
+    if (resolvedSid) {
+      await registerCheckoutReturnHandoff({
+        sessionId: resolvedSid,
+        url: destinationUrl,
+        plan: plan.planKey,
+      }).catch(() => {});
+    }
+
     startPostCheckoutPolling(plan.planKey);
 
-    let tabOpened = false;
-    if (reservedWin && !reservedWin.closed) {
+    const inIframe = (() => {
       try {
-        reservedWin.location.href = destinationUrl;
-        tabOpened = true;
+        return window.self !== window.top;
       } catch {
-        tabOpened = false;
-      }
-    }
-
-    if (!tabOpened) {
-      try {
-        const win = window.open(destinationUrl, '_blank');
-        if (win && !win.closed && typeof win.closed !== 'undefined') {
-          tabOpened = true;
-        }
-      } catch {
-        // window.open blocked
-      }
-    }
-
-    if (!tabOpened) {
-      const inIframe = (() => {
-        try {
-          return window.self !== window.top;
-        } catch {
-          return true;
-        }
-      })();
-
-      if (!inIframe) {
-        window.location.assign(destinationUrl);
         return true;
       }
+    })();
 
+    if (!inIframe) {
+      window.location.assign(destinationUrl);
+      return true;
+    }
+
+    // Inside an iframe host (such as preview), navigate the single top browser tab directly.
+    let topNavError = false;
+    try {
+      window.top.location.href = destinationUrl;
+    } catch {
+      topNavError = true;
+    }
+
+    if (topNavError) {
       setBlockedCheckout({
         planKey: plan.planKey,
         planName: plan.name,
         url: destinationUrl,
       });
-      toast.info(`Click "Continue to ${plan.name} Checkout" below to open Stripe.`);
       return true;
     }
 
-    toast.info(`Stripe Checkout opened in new tab. Complete checkout to unlock ${plan.name}.`);
+    // If top-navigation-by-user-activation silently blocked async top navigation, show a native target="_top" link after 300ms.
+    window.setTimeout(() => {
+      setBlockedCheckout({
+        planKey: plan.planKey,
+        planName: plan.name,
+        url: destinationUrl,
+      });
+    }, 300);
     return true;
   }, [startPostCheckoutPolling]);
 
@@ -627,43 +635,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     setCardError(null);
     setBlockedCheckout(null);
 
-    // Synchronously reserve a tab inside the user click gesture so async fetches never get popup-blocked.
-    // Omit 'noopener' so /subscription-return preserves window.opener to close & notify cleanly.
-    let checkoutWin = null;
-    try {
-      checkoutWin = window.open('about:blank', '_blank');
-      if (checkoutWin && !checkoutWin.closed) {
-        try {
-          checkoutWin.document.open();
-          checkoutWin.document.write(
-            '<!doctype html><html><head><title>Connecting to Stripe Checkout…</title></head>' +
-              '<body style="margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#090d16;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;">' +
-              '<div style="text-align:center;padding:24px;">' +
-              '<div style="font-weight:700;font-size:18px;margin-bottom:8px;">Connecting to Stripe Checkout…</div>' +
-              '<div style="font-size:13px;color:#94a3b8;">Preparing your ' +
-              String(plan.name || '').replace(/[<>&"]/g, '') +
-              ' plan. Redirecting in a moment…</div>' +
-              '</div></body></html>'
-          );
-          checkoutWin.document.close();
-        } catch {
-          // ignore document write error
-        }
-      }
-    } catch {
-      checkoutWin = null;
-    }
-
-    const closeReservedWindow = () => {
-      try {
-        if (checkoutWin && !checkoutWin.closed) {
-          checkoutWin.close();
-        }
-      } catch {
-        // ignore close error
-      }
-    };
-
     try {
       const latestStoredUser = (() => {
         try {
@@ -680,6 +651,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       document.cookie = `washek_pending_checkout_plan=${plan.planKey}; path=/; max-age=86400; SameSite=Lax`;
 
       let destinationUrl = null;
+      let resolvedSessionId = '';
       let checkoutErrorMessage = '';
       let needsReauth = false;
       let needsBillingSync = false;
@@ -692,7 +664,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           checkoutResult?.action === 'already_current' ||
           checkoutResult?.action === 'changed'
         ) {
-          closeReservedWindow();
           applySubscriptionUpgrade(plan.planKey, 'active', { syncServer: false });
           setCurrentPlan(plan.planKey);
           onPlanChangeRef.current?.(plan.planKey);
@@ -703,6 +674,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
         if (checkoutResult?.url) {
           destinationUrl = checkoutResult.url;
+          resolvedSessionId = checkoutResult.session_id || '';
         }
       } catch (edgeErr) {
         checkoutErrorMessage = edgeErr?.message || '';
@@ -712,6 +684,12 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           needsReauth = true;
         }
         console.warn('[PricingSection] createStripeCheckout note:', checkoutErrorMessage || edgeErr);
+      }
+
+      // If vault/Supabase password sync is known to be required for a signed-in user, open inline prompt immediately
+      if (!destinationUrl && needsBillingSync && userEmail) {
+        openBillingSyncModalFor('checkout', userEmail, plan);
+        return;
       }
 
       // 2. Fallback: Express checkout endpoint (also runs server JWKS/HMAC vault session recovery automatically)
@@ -770,7 +748,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                 sessionDataJson?.action === 'changed'
               )
             ) {
-              closeReservedWindow();
               applySubscriptionUpgrade(plan.planKey, 'active', { syncServer: false });
               setCurrentPlan(plan.planKey);
               onPlanChangeRef.current?.(plan.planKey);
@@ -781,6 +758,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
             }
             if (sessionRes.ok && sessionDataJson?.url) {
               destinationUrl = sessionDataJson.url;
+              resolvedSessionId = sessionDataJson.session_id || sessionDataJson.sessionId || '';
               needsReauth = false;
               needsBillingSync = false;
             } else if (
@@ -804,13 +782,11 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       }
 
       if (!destinationUrl && (needsBillingSync || (needsReauth && userEmail)) && userEmail) {
-        closeReservedWindow();
         openBillingSyncModalFor('checkout', userEmail, plan);
         return;
       }
 
       if (!destinationUrl) {
-        closeReservedWindow();
         const err = new Error(
           checkoutErrorMessage ||
             'Please sign in to connect your account with Stripe Checkout.'
@@ -819,9 +795,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         throw err;
       }
 
-      openCheckoutTab(destinationUrl, plan, checkoutWin);
+      await navigateSingleTabToCheckout(destinationUrl, plan, resolvedSessionId);
     } catch (checkoutError) {
-      closeReservedWindow();
       const isAuthErr = checkoutError?.code === 'AUTH_SESSION_EXPIRED';
       const msg = isAuthErr
         ? 'Please sign in to upgrade your plan.'
@@ -982,19 +957,12 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }
   };
 
-  const finishAfterBillingSync = async (reservedWin) => {
+  const finishAfterBillingSync = async () => {
     const targetMode = billingSyncModal?.mode;
     const targetPlan = billingSyncModal?.plan;
-    setBillingSyncModal(null);
 
     if (targetMode === 'cancel') {
-      if (reservedWin && !reservedWin.closed) {
-        try {
-          reservedWin.close();
-        } catch {
-          // ignore
-        }
-      }
+      setBillingSyncModal(null);
       await executeCancel();
       return;
     }
@@ -1007,13 +975,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           result?.action === 'already_current' ||
           result?.action === 'changed'
         ) {
-          if (reservedWin && !reservedWin.closed) {
-            try {
-              reservedWin.close();
-            } catch {
-              // ignore
-            }
-          }
+          setBillingSyncModal(null);
           applySubscriptionUpgrade(targetPlan.planKey, 'active', { syncServer: false });
           setCurrentPlan(targetPlan.planKey);
           onPlanChangeRef.current?.(targetPlan.planKey);
@@ -1023,19 +985,16 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           return;
         }
         if (result?.url) {
-          openCheckoutTab(result.url, targetPlan, reservedWin);
+          setBillingSyncModal(null);
+          await navigateSingleTabToCheckout(result.url, targetPlan, result.session_id || '');
           return;
         }
       } catch (err) {
-        if (reservedWin && !reservedWin.closed) {
-          try {
-            reservedWin.close();
-          } catch {
-            // ignore
-          }
-        }
+        setBillingSyncModal(null);
         toast.error(err?.message || 'Unable to launch Stripe Checkout.');
       }
+    } else {
+      setBillingSyncModal(null);
     }
   };
 
@@ -1045,15 +1004,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
     setBillingSyncBusy(true);
     setBillingSyncError('');
-
-    let reservedWin = null;
-    if (billingSyncModal.mode === 'checkout') {
-      try {
-        reservedWin = window.open('about:blank', '_blank');
-      } catch {
-        reservedWin = null;
-      }
-    }
 
     try {
       const res = await fetch('/api/auth/sync-supabase-session', {
@@ -1074,15 +1024,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       }
 
       await syncSupabaseSession?.(data.session, data.profile || null, data.serverSessionToken || '');
-      await finishAfterBillingSync(reservedWin);
+      await finishAfterBillingSync();
     } catch (err) {
-      if (reservedWin && !reservedWin.closed) {
-        try {
-          reservedWin.close();
-        } catch {
-          // ignore
-        }
-      }
       setBillingSyncError(err?.message || 'Unable to verify password.');
     } finally {
       setBillingSyncBusy(false);
@@ -1113,15 +1056,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
     setBillingSyncBusy(true);
     setBillingSyncError('');
-
-    let reservedWin = null;
-    if (billingSyncModal.mode === 'checkout') {
-      try {
-        reservedWin = window.open('about:blank', '_blank');
-      } catch {
-        reservedWin = null;
-      }
-    }
 
     try {
       const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
@@ -1156,15 +1090,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         user: updatedUser?.user || otpData.session.user,
       };
       await syncSupabaseSession?.(finalSession, null, vaultSyncData?.serverSessionToken || '');
-      await finishAfterBillingSync(reservedWin);
+      await finishAfterBillingSync();
     } catch (err) {
-      if (reservedWin && !reservedWin.closed) {
-        try {
-          reservedWin.close();
-        } catch {
-          // ignore
-        }
-      }
       setBillingSyncError(err?.message || 'Unable to verify email code.');
     } finally {
       setBillingSyncBusy(false);
@@ -1334,8 +1261,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                 {blockedCheckout?.planKey === plan.planKey && blockedCheckout?.url ? (
                   <a
                     href={blockedCheckout.url}
-                    target="_blank"
-                    rel="opener"
+                    target="_top"
                     onClick={() => startPostCheckoutPolling(plan.planKey)}
                     className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide flex items-center justify-center ${plan.buttonClass}`}
                   >

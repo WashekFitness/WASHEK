@@ -12,8 +12,14 @@ import {
 
 import {
   supabase,
+  supabaseUrl,
+  supabaseAnonKey,
+  syncClientSessionSafely,
 } from '@/lib/supabase';
-import { resolveValidSupabaseSession } from '@/lib/stripeCheckout';
+import {
+  resolveValidSupabaseSession,
+  applyRecoveredSessionToStorage,
+} from '@/lib/stripeCheckout';
 import { queryClientInstance } from '@/lib/query-client';
 
 import {
@@ -178,9 +184,11 @@ export default function SubscriptionReturn() {
 
       // Recover authenticated Supabase session before reading profiles
       let authUser = null;
+      let recoveredAccessToken = '';
       try {
         const session = await resolveValidSupabaseSession(false);
         authUser = session?.user || null;
+        recoveredAccessToken = session?.access_token || '';
       } catch {
         // Fallback if token recovery returned no user object directly
       }
@@ -189,6 +197,7 @@ export default function SubscriptionReturn() {
         try {
           const { data: sessionData } = await supabase.auth.getSession();
           authUser = sessionData?.session?.user || null;
+          recoveredAccessToken = sessionData?.session?.access_token || recoveredAccessToken;
           if (!authUser) {
             const { data: authData } = await supabase.auth.getUser();
             authUser = authData?.user || null;
@@ -198,10 +207,34 @@ export default function SubscriptionReturn() {
         }
       }
 
-      // If this return tab has no local session (e.g. Chrome storage partitioning when opened from AI Studio iframe),
-      // delegate authoritative Postgres verification to window.opener (which holds the authenticated session).
+      // Single-tab partition recovery: claim authenticated session bound to Stripe's high-entropy session_id
+      const sessionId = searchParams.get('session_id') || '';
+      if (!authUser?.id && sessionId) {
+        try {
+          const claimRes = await fetch('/api/checkout/claim-return-session', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ session_id: sessionId }),
+          });
+          const claimData = await claimRes.json().catch(() => null);
+          if (claimRes.ok && claimData?.success && claimData?.session?.access_token) {
+            await syncClientSessionSafely(claimData.session);
+            applyRecoveredSessionToStorage(
+              claimData.session,
+              claimData.profile || null,
+              claimData.serverSessionToken || ''
+            );
+            authUser = claimData.session.user || claimData.user || null;
+            recoveredAccessToken = claimData.session.access_token;
+          }
+        } catch (claimErr) {
+          console.debug('[SubscriptionReturn] Return session claim note:', claimErr);
+        }
+      }
+
+      // Legacy fallback: if opened as a child popup with window.opener and still no local session
       if (!authUser?.id && window.opener && !window.opener.closed) {
-        const sessionId = searchParams.get('session_id') || '';
         let settled = false;
 
         const onOpenerReply = (event) => {
@@ -286,13 +319,43 @@ export default function SubscriptionReturn() {
       for (let attempt = 0; attempt < 25; attempt++) {
         if (cancelledRef.current) return;
         try {
-          const { data: dbProf, error: profErr } = await supabase
+          let dbProf = null;
+          const { data: clientProf, error: profErr } = await supabase
             .from('profiles')
             .select('subscription_plan, subscription_status, stripe_subscription_id')
             .eq('id', authUser.id)
             .maybeSingle();
 
-          if (!profErr && dbProf) {
+          if (!profErr && clientProf) {
+            dbProf = clientProf;
+          } else {
+            const bearer =
+              recoveredAccessToken ||
+              (() => {
+                try {
+                  return localStorage.getItem('washek_auth_token') || '';
+                } catch {
+                  return '';
+                }
+              })();
+            if (bearer && bearer.split('.').length === 3) {
+              const restRes = await fetch(
+                `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(authUser.id)}&select=subscription_plan,subscription_status,stripe_subscription_id&limit=1`,
+                {
+                  headers: {
+                    apikey: supabaseAnonKey,
+                    Authorization: `Bearer ${bearer}`,
+                  },
+                }
+              );
+              const rows = await restRes.json().catch(() => null);
+              if (Array.isArray(rows) && rows[0]) {
+                dbProf = rows[0];
+              }
+            }
+          }
+
+          if (dbProf) {
             const dbPlan = normalizePlan(dbProf.subscription_plan);
             const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
             if (dbPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(dbStatus)) {
