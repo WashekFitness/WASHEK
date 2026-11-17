@@ -74,17 +74,36 @@ if (typeof window !== 'undefined') {
   }, true);
 }
 
-// Register service worker for offline fitness data and asset caching
+// Register service worker only in production; in development, unregister any stale SW so Vite dev loads fast
 if (typeof window !== 'undefined' && 'serviceWorker' in navigator) {
-  registerSW({
-    immediate: true,
-    onNeedRefresh() {
-      console.debug('[PWA] New workout updates available.');
-    },
-    onOfflineReady() {
-      console.debug('[PWA] Workout programs and assets cached for offline use.');
-    },
-  });
+  if (import.meta.env.PROD) {
+    registerSW({
+      immediate: true,
+      onNeedRefresh() {
+        console.debug('[PWA] New workout updates available.');
+      },
+      onOfflineReady() {
+        console.debug('[PWA] Workout programs and assets cached for offline use.');
+      },
+    });
+  } else {
+    navigator.serviceWorker
+      .getRegistrations()
+      .then((regs) => Promise.all(regs.map((r) => r.unregister())))
+      .catch(() => {});
+    if ('caches' in window) {
+      caches
+        .keys()
+        .then((keys) =>
+          Promise.all(
+            keys
+              .filter((k) => /workbox|washek|vite-pwa/i.test(k))
+              .map((k) => caches.delete(k))
+          )
+        )
+        .catch(() => {});
+    }
+  }
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(

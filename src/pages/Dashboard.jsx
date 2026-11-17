@@ -107,7 +107,7 @@ export default function Dashboard() {
     return () => {
       mounted = false;
     };
-  }, [authUser, navigate]);
+  }, [authUser?.id, navigate]);
 
   const effectiveUser = user || authUser;
   const userKey =

@@ -5,10 +5,13 @@ import { Input } from '@/components/ui/input';
 import { KeyRound, Shield, CheckCircle2, ArrowRight, Mail } from 'lucide-react';
 import { toast } from 'sonner';
 import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
+import { supabase, syncClientSessionSafely } from '@/lib/supabase';
+import { useAuth } from '@/lib/AuthContext';
 
 export default function ResetPassword() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { syncSupabaseSession } = useAuth();
 
   const [email, setEmail] = useState('');
   const [recoveryCode, setRecoveryCode] = useState('');
@@ -21,37 +24,91 @@ export default function ResetPassword() {
   const [success, setSuccess] = useState(false);
 
   useEffect(() => {
-    // 1. Check for token in URL hash (e.g. #access_token=...&refresh_token=...&type=recovery)
-    const hash = window.location.hash ? window.location.hash.substring(1) : '';
-    const hashParams = new URLSearchParams(hash);
-    const tokenFromHash = hashParams.get('access_token');
-    const typeFromHash = hashParams.get('type');
+    let active = true;
 
-    // 2. Check for token or code in query params
-    const tokenFromQuery = searchParams.get('token') || searchParams.get('access_token') || searchParams.get('code');
-    const emailParam = searchParams.get('email');
+    const initRecovery = async () => {
+      // 1. Check for tokens in URL hash (e.g. #access_token=...&refresh_token=...&type=recovery)
+      const hash = window.location.hash ? window.location.hash.substring(1) : '';
+      const hashParams = new URLSearchParams(hash);
+      const tokenFromHash = hashParams.get('access_token');
+      const refreshFromHash = hashParams.get('refresh_token');
+      const typeFromHash = hashParams.get('type');
 
-    if (emailParam) {
-      setEmail(emailParam.trim());
-    }
+      // 2. Check for token_hash, code, or token in query params
+      const tokenHash = searchParams.get('token_hash');
+      const codeParam = searchParams.get('code');
+      const tokenFromQuery = searchParams.get('token') || searchParams.get('access_token');
+      const emailParam = searchParams.get('email');
 
-    const token = tokenFromHash || tokenFromQuery;
-    if (token) {
-      setAccessToken(token);
-      setHasToken(true);
-      try {
-        localStorage.setItem('washek_auth_token', token);
-      } catch (err) {
-        console.debug('[RESET] Token save note:', err);
+      if (emailParam && active) {
+        setEmail(emailParam.trim());
       }
-    } else {
-      // Also check stored token if any
-      const storedToken = localStorage.getItem('washek_auth_token');
-      if (storedToken && typeFromHash === 'recovery') {
-        setAccessToken(storedToken);
+
+      if (tokenFromHash) {
+        if (!active) return;
+        setAccessToken(tokenFromHash);
         setHasToken(true);
+        await syncClientSessionSafely({
+          access_token: tokenFromHash,
+          refresh_token: refreshFromHash || undefined,
+        });
+        return;
       }
-    }
+
+      if (tokenHash) {
+        try {
+          const { data: verifyData, error: verifyErr } = await supabase.auth.verifyOtp({
+            token_hash: tokenHash,
+            type: 'recovery',
+          });
+          if (!verifyErr && verifyData?.session?.access_token && active) {
+            setAccessToken(verifyData.session.access_token);
+            setHasToken(true);
+            if (verifyData.session.user?.email) {
+              setEmail(verifyData.session.user.email);
+            }
+            return;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (codeParam) {
+        try {
+          const { data: exchangeData, error: exchangeErr } = await supabase.auth.exchangeCodeForSession(codeParam);
+          if (!exchangeErr && exchangeData?.session?.access_token && active) {
+            setAccessToken(exchangeData.session.access_token);
+            setHasToken(true);
+            if (exchangeData.session.user?.email) {
+              setEmail(exchangeData.session.user.email);
+            }
+            return;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (tokenFromQuery && active) {
+        setAccessToken(tokenFromQuery);
+        setHasToken(true);
+        return;
+      }
+
+      if (typeFromHash === 'recovery') {
+        const storedToken = localStorage.getItem('washek_auth_token');
+        if (storedToken && storedToken.split('.').length === 3 && active) {
+          setAccessToken(storedToken);
+          setHasToken(true);
+        }
+      }
+    };
+
+    initRecovery();
+    return () => {
+      active = false;
+    };
   }, [searchParams]);
 
   const handleSendResetEmail = async (e) => {
@@ -72,12 +129,6 @@ export default function ResetPassword() {
       const data = await res.json();
       if (!res.ok || !data?.success) {
         throw new Error(data?.error || 'Unable to send password reset email.');
-      }
-      if (data?.recoveryCode) {
-        setRecoveryCode(data.recoveryCode);
-        toast.success(`Recovery code generated: ${data.recoveryCode}. Enter your new password below.`);
-      } else {
-        toast.success(data?.message || `Password reset link and code sent to ${cleanEmail}`);
       }
     } catch (err) {
       toast.error(err?.message || 'Failed to send password reset instructions.');
@@ -112,6 +163,7 @@ export default function ResetPassword() {
     try {
       const response = await fetch('/api/auth/change-password', {
         method: 'POST',
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
           ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
@@ -130,22 +182,16 @@ export default function ResetPassword() {
         throw new Error(data?.error || 'Unable to update your password. Please verify your recovery code.');
       }
 
-      setSuccess(true);
-      toast.success('Password updated successfully! Welcome back.');
-
-      // If a session was returned, save it
-      if (data?.session?.access_token) {
-        try {
-          localStorage.setItem('washek_auth_token', data.session.access_token);
-        } catch {
-          // ignore
-        }
+      if (data?.session?.access_token && data?.session?.refresh_token) {
+        await syncSupabaseSession?.(data.session, null, data.serverSessionToken || '');
       }
 
-      // Automatically redirect to login after short delay
+      setSuccess(true);
+
+      const targetRoute = data?.session?.refresh_token ? '/' : '/login';
       setTimeout(() => {
-        navigate('/login', { replace: true });
-      }, 1500);
+        navigate(targetRoute, { replace: true });
+      }, 1400);
     } catch (error) {
       console.error('[RESET] Password update failed:', error);
       toast.error(error?.message || 'Unable to update your password.');

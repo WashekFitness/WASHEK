@@ -18,15 +18,6 @@ export const PLAN_HIERARCHY = [
   'elite',
 ];
 
-/**
- * Stripe Payment Link URLs for direct plan upgrades.
- */
-export const PLAN_PAYMENT_URLS = {
-  progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
-  performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
-  elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
-};
-
 
 /**
  * Monthly Kael message allowances.
@@ -39,6 +30,153 @@ export const AI_MESSAGE_LIMITS = {
 };
 
 
+export const ACTIVE_SUBSCRIPTION_STATUSES = [
+  'active',
+  'trialing',
+  'past_due',
+];
+
+export function isActiveSubscriptionStatus(status) {
+  const normalized = String(status || '').toLowerCase().trim();
+  return ACTIVE_SUBSCRIPTION_STATUSES.includes(normalized);
+}
+
+/**
+ * Resolve the effective subscription plan authoritatively.
+ * Requires both a paid plan AND an active subscription_status ('active', 'trialing', 'past_due').
+ * Missing, 'inactive', 'canceled', 'cancelled', 'paused', 'unpaid', or 'expired' statuses ALWAYS resolve to 'free'.
+ */
+export function resolveEffectivePlan(userOrPlan, explicitStatus) {
+  if (userOrPlan && typeof userOrPlan === 'object') {
+    const status =
+      explicitStatus !== undefined
+        ? explicitStatus
+        : userOrPlan.subscription_status;
+
+    if (!isActiveSubscriptionStatus(status)) {
+      return 'free';
+    }
+
+    const rawPlan =
+      userOrPlan.subscription_plan ||
+      userOrPlan.plan ||
+      userOrPlan.tier ||
+      userOrPlan.subscription_tier ||
+      'free';
+
+    return normalizePlan(rawPlan);
+  }
+
+  if (typeof userOrPlan === 'string' && userOrPlan.trim() !== '') {
+    const normPlan = normalizePlan(userOrPlan);
+    if (normPlan === 'free') {
+      return 'free';
+    }
+
+    if (explicitStatus !== undefined) {
+      return isActiveSubscriptionStatus(explicitStatus) ? normPlan : 'free';
+    }
+
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+        if (storedStatus && !isActiveSubscriptionStatus(storedStatus)) {
+          return 'free';
+        }
+        const storedUser = localStorage.getItem('washek_user');
+        if (storedUser) {
+          const parsed = JSON.parse(storedUser);
+          if (parsed && typeof parsed === 'object') {
+            const parsedStatus = parsed.subscription_status || storedStatus;
+            if (!isActiveSubscriptionStatus(parsedStatus)) {
+              return 'free';
+            }
+            const parsedPlan = normalizePlan(
+              parsed.subscription_plan ||
+              parsed.plan ||
+              parsed.tier ||
+              parsed.subscription_tier ||
+              'free'
+            );
+            if (parsedPlan === 'free') {
+              return 'free';
+            }
+          }
+        } else if (!isActiveSubscriptionStatus(storedStatus)) {
+          return 'free';
+        }
+      }
+    } catch {
+      return 'free';
+    }
+
+    return normPlan;
+  }
+
+  // Fallback when caller passed null/undefined: only trust localStorage if status is strictly active
+  try {
+    if (typeof localStorage !== 'undefined') {
+      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+      const storedUser = localStorage.getItem('washek_user');
+      if (storedUser) {
+        const parsed = JSON.parse(storedUser);
+        if (parsed && typeof parsed === 'object') {
+          const userStatus = parsed.subscription_status || storedStatus;
+          if (!isActiveSubscriptionStatus(userStatus)) {
+            return 'free';
+          }
+          const p =
+            parsed.subscription_plan ||
+            parsed.plan ||
+            parsed.tier ||
+            parsed.subscription_tier ||
+            'free';
+          return normalizePlan(p);
+        }
+      }
+      if (isActiveSubscriptionStatus(storedStatus)) {
+        const storedPlan = localStorage.getItem('washek_subscription_plan');
+        return normalizePlan(storedPlan);
+      }
+    }
+  } catch {
+    // Storage access fallback
+  }
+
+  return 'free';
+}
+
+/**
+ * Normalize subscription fields on any cached/loaded user object so inactive/canceled/unpaid
+ * accounts can never retain stale paid tier fields.
+ */
+export function enforceUserSubscriptionState(userObj) {
+  if (!userObj || typeof userObj !== 'object') return userObj;
+  const rawStatus = String(userObj.subscription_status || '').toLowerCase().trim();
+  const effectiveStatus = rawStatus || 'inactive';
+  const effectivePlan = isActiveSubscriptionStatus(effectiveStatus)
+    ? normalizePlan(
+        userObj.subscription_plan ||
+        userObj.plan ||
+        userObj.tier ||
+        userObj.subscription_tier ||
+        'free'
+      )
+    : 'free';
+
+  return {
+    ...userObj,
+    plan: effectivePlan,
+    tier: effectivePlan,
+    subscription_plan: effectivePlan,
+    subscription_tier: effectivePlan,
+    subscription_status: effectivePlan === 'free' && isActiveSubscriptionStatus(effectiveStatus)
+      ? 'inactive'
+      : effectiveStatus,
+  };
+}
+
+
 /**
  * Return true when the user's plan is equal to or higher
  * than the required plan.
@@ -47,76 +185,8 @@ export function hasPlan(
   userPlan,
   requiredPlan
 ) {
-  let resolvedUserPlan = userPlan;
-  const hasExplicitInput = userPlan !== undefined && userPlan !== null;
-
-  // Handle object inputs gracefully (e.g. user object passed directly)
-  if (resolvedUserPlan && typeof resolvedUserPlan === 'object') {
-    const status = String(resolvedUserPlan.subscription_status || '').toLowerCase().trim();
-    if (status === 'canceled' || status === 'cancelled' || status === 'inactive') {
-      resolvedUserPlan = 'free';
-    } else {
-      resolvedUserPlan =
-        resolvedUserPlan.subscription_plan ||
-        resolvedUserPlan.plan ||
-        resolvedUserPlan.tier ||
-        resolvedUserPlan.subscription_tier ||
-        'free';
-    }
-  } else if (typeof resolvedUserPlan === 'string' && resolvedUserPlan.trim() !== '') {
-    // Respect explicit string plan unless local status explicitly says canceled/inactive
-    try {
-      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
-        resolvedUserPlan = 'free';
-      }
-    } catch {
-      // ignore storage access failure
-    }
-  }
-
-  // Only inspect localStorage fallback when caller omitted userPlan (undefined/null)
-  if (!hasExplicitInput || (typeof resolvedUserPlan === 'string' && resolvedUserPlan.trim() === '')) {
-    try {
-      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
-        resolvedUserPlan = 'free';
-      } else {
-        const storedPlan = localStorage.getItem('washek_subscription_plan');
-        if (storedPlan && storedPlan !== 'free') {
-          resolvedUserPlan = storedPlan;
-        } else {
-          const storedUser = localStorage.getItem('washek_user');
-          if (storedUser) {
-            const parsed = JSON.parse(storedUser);
-            const userStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
-            if (userStatus !== 'canceled' && userStatus !== 'cancelled' && userStatus !== 'inactive') {
-              const p = parsed?.subscription_plan || parsed?.plan || parsed?.tier || parsed?.subscription_tier;
-              if (p && p !== 'free') {
-                resolvedUserPlan = p;
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      // Storage access fallback
-    }
-  }
-
-  const normalizedUserPlan =
-    String(
-      resolvedUserPlan || 'free'
-    )
-      .toLowerCase()
-      .trim();
-
-  const normalizedRequiredPlan =
-    String(
-      requiredPlan || 'free'
-    )
-      .toLowerCase()
-      .trim();
+  const normalizedUserPlan = resolveEffectivePlan(userPlan);
+  const normalizedRequiredPlan = normalizePlan(requiredPlan);
 
   const userIndex =
     PLAN_HIERARCHY.indexOf(
@@ -531,6 +601,8 @@ export function applySubscriptionCancellation(details = {}) {
     userObj.subscription_tier = 'free';
     userObj.stripe_subscription_id = null;
     userObj.stripe_price_id = null;
+    userObj.paddle_subscription_id = null;
+    userObj.paddle_price_id = null;
     userObj.has_used_trial = true;
     userObj.trial_used = true;
     userObj.subscription_cancelled_at = cancelledAt;

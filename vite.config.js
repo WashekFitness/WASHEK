@@ -117,8 +117,7 @@ export default defineConfig({
         ],
       },
       devOptions: {
-        enabled: true,
-        type: "module",
+        enabled: false,
       },
     }),
   ],
@@ -127,6 +126,25 @@ export default defineConfig({
     alias: {
       "@": path.resolve(process.cwd(), "src"),
     },
+  },
+
+  optimizeDeps: {
+    include: [
+      "react",
+      "react-dom",
+      "react-router-dom",
+      "@tanstack/react-query",
+      "@supabase/supabase-js",
+      "lucide-react",
+      "framer-motion",
+      "sonner",
+      "clsx",
+      "tailwind-merge",
+      "class-variance-authority",
+      "date-fns",
+      "canvas-confetti",
+      "@paddle/paddle-js",
+    ],
   },
 
   server: {

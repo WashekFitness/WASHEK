@@ -4,7 +4,6 @@ import { supabaseApi } from '@/lib/supabaseApi';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import DayWorkout from '@/components/program/DayWorkout';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
-import { toast } from 'sonner';
 
 export default function ProgramDay() {
   const { dayIndex } = useParams();
@@ -32,7 +31,6 @@ export default function ProgramDay() {
     mutationFn: (data) => supabaseApi.entities.WorkoutLog.create(data),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['logs'] });
-      toast.success('Workout logged! Great job 💪');
     },
   });
 

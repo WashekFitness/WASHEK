@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
-import { Flame, Drumstick, Wheat, Droplets } from 'lucide-react';
+import { Flame, Drumstick, Wheat, Droplets, Lock } from 'lucide-react';
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import { getLocalDateKey } from '@/lib/messageLimit';
+import { canAccess } from '@/lib/subscription';
 
 export default function NutritionSummary({ entries, user, logs, program }) {
   const [today, setToday] = useState(
@@ -66,6 +67,11 @@ export default function NutritionSummary({ entries, user, logs, program }) {
   const calorieGoal =
     goals.calories || 1;
 
+  const hasAdvancedMacros = canAccess(
+    user,
+    'advanced_macro_tracking'
+  );
+
   const progress = Math.min(
     (totals.calories / calorieGoal) * 100,
     100
@@ -114,11 +120,11 @@ export default function NutritionSummary({ entries, user, logs, program }) {
               <p className="font-heading font-bold text-sm tracking-tight text-foreground">
                 Daily Fuel
               </p>
-              {goals?.adaptation?.demandBadge ? (
+              {hasAdvancedMacros && goals?.adaptation?.demandBadge ? (
                 <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/15 border border-primary/30 text-primary shadow-[0_0_8px_rgba(37,99,235,0.25)] leading-none">
                   {goals.adaptation.demandBadge}
                 </span>
-              ) : goals?.adaptation?.currentWeek ? (
+              ) : hasAdvancedMacros && goals?.adaptation?.currentWeek ? (
                 <span className="px-1.5 py-0.5 rounded-full text-[9px] font-bold bg-primary/15 border border-primary/30 text-primary shadow-[0_0_8px_rgba(37,99,235,0.25)] leading-none">
                   W{goals.adaptation.currentWeek} Adapted
                 </span>
@@ -126,11 +132,11 @@ export default function NutritionSummary({ entries, user, logs, program }) {
             </div>
 
             <p className="text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
-              {goals?.adaptation?.statusTitle
+              {hasAdvancedMacros && goals?.adaptation?.statusTitle
                 ? goals.adaptation.statusTitle
-                : goals?.adaptation?.phaseName
+                : hasAdvancedMacros && goals?.adaptation?.phaseName
                   ? `${goals.adaptation.phaseName.split('&')[0].trim()}`
-                  : 'Nutrition Target'}
+                  : 'Daily Calorie Target'}
             </p>
           </div>
         </div>
@@ -164,56 +170,80 @@ export default function NutritionSummary({ entries, user, logs, program }) {
         </div>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 sm:gap-3">
-        {macros.map(
-          ({
-            label,
-            value,
-            goal,
-            unit,
-            icon: Icon,
-            color,
-          }) => {
-            const isProtein = label === 'Protein';
-            const isCarbs = label === 'Carbs';
-            const tintBorder = isProtein
-              ? 'border-blue-500/25 dark:border-blue-500/20 hover:border-blue-500/40'
-              : isCarbs
-                ? 'border-emerald-500/25 dark:border-emerald-500/20 hover:border-emerald-500/40'
-                : 'border-amber-500/25 dark:border-amber-500/20 hover:border-amber-500/40';
+      {hasAdvancedMacros ? (
+        <div className="grid grid-cols-3 gap-2 sm:gap-3">
+          {macros.map(
+            ({
+              label,
+              value,
+              goal,
+              unit,
+              icon: Icon,
+              color,
+            }) => {
+              const isProtein = label === 'Protein';
+              const isCarbs = label === 'Carbs';
+              const tintBorder = isProtein
+                ? 'border-blue-500/25 dark:border-blue-500/20 hover:border-blue-500/40'
+                : isCarbs
+                  ? 'border-emerald-500/25 dark:border-emerald-500/20 hover:border-emerald-500/40'
+                  : 'border-amber-500/25 dark:border-amber-500/20 hover:border-amber-500/40';
 
-            const tintBg = isProtein
-              ? 'bg-blue-500/[0.04] dark:bg-blue-500/[0.06]'
-              : isCarbs
-                ? 'bg-emerald-500/[0.04] dark:bg-emerald-500/[0.06]'
-                : 'bg-amber-500/[0.04] dark:bg-amber-500/[0.06]';
+              const tintBg = isProtein
+                ? 'bg-blue-500/[0.04] dark:bg-blue-500/[0.06]'
+                : isCarbs
+                  ? 'bg-emerald-500/[0.04] dark:bg-emerald-500/[0.06]'
+                  : 'bg-amber-500/[0.04] dark:bg-amber-500/[0.06]';
 
-            return (
-              <div
-                key={label}
-                className={`rounded-xl ${tintBg} ${tintBorder} border p-2.5 sm:p-3 text-center flex flex-col items-center justify-center transition-all duration-200 shadow-2xs hover:-translate-y-0.5`}
-              >
-                <div className="flex items-center gap-1.5 mb-1.5">
-                  <Icon
-                    className={`w-3.5 h-3.5 ${color}`}
-                  />
+              return (
+                <div
+                  key={label}
+                  className={`rounded-xl ${tintBg} ${tintBorder} border p-2.5 sm:p-3 text-center flex flex-col items-center justify-center transition-all duration-200 shadow-2xs hover:-translate-y-0.5`}
+                >
+                  <div className="flex items-center gap-1.5 mb-1.5">
+                    <Icon
+                      className={`w-3.5 h-3.5 ${color}`}
+                    />
 
-                  <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest font-heading">
-                    {label}
-                  </span>
+                    <span className="text-[10px] font-bold text-muted-foreground uppercase tracking-widest font-heading">
+                      {label}
+                    </span>
+                  </div>
+
+                  <p className="font-heading font-extrabold text-base sm:text-lg leading-none tabular-nums text-foreground">
+                    {Math.round(value)}
+                    <span className="text-[10px] sm:text-[11px] font-semibold text-muted-foreground ml-0.5 font-sans">
+                      / {Math.round(goal || 0)}{unit}
+                    </span>
+                  </p>
                 </div>
-
-                <p className="font-heading font-extrabold text-base sm:text-lg leading-none tabular-nums text-foreground">
-                  {Math.round(value)}
-                  <span className="text-[10px] sm:text-[11px] font-semibold text-muted-foreground ml-0.5 font-sans">
-                    / {Math.round(goal || 0)}{unit}
-                  </span>
-                </p>
-              </div>
-            );
-          }
-        )}
-      </div>
+              );
+            }
+          )}
+        </div>
+      ) : (
+        <Link
+          to="/profile"
+          className="flex items-center justify-between gap-3 rounded-xl border border-border/80 dark:border-white/10 bg-muted/40 dark:bg-background/40 px-3.5 py-3 hover:border-primary/40 transition-colors"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-7 h-7 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
+              <Lock className="w-3.5 h-3.5 text-primary" />
+            </div>
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-foreground truncate">
+                Protein, Carbs &amp; Fat Targets
+              </p>
+              <p className="text-[11px] text-muted-foreground truncate">
+                Unlock macro targets &amp; adaptive fueling with Progress+
+              </p>
+            </div>
+          </div>
+          <span className="text-[11px] font-semibold text-primary shrink-0">
+            Upgrade →
+          </span>
+        </Link>
+      )}
     </Card>
   );
 }

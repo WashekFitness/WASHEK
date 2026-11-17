@@ -215,8 +215,13 @@ export default function WeeklyUpdate({
   const monday = isMondayInTimeZone(new Date(), effectiveTz);
 
   const hasNutritionInsights = canAccess(
-    user?.subscription_plan,
+    user,
     'nutrition_insights'
+  );
+
+  const hasAdaptiveProgramming = canAccess(
+    user,
+    'adaptive_programming'
   );
 
   const previousWeek = useMemo(
@@ -1149,6 +1154,7 @@ ${JSON.stringify(
   2
 )}
 
+${hasNutritionInsights ? `
 PERFORMANCE NUTRITION METRICS:
 Tracked days: ${nutritionMetrics.trackedDays}
 Average calories: ${nutritionMetrics.averageCalories || 'Not available'}
@@ -1165,7 +1171,11 @@ Identify meaningful patterns in calories, protein, carbs, fat, hydration, meal c
 or nutrition adherence when the data supports them. Give practical suggestions.
 Do NOT invent calorie or macro targets that are not present in the athlete profile.
 Do NOT diagnose deficiencies or medical conditions. If there is not enough data, say so.
-For Free/Progress users, return an empty nutrition_insight and an empty nutrition_suggestions array.
+` : `
+NUTRITION INSIGHT RULES:
+
+User is NOT on Performance/Elite. You MUST return an empty nutrition_insight ("") and an empty nutrition_suggestions array ([]).
+`}${hasAdaptiveProgramming ? '' : '\nADAPTIVE PROGRAMMING LOCKED: User is NOT on Progress+. You MUST return adjusted_microcycle as null and must not modify next week\'s workouts.\n'}
 
 ============================================================
 CURRENT PROGRAM
@@ -1600,6 +1610,7 @@ Never diagnose a medical condition.
       // --------------------------------------------------------
 
       if (
+        hasAdaptiveProgramming &&
         result.adjusted_microcycle &&
         nextMicrocycle &&
         program?.id &&

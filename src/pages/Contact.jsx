@@ -24,8 +24,8 @@ import {
 } from '@/components/ui/button';
 
 import {
-  useToast,
-} from '@/components/ui/use-toast';
+  toast,
+} from 'sonner';
 
 import {
   supabaseApi,
@@ -33,9 +33,6 @@ import {
 
 
 export default function Contact() {
-  const {
-    toast,
-  } = useToast();
 
 
   const [
@@ -83,15 +80,8 @@ export default function Contact() {
 
 
       if (!name) {
-        toast({
-          title:
-            'Name required',
-
-          description:
-            'Please enter your name.',
-
-          variant:
-            'destructive',
+        toast.error('Name required', {
+          description: 'Please enter your name.',
         });
 
         return;
@@ -99,15 +89,8 @@ export default function Contact() {
 
 
       if (!email) {
-        toast({
-          title:
-            'Email required',
-
-          description:
-            'Please enter your email address.',
-
-          variant:
-            'destructive',
+        toast.error('Email required', {
+          description: 'Please enter your email address.',
         });
 
         return;
@@ -115,15 +98,8 @@ export default function Contact() {
 
 
       if (!message) {
-        toast({
-          title:
-            'Message required',
-
-          description:
-            'Please enter a message.',
-
-          variant:
-            'destructive',
+        toast.error('Message required', {
+          description: 'Please enter a message.',
         });
 
         return;
@@ -150,10 +126,7 @@ export default function Contact() {
 
         setSentSuccess(true);
 
-        toast({
-          title:
-            'Message sent',
-
+        toast.success('Message sent', {
           description:
             'Thank you for reaching out — we will get back to you as soon as possible.',
         });
@@ -167,16 +140,10 @@ export default function Contact() {
         );
 
 
-        toast({
-          title:
-            'Something went wrong',
-
+        toast.error('Something went wrong', {
           description:
             error?.message ||
             'Please try emailing washekfitness@gmail.com directly.',
-
-          variant:
-            'destructive',
         });
 
       } finally {

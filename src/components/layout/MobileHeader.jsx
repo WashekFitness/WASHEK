@@ -6,6 +6,7 @@ import { useAuth } from '@/lib/AuthContext';
 import AppSettingsModal from '@/components/AppSettingsModal';
 import PWAInstallButton from '@/components/pwa/PWAInstallButton';
 import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
+import { getPlanLabel, resolveEffectivePlan } from '@/lib/subscription';
 
 const ROOT_PATHS = ['/', '/program', '/nutrition', '/profile', '/kael'];
 
@@ -49,8 +50,8 @@ export default function MobileHeader({ scrollRef }) {
     }
   };
 
-  const plan = user?.subscription_plan;
-  const isUpgraded = plan && plan !== 'free';
+  const plan = resolveEffectivePlan(user);
+  const isUpgraded = plan !== 'free';
 
   return (
     <header
@@ -100,7 +101,7 @@ export default function MobileHeader({ scrollRef }) {
                 </span>
                 {isUpgraded && (
                   <span className="text-[9px] font-heading font-extrabold px-1.5 py-0.2 rounded-md bg-primary/15 text-primary border border-primary/25 uppercase tracking-wider leading-tight">
-                    {plan}
+                    {getPlanLabel(plan)}
                   </span>
                 )}
               </div>

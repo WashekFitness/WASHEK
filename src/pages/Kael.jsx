@@ -61,6 +61,7 @@ import {
   getCurrentMonthKey,
   getPlanLimit,
 } from '@/lib/messageLimit';
+import { resolveEffectivePlan } from '@/lib/subscription';
 import {
   kaelStore,
   useKaelStore,
@@ -323,11 +324,7 @@ export default function Kael() {
       const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
       if (stored) {
         const u = JSON.parse(stored);
-        const uStatus = String(u?.subscription_status || '').toLowerCase().trim();
-        const uPlan =
-          uStatus === 'canceled' || uStatus === 'cancelled' || uStatus === 'inactive'
-            ? 'free'
-            : (u?.subscription_plan || 'free');
+        const uPlan = resolveEffectivePlan(u);
         return getCachedMessageStats(u, uPlan);
       }
     } catch (_initErr) {
@@ -429,7 +426,7 @@ export default function Kael() {
     return () => {
       active = false;
     };
-  }, [timeZone, authUser]);
+  }, [timeZone, authUser?.id]);
 
   // Real-time listener for quota updates dispatched anywhere in the app
   useEffect(() => {
@@ -554,13 +551,7 @@ export default function Kael() {
    * ==========================================================
    */
 
-  const effectiveSubStatus = String(effectiveUser?.subscription_status || '').toLowerCase().trim();
-  const plan =
-    effectiveSubStatus === 'canceled' ||
-    effectiveSubStatus === 'cancelled' ||
-    effectiveSubStatus === 'inactive'
-      ? 'free'
-      : (effectiveUser?.subscription_plan || 'free');
+  const plan = resolveEffectivePlan(effectiveUser);
 
   const effectiveTz = timeZone || getUserTimeZone(effectiveUser);
   const activeLimit = getPlanLimit(plan);

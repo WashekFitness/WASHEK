@@ -894,7 +894,7 @@ async function generateOneWeek(
    */
 
   const canAdapt = hasPlan(
-    profile?.subscription_plan,
+    profile,
     'progress'
   );
 

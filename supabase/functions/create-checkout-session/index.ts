@@ -509,7 +509,6 @@ Deno.serve(async (req) => {
         .upsert(
           {
             id: user.id,
-            email: user.email ?? null,
           },
           { onConflict: 'id', ignoreDuplicates: true },
         )

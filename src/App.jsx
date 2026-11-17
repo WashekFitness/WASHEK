@@ -1,4 +1,4 @@
-import React, { Suspense } from 'react';
+import React, { Suspense, lazy } from 'react';
 import {
   BrowserRouter as Router,
   Route,
@@ -22,31 +22,30 @@ import PageNotFound from '@/lib/PageNotFound';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import OfflineIndicator from '@/components/pwa/OfflineIndicator';
 
-import Dashboard from '@/pages/Dashboard';
-import Onboarding from '@/pages/Onboarding';
-import About from '@/pages/About';
-import Contact from '@/pages/Contact';
-import Login from '@/pages/Login';
-import ResetPassword from '@/pages/ResetPassword';
-import Terms from '@/pages/Terms';
-import Privacy from '@/pages/Privacy';
-import Profile from '@/pages/Profile';
-import Program from '@/pages/Program';
-import Nutrition from '@/pages/Nutrition';
-import Progress from '@/pages/Progress';
-import Kael from '@/pages/Kael';
-import ProgressPhotos from '@/pages/ProgressPhotos';
-import FormLab from '@/pages/FormLab';
-import MuscleHeatmapPage from '@/pages/MuscleHeatmapPage';
-import ProgramDay from '@/pages/ProgramDay';
-import LiveWorkout from '@/pages/LiveWorkout';
-import SubscriptionReturn from '@/pages/SubscriptionReturn';
+const Dashboard = lazy(() => import('@/pages/Dashboard'));
+const Onboarding = lazy(() => import('@/pages/Onboarding'));
+const About = lazy(() => import('@/pages/About'));
+const Contact = lazy(() => import('@/pages/Contact'));
+const Login = lazy(() => import('@/pages/Login'));
+const ResetPassword = lazy(() => import('@/pages/ResetPassword'));
+const Terms = lazy(() => import('@/pages/Terms'));
+const Privacy = lazy(() => import('@/pages/Privacy'));
+const Profile = lazy(() => import('@/pages/Profile'));
+const Program = lazy(() => import('@/pages/Program'));
+const Nutrition = lazy(() => import('@/pages/Nutrition'));
+const Progress = lazy(() => import('@/pages/Progress'));
+const Kael = lazy(() => import('@/pages/Kael'));
+const ProgressPhotos = lazy(() => import('@/pages/ProgressPhotos'));
+const FormLab = lazy(() => import('@/pages/FormLab'));
+const MuscleHeatmapPage = lazy(() => import('@/pages/MuscleHeatmapPage'));
+const ProgramDay = lazy(() => import('@/pages/ProgramDay'));
+const LiveWorkout = lazy(() => import('@/pages/LiveWorkout'));
+const SubscriptionReturn = lazy(() => import('@/pages/SubscriptionReturn'));
 
 import { supabase } from '@/lib/supabase';
-import { resolveValidSupabaseSession } from '@/lib/stripeCheckout';
+import { resolveValidSupabaseSession } from '@/lib/paddleCheckout';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { applySubscriptionUpgrade, normalizePlan } from '@/lib/subscription';
-import { toast } from 'sonner';
 
 function PageLoader() {
   return (
@@ -85,9 +84,6 @@ function SubscriptionWatcher() {
           const now = Date.now();
           if (showToast && now - lastAppliedRef.current > 2000) {
             lastAppliedRef.current = now;
-            toast.success(
-              `Payment confirmed! You are now upgraded to the ${verifiedPlan.charAt(0).toUpperCase() + verifiedPlan.slice(1)} plan.`
-            );
           }
         }
       } catch {
@@ -96,7 +92,9 @@ function SubscriptionWatcher() {
     };
 
     // Strip any ?subscribed= / ?plan= query parameters on non-return routes without trusting URL params
-    const isReturnRoute = location.pathname.startsWith('/subscription');
+    const isReturnRoute =
+      location.pathname.startsWith('/subscription') ||
+      location.pathname.startsWith('/welcome');
     const params = new URLSearchParams(location.search);
     if (!isReturnRoute && (params.has('subscribed') || params.has('plan') || params.has('sub_status'))) {
       const hasSubHint = params.has('subscribed');
@@ -111,7 +109,8 @@ function SubscriptionWatcher() {
       }
     }
 
-    const handleOpenerCheckoutReturn = async (sourceWindow) => {
+    const handleOpenerCheckoutReturn = async (sourceWindow, expectedPlanRaw = '') => {
+      const expectedPlan = normalizePlan(expectedPlanRaw);
       try {
         let uid = null;
         try {
@@ -144,7 +143,8 @@ function SubscriptionWatcher() {
             if (!profErr && dbProf) {
               const dbPlan = normalizePlan(dbProf.subscription_plan);
               const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
-              if (dbPlan !== 'free' && ['active', 'trialing', 'past_due'].includes(dbStatus)) {
+              const matchesExpected = expectedPlan === 'free' || dbPlan === expectedPlan;
+              if (dbPlan !== 'free' && matchesExpected && ['active', 'trialing', 'past_due'].includes(dbStatus)) {
                 confirmedPlan = dbPlan;
                 confirmedStatus = dbStatus;
                 break;
@@ -167,9 +167,6 @@ function SubscriptionWatcher() {
           const now = Date.now();
           if (now - lastAppliedRef.current > 2000) {
             lastAppliedRef.current = now;
-            toast.success(
-              `Payment confirmed! You are now upgraded to the ${confirmedPlan.charAt(0).toUpperCase() + confirmedPlan.slice(1)} plan.`
-            );
           }
 
           sourceWindow?.postMessage(
@@ -197,7 +194,7 @@ function SubscriptionWatcher() {
       if (e.data?.type === 'WASHEK_SUBSCRIPTION_SUCCESS') {
         verifyAndSyncFromServer(true);
       } else if (e.data?.type === 'WASHEK_CHECKOUT_RETURN' && e.origin === window.location.origin) {
-        handleOpenerCheckoutReturn(e.source);
+        handleOpenerCheckoutReturn(e.source, e.data?.plan || '');
       }
     };
     window.addEventListener('message', onWindowMsg);
@@ -245,6 +242,7 @@ function AuthenticatedApp() {
     location.pathname !== '/reset-password' &&
     location.pathname !== '/subscription-return' &&
     location.pathname !== '/subscription/return' &&
+    location.pathname !== '/welcome' &&
     location.pathname !== '/terms' &&
     location.pathname !== '/privacy'
   ) {
@@ -281,6 +279,10 @@ function AuthenticatedApp() {
             />
             <Route
               path="/subscription/return"
+              element={<SubscriptionReturn />}
+            />
+            <Route
+              path="/welcome"
               element={<SubscriptionReturn />}
             />
 

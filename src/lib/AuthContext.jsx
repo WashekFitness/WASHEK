@@ -3,6 +3,7 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useRef,
   useState,
 } from 'react';
 
@@ -12,8 +13,18 @@ import {
   refreshSupabaseSessionLocked,
   syncClientSessionSafely,
 } from '@/lib/supabase';
-import { supabaseApi, isUserMarkedOnboarded, markUserOnboarded } from '@/lib/supabaseApi';
+import {
+  supabaseApi,
+  invalidateCurrentUserCache,
+  isUserMarkedOnboarded,
+  markUserOnboarded,
+} from '@/lib/supabaseApi';
 import { isLogo } from '@/lib/avatarUtils';
+import {
+  enforceUserSubscriptionState,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+} from '@/lib/subscription';
 
 const AuthContext = createContext(null);
 
@@ -22,10 +33,22 @@ export const AuthProvider = ({ children }) => {
     try {
       const saved = localStorage.getItem('washek_user');
       if (!saved) return null;
-      const parsed = JSON.parse(saved);
+      const parsed = enforceUserSubscriptionState(JSON.parse(saved));
+      let modified = false;
       if (parsed && isLogo(parsed.avatar_url)) {
         parsed.avatar_url = null;
         parsed.photo_url = null;
+        modified = true;
+      }
+      if (parsed && !isActiveSubscriptionStatus(parsed.subscription_status)) {
+        try {
+          localStorage.removeItem('washek_subscription_plan');
+        } catch (_err) {
+          // ignore
+        }
+        modified = true;
+      }
+      if (parsed && modified) {
         try {
           localStorage.setItem('washek_user', JSON.stringify(parsed));
         } catch (_err) {
@@ -93,28 +116,32 @@ export const AuthProvider = ({ children }) => {
         ? profileData.avatar_url
         : null;
 
-    return {
+    return enforceUserSubscriptionState({
+      ...profileData,
       id: supaUser.id,
       email: supaUser.email || meta.email || '',
       first_name: firstName,
       last_name: lastName,
       full_name: fullName,
       role: profileData.role || meta.role || 'athlete',
-      plan: profileData.subscription_plan || profileData.plan || 'free',
-      tier: profileData.subscription_plan || profileData.tier || 'free',
-      subscription_plan: profileData.subscription_plan || 'free',
-      subscription_status: profileData.subscription_status || 'active',
-      subscription_tier: profileData.subscription_plan || 'free',
+      subscription_plan: profileData.subscription_plan || profileData.plan || 'free',
+      subscription_status: profileData.subscription_status || 'inactive',
       avatar_url: cleansedAvatar,
       photo_url: cleansedAvatar,
       onboarded: profileData.onboarded ?? true,
       created_at: profileData.created_at || supaUser.created_at || new Date().toISOString(),
-      ...profileData,
-    };
+    });
   }, []);
 
-  // Load user from Supabase session
-  const loadSupabaseSessionUser = useCallback(async () => {
+  const loadSessionInFlightRef = useRef(null);
+  const lastLoadedTokenRef = useRef('');
+
+  // Load user from Supabase session (deduplicated across concurrent mounts/events)
+  const loadSupabaseSessionUser = useCallback(() => {
+    if (loadSessionInFlightRef.current) {
+      return loadSessionInFlightRef.current;
+    }
+    const promise = (async () => {
     try {
       let session = null;
       try {
@@ -124,20 +151,22 @@ export const AuthProvider = ({ children }) => {
         // session query note
       }
 
-      // If no active session but tokens are in localStorage, attempt recovery or refresh
+      // If no active session but genuine JWT/refresh tokens are in localStorage, attempt recovery or refresh
       if (!session) {
         const nativeSession = readNativeSupabaseStorageSession();
         const storedToken = localStorage.getItem('washek_auth_token') || '';
+        const isVaultTok =
+          storedToken.startsWith('vault_tok_') || storedToken.startsWith('washek_sess_');
         const token =
-          storedToken && !storedToken.startsWith('vault_tok_') && !storedToken.startsWith('washek_sess_')
+          storedToken && !isVaultTok
             ? storedToken
             : nativeSession?.access_token || '';
         const refreshToken =
           localStorage.getItem('washek_refresh_token') ||
-          nativeSession?.refresh_token ||
+          (!isVaultTok ? nativeSession?.refresh_token : '') ||
           '';
 
-        if (refreshToken) {
+        if (!isVaultTok && refreshToken) {
           if (token && !token.startsWith('vault_tok_') && !token.startsWith('washek_sess_')) {
             try {
               session = await syncClientSessionSafely({
@@ -165,6 +194,7 @@ export const AuthProvider = ({ children }) => {
       }
 
       if (session?.access_token) {
+        lastLoadedTokenRef.current = session.access_token;
         try {
           localStorage.setItem('washek_auth_token', session.access_token);
           if (session.refresh_token) {
@@ -204,6 +234,13 @@ export const AuthProvider = ({ children }) => {
       console.debug('[AUTH] Session load note:', err);
     }
     return null;
+    })();
+    loadSessionInFlightRef.current = promise;
+    return promise.finally(() => {
+      if (loadSessionInFlightRef.current === promise) {
+        loadSessionInFlightRef.current = null;
+      }
+    });
   }, [formatAthleteUser]);
 
   const checkUserAuth = useCallback(async () => {
@@ -290,9 +327,13 @@ export const AuthProvider = ({ children }) => {
       (event, session) => {
         if (!mounted) return;
         if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'TOKEN_REFRESHED') {
-          if (session?.access_token) {
+          const incomingToken = session?.access_token || '';
+          const tokenUnchanged =
+            Boolean(incomingToken) && incomingToken === lastLoadedTokenRef.current;
+
+          if (incomingToken) {
             try {
-              localStorage.setItem('washek_auth_token', session.access_token);
+              localStorage.setItem('washek_auth_token', incomingToken);
               if (session.refresh_token) {
                 localStorage.setItem('washek_refresh_token', session.refresh_token);
               }
@@ -300,6 +341,12 @@ export const AuthProvider = ({ children }) => {
               // ignore
             }
           }
+
+          if (tokenUnchanged && event !== 'USER_UPDATED') {
+            return;
+          }
+
+          invalidateCurrentUserCache();
           if (session?.user) {
             // Defer outside Supabase's internal auth lock callback to prevent getSession/setSession deadlocks
             window.setTimeout(() => {
@@ -319,6 +366,8 @@ export const AuthProvider = ({ children }) => {
           if (activeToken.startsWith('vault_tok_') || activeToken.startsWith('washek_sess_')) {
             return;
           }
+          lastLoadedTokenRef.current = '';
+          invalidateCurrentUserCache();
           setUser(null);
           setIsAuthenticated(false);
           try {
@@ -363,27 +412,33 @@ export const AuthProvider = ({ children }) => {
   // Listen to subscription plan updates across the app
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const newPlan = e.detail?.plan;
-      const newStatus = e.detail?.status || (newPlan === 'free' ? 'canceled' : 'active');
-      if (newPlan) {
+      const rawPlan = e.detail?.plan ?? e.detail?.subscription_plan;
+      const rawStatus = e.detail?.status ?? e.detail?.subscription_status;
+      if (rawPlan || rawStatus) {
+        const requestedPlan = normalizePlan(rawPlan || 'free');
+        const nextStatus = String(
+          rawStatus || (requestedPlan === 'free' ? 'canceled' : 'active')
+        ).toLowerCase().trim();
+        const isActive = requestedPlan !== 'free' && isActiveSubscriptionStatus(nextStatus);
+        const effectivePlan = isActive ? requestedPlan : 'free';
         setUser((prev) => {
           if (!prev) return prev;
-          const updated = {
+          const updated = enforceUserSubscriptionState({
             ...prev,
-            subscription_plan: newPlan,
-            subscription_status: newStatus,
-            tier: newPlan,
-            plan: newPlan,
-            subscription_tier: newPlan,
-          };
+            subscription_plan: effectivePlan,
+            subscription_status: nextStatus,
+            tier: effectivePlan,
+            plan: effectivePlan,
+            subscription_tier: effectivePlan,
+          });
           try {
             localStorage.setItem('washek_user', JSON.stringify(updated));
-            if (newPlan === 'free' || newStatus === 'canceled' || newStatus === 'cancelled') {
+            if (!isActive) {
               localStorage.removeItem('washek_subscription_plan');
-              localStorage.setItem('washek_subscription_status', 'canceled');
+              localStorage.setItem('washek_subscription_status', updated.subscription_status);
             } else {
-              localStorage.setItem('washek_subscription_plan', newPlan);
-              localStorage.setItem('washek_subscription_status', newStatus);
+              localStorage.setItem('washek_subscription_plan', effectivePlan);
+              localStorage.setItem('washek_subscription_status', nextStatus);
             }
           } catch (_err) {
             // ignore
@@ -401,13 +456,13 @@ export const AuthProvider = ({ children }) => {
       const profileData = e.detail?.profile;
       if (recoveredUser?.id || profileData?.id) {
         setUser((prev) => {
-          const updated = {
+          const updated = enforceUserSubscriptionState({
             ...(prev || {}),
             ...(profileData || {}),
             id: recoveredUser?.id || profileData?.id || prev?.id,
             email: recoveredUser?.email || profileData?.email || prev?.email || '',
             onboarded: prev?.onboarded ?? profileData?.onboarded ?? true,
-          };
+          });
           try {
             localStorage.setItem('washek_user', JSON.stringify(updated));
           } catch {
@@ -450,6 +505,8 @@ export const AuthProvider = ({ children }) => {
   const signInWithEmail = useCallback(async (email, password) => {
     setIsLoadingAuth(true);
     setAuthError(null);
+    lastLoadedTokenRef.current = '';
+    invalidateCurrentUserCache();
 
     const cleanEmail = email.trim();
     let authSucceeded = false;
@@ -477,20 +534,17 @@ export const AuthProvider = ({ children }) => {
           cleanEmail.split('@')[0] ||
           'Athlete';
 
-        finalProfile = {
+        finalProfile = enforceUserSubscriptionState({
+          ...p,
           id: u.id || p.id,
           email: u.email || p.email || cleanEmail,
           first_name: p.first_name || meta.first_name || '',
           last_name: p.last_name || meta.last_name || '',
           full_name: fullName,
           role: p.role || meta.role || 'athlete',
-          plan: p.subscription_plan || p.plan || 'free',
-          tier: p.subscription_plan || p.tier || 'free',
-          subscription_tier: p.subscription_plan || 'free',
-          subscription_plan: p.subscription_plan || 'free',
-          subscription_status: p.subscription_status || 'active',
-          ...p,
-        };
+          subscription_plan: p.subscription_plan || p.plan || 'free',
+          subscription_status: p.subscription_status || 'inactive',
+        });
 
         if (data.serverSessionToken) {
           try {
@@ -509,11 +563,12 @@ export const AuthProvider = ({ children }) => {
                 access_token: data.session.access_token,
                 refresh_token: data.session.refresh_token,
               });
+            } else if (data.isVaultSession) {
+              // Server /api/auth/signin already verified against Supabase and fell back to vault;
+              // clear stale refresh tokens instead of repeating a failing signInWithPassword RTT.
+              localStorage.removeItem('washek_refresh_token');
             } else {
-              if (data.isVaultSession) {
-                localStorage.removeItem('washek_refresh_token');
-              }
-              // Attempt direct browser signInWithPassword so a genuine Supabase JWT is acquired if possible
+              // Non-vault token missing refresh token: try browser signInWithPassword once
               try {
                 const { data: directData } = await supabase.auth.signInWithPassword({
                   email: cleanEmail,
@@ -529,7 +584,7 @@ export const AuthProvider = ({ children }) => {
                   }
                 }
               } catch {
-                // keep vault session without triggering a destructive SIGNED_OUT event
+                // keep existing session without triggering SIGNED_OUT
               }
             }
           } catch (tokenErr) {
@@ -597,6 +652,8 @@ export const AuthProvider = ({ children }) => {
   const signUpWithEmail = useCallback(async (email, password, metadata = {}) => {
     setIsLoadingAuth(true);
     setAuthError(null);
+    lastLoadedTokenRef.current = '';
+    invalidateCurrentUserCache();
 
     const cleanEmail = email.trim();
     const firstName = (metadata?.firstName || '').trim();
@@ -633,20 +690,17 @@ export const AuthProvider = ({ children }) => {
           cleanEmail.split('@')[0] ||
           'Athlete';
 
-        const finalProfile = {
+        const finalProfile = enforceUserSubscriptionState({
+          ...p,
           id: u.id || p.id,
           email: u.email || cleanEmail,
           first_name: firstName || p.first_name || meta.first_name || '',
           last_name: lastName || p.last_name || meta.last_name || '',
           full_name: resolvedName,
           role: p.role || meta.role || 'athlete',
-          plan: 'free',
-          tier: 'free',
-          subscription_tier: 'free',
-          subscription_plan: 'free',
-          subscription_status: 'active',
-          ...p,
-        };
+          subscription_plan: p.subscription_plan || 'free',
+          subscription_status: p.subscription_status || 'inactive',
+        });
 
         if (data.serverSessionToken) {
           try {
@@ -787,13 +841,6 @@ export const AuthProvider = ({ children }) => {
       throw new Error('Please enter your email address.');
     }
 
-    // Trigger password reset via Supabase and server proxy
-    try {
-      await supabase.auth.resetPasswordForEmail(cleanEmail).catch(() => {});
-    } catch (_supaErr) {
-      // non-blocking
-    }
-
     const response = await fetch('/api/auth/reset-password', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -813,6 +860,8 @@ export const AuthProvider = ({ children }) => {
     } catch (err) {
       console.warn('[AUTH] Sign out error:', err);
     } finally {
+      lastLoadedTokenRef.current = '';
+      invalidateCurrentUserCache();
       setUser(null);
       setIsAuthenticated(false);
       setAuthError(null);
@@ -832,6 +881,8 @@ export const AuthProvider = ({ children }) => {
 
   const syncSupabaseSession = useCallback(async (session, profileData = null, serverSessionToken = '') => {
     if (!session?.access_token) return null;
+    lastLoadedTokenRef.current = session.access_token;
+    invalidateCurrentUserCache();
     try {
       localStorage.setItem('washek_auth_token', session.access_token);
       if (session.refresh_token) {

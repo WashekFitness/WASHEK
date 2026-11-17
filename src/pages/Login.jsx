@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/lib/AuthContext';
+import { supabase } from '@/lib/supabase';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { toast } from 'sonner';
@@ -9,7 +10,7 @@ import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 export default function Login() {
   const navigate = useNavigate();
-  const { signInWithEmail, signUpWithEmail, resetPassword } = useAuth();
+  const { signInWithEmail, signUpWithEmail, resetPassword, syncSupabaseSession } = useAuth();
 
   const [mode, setMode] = useState('login');
   const [email, setEmail] = useState('');
@@ -26,51 +27,85 @@ export default function Login() {
   const [existingAccountNotice, setExistingAccountNotice] = useState(null);
   const [quickResetSent, setQuickResetSent] = useState(false);
   const [quickResetLoading, setQuickResetLoading] = useState(false);
-  const [inlineResetOpen, setInlineResetOpen] = useState(false);
-  const [inlineNewPassword, setInlineNewPassword] = useState('');
-  const [inlineResetLoading, setInlineResetLoading] = useState(false);
+
+  // Passwordless 6-digit email sign-in code (links genuine Supabase cloud session for billing)
+  const [otpMode, setOtpMode] = useState(false);
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpCode, setOtpCode] = useState('');
+  const [otpBusy, setOtpBusy] = useState(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     if (params.get('deleted') === 'true') {
-      toast.success('Your account has been permanently deleted.');
+      // Account deleted redirect
     }
   }, []);
 
-  const handleInstantReset = async (targetEmail) => {
-    const clean = (targetEmail || email || '').trim();
+  const handleSendEmailSignInCode = async (targetEmail) => {
+    const clean = (targetEmail || email || '').trim().toLowerCase();
     if (!clean) {
       toast.error('Please enter your email address first.');
       return;
     }
-    if (!inlineNewPassword || inlineNewPassword.length < 6) {
-      toast.error('New password must be at least 6 characters.');
-      return;
-    }
-    setInlineResetLoading(true);
+    setOtpBusy(true);
     try {
-      const res = await fetch('/api/auth/instant-reset', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: clean, newPassword: inlineNewPassword }),
+      const { error } = await supabase.auth.signInWithOtp({
+        email: clean,
+        options: {
+          shouldCreateUser: false,
+          emailRedirectTo: `${window.location.origin}/`,
+        },
       });
-      const data = await res.json();
-      if (!res.ok || !data?.success) {
-        throw new Error(data?.error || 'Unable to update password.');
-      }
-      toast.success('Password updated! Signing in to your account…');
-      if (data?.session?.access_token) {
-        localStorage.setItem('washek_auth_token', data.session.access_token);
-      }
-      if (data?.profile || data?.user) {
-        localStorage.setItem('washek_user', JSON.stringify(data.profile || data.user));
-      }
-      await signInWithEmail(clean, inlineNewPassword);
-      navigate('/');
+      if (error) throw error;
+      setEmail(clean);
+      setOtpMode(true);
+      setOtpSent(true);
+      setDiagnosticNotice(null);
     } catch (err) {
-      toast.error(err?.message || 'Failed to update password.');
+      toast.error(err?.message || 'Unable to send email sign-in code right now.');
     } finally {
-      setInlineResetLoading(false);
+      setOtpBusy(false);
+    }
+  };
+
+  const handleVerifyEmailSignInCode = async (e) => {
+    e?.preventDefault();
+    const clean = email.trim().toLowerCase();
+    const token = otpCode.trim();
+    if (!clean || !token || otpBusy) return;
+
+    setOtpBusy(true);
+    try {
+      const { data, error } = await supabase.auth.verifyOtp({
+        email: clean,
+        token,
+        type: 'email',
+      });
+      if (error || !data?.session?.access_token) {
+        throw new Error(error?.message || 'Invalid or expired 6-digit code.');
+      }
+
+      const syncRes = await fetch('/api/auth/sync-vault-after-otp', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${data.session.access_token}`,
+        },
+        body: JSON.stringify({}),
+      });
+      const syncData = await syncRes.json().catch(() => null);
+
+      await syncSupabaseSession?.(
+        data.session,
+        syncData?.profile || null,
+        syncData?.serverSessionToken || ''
+      );
+      navigate('/', { replace: true });
+    } catch (err) {
+      toast.error(err?.message || 'Invalid or expired 6-digit sign-in code.');
+    } finally {
+      setOtpBusy(false);
     }
   };
 
@@ -84,7 +119,6 @@ export default function Login() {
     try {
       await resetPassword(clean);
       setQuickResetSent(true);
-      toast.success(`Password reset code generated and sent for ${clean}`);
     } catch (err) {
       toast.error(err?.message || 'Unable to send password reset email.');
     } finally {
@@ -121,7 +155,6 @@ export default function Login() {
             firstName: firstName.trim(),
             lastName: lastName.trim(),
           });
-          toast.success('Account created! Welcome to WASHEK.');
           navigate('/');
         } catch (signupErr) {
           const errText = signupErr?.message || '';
@@ -135,14 +168,12 @@ export default function Login() {
             // Attempt signing in immediately in case user entered existing password
             try {
               await signInWithEmail(cleanEmail, password);
-              toast.success('Welcome back to WASHEK!');
               navigate('/');
               return;
             } catch {
               // Seamlessly switch to login tab with clear resolution guidance
               setMode('login');
               setExistingAccountNotice(cleanEmail);
-              toast.info('Account already exists for this email. Please sign in below or reset your password.');
               return;
             }
           }
@@ -150,7 +181,6 @@ export default function Login() {
         }
       } else {
         await signInWithEmail(cleanEmail, password);
-        toast.success('Welcome back!');
         navigate('/');
       }
     } catch (error) {
@@ -215,7 +245,6 @@ export default function Login() {
       if (resetPassword) {
         await resetPassword(resetEmail);
       }
-      toast.success('Password reset instructions have been sent to your email.');
       setForgotEmail('');
       setShowForgotPassword(false);
     } catch (error) {
@@ -301,86 +330,52 @@ export default function Login() {
 
                 {diagnosticNotice.type === 'incorrect_password' && (
                   <div className="pt-2 space-y-3">
-                    {inlineResetOpen ? (
-                      <div className="p-3 rounded-xl bg-background/80 border border-amber-500/30 space-y-2">
-                        <span className="text-[11px] font-semibold text-foreground block">
-                          Set New Password for {diagnosticNotice.email}
-                        </span>
-                        <div className="flex gap-2">
-                          <Input
-                            type="password"
-                            placeholder="Min 6 characters"
-                            value={inlineNewPassword}
-                            onChange={(e) => setInlineNewPassword(e.target.value)}
-                            minLength={6}
-                            autoComplete="new-password"
-                            className="rounded-lg h-9 bg-background/90 text-xs"
-                          />
-                          <Button
-                            type="button"
-                            size="sm"
-                            disabled={inlineResetLoading || inlineNewPassword.length < 6}
-                            onClick={() => handleInstantReset(diagnosticNotice.email)}
-                            className="h-9 px-3 text-xs font-semibold rounded-lg bg-amber-500 hover:bg-amber-600 text-slate-950 shrink-0"
-                          >
-                            {inlineResetLoading ? 'Updating…' : 'Save & Sign In'}
-                          </Button>
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => setInlineResetOpen(false)}
-                          className="text-[10px] text-muted-foreground hover:underline"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    ) : (
-                      <div className="flex flex-wrap items-center gap-2">
-                        <Button
-                          type="button"
-                          size="sm"
-                          onClick={() => setInlineResetOpen(true)}
-                          className="h-8 px-3 text-xs font-semibold rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 shadow-sm flex items-center gap-1.5"
-                        >
-                          <KeyRound className="w-3.5 h-3.5" />
-                          <span>Set New Password Now</span>
-                        </Button>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button
+                        type="button"
+                        size="sm"
+                        disabled={otpBusy}
+                        onClick={() => handleSendEmailSignInCode(diagnosticNotice.email)}
+                        className="h-8 px-3 text-xs font-semibold rounded-xl bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 shadow-sm flex items-center gap-1.5"
+                      >
+                        <Mail className="w-3.5 h-3.5" />
+                        <span>{otpBusy ? 'Sending Code…' : 'Sign In with Email Code'}</span>
+                      </Button>
 
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          disabled={quickResetLoading || quickResetSent}
-                          onClick={() => handleQuickReset(diagnosticNotice.email)}
-                          className="h-8 px-3 text-xs font-semibold rounded-xl border-amber-500/40 bg-card hover:bg-amber-500/15 text-amber-400 shadow-sm flex items-center gap-1.5"
-                        >
-                          {quickResetLoading ? (
-                            <span className="inline-block w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
-                          ) : quickResetSent ? (
-                            <>
-                              <CheckCircle2 className="w-3.5 h-3.5 text-accent" />
-                              <span>Code Generated</span>
-                            </>
-                          ) : (
-                            <>
-                              <Mail className="w-3.5 h-3.5" />
-                              <span>Email / Code Reset</span>
-                            </>
-                          )}
-                        </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        disabled={quickResetLoading || quickResetSent}
+                        onClick={() => handleQuickReset(diagnosticNotice.email)}
+                        className="h-8 px-3 text-xs font-semibold rounded-xl border-amber-500/40 bg-card hover:bg-amber-500/15 text-amber-400 shadow-sm flex items-center gap-1.5"
+                      >
+                        {quickResetLoading ? (
+                          <span className="inline-block w-3 h-3 border-2 border-amber-400 border-t-transparent rounded-full animate-spin" />
+                        ) : quickResetSent ? (
+                          <>
+                            <CheckCircle2 className="w-3.5 h-3.5 text-accent" />
+                            <span>Reset Email Sent</span>
+                          </>
+                        ) : (
+                          <>
+                            <KeyRound className="w-3.5 h-3.5" />
+                            <span>Send Reset Email</span>
+                          </>
+                        )}
+                      </Button>
 
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => navigate(`/reset-password?email=${encodeURIComponent(diagnosticNotice.email)}`)}
-                          className="h-8 px-2.5 text-xs font-medium text-primary hover:text-primary hover:bg-primary/10"
-                        >
-                          <span>Reset Page</span>
-                          <ArrowRight className="w-3 h-3 ml-1" />
-                        </Button>
-                      </div>
-                    )}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => navigate(`/reset-password?email=${encodeURIComponent(diagnosticNotice.email)}`)}
+                        className="h-8 px-2.5 text-xs font-medium text-primary hover:text-primary hover:bg-primary/10"
+                      >
+                        <span>Reset Page</span>
+                        <ArrowRight className="w-3 h-3 ml-1" />
+                      </Button>
+                    </div>
                   </div>
                 )}
 
@@ -455,87 +450,168 @@ export default function Login() {
             </div>
           )}
 
-          <form onSubmit={submit} className="space-y-4">
-            {mode === 'signup' && (
-              <div className="grid grid-cols-2 gap-3">
+          {mode === 'login' && otpMode ? (
+            <form onSubmit={otpSent ? handleVerifyEmailSignInCode : (e) => { e.preventDefault(); handleSendEmailSignInCode(email); }} className="space-y-4">
+              <div className="space-y-1">
+                <p className="font-heading font-bold text-sm text-foreground flex items-center gap-1.5">
+                  <Mail className="w-4 h-4 text-primary" />
+                  Sign In with Email Code
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {otpSent
+                    ? `Enter the 6-digit code sent to ${email} (or click the link in the email).`
+                    : 'We will send a 6-digit sign-in code to your email — no password required.'}
+                </p>
+              </div>
+
+              <Input
+                type="email"
+                placeholder="athlete@washek.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary"
+                required
+              />
+
+              {otpSent && (
                 <Input
-                  placeholder="First name"
-                  value={firstName}
-                  onChange={(e) => setFirstName(e.target.value)}
-                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
+                  type="text"
+                  inputMode="numeric"
+                  placeholder="6-digit code from email"
+                  value={otpCode}
+                  onChange={(e) => setOtpCode(e.target.value)}
+                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 font-mono text-sm tracking-widest"
+                  autoFocus
                   required
                 />
-                <Input
-                  placeholder="Last name"
-                  value={lastName}
-                  onChange={(e) => setLastName(e.target.value)}
-                  className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
-                />
-              </div>
-            )}
+              )}
 
-            <Input
-              type="email"
-              placeholder="athlete@washek.com"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
-              required
-            />
+              <Button
+                type="submit"
+                className="w-full h-12 rounded-2xl font-bold font-heading text-sm bg-primary text-primary-foreground hover:bg-primary/95 border border-primary/40 flex items-center justify-center gap-2"
+                disabled={otpBusy || (otpSent && !otpCode.trim())}
+              >
+                {otpBusy
+                  ? 'Verifying…'
+                  : otpSent
+                    ? 'Verify Code & Sign In'
+                    : 'Send 6-Digit Sign-In Code'}
+              </Button>
 
-            <Input
-              type="password"
-              placeholder="••••••••"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              minLength={6}
-              className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
-              required
-            />
-
-            {mode === 'login' && (
-              <div className="flex justify-center text-center">
+              {otpSent && (
                 <button
                   type="button"
-                  className="text-xs font-medium text-muted-foreground hover:text-primary transition-colors text-center"
-                  onClick={() => {
-                    setForgotEmail(email);
-                    setShowForgotPassword(true);
-                  }}
+                  onClick={() => handleSendEmailSignInCode(email)}
+                  disabled={otpBusy}
+                  className="w-full text-xs text-primary hover:underline text-center font-medium"
                 >
-                  Forgot password?
+                  Resend code to {email}
                 </button>
-              </div>
-            )}
-
-            <Button
-              type="submit"
-              className="w-full h-12 rounded-2xl font-bold font-heading text-sm bg-primary text-primary-foreground hover:bg-primary/95 transition-all duration-200 active:scale-[0.98] shadow-[0_0_24px_rgba(37,99,235,0.45)] hover:shadow-[0_0_35px_rgba(37,99,235,0.65)] border border-primary/40 flex items-center justify-center gap-2"
-              disabled={loading}
-            >
-              {loading ? (
-                'Processing…'
-              ) : (
-                <>
-                  <span>{mode === 'login' ? 'Sign In' : 'Create Athlete Profile'}</span>
-                  <ArrowRight className="w-4 h-4 ml-1" />
-                </>
               )}
-            </Button>
 
-            <button
-              type="button"
-              className="w-full pt-2 text-xs text-muted-foreground hover:text-primary font-medium text-center transition-colors"
-              onClick={() => {
-                setMode(mode === 'login' ? 'signup' : 'login');
-                setExistingAccountNotice(null);
-              }}
-            >
-              {mode === 'login'
-                ? "Don't have an account yet? Create one"
-                : 'Already have an account? Sign in'}
-            </button>
-          </form>
+              <button
+                type="button"
+                className="w-full pt-1 text-xs text-muted-foreground hover:text-primary font-medium text-center transition-colors"
+                onClick={() => {
+                  setOtpMode(false);
+                  setOtpSent(false);
+                  setOtpCode('');
+                }}
+              >
+                Use password sign-in instead
+              </button>
+            </form>
+          ) : (
+            <form onSubmit={submit} className="space-y-4">
+              {mode === 'signup' && (
+                <div className="grid grid-cols-2 gap-3">
+                  <Input
+                    placeholder="First name"
+                    value={firstName}
+                    onChange={(e) => setFirstName(e.target.value)}
+                    className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
+                    required
+                  />
+                  <Input
+                    placeholder="Last name"
+                    value={lastName}
+                    onChange={(e) => setLastName(e.target.value)}
+                    className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
+                  />
+                </div>
+              )}
+
+              <Input
+                type="email"
+                placeholder="athlete@washek.com"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
+                required
+              />
+
+              <Input
+                type="password"
+                placeholder="••••••••"
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                minLength={6}
+                className="rounded-xl h-11 bg-background/50 border-border/70 dark:border-white/10 text-sm focus:border-primary focus:shadow-[0_0_15px_rgba(37,99,235,0.25)] transition-all"
+                required
+              />
+
+              {mode === 'login' && (
+                <div className="flex items-center justify-between gap-2 text-center">
+                  <button
+                    type="button"
+                    className="text-xs font-medium text-primary hover:underline transition-colors"
+                    onClick={() => setOtpMode(true)}
+                  >
+                    Sign in with email code
+                  </button>
+                  <button
+                    type="button"
+                    className="text-xs font-medium text-muted-foreground hover:text-primary transition-colors"
+                    onClick={() => {
+                      setForgotEmail(email);
+                      setShowForgotPassword(true);
+                    }}
+                  >
+                    Forgot password?
+                  </button>
+                </div>
+              )}
+
+              <Button
+                type="submit"
+                className="w-full h-12 rounded-2xl font-bold font-heading text-sm bg-primary text-primary-foreground hover:bg-primary/95 transition-all duration-200 active:scale-[0.98] shadow-[0_0_24px_rgba(37,99,235,0.45)] hover:shadow-[0_0_35px_rgba(37,99,235,0.65)] border border-primary/40 flex items-center justify-center gap-2"
+                disabled={loading}
+              >
+                {loading ? (
+                  'Processing…'
+                ) : (
+                  <>
+                    <span>{mode === 'login' ? 'Sign In' : 'Create Athlete Profile'}</span>
+                    <ArrowRight className="w-4 h-4 ml-1" />
+                  </>
+                )}
+              </Button>
+
+              <button
+                type="button"
+                className="w-full pt-2 text-xs text-muted-foreground hover:text-primary font-medium text-center transition-colors"
+                onClick={() => {
+                  setMode(mode === 'login' ? 'signup' : 'login');
+                  setExistingAccountNotice(null);
+                  setOtpMode(false);
+                }}
+              >
+                {mode === 'login'
+                  ? "Don't have an account yet? Create one"
+                  : 'Already have an account? Sign in'}
+              </button>
+            </form>
+          )}
 
           {/* Security & Sync Pill */}
           <div className="mt-6 pt-5 border-t border-border/40 dark:border-white/5 flex flex-col items-center justify-center gap-1.5 text-[11px] text-muted-foreground/80 font-medium">

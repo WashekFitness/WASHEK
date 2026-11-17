@@ -640,7 +640,6 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
         }
       }
 
-      toast.success('Password changed successfully.');
       closeChangePassword();
     } catch (error) {
       toast.error(error?.message || 'Unable to change your password.');
@@ -660,7 +659,6 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
       } catch (err) {
         // Safe fallback
       }
-      toast.success('Logged out successfully.');
       window.location.assign('/login');
     } catch (error) {
       console.error(
@@ -691,10 +689,6 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
 
       setConfirmDeleteOpen(false);
       closeModal();
-
-      toast.success(
-        'Your account has been permanently deleted.'
-      );
 
       window.location.assign('/login');
     } catch (error) {
@@ -1596,7 +1590,7 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                   <Shield className="w-3.5 h-3.5 text-primary" /> Automatic Subscription Cancellation
                 </span>
                 <p className="text-muted-foreground leading-normal">
-                  If you have an active paid subscription (Progress, Performance, or Elite), it will be automatically canceled with Stripe immediately. You will not be billed again.
+                  If you have an active paid subscription (Progress, Performance, or Elite), it will be automatically canceled with Paddle immediately. You will not be billed again.
                 </p>
               </div>
 

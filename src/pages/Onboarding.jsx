@@ -826,10 +826,6 @@ export default function Onboarding() {
         'All 12 weeks ready — let’s get to work!'
       );
 
-      toast.success(
-        'Your complete 12-week periodized program is ready!'
-      );
-
       await new Promise(resolve =>
         window.setTimeout(resolve, 800)
       );

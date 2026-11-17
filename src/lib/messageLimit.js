@@ -6,6 +6,10 @@ import {
   getPreviousLocalDateKey as getPreviousLocalDateKeyUtil,
   getCurrentMonthKey as getCurrentMonthKeyUtil,
 } from './dateUtils';
+import {
+  isActiveSubscriptionStatus,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
 
 export const PLAN_LIMITS = {
   free: 100,
@@ -102,10 +106,12 @@ export function syncQuotaAcrossApp(stats, { dispatch = true } = {}) {
   return stats;
 }
 
-export function getCachedMessageStats(user, plan = 'free', timeZone = null) {
+export function getCachedMessageStats(user, plan = null, timeZone = null) {
   const effectiveTz = timeZone || getUserTimeZone(user);
   const monthKey = getCurrentMonthKey(new Date(), effectiveTz);
-  const effectivePlan = String(plan || user?.subscription_plan || 'free').toLowerCase().trim();
+  const effectivePlan = plan
+    ? resolveEffectivePlan(plan, user?.subscription_status)
+    : resolveEffectivePlan(user);
   const limit = getPlanLimit(effectivePlan);
 
   let used =
@@ -166,134 +172,143 @@ export function computeStats(user, plan = 'free', timeZone = null) {
   };
 }
 
+let inFlightStatsPromise = null;
+
 export async function getServerMessageStats(timeZone = null) {
-  try {
-    let effectiveUserId = null;
-    let cachedUser = null;
+  if (inFlightStatsPromise) {
+    return inFlightStatsPromise;
+  }
 
+  inFlightStatsPromise = (async () => {
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (sessionData?.session?.user) {
-        effectiveUserId = sessionData.session.user.id;
-      }
-    } catch (_sessionErr) {
-      // Session fetch not available
-    }
+      let effectiveUserId = null;
+      let hasSupabaseSession = false;
+      let cachedUser = null;
 
-    if (typeof localStorage !== 'undefined') {
       try {
-        const raw = localStorage.getItem('washek_user');
-        if (raw) {
-          cachedUser = JSON.parse(raw);
-          if (!effectiveUserId && cachedUser?.id) {
-            effectiveUserId = cachedUser.id;
+        const { data: sessionData } = await supabase.auth.getSession();
+        if (sessionData?.session?.user) {
+          effectiveUserId = sessionData.session.user.id;
+          hasSupabaseSession = true;
+        }
+      } catch (_sessionErr) {
+        // Session fetch not available
+      }
+
+      if (typeof localStorage !== 'undefined') {
+        try {
+          const raw = localStorage.getItem('washek_user');
+          if (raw) {
+            cachedUser = JSON.parse(raw);
+            if (!effectiveUserId && cachedUser?.id) {
+              effectiveUserId = cachedUser.id;
+            }
+          }
+        } catch (_storageErr) {
+          // Storage read fallback
+        }
+      }
+
+      if (!effectiveUserId && !cachedUser) return null;
+
+      const effectiveTz = timeZone || getUserTimeZone(cachedUser);
+
+      // Fast-path local/vault sessions: no Supabase JWT exists, so skip doomed RPC/profiles calls
+      if (!hasSupabaseSession) {
+        if (cachedUser) {
+          const cachedPlan = resolveEffectivePlan(cachedUser);
+          const stats = getCachedMessageStats(cachedUser, cachedPlan, effectiveTz || cachedUser.timezone);
+          return syncQuotaAcrossApp(stats);
+        }
+        return null;
+      }
+
+      let data = null;
+      let error = null;
+
+      try {
+        const res = await supabase.rpc('get_kael_usage');
+        data = res.data;
+        error = res.error;
+        if (error && error.code === 'PGRST202') {
+          const fallbackRes = await supabase.rpc('get_kael_usage', {
+            p_timezone: effectiveTz,
+          });
+          if (!fallbackRes.error) {
+            data = fallbackRes.data;
+            error = null;
           }
         }
-      } catch (_storageErr) {
-        // Storage read fallback
+      } catch (rpcErr) {
+        error = rpcErr;
       }
-    }
 
-    if (!effectiveUserId && !cachedUser) return null;
-
-    const effectiveTz = timeZone || getUserTimeZone(cachedUser);
-    let data = null;
-    let error = null;
-
-    try {
-      const res = await supabase.rpc('get_kael_usage');
-      data = res.data;
-      error = res.error;
-      if (error && error.code === 'PGRST202') {
-        const fallbackRes = await supabase.rpc('get_kael_usage', {
-          p_timezone: effectiveTz,
-        });
-        if (!fallbackRes.error) {
-          data = fallbackRes.data;
-          error = null;
-        }
+      if (!error && data && typeof data.used === 'number') {
+        const stats = {
+          ...data,
+          remaining:
+            typeof data.remaining === 'number'
+              ? data.remaining
+              : Math.max(0, (data.limit || 100) - data.used),
+          timezone: effectiveTz,
+          forceAuthoritative: true,
+        };
+        return syncQuotaAcrossApp(stats);
       }
-    } catch (rpcErr) {
-      error = rpcErr;
-    }
 
-    if (!error && data && typeof data.used === 'number') {
-      const stats = {
-        ...data,
-        remaining:
-          typeof data.remaining === 'number'
-            ? data.remaining
-            : Math.max(0, (data.limit || 100) - data.used),
-        timezone: effectiveTz,
-        forceAuthoritative: true,
-      };
-      return syncQuotaAcrossApp(stats);
-    }
-
-    // Direct profile table fallback if RPC is ever unreachable or unauthenticated
-    if (effectiveUserId || cachedUser?.email) {
-      try {
-        let profile = null;
-        if (effectiveUserId && isValidUUID(effectiveUserId)) {
-          const { data: pData } = await supabase
+      // Direct profile table lookup by UUID only (profiles has no email column)
+      if (effectiveUserId && isValidUUID(effectiveUserId)) {
+        try {
+          const { data: profile } = await supabase
             .from('profiles')
             .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
             .eq('id', effectiveUserId)
             .maybeSingle();
-          profile = pData;
-        }
-        if (!profile && cachedUser?.email) {
-          const { data: pData } = await supabase
-            .from('profiles')
-            .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
-            .ilike('email', String(cachedUser.email).trim())
-            .maybeSingle();
-          profile = pData;
-        }
 
-        if (profile) {
-          const monthKey = getCurrentMonthKey(new Date(), effectiveTz || profile.timezone);
-          const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
-          const isSubActive = ['active', 'trialing', 'past_due'].includes(dbStatus);
-          const effectivePlan = isSubActive ? (profile.subscription_plan || 'free') : 'free';
-          const effectiveLimit = getPlanLimit(effectivePlan);
+          if (profile) {
+            const monthKey = getCurrentMonthKey(new Date(), effectiveTz || profile.timezone);
+            const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
+            const isSubActive = isActiveSubscriptionStatus(dbStatus);
+            const effectivePlan = isSubActive ? resolveEffectivePlan(profile) : 'free';
+            const effectiveLimit = getPlanLimit(effectivePlan);
 
-          let effectiveCount = Number(profile.kael_msg_month === monthKey ? profile.kael_msg_count || 0 : 0);
-          if (cachedUser?.kael_msg_month === monthKey && Number(cachedUser?.kael_msg_count || 0) > effectiveCount) {
-            effectiveCount = Number(cachedUser.kael_msg_count);
+            let effectiveCount = Number(profile.kael_msg_month === monthKey ? profile.kael_msg_count || 0 : 0);
+            if (cachedUser?.kael_msg_month === monthKey && Number(cachedUser?.kael_msg_count || 0) > effectiveCount) {
+              effectiveCount = Number(cachedUser.kael_msg_count);
+            }
+
+            const stats = {
+              used: effectiveCount,
+              limit: effectiveLimit,
+              remaining: Math.max(0, effectiveLimit - effectiveCount),
+              monthKey,
+              plan: effectivePlan,
+              timezone: effectiveTz || profile.timezone,
+            };
+
+            return syncQuotaAcrossApp(stats);
           }
-
-          const stats = {
-            used: effectiveCount,
-            limit: effectiveLimit,
-            remaining: Math.max(0, effectiveLimit - effectiveCount),
-            monthKey,
-            plan: effectivePlan,
-            timezone: effectiveTz || profile.timezone,
-          };
-
-          return syncQuotaAcrossApp(stats);
+        } catch (profileFetchErr) {
+          console.warn('[messageLimit] profiles table query error:', profileFetchErr);
         }
-      } catch (profileFetchErr) {
-        console.warn('[messageLimit] profiles table query error:', profileFetchErr);
       }
-    }
 
-    if (cachedUser) {
-      const cachedStatus = String(cachedUser.subscription_status || '').toLowerCase().trim();
-      const cachedPlan =
-        cachedStatus === 'canceled' || cachedStatus === 'cancelled' || cachedStatus === 'inactive'
-          ? 'free'
-          : (cachedUser.subscription_plan || 'free');
-      const stats = getCachedMessageStats(cachedUser, cachedPlan, effectiveTz || cachedUser.timezone);
-      return syncQuotaAcrossApp(stats);
-    }
+      if (cachedUser) {
+        const cachedPlan = resolveEffectivePlan(cachedUser);
+        const stats = getCachedMessageStats(cachedUser, cachedPlan, effectiveTz || cachedUser.timezone);
+        return syncQuotaAcrossApp(stats);
+      }
 
-    return null;
-  } catch (err) {
-    console.warn('[messageLimit] Error fetching server message stats:', err);
-    return null;
-  }
+      return null;
+    } catch (err) {
+      console.warn('[messageLimit] Error fetching server message stats:', err);
+      return null;
+    } finally {
+      inFlightStatsPromise = null;
+    }
+  })();
+
+  return inFlightStatsPromise;
 }
 
 export async function claimMessage(timeZone = null) {
@@ -357,11 +372,7 @@ export async function claimMessage(timeZone = null) {
     }
 
     const currentMonthKey = getCurrentMonthKey(new Date(), effectiveTz);
-    const localStatus = String(localUser?.subscription_status || '').toLowerCase().trim();
-    const plan =
-      localStatus === 'canceled' || localStatus === 'cancelled' || localStatus === 'inactive'
-        ? 'free'
-        : (localUser?.subscription_plan || 'free');
+    const plan = resolveEffectivePlan(localUser);
     const limit = getPlanLimit(plan);
 
     const prevCount =
@@ -370,29 +381,18 @@ export async function claimMessage(timeZone = null) {
         : 0;
     const newCount = prevCount + 1;
 
-    // Update profiles table in database if user is known
-    const userEmail = localUser?.email || (typeof localStorage !== 'undefined' ? JSON.parse(localStorage.getItem('washek_user') || '{}')?.email : null);
-    if (userId || userEmail) {
+    // Update profiles table in database if user is an authenticated UUID
+    if (userId && isValidUUID(userId)) {
       try {
         const updatePayload = {
           kael_msg_count: newCount,
           kael_msg_month: currentMonthKey,
           timezone: effectiveTz,
         };
-        let updated = false;
-        if (userId && isValidUUID(userId)) {
-          const { error: dbErr } = await supabase
-            .from('profiles')
-            .update(updatePayload)
-            .eq('id', userId);
-          if (!dbErr) updated = true;
-        }
-        if (!updated && userEmail) {
-          await supabase
-            .from('profiles')
-            .update(updatePayload)
-            .ilike('email', String(userEmail).trim());
-        }
+        await supabase
+          .from('profiles')
+          .update(updatePayload)
+          .eq('id', userId);
       } catch (dbErr) {
         console.warn('[messageLimit] Fallback profile update note:', dbErr);
       }

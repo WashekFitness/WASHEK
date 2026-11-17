@@ -8,29 +8,35 @@ import {
   Loader2,
   XCircle,
   ShieldCheck,
-  Lock,
-  Mail,
-  KeyRound,
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Input } from '@/components/ui/input';
 
-import { supabase } from '@/lib/supabase';
+import {
+  supabase,
+  supabaseUrl,
+  supabaseAnonKey,
+  readNativeSupabaseStorageSession,
+} from '@/lib/supabase';
 import {
   applySubscriptionUpgrade,
   applySubscriptionCancellation,
   clearRecentUpgradeGrace,
 } from '@/lib/subscription';
 import {
-  createStripeCheckout,
+  PADDLE_TIERS,
+  getTierKey,
+} from '@/lib/paddleTiers';
+import {
+  fetchLocalizedPaddlePrices,
+  openPaddleCheckout,
   resolveValidSupabaseSession,
   extractInvokeErrorMessage,
-  extractStripeSessionId,
-  registerCheckoutReturnHandoff,
-} from '@/lib/stripeCheckout';
+  isNonJwtToken,
+} from '@/lib/paddleCheckout';
 import { queryClientInstance } from '@/lib/query-client';
+import { invalidateCurrentUserCache } from '@/lib/supabaseApi';
 import { toast } from 'sonner';
 import { useAuth } from '@/lib/AuthContext';
 
@@ -53,11 +59,8 @@ const freePlan = {
   ],
 };
 
-const plans = [
-  {
-    name: 'Progress',
-    planKey: 'progress',
-    price: '$9.99',
+const TIER_VISUALS = {
+  progress: {
     period: '/mo',
     icon: Flame,
     color: 'text-emerald-400',
@@ -66,21 +69,10 @@ const plans = [
     glowClass: 'shadow-[0_0_25px_rgba(16,185,129,0.12)]',
     iconGlow: 'bg-emerald-500/15 border-emerald-500/30 text-emerald-400',
     badge: null,
+    badgeClass: null,
     buttonClass: 'bg-emerald-600 hover:bg-emerald-500 text-white font-heading font-semibold shadow-sm transition-colors',
-    features: [
-      '300 Coach Kael messages/month (3x Free)',
-      'In-depth Coach Kael — biomechanical rationale & progression milestones',
-      'Full custom workout adjustments',
-      'Adaptive programming — calibrated from your workout performance',
-      'Food & package nutrition scan',
-      'Advanced macro tracking',
-      'Save & compare progress photos',
-    ],
   },
-  {
-    name: 'Performance',
-    planKey: 'performance',
-    price: '$17.99',
+  performance: {
     period: '/mo',
     icon: Zap,
     color: 'text-primary',
@@ -91,21 +83,10 @@ const plans = [
     badge: 'Most Popular',
     badgeClass: 'bg-primary/15 text-primary border border-primary/30',
     buttonClass: 'bg-primary hover:bg-primary/90 text-primary-foreground font-heading font-semibold shadow-sm transition-colors',
-    features: [
-      '800 Coach Kael messages/month (8x Free)',
-      'High-performance coaching — tempo breakdowns, activation cues & fueling synergy',
-      'Everything in Progress',
-      'Body composition scanner*',
-      'Nutrition insights & suggestions',
-      'Workout analytics dashboard',
-    ],
     disclaimer:
       '* Body composition estimates are approximations only and may not be fully accurate.',
   },
-  {
-    name: 'Elite',
-    planKey: 'elite',
-    price: '$34.99',
+  elite: {
     period: '/mo',
     icon: Crown,
     color: 'text-amber-400',
@@ -116,18 +97,22 @@ const plans = [
     badge: 'Best Value',
     badgeClass: 'bg-amber-500/15 text-amber-400 border border-amber-500/30',
     buttonClass: 'bg-amber-500 hover:bg-amber-400 text-zinc-950 font-heading font-bold shadow-sm transition-colors',
-    features: [
-      '2,000 Coach Kael messages/month (20x Free)',
-      'Masterclass coaching — kinetic chain mastery & recovery diagnostics',
-      'Everything in Performance',
-      'Live workout adjustments (real-time coaching while training)',
-      'Form Lab video analysis',
-      'Technical form scoring, rep/hold counting & corrective drills',
-      'Elite tips & coaching insights',
-      'Deep recovery & deload protocols',
-    ],
   },
-];
+};
+
+const plans = PADDLE_TIERS.map((tier) => {
+  const planKey = getTierKey(tier.name);
+  const visuals = TIER_VISUALS[planKey] || TIER_VISUALS.progress;
+  return {
+    name: tier.name,
+    planKey,
+    description: tier.description,
+    productId: tier.productId,
+    priceId: tier.priceId,
+    features: tier.features,
+    ...visuals,
+  };
+});
 
 const PAID_PLANS = [
   'progress',
@@ -139,7 +124,6 @@ const ACTIVE_STATUSES = [
   'active',
   'trialing',
   'past_due',
-  'unpaid',
 ];
 
 const TIER_LEVELS = {
@@ -173,26 +157,34 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     onPlanChangeRef.current = onPlanChange;
   }, [onPlanChange]);
 
+  const currentPlanPropRef = useRef(currentPlanProp);
+  useEffect(() => {
+    currentPlanPropRef.current = currentPlanProp;
+  }, [currentPlanProp]);
+
+  const hasLoadedOnceRef = useRef(false);
+  const lastLoadAtRef = useRef(0);
+
   const [loadingPlan, setLoadingPlan] = useState(null);
   const [cancelling, setCancelling] = useState(false);
   const [showCancelConfirm, setShowCancelConfirm] = useState(false);
   const [currentPlan, setCurrentPlan] = useState(() => {
     try {
       const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
+      if (storedStatus && !isActiveStatus(storedStatus)) {
         return 'free';
       }
       if (currentPlanProp && currentPlanProp !== 'free') {
         return normalizePlan(currentPlanProp);
       }
-      const stored = localStorage.getItem('washek_subscription_plan');
-      if (stored && stored !== 'free') return normalizePlan(stored);
+      if (isActiveStatus(storedStatus)) {
+        const stored = localStorage.getItem('washek_subscription_plan');
+        if (stored && stored !== 'free') return normalizePlan(stored);
+      }
       const userObj = JSON.parse(localStorage.getItem('washek_user') || '{}');
       const userStatus = String(userObj?.subscription_status || '').toLowerCase().trim();
       if (
-        userStatus !== 'canceled' &&
-        userStatus !== 'cancelled' &&
-        userStatus !== 'inactive' &&
+        isActiveStatus(userStatus) &&
         userObj?.subscription_plan &&
         userObj.subscription_plan !== 'free'
       ) {
@@ -208,7 +200,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     try {
       if (sessionStorage.getItem('washek_just_canceled') === '1') {
         sessionStorage.removeItem('washek_just_canceled');
-        toast.success('Your subscription has been canceled. Your account is now on the Free Plan.');
       }
     } catch {
       // ignore sessionStorage error
@@ -216,27 +207,58 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   }, []);
 
   useEffect(() => {
-    if (currentPlanProp) {
+    if (!hasLoadedOnceRef.current && currentPlanProp) {
       const safe = normalizePlan(currentPlanProp);
       setCurrentPlan(safe);
+    } else if (hasLoadedOnceRef.current && currentPlanProp === 'free') {
+      setCurrentPlan('free');
     }
   }, [currentPlanProp]);
 
   const [subscription, setSubscription] = useState(null);
   const [error, setError] = useState('');
   const [cardError, setCardError] = useState(null); // { planKey, message, needsReauth }
-  const [blockedCheckout, setBlockedCheckout] = useState(null); // { planKey, planName, url }
-  const [billingSyncModal, setBillingSyncModal] = useState(null); // { mode: 'checkout' | 'cancel', plan?, email }
-  const [billingSyncStep, setBillingSyncStep] = useState('password'); // 'password' | 'otp'
-  const [billingPassword, setBillingPassword] = useState('');
-  const [billingOtpSent, setBillingOtpSent] = useState(false);
-  const [billingOtpCode, setBillingOtpCode] = useState('');
-  const [billingNewPassword, setBillingNewPassword] = useState('');
-  const [billingSyncBusy, setBillingSyncBusy] = useState(false);
-  const [billingSyncError, setBillingSyncError] = useState('');
+  const [localizedPrices, setLocalizedPrices] = useState({});
+  const [loadingPrices, setLoadingPrices] = useState(true);
+  const [paddlePriceError, setPaddlePriceError] = useState('');
   const [loadingSubscription, setLoadingSubscription] = useState(true);
   const checkoutPollTimerRef = useRef(null);
   const lastSyncEventRef = useRef(0);
+
+  useEffect(() => {
+    let active = true;
+    setLoadingPrices(true);
+    setPaddlePriceError('');
+
+    fetchLocalizedPaddlePrices({ interval: 'month' })
+      .then((res) => {
+        if (!active) return;
+        setLocalizedPrices(res?.pricesByTier || {});
+      })
+      .catch((err) => {
+        if (!active) return;
+        const msg = err?.message || 'Unable to load localized Paddle pricing.';
+        const isConfigErr = [
+          'PADDLE_ENV_MISSING',
+          'PADDLE_TOKEN_MISSING',
+          'PADDLE_TOKEN_ENV_MISMATCH',
+          'PADDLE_PRICE_ID_REQUIRED',
+        ].includes(err?.code);
+        if (isConfigErr) {
+          console.warn('[PricingSection] Paddle configuration required:', msg);
+        } else {
+          console.error('[PricingSection] Paddle PricePreview failed:', err);
+        }
+        setPaddlePriceError(msg);
+      })
+      .finally(() => {
+        if (active) setLoadingPrices(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const storedUser = (() => {
     try {
@@ -256,12 +278,15 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   );
 
   const loadSubscription = useCallback(async () => {
-    setLoadingSubscription(true);
+    if (!hasLoadedOnceRef.current) {
+      setLoadingSubscription(true);
+    }
+    lastLoadAtRef.current = Date.now();
 
     try {
       clearRecentUpgradeGrace();
 
-      // 1. Check LocalStorage plan as offline fallback only when status isn't canceled/inactive
+      // 1. Check LocalStorage plan strictly for offline fallback
       const storedStatusRaw = (() => {
         try {
           return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
@@ -270,9 +295,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       })();
       const isLocallyInactive =
-        storedStatusRaw === 'canceled' ||
-        storedStatusRaw === 'cancelled' ||
-        storedStatusRaw === 'inactive';
+        !isActiveStatus(storedStatusRaw);
 
       const localPlanRaw = (() => {
         if (isLocallyInactive) return null;
@@ -284,41 +307,93 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       })();
 
-      // 2. Query authoritative Supabase profile row
+      // 2. Query authoritative Supabase profile row (with Bearer REST fallback)
       let hasRemoteProfile = false;
       let profilePlan = 'free';
       let profileStatus = '';
       let profileSubId = null;
       let profilePriceId = null;
       try {
-        const { data: sessionData } = await supabase.auth.getSession();
-        const authUid = sessionData?.session?.user?.id;
-        if (authUid) {
-          const { data: profile, error: profErr } = await supabase
-            .from('profiles')
-            .select('subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id')
-            .eq('id', authUid)
-            .maybeSingle();
-
-          if (!profErr && profile) {
-            hasRemoteProfile = true;
-            profilePlan = normalizePlan(profile.subscription_plan);
-            profileStatus = String(profile.subscription_status || '').toLowerCase().trim();
-            profileSubId = profile.stripe_subscription_id;
-            profilePriceId = profile.stripe_price_id;
+        const storedTok = (() => {
+          try {
+            return localStorage.getItem('washek_auth_token') || '';
+          } catch {
+            return '';
           }
+        })();
+        const storedUid = (() => {
+          try {
+            const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
+            return u?.id && !String(u.id).startsWith('usr_') ? u.id : '';
+          } catch {
+            return '';
+          }
+        })();
+
+        const { data: sessionData } = await supabase.auth.getSession();
+        const authUid = sessionData?.session?.user?.id || '';
+        const sessionToken = sessionData?.session?.access_token || '';
+        const bearer = !isNonJwtToken(sessionToken) ? sessionToken : !isNonJwtToken(storedTok) ? storedTok : '';
+        const effectiveUid = authUid && !String(authUid).startsWith('usr_') ? authUid : storedUid;
+        let dbProf = null;
+
+        if (bearer && effectiveUid) {
+          if (authUid && !isNonJwtToken(sessionToken)) {
+            const { data: profile, error: profErr } = await supabase
+              .from('profiles')
+              .select('subscription_plan, subscription_status, paddle_subscription_id, paddle_price_id')
+              .eq('id', authUid)
+              .maybeSingle();
+
+            if (!profErr && profile) {
+              dbProf = profile;
+            } else if (profErr) {
+              const { data: baseProfile, error: baseErr } = await supabase
+                .from('profiles')
+                .select('subscription_plan, subscription_status')
+                .eq('id', authUid)
+                .maybeSingle();
+              if (!baseErr && baseProfile) {
+                dbProf = baseProfile;
+              }
+            }
+          }
+
+          if (!dbProf) {
+            const restRes = await fetch(
+              `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(effectiveUid)}&select=subscription_plan,subscription_status&limit=1`,
+              {
+                headers: {
+                  apikey: supabaseAnonKey,
+                  Authorization: `Bearer ${bearer}`,
+                },
+              }
+            );
+            const rows = await restRes.json().catch(() => null);
+            if (Array.isArray(rows) && rows[0]) {
+              dbProf = rows[0];
+            }
+          }
+        }
+
+        if (dbProf) {
+          hasRemoteProfile = true;
+          profilePlan = normalizePlan(dbProf.subscription_plan);
+          profileStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
+          profileSubId = dbProf.paddle_subscription_id || null;
+          profilePriceId = dbProf.paddle_price_id || null;
         }
       } catch (sbErr) {
         console.debug('[PricingSection] Supabase profile lookup note:', sbErr);
       }
 
-      // 3. Check stored user object fallback
+      // 3. Check stored user object fallback (only used when offline)
       let userObjPlan = null;
       if (!isLocallyInactive) {
         try {
           const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
           const uStatus = String(u?.subscription_status || '').toLowerCase().trim();
-          if (uStatus !== 'canceled' && uStatus !== 'cancelled' && uStatus !== 'inactive' && u?.subscription_plan) {
+          if (isActiveStatus(uStatus) && u?.subscription_plan) {
             userObjPlan = normalizePlan(u.subscription_plan);
           }
         } catch {
@@ -326,7 +401,9 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       }
 
-      // Resolve the true active plan (Postgres profiles is authoritative)
+      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+
+      // Resolve the true active plan (Postgres profiles is authoritative whenever online)
       let resolvedPlan = 'free';
       let resolvedStatus = 'inactive';
 
@@ -340,18 +417,20 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           resolvedPlan = 'free';
           resolvedStatus = profileStatus || 'inactive';
         }
-      } else if (!isLocallyInactive) {
+      } else if (isOffline && !isLocallyInactive) {
         if (localPlanRaw && localPlanRaw !== 'free') {
           resolvedPlan = localPlanRaw;
           resolvedStatus = 'active';
         } else if (userObjPlan && userObjPlan !== 'free') {
           resolvedPlan = userObjPlan;
           resolvedStatus = 'active';
-        } else if (currentPlanProp && currentPlanProp !== 'free') {
-          resolvedPlan = normalizePlan(currentPlanProp);
+        } else if (currentPlanPropRef.current && currentPlanPropRef.current !== 'free') {
+          resolvedPlan = normalizePlan(currentPlanPropRef.current);
           resolvedStatus = 'active';
         }
       }
+
+      hasLoadedOnceRef.current = true;
 
       if (resolvedPlan !== 'free') {
         setSubscription({
@@ -359,18 +438,20 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           plan: resolvedPlan,
           plan_key: resolvedPlan,
           status: resolvedStatus,
-          stripe_price_id: profilePriceId,
+          paddle_price_id: profilePriceId,
         });
         if (localPlanRaw !== resolvedPlan) {
           applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { syncServer: false });
         }
       } else {
         setSubscription(null);
-        if (hasRemoteProfile) {
+        if (hasRemoteProfile || !isOffline) {
           try {
             localStorage.removeItem('washek_subscription_plan');
             localStorage.removeItem('washek_recent_upgrade');
-            localStorage.setItem('washek_subscription_status', resolvedStatus || 'inactive');
+            if (hasRemoteProfile) {
+              localStorage.setItem('washek_subscription_status', resolvedStatus || 'inactive');
+            }
           } catch {
             /* ignore */
           }
@@ -389,7 +470,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     } finally {
       setLoadingSubscription(false);
     }
-  }, [currentPlanProp]);
+  }, []);
 
   // Listen for payment signals from checkout return tab and verify against Postgres before unlocking
   useEffect(() => {
@@ -423,12 +504,10 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
 
         applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
-        setBlockedCheckout(null);
         setCurrentPlan(dbPlan);
         onPlanChangeRef.current?.(dbPlan);
         await checkUserAuth?.().catch(() => {});
         await loadSubscription();
-        toast.success(`Payment verified! Your ${dbPlan.charAt(0).toUpperCase() + dbPlan.slice(1)} plan is now active.`);
       } catch {
         // ignore transient verification errors
       }
@@ -484,10 +563,9 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }
 
     const handleFocus = () => {
-      if (active) {
-        loadSubscription();
-        checkUserAuth?.().catch(() => {});
-      }
+      if (!active) return;
+      if (Date.now() - lastLoadAtRef.current < 15000) return;
+      loadSubscription();
     };
 
     window.addEventListener('focus', handleFocus);
@@ -498,8 +576,9 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     };
     document.addEventListener('visibilitychange', handleVisChange);
 
-    const { data: authListener } = supabase.auth.onAuthStateChange(() => {
-      if (active) {
+    const { data: authListener } = supabase.auth.onAuthStateChange((event) => {
+      if (!active) return;
+      if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'SIGNED_OUT') {
         window.setTimeout(() => {
           if (active) {
             loadSubscription();
@@ -514,24 +593,27 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       document.removeEventListener('visibilitychange', handleVisChange);
       authListener?.subscription?.unsubscribe();
     };
-  }, [loadSubscription, checkUserAuth]);
+  }, [loadSubscription]);
 
-  const startPostCheckoutPolling = useCallback((expectedPlan) => {
+  const stopPostCheckoutPolling = useCallback(() => {
     if (checkoutPollTimerRef.current) {
       clearInterval(checkoutPollTimerRef.current);
       checkoutPollTimerRef.current = null;
     }
+  }, []);
+
+  const startPostCheckoutPolling = useCallback((expectedPlan) => {
+    stopPostCheckoutPolling();
     const startedAt = Date.now();
     checkoutPollTimerRef.current = window.setInterval(async () => {
       if (Date.now() - startedAt > 120000) {
-        clearInterval(checkoutPollTimerRef.current);
-        checkoutPollTimerRef.current = null;
+        stopPostCheckoutPolling();
         return;
       }
       try {
         const { data: sessionData } = await supabase.auth.getSession();
         const uid = sessionData?.session?.user?.id || user?.id;
-        if (!uid) return;
+        if (!uid || String(uid).startsWith('usr_') || isNonJwtToken(sessionData?.session?.access_token)) return;
         const { data: profile } = await supabase
           .from('profiles')
           .select('subscription_plan, subscription_status')
@@ -541,84 +623,18 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         const dbPlan = normalizePlan(profile?.subscription_plan);
         const dbStatus = String(profile?.subscription_status || '').toLowerCase().trim();
         if (dbPlan === expectedPlan && isActiveStatus(dbStatus)) {
-          clearInterval(checkoutPollTimerRef.current);
-          checkoutPollTimerRef.current = null;
+          stopPostCheckoutPolling();
           applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
-          setBlockedCheckout(null);
           setCurrentPlan(dbPlan);
           onPlanChangeRef.current?.(dbPlan);
           checkUserAuth?.().catch(() => {});
           loadSubscription();
-          toast.success(`Subscription synced! Welcome to ${dbPlan.charAt(0).toUpperCase() + dbPlan.slice(1)}.`);
         }
       } catch {
         // ignore transient poll errors
       }
     }, 2500);
-  }, [checkUserAuth, loadSubscription, user?.id]);
-
-  const navigateSingleTabToCheckout = useCallback(async (destinationUrl, plan, sessionId = '') => {
-    const resolvedSid = extractStripeSessionId(sessionId, destinationUrl);
-    if (resolvedSid) {
-      await registerCheckoutReturnHandoff({
-        sessionId: resolvedSid,
-        url: destinationUrl,
-        plan: plan.planKey,
-      }).catch(() => {});
-    }
-
-    startPostCheckoutPolling(plan.planKey);
-
-    const inIframe = (() => {
-      try {
-        return window.self !== window.top;
-      } catch {
-        return true;
-      }
-    })();
-
-    if (!inIframe) {
-      window.location.assign(destinationUrl);
-      return true;
-    }
-
-    // Inside an iframe host (such as preview), navigate the single top browser tab directly.
-    let topNavError = false;
-    try {
-      window.top.location.href = destinationUrl;
-    } catch {
-      topNavError = true;
-    }
-
-    if (topNavError) {
-      setBlockedCheckout({
-        planKey: plan.planKey,
-        planName: plan.name,
-        url: destinationUrl,
-      });
-      return true;
-    }
-
-    // If top-navigation-by-user-activation silently blocked async top navigation, show a native target="_top" link after 300ms.
-    window.setTimeout(() => {
-      setBlockedCheckout({
-        planKey: plan.planKey,
-        planName: plan.name,
-        url: destinationUrl,
-      });
-    }, 300);
-    return true;
-  }, [startPostCheckoutPolling]);
-
-  const openBillingSyncModalFor = useCallback((mode, email, plan = null) => {
-    setBillingSyncStep('password');
-    setBillingPassword('');
-    setBillingOtpSent(false);
-    setBillingOtpCode('');
-    setBillingNewPassword('');
-    setBillingSyncError('');
-    setBillingSyncModal({ mode, email, plan });
-  }, []);
+  }, [checkUserAuth, loadSubscription, stopPostCheckoutPolling, user?.id]);
 
   const handleCheckout = async (plan) => {
     if (!plan?.planKey || loadingPlan) {
@@ -626,14 +642,12 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }
 
     if (currentPlan === plan.planKey && subscription?.status === 'active') {
-      toast.info(`You already have active access to the ${plan.name} plan.`);
       return;
     }
 
     setLoadingPlan(plan.planKey);
     setError('');
     setCardError(null);
-    setBlockedCheckout(null);
 
     try {
       const latestStoredUser = (() => {
@@ -650,158 +664,53 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
       document.cookie = `washek_pending_checkout_plan=${plan.planKey}; path=/; max-age=86400; SameSite=Lax`;
 
-      let destinationUrl = null;
-      let resolvedSessionId = '';
-      let checkoutErrorMessage = '';
-      let needsReauth = false;
-      let needsBillingSync = false;
+      const selectedPriceId = localizedPrices[plan.planKey]?.priceId || plan.priceId?.month || '';
 
-      // 1. Primary: create real Stripe Checkout Session via Supabase Edge Function
-      try {
-        const checkoutResult = await createStripeCheckout(plan.planKey);
-        if (
-          checkoutResult?.action === 'already_active' ||
-          checkoutResult?.action === 'already_current' ||
-          checkoutResult?.action === 'changed'
-        ) {
-          applySubscriptionUpgrade(plan.planKey, 'active', { syncServer: false });
-          setCurrentPlan(plan.planKey);
-          onPlanChangeRef.current?.(plan.planKey);
-          await checkUserAuth?.().catch(() => {});
-          await loadSubscription();
-          toast.success(`Your ${plan.name} subscription is active and synced!`);
-          return;
-        }
-        if (checkoutResult?.url) {
-          destinationUrl = checkoutResult.url;
-          resolvedSessionId = checkoutResult.session_id || '';
-        }
-      } catch (edgeErr) {
-        checkoutErrorMessage = edgeErr?.message || '';
-        if (edgeErr?.code === 'BILLING_SYNC_REQUIRED') {
-          needsBillingSync = true;
-        } else if (edgeErr?.code === 'AUTH_SESSION_EXPIRED') {
-          needsReauth = true;
-        }
-        console.warn('[PricingSection] createStripeCheckout note:', checkoutErrorMessage || edgeErr);
-      }
+      startPostCheckoutPolling(plan.planKey);
 
-      // If vault/Supabase password sync is known to be required for a signed-in user, open inline prompt immediately
-      if (!destinationUrl && needsBillingSync && userEmail) {
-        openBillingSyncModalFor('checkout', userEmail, plan);
-        return;
-      }
-
-      // 2. Fallback: Express checkout endpoint (also runs server JWKS/HMAC vault session recovery automatically)
-      if (!destinationUrl) {
-        try {
-          let freshToken = '';
-          let sessionUserId = userId;
-          let sessionUserEmail = userEmail;
-          try {
-            const validSession = await resolveValidSupabaseSession(false);
-            freshToken = validSession?.access_token || '';
-            sessionUserId = validSession?.user?.id || userId;
-            sessionUserEmail = validSession?.user?.email || userEmail;
-          } catch {
-            const { data: sessionData } = await supabase.auth.getSession();
-            freshToken =
-              sessionData?.session?.access_token ||
-              localStorage.getItem('washek_auth_token') ||
-              '';
-            sessionUserId = sessionData?.session?.user?.id || userId;
-            sessionUserEmail = sessionData?.session?.user?.email || userEmail;
-          }
-
-          const refreshTok = localStorage.getItem('washek_refresh_token') || '';
-          const srvTok = localStorage.getItem('washek_srv_session') || '';
-
-          if (freshToken || srvTok || sessionUserEmail) {
-            const sessionRes = await fetch('/api/create-checkout-session', {
-              method: 'POST',
-              credentials: 'include',
-              headers: {
-                'Content-Type': 'application/json',
-                ...(freshToken ? { Authorization: `Bearer ${freshToken}` } : {}),
-                ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
-              },
-              body: JSON.stringify({
-                plan: plan.planKey,
-                userId: sessionUserId,
-                email: sessionUserEmail,
-                returnUrl: window.location.origin,
-                hasUsedTrial,
-                refreshToken: refreshTok || undefined,
-              }),
-            });
-            const sessionDataJson = await sessionRes.json().catch(() => null);
-
-            if (sessionDataJson?.refreshedSession?.access_token) {
-              await syncSupabaseSession?.(sessionDataJson.refreshedSession).catch(() => {});
-            }
-
-            if (
-              sessionRes.ok &&
-              (
-                sessionDataJson?.action === 'already_active' ||
-                sessionDataJson?.action === 'already_current' ||
-                sessionDataJson?.action === 'changed'
-              )
-            ) {
-              applySubscriptionUpgrade(plan.planKey, 'active', { syncServer: false });
-              setCurrentPlan(plan.planKey);
-              onPlanChangeRef.current?.(plan.planKey);
-              await checkUserAuth?.().catch(() => {});
-              await loadSubscription();
-              toast.success(`Your ${plan.name} subscription is active and synced!`);
-              return;
-            }
-            if (sessionRes.ok && sessionDataJson?.url) {
-              destinationUrl = sessionDataJson.url;
-              resolvedSessionId = sessionDataJson.session_id || sessionDataJson.sessionId || '';
-              needsReauth = false;
-              needsBillingSync = false;
-            } else if (
-              sessionRes.status === 409 ||
-              sessionDataJson?.code === 'VAULT_SUPABASE_SYNC_NEEDED' ||
-              sessionDataJson?.needsBillingPasswordSync
-            ) {
-              needsBillingSync = true;
-              needsReauth = false;
-            } else if (sessionDataJson?.error) {
-              checkoutErrorMessage = sessionDataJson.error;
-              if (sessionRes.status === 401 || sessionDataJson?.code === 'AUTH_SESSION_EXPIRED') {
-                if (sessionUserEmail) needsBillingSync = true;
-                else needsReauth = true;
-              }
-            }
-          }
-        } catch (err) {
-          console.debug('[PricingSection] create-checkout-session fetch note:', err);
-        }
-      }
-
-      if (!destinationUrl && (needsBillingSync || (needsReauth && userEmail)) && userEmail) {
-        openBillingSyncModalFor('checkout', userEmail, plan);
-        return;
-      }
-
-      if (!destinationUrl) {
-        const err = new Error(
-          checkoutErrorMessage ||
-            'Please sign in to connect your account with Stripe Checkout.'
-        );
-        if (needsReauth || !userEmail) err.code = 'AUTH_SESSION_EXPIRED';
-        throw err;
-      }
-
-      await navigateSingleTabToCheckout(destinationUrl, plan, resolvedSessionId);
+      await openPaddleCheckout({
+        planKey: plan.planKey,
+        priceId: selectedPriceId,
+        email: userEmail,
+        userId,
+        onCompleted: (txData, completedPlanKey) => {
+          stopPostCheckoutPolling();
+          const txId = txData?.transaction_id || txData?.id || '';
+          const params = new URLSearchParams({
+            plan: completedPlanKey || plan.planKey,
+          });
+          if (txId) params.set('transaction_id', txId);
+          window.location.assign(`/welcome?${params.toString()}`);
+        },
+        onError: (formattedErr) => {
+          stopPostCheckoutPolling();
+          setLoadingPlan(null);
+          const msg = formattedErr?.message || 'Unable to open Paddle Checkout.';
+          setError(msg);
+          setCardError({ planKey: plan.planKey, message: msg, needsReauth: false });
+          toast.error(msg);
+        },
+        onClosed: () => {
+          stopPostCheckoutPolling();
+          setLoadingPlan(null);
+        },
+      });
     } catch (checkoutError) {
       const isAuthErr = checkoutError?.code === 'AUTH_SESSION_EXPIRED';
+      const isConfigErr = [
+        'PADDLE_ENV_MISSING',
+        'PADDLE_TOKEN_MISSING',
+        'PADDLE_TOKEN_ENV_MISMATCH',
+        'PADDLE_PRICE_ID_REQUIRED',
+      ].includes(checkoutError?.code);
       const msg = isAuthErr
         ? 'Please sign in to upgrade your plan.'
-        : checkoutError?.message || 'Unable to start checkout.';
-      console.error('[PricingSection] Stripe redirect failed:', checkoutError);
+        : checkoutError?.message || 'Unable to open Paddle Checkout.';
+      if (isConfigErr || isAuthErr) {
+        console.warn('[PricingSection] Paddle checkout blocked:', msg);
+      } else {
+        console.error('[PricingSection] Paddle checkout failed:', checkoutError);
+      }
       setError(msg);
       setCardError({ planKey: plan.planKey, message: msg, needsReauth: isAuthErr });
       toast.error(msg);
@@ -809,7 +718,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       setLoadingPlan(null);
     }
   };
-
 
   const executeCancel = async () => {
     if (cancelling || currentPlan === 'free') {
@@ -820,34 +728,54 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     setError('');
 
     try {
-      // 1. Obtain a freshly validated Supabase JWT session so Edge Function auth succeeds
-      let session = null;
-      try {
-        session = await resolveValidSupabaseSession(false);
-      } catch (sessionErr) {
-        if (sessionErr?.code === 'BILLING_SYNC_REQUIRED' && (user?.email || storedUser?.email)) {
-          setCancelling(false);
-          openBillingSyncModalFor('cancel', user?.email || storedUser?.email);
-          return;
-        }
-        await checkUserAuth?.().catch(() => {});
+      const latestStoredUser = (() => {
         try {
-          session = await resolveValidSupabaseSession(true);
-        } catch (retryErr) {
-          if (retryErr?.code === 'BILLING_SYNC_REQUIRED' && (user?.email || storedUser?.email)) {
-            setCancelling(false);
-            openBillingSyncModalFor('cancel', user?.email || storedUser?.email);
-            return;
+          return JSON.parse(localStorage.getItem('washek_user') || '{}');
+        } catch {
+          return storedUser || {};
+        }
+      })();
+      const nativeSess = readNativeSupabaseStorageSession();
+      const storedTok = localStorage.getItem('washek_auth_token') || '';
+      let freshToken = !isNonJwtToken(storedTok)
+        ? storedTok
+        : !isNonJwtToken(nativeSess?.access_token)
+          ? nativeSess.access_token
+          : storedTok;
+      const refreshTok =
+        localStorage.getItem('washek_refresh_token') ||
+        nativeSess?.refresh_token ||
+        '';
+      const srvTok = localStorage.getItem('washek_srv_session') || '';
+      const hasJwtOrRefresh = !isNonJwtToken(freshToken) || Boolean(refreshTok);
+
+      // 1. Try obtaining a client Supabase JWT session if available (skip futile attempts for pure local vault sessions)
+      let session = null;
+      if (hasJwtOrRefresh) {
+        try {
+          session = await resolveValidSupabaseSession(false);
+          if (session?.access_token) {
+            freshToken = session.access_token;
           }
-          throw retryErr;
+        } catch {
+          session = null;
         }
       }
 
-      const currentUserId = session?.user?.id || user?.id || storedUser?.id || null;
-      const currentUserEmail = session?.user?.email || user?.email || storedUser?.email || null;
+      const currentUserId =
+        session?.user?.id ||
+        user?.id ||
+        latestStoredUser?.id ||
+        latestStoredUser?.uid ||
+        null;
+      const currentUserEmail =
+        session?.user?.email ||
+        user?.email ||
+        latestStoredUser?.email ||
+        null;
       const cancelPayload = {
-        userId: currentUserId,
-        email: currentUserEmail,
+        userId: currentUserId || undefined,
+        email: currentUserEmail || undefined,
       };
 
       const invokeCancelEdge = (activeSession) =>
@@ -858,45 +786,78 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           },
         });
 
-      // 2. Call Supabase cancel-subscription Edge Function with explicit Authorization header
-      let { data, error: invokeError } = await invokeCancelEdge(session);
-      let detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
-
       const looksLikeAuthFailure = (msg) =>
         /(^|\b)(401|unauthorized|jwt|missing authorization|invalid claim|invalid token|not authenticated|signed in)(\b|$)/i.test(
           String(msg || '')
         );
 
-      if (
-        (invokeError && (looksLikeAuthFailure(invokeError.message) || looksLikeAuthFailure(detailedMessage))) ||
-        (data?.success === false && looksLikeAuthFailure(data?.error))
-      ) {
-        session = await resolveValidSupabaseSession(true);
-        ({ data, error: invokeError } = await invokeCancelEdge(session));
-        detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
-      }
+      let canceledConfirmed = false;
+      let detailedMessage = '';
+      let confirmedCancelProfile = null;
+      let data = null;
 
-      let canceledConfirmed = Boolean(!invokeError && data?.success !== false);
-
-      // 3. Fallback through Express proxy forwarding the authenticated Supabase JWT if Edge invoke failed
+      // 2. Call Express Paddle cancel-subscription endpoint (cancels via Paddle API or clears local/vault state)
       if (!canceledConfirmed) {
         try {
-          const proxyRes = await fetch('/api/cancel-subscription', {
+          const proxyRes = await fetch('/api/paddle/cancel-subscription', {
             method: 'POST',
+            credentials: 'include',
             headers: {
               'Content-Type': 'application/json',
-              Authorization: `Bearer ${session.access_token}`,
+              ...(freshToken ? { Authorization: `Bearer ${freshToken}` } : {}),
+              ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
             },
-            body: JSON.stringify(cancelPayload),
+            body: JSON.stringify({
+              ...cancelPayload,
+              subscriptionId: subscription?.id || undefined,
+              refreshToken: refreshTok || undefined,
+            }),
           });
           const proxyData = await proxyRes.json().catch(() => null);
+
+          if (proxyData?.refreshedSession?.access_token) {
+            freshToken = proxyData.refreshedSession.access_token;
+            await syncSupabaseSession?.(proxyData.refreshedSession).catch(() => {});
+          }
+
           if (proxyRes.ok && proxyData?.success) {
             canceledConfirmed = true;
+            confirmedCancelProfile = proxyData?.user || null;
           } else if (proxyData?.error) {
             detailedMessage = proxyData.error;
           }
         } catch (proxyErr) {
-          console.debug('[PricingSection] Cancel proxy note:', proxyErr);
+          console.debug('[PricingSection] Paddle cancel note:', proxyErr);
+        }
+      }
+
+      // 3. Fallback to legacy Supabase cancel-subscription Edge Function if still needed and JWT exists
+      if (!canceledConfirmed && session?.access_token && !isNonJwtToken(session.access_token)) {
+        let invokeError = null;
+        ({ data, error: invokeError } = await invokeCancelEdge(session));
+        detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
+
+        if (
+          (invokeError && (looksLikeAuthFailure(invokeError.message) || looksLikeAuthFailure(detailedMessage))) ||
+          (data?.success === false && looksLikeAuthFailure(data?.error))
+        ) {
+          try {
+            session = await resolveValidSupabaseSession(true);
+            if (session?.access_token) {
+              freshToken = session.access_token;
+              ({ data, error: invokeError } = await invokeCancelEdge(session));
+              detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
+            }
+          } catch {
+            // ignore
+          }
+        }
+
+        if (!invokeError && data?.success !== false) {
+          canceledConfirmed = true;
+          confirmedCancelProfile = data?.user || null;
+        } else if (data?.error && !detailedMessage) {
+          detailedMessage = data.error;
         }
       }
 
@@ -908,14 +869,46 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         );
       }
 
-      // 4. Verify Postgres profile no longer shows an active paid plan (when profile row exists)
-      if (currentUserId) {
+      // 4. Verify Postgres profile no longer shows an active paid plan (when backed by Supabase UUID)
+      let verifiedFreeViaCancelResponse = false;
+      if (confirmedCancelProfile) {
+        const respPlan = normalizePlan(confirmedCancelProfile.subscription_plan);
+        const respStatus = String(confirmedCancelProfile.subscription_status || '').toLowerCase().trim();
+        if (respPlan === 'free' || !isActiveStatus(respStatus)) {
+          verifiedFreeViaCancelResponse = true;
+        }
+      }
+
+      const verifyUid =
+        confirmedCancelProfile?.id ||
+        (currentUserId && !String(currentUserId).startsWith('usr_') ? currentUserId : null);
+
+      if (!verifiedFreeViaCancelResponse && verifyUid && !isNonJwtToken(freshToken)) {
         try {
-          const { data: verifyProf } = await supabase
+          let verifyProf = null;
+          const { data: clientProf, error: verifyErr } = await supabase
             .from('profiles')
             .select('subscription_plan, subscription_status')
-            .eq('id', currentUserId)
+            .eq('id', verifyUid)
             .maybeSingle();
+
+          if (!verifyErr && clientProf) {
+            verifyProf = clientProf;
+          } else {
+            const restRes = await fetch(
+              `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(verifyUid)}&select=subscription_plan,subscription_status&limit=1`,
+              {
+                headers: {
+                  apikey: supabaseAnonKey,
+                  Authorization: `Bearer ${freshToken}`,
+                },
+              }
+            );
+            const rows = await restRes.json().catch(() => null);
+            if (Array.isArray(rows) && rows[0]) {
+              verifyProf = rows[0];
+            }
+          }
 
           if (verifyProf) {
             const dbPlan = normalizePlan(verifyProf.subscription_plan);
@@ -933,12 +926,13 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       }
 
-      // 5. Clear all local/session/query subscription caches and reload cleanly onto Free Plan
+      // 5. Clear all local/session/query/user caches and reload cleanly onto Free Plan
+      invalidateCurrentUserCache();
       applySubscriptionCancellation();
       setCurrentPlan('free');
       setSubscription(null);
       setShowCancelConfirm(false);
-      onPlanChange?.('free');
+      onPlanChangeRef.current?.('free');
       queryClientInstance.clear();
 
       try {
@@ -957,147 +951,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }
   };
 
-  const finishAfterBillingSync = async () => {
-    const targetMode = billingSyncModal?.mode;
-    const targetPlan = billingSyncModal?.plan;
-
-    if (targetMode === 'cancel') {
-      setBillingSyncModal(null);
-      await executeCancel();
-      return;
-    }
-
-    if (targetPlan) {
-      try {
-        const result = await createStripeCheckout(targetPlan.planKey);
-        if (
-          result?.action === 'already_active' ||
-          result?.action === 'already_current' ||
-          result?.action === 'changed'
-        ) {
-          setBillingSyncModal(null);
-          applySubscriptionUpgrade(targetPlan.planKey, 'active', { syncServer: false });
-          setCurrentPlan(targetPlan.planKey);
-          onPlanChangeRef.current?.(targetPlan.planKey);
-          await checkUserAuth?.().catch(() => {});
-          await loadSubscription();
-          toast.success(`Your ${targetPlan.name} subscription is active and synced!`);
-          return;
-        }
-        if (result?.url) {
-          setBillingSyncModal(null);
-          await navigateSingleTabToCheckout(result.url, targetPlan, result.session_id || '');
-          return;
-        }
-      } catch (err) {
-        setBillingSyncModal(null);
-        toast.error(err?.message || 'Unable to launch Stripe Checkout.');
-      }
-    } else {
-      setBillingSyncModal(null);
-    }
-  };
-
-  const handleBillingPasswordSubmit = async (e) => {
-    e.preventDefault();
-    if (!billingSyncModal?.email || !billingPassword || billingSyncBusy) return;
-
-    setBillingSyncBusy(true);
-    setBillingSyncError('');
-
-    try {
-      const res = await fetch('/api/auth/sync-supabase-session', {
-        method: 'POST',
-        credentials: 'include',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          email: billingSyncModal.email,
-          password: billingPassword,
-        }),
-      });
-      const data = await res.json().catch(() => null);
-      if (!res.ok || !data?.success || !data?.session?.access_token) {
-        throw new Error(
-          data?.error ||
-            'That password did not match your cloud billing password. Try your original password or verify with a 6-digit email code below.'
-        );
-      }
-
-      await syncSupabaseSession?.(data.session, data.profile || null, data.serverSessionToken || '');
-      await finishAfterBillingSync();
-    } catch (err) {
-      setBillingSyncError(err?.message || 'Unable to verify password.');
-    } finally {
-      setBillingSyncBusy(false);
-    }
-  };
-
-  const handleSendBillingOtp = async () => {
-    if (!billingSyncModal?.email || billingSyncBusy) return;
-    setBillingSyncBusy(true);
-    setBillingSyncError('');
-    try {
-      const { error: resetErr } = await supabase.auth.resetPasswordForEmail(billingSyncModal.email, {
-        redirectTo: `${window.location.origin}/profile`,
-      });
-      if (resetErr) throw resetErr;
-      setBillingOtpSent(true);
-      toast.success(`Verification email sent to ${billingSyncModal.email}. Enter the 6-digit code below.`);
-    } catch (err) {
-      setBillingSyncError(err?.message || 'Unable to send verification code email.');
-    } finally {
-      setBillingSyncBusy(false);
-    }
-  };
-
-  const handleVerifyBillingOtp = async (e) => {
-    e.preventDefault();
-    if (!billingSyncModal?.email || !billingOtpCode.trim() || billingNewPassword.length < 6 || billingSyncBusy) return;
-
-    setBillingSyncBusy(true);
-    setBillingSyncError('');
-
-    try {
-      const { data: otpData, error: otpErr } = await supabase.auth.verifyOtp({
-        email: billingSyncModal.email,
-        token: billingOtpCode.trim(),
-        type: 'recovery',
-      });
-      if (otpErr || !otpData?.session?.access_token) {
-        throw new Error(otpErr?.message || 'Invalid or expired 6-digit verification code.');
-      }
-
-      const { data: updatedUser, error: updErr } = await supabase.auth.updateUser({
-        password: billingNewPassword,
-      });
-      if (updErr) {
-        throw new Error(updErr.message || 'Unable to set updated password.');
-      }
-
-      const vaultSyncRes = await fetch('/api/auth/sync-vault-after-otp', {
-        method: 'POST',
-        credentials: 'include',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${otpData.session.access_token}`,
-        },
-        body: JSON.stringify({ newPassword: billingNewPassword }),
-      });
-      const vaultSyncData = await vaultSyncRes.json().catch(() => null);
-
-      const finalSession = {
-        ...otpData.session,
-        user: updatedUser?.user || otpData.session.user,
-      };
-      await syncSupabaseSession?.(finalSession, null, vaultSyncData?.serverSessionToken || '');
-      await finishAfterBillingSync();
-    } catch (err) {
-      setBillingSyncError(err?.message || 'Unable to verify email code.');
-    } finally {
-      setBillingSyncBusy(false);
-    }
-  };
-
 
   return (
     <div className="space-y-4 relative">
@@ -1106,12 +959,12 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       <div className="absolute top-1/2 -left-20 w-80 h-80 bg-emerald-500/15 rounded-full blur-[100px] pointer-events-none" />
       <div className="absolute bottom-10 -right-20 w-80 h-80 bg-amber-500/15 rounded-full blur-[100px] pointer-events-none" />
 
-      {error && (
+      {(error || paddlePriceError) && (
         <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm relative z-10">
           <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
 
           <span>
-            {error}
+            {error || paddlePriceError}
           </span>
         </div>
       )}
@@ -1182,6 +1035,9 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         const isCurrent = currentPlan === plan.planKey;
         const isIncludedInHigherTier = cardTierLevel < currentTierLevel;
 
+        const localizedPrice = localizedPrices[plan.planKey]?.formattedTotal || null;
+        const displayPrice = localizedPrice || (loadingPrices ? '…' : '—');
+
         return (
           <Card
             key={plan.name}
@@ -1206,11 +1062,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                     )}
                   </div>
                   <span className="text-xs text-muted-foreground font-medium block mt-0.5">
-                    {plan.planKey === 'progress'
-                      ? 'Daily Progression'
-                      : plan.planKey === 'performance'
-                        ? 'High Performance'
-                        : 'Masterclass Athlete'}
+                    {plan.description}
                   </span>
                 </div>
               </div>
@@ -1219,7 +1071,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
               <div className="text-right shrink-0">
                 <div className="flex items-baseline justify-end gap-0.5">
                   <span className={`font-heading font-black text-2xl sm:text-3xl ${plan.color} tracking-tight`}>
-                    {plan.price}
+                    {displayPrice}
                   </span>
                   <span className="text-xs text-muted-foreground font-medium">
                     {plan.period}
@@ -1258,31 +1110,20 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
               </div>
             ) : (
               <div className="space-y-2">
-                {blockedCheckout?.planKey === plan.planKey && blockedCheckout?.url ? (
-                  <a
-                    href={blockedCheckout.url}
-                    target="_top"
-                    onClick={() => startPostCheckoutPolling(plan.planKey)}
-                    className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide flex items-center justify-center ${plan.buttonClass}`}
-                  >
-                    Continue to {plan.name} Checkout →
-                  </a>
-                ) : (
-                  <Button
-                    className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide ${plan.buttonClass}`}
-                    onClick={() => handleCheckout(plan)}
-                    disabled={!!loadingPlan}
-                  >
-                    {loadingPlan === plan.planKey ? (
-                      <>
-                        <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                        Opening Stripe Checkout…
-                      </>
-                    ) : (
-                      `Upgrade to ${plan.name}`
-                    )}
-                  </Button>
-                )}
+                <Button
+                  className={`w-full h-11 rounded-xl font-heading font-semibold text-sm tracking-wide ${plan.buttonClass}`}
+                  onClick={() => handleCheckout(plan)}
+                  disabled={!!loadingPlan || loadingPrices}
+                >
+                  {loadingPlan === plan.planKey ? (
+                    <>
+                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                      Opening Paddle Checkout…
+                    </>
+                  ) : (
+                    `Subscribe to ${plan.name}`
+                  )}
+                </Button>
                 {cardError?.planKey === plan.planKey && cardError?.message && (
                   <div className="space-y-2 text-center">
                     <p className="text-[11px] text-destructive font-medium">
@@ -1305,9 +1146,13 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                   </div>
                 )}
                 <p className="text-[11px] text-center text-muted-foreground font-medium">
-                  {hasUsedTrial
-                    ? `Billed today: ${plan.price}/mo · Cancel anytime`
-                    : `7 days free, then ${plan.price}/mo · Cancel anytime`}
+                  {localizedPrice
+                    ? hasUsedTrial
+                      ? `Billed today: ${localizedPrice}/mo · Cancel anytime`
+                      : `7 days free, then ${localizedPrice}/mo · Cancel anytime`
+                    : loadingPrices
+                      ? 'Loading localized price…'
+                      : 'Cancel anytime'}
                 </p>
               </div>
             )}
@@ -1315,7 +1160,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         );
       })}
 
-      {currentPlan !== 'free' && !loadingSubscription && (
+      {currentPlan !== 'free' && (
         <div className="pt-2">
           {showCancelConfirm ? (
             <div className="p-4 rounded-xl border border-destructive/30 bg-destructive/5 space-y-3">
@@ -1375,160 +1220,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       <p className="text-[10px] text-muted-foreground text-center">
         Cancel anytime. Billed monthly.
       </p>
-
-      {billingSyncModal && (
-        <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/75 backdrop-blur-sm px-4">
-          <div className="w-full max-w-md rounded-3xl border border-primary/35 bg-card p-6 shadow-2xl space-y-4">
-            <div className="flex items-start justify-between gap-3">
-              <div className="flex items-center gap-2.5">
-                <div className="w-10 h-10 rounded-2xl bg-primary/15 border border-primary/30 flex items-center justify-center text-primary shrink-0">
-                  <Lock className="w-5 h-5" />
-                </div>
-                <div>
-                  <h3 className="font-heading font-bold text-base text-foreground">
-                    {billingSyncModal.mode === 'cancel'
-                      ? 'Confirm Password to Cancel Plan'
-                      : 'Authorize Stripe Checkout'}
-                  </h3>
-                  <p className="text-xs text-muted-foreground">
-                    Signed in as <span className="font-semibold text-foreground">{billingSyncModal.email}</span>
-                  </p>
-                </div>
-              </div>
-              <button
-                type="button"
-                onClick={() => setBillingSyncModal(null)}
-                disabled={billingSyncBusy}
-                className="text-xs text-muted-foreground hover:text-foreground"
-                aria-label="Close billing authorization"
-              >
-                ✕
-              </button>
-            </div>
-
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              Your account is signed in locally, and Stripe Checkout needs to verify your cloud billing password once to connect your subscription.
-            </p>
-
-            {billingSyncError && (
-              <div className="rounded-xl border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
-                {billingSyncError}
-              </div>
-            )}
-
-            {billingSyncStep === 'password' ? (
-              <form onSubmit={handleBillingPasswordSubmit} className="space-y-3">
-                <Input
-                  type="password"
-                  placeholder="Enter your cloud account password"
-                  value={billingPassword}
-                  onChange={(e) => setBillingPassword(e.target.value)}
-                  minLength={6}
-                  required
-                  autoFocus
-                  className="h-11 rounded-xl bg-background/60"
-                />
-                <Button
-                  type="submit"
-                  disabled={billingSyncBusy || !billingPassword}
-                  className="w-full h-11 rounded-xl font-heading font-semibold text-sm"
-                >
-                  {billingSyncBusy ? (
-                    <>
-                      <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Verifying & Connecting…
-                    </>
-                  ) : billingSyncModal.mode === 'cancel' ? (
-                    'Verify & Cancel Subscription'
-                  ) : (
-                    `Verify & Open ${billingSyncModal.plan?.name || ''} Checkout`
-                  )}
-                </Button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBillingSyncStep('otp');
-                    setBillingSyncError('');
-                  }}
-                  className="w-full text-xs text-primary hover:underline text-center pt-1 font-medium"
-                >
-                  Used a local recovery password or forgot original password? Verify with email code
-                </button>
-              </form>
-            ) : (
-              <div className="space-y-3">
-                {!billingOtpSent ? (
-                  <div className="space-y-3">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      onClick={handleSendBillingOtp}
-                      disabled={billingSyncBusy}
-                      className="w-full h-11 rounded-xl font-semibold text-xs flex items-center justify-center gap-2 border-primary/40"
-                    >
-                      {billingSyncBusy ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Mail className="h-4 w-4 text-primary" />
-                      )}
-                      <span>Send 6-Digit Verification Code to {billingSyncModal.email}</span>
-                    </Button>
-                  </div>
-                ) : (
-                  <form onSubmit={handleVerifyBillingOtp} className="space-y-3">
-                    <Input
-                      type="text"
-                      placeholder="6-digit verification code from email"
-                      value={billingOtpCode}
-                      onChange={(e) => setBillingOtpCode(e.target.value)}
-                      required
-                      autoFocus
-                      className="h-11 rounded-xl bg-background/60"
-                    />
-                    <Input
-                      type="password"
-                      placeholder="Set synced password (min 6 characters)"
-                      value={billingNewPassword}
-                      onChange={(e) => setBillingNewPassword(e.target.value)}
-                      minLength={6}
-                      required
-                      className="h-11 rounded-xl bg-background/60"
-                    />
-                    <Button
-                      type="submit"
-                      disabled={billingSyncBusy || !billingOtpCode.trim() || billingNewPassword.length < 6}
-                      className="w-full h-11 rounded-xl font-heading font-semibold text-sm flex items-center justify-center gap-2"
-                    >
-                      {billingSyncBusy ? (
-                        <>
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                          Syncing & Opening Stripe…
-                        </>
-                      ) : (
-                        <>
-                          <KeyRound className="h-4 w-4" />
-                          <span>Verify Code & Open Stripe Checkout</span>
-                        </>
-                      )}
-                    </Button>
-                  </form>
-                )}
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    setBillingSyncStep('password');
-                    setBillingSyncError('');
-                  }}
-                  className="w-full text-xs text-muted-foreground hover:text-foreground text-center pt-1"
-                >
-                  Back to password verification
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
     </div>
   );
 }

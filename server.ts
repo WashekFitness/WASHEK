@@ -6,6 +6,32 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 
+// Load local .env / .env.local files into process.env for any variables not already set by the host environment
+for (const envFile of ['.env.local', '.env']) {
+  try {
+    const envPath = path.join(process.cwd(), envFile);
+    if (fs.existsSync(envPath)) {
+      const content = fs.readFileSync(envPath, 'utf-8');
+      for (const rawLine of content.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith('#')) continue;
+        const eqIdx = line.indexOf('=');
+        if (eqIdx <= 0) continue;
+        const key = line.slice(0, eqIdx).trim();
+        let val = line.slice(eqIdx + 1).trim();
+        if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+          val = val.slice(1, -1);
+        }
+        if (key && !process.env[key]) {
+          process.env[key] = val;
+        }
+      }
+    }
+  } catch {
+    // ignore local env file read errors
+  }
+}
+
 const app = express();
 // Parse CLI flags and environment variables for port and host
 const args = process.argv.slice(2);
@@ -26,8 +52,15 @@ const cliHost = parseArg('--host') || parseArg('-h');
 const PORT = parseInt(cliPort || process.env.PORT || '3000', 10);
 const HOST = cliHost || process.env.HOST || '0.0.0.0';
 
-// Body parsers with generous limits for media & base64 frames
-app.use(express.json({ limit: '50mb' }));
+// Body parsers with generous limits + rawBody capture for Paddle webhook signature verification
+app.use(
+  express.json({
+    limit: '50mb',
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf.toString('utf8');
+    },
+  })
+);
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Supabase configuration for backend authorization and quota enforcement
@@ -90,12 +123,681 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 // ------------------------------------------------------------
-// API ROUTES & REDIRECTS
+// PADDLE BILLING CONFIGURATION & SERVER HELPERS
 // ------------------------------------------------------------
 
+const PADDLE_PRODUCT_IDS: Record<'progress' | 'performance' | 'elite', string> = {
+  progress: 'pro_01m7j8yvn5p9qk5kpzab25s43d',
+  performance: 'pro_01m7j8z8zgpzyxxsjf3agxzh5j',
+  elite: 'pro_01m7j8zjcvphk0vjjt48d3d182',
+};
+
+const PRODUCT_ID_TO_PLAN: Record<string, 'progress' | 'performance' | 'elite'> = {
+  pro_01m7j8yvn5p9qk5kpzab25s43d: 'progress',
+  pro_01m7j8z8zgpzyxxsjf3agxzh5j: 'performance',
+  pro_01m7j8zjcvphk0vjjt48d3d182: 'elite',
+};
+
+const pendingCheckouts = new Map<string, { plan: string; timestamp: number }>();
+
+function getServiceRoleSupabase() {
+  const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  if (!serviceKey) return null;
+  return createClient(SUPABASE_URL, serviceKey, {
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+    },
+  });
+}
+
+function getServerPaddleConfig() {
+  const rawEnv = String(process.env.PADDLE_ENV || process.env.VITE_PADDLE_ENV || '')
+    .trim()
+    .toLowerCase();
+  const environment =
+    rawEnv === 'production' || rawEnv === 'sandbox' ? (rawEnv as 'production' | 'sandbox') : null;
+  const apiBaseUrl =
+    environment === 'production'
+      ? 'https://api.paddle.com'
+      : environment === 'sandbox'
+        ? 'https://sandbox-api.paddle.com'
+        : null;
+  const apiKey = String(process.env.PADDLE_API_KEY || '').trim();
+  const webhookSecret = String(process.env.PADDLE_WEBHOOK_SECRET || '').trim();
+  const rawClientToken = String(
+    process.env.VITE_PADDLE_CLIENT_TOKEN || process.env.PADDLE_CLIENT_TOKEN || ''
+  ).trim();
+  const clientToken =
+    rawClientToken.startsWith('live_') || rawClientToken.startsWith('test_')
+      ? rawClientToken
+      : '';
+
+  return {
+    configured: Boolean(environment && apiBaseUrl),
+    environment,
+    apiBaseUrl,
+    apiKey,
+    webhookSecret,
+    clientToken,
+  };
+}
+
+/**
+ * Detects user's 2-letter ISO country code from hosting/CDN headers.
+ * Keeps 'OTHERS' strictly as an internal fallback sentinel and returns countryCode: null when absent
+ * so client-side Paddle.PricePreview() auto-detects from the visitor's IP without any invalid country code.
+ */
+function detectCountryFromHeaders(req: express.Request): {
+  countryCode: string | null;
+  regionTag: string;
+} {
+  const candidateHeaders = [
+    req.headers['x-vercel-ip-country'],
+    req.headers['cf-ipcountry'],
+    req.headers['x-appengine-country'],
+    req.headers['cloudfront-viewer-country'],
+    req.headers['x-country-code'],
+    req.headers['x-forwarded-country'],
+  ];
+
+  for (const raw of candidateHeaders) {
+    const first = Array.isArray(raw) ? raw[0] : raw;
+    const code = String(first || '').trim().toUpperCase();
+    if (
+      /^[A-Z]{2}$/.test(code) &&
+      code !== 'XX' &&
+      code !== 'ZZ' &&
+      code !== 'T1' &&
+      code !== 'OT'
+    ) {
+      return { countryCode: code, regionTag: code };
+    }
+  }
+
+  return { countryCode: null, regionTag: 'OTHERS' };
+}
+
+function getEnvConfiguredPriceIds() {
+  const read = (...names: string[]) => {
+    for (const name of names) {
+      const val = String(process.env[name] || '').trim();
+      if (/^pri_[a-zA-Z0-9]+$/.test(val)) return val;
+    }
+    return '';
+  };
+
+  return {
+    progress: {
+      month: read('VITE_PADDLE_PRICE_PROGRESS_MONTH', 'PADDLE_PRICE_PROGRESS_MONTH') || 'pri_01m7j94jsmj6m6c23fmpx30eb7',
+      year: read('VITE_PADDLE_PRICE_PROGRESS_YEAR', 'PADDLE_PRICE_PROGRESS_YEAR'),
+    },
+    performance: {
+      month: read('VITE_PADDLE_PRICE_PERFORMANCE_MONTH', 'PADDLE_PRICE_PERFORMANCE_MONTH') || 'pri_01m7j980nyk4c5sexqs2anj39h',
+      year: read('VITE_PADDLE_PRICE_PERFORMANCE_YEAR', 'PADDLE_PRICE_PERFORMANCE_YEAR'),
+    },
+    elite: {
+      month: read('VITE_PADDLE_PRICE_ELITE_MONTH', 'PADDLE_PRICE_ELITE_MONTH') || 'pri_01m7j995eanq5e99wbwkpb3dz6',
+      year: read('VITE_PADDLE_PRICE_ELITE_YEAR', 'PADDLE_PRICE_ELITE_YEAR'),
+    },
+  };
+}
+
+let cachedPaddlePriceLookup: {
+  env: string;
+  fetchedAt: number;
+  resolved: Record<'progress' | 'performance' | 'elite', { month: string; year: string }>;
+} | null = null;
+
+async function resolveTierPriceIdsOnServer() {
+  const envMap = getEnvConfiguredPriceIds();
+  const merged = {
+    progress: { ...envMap.progress },
+    performance: { ...envMap.performance },
+    elite: { ...envMap.elite },
+  };
+
+  const cfg = getServerPaddleConfig();
+  if (!cfg.configured || !cfg.apiBaseUrl || !cfg.apiKey) {
+    return { cfg, resolvedPriceIds: merged };
+  }
+
+  if (
+    cachedPaddlePriceLookup &&
+    cachedPaddlePriceLookup.env === cfg.environment &&
+    Date.now() - cachedPaddlePriceLookup.fetchedAt < 5 * 60 * 1000
+  ) {
+    for (const tier of ['progress', 'performance', 'elite'] as const) {
+      if (!merged[tier].month && cachedPaddlePriceLookup.resolved[tier].month) {
+        merged[tier].month = cachedPaddlePriceLookup.resolved[tier].month;
+      }
+      if (!merged[tier].year && cachedPaddlePriceLookup.resolved[tier].year) {
+        merged[tier].year = cachedPaddlePriceLookup.resolved[tier].year;
+      }
+    }
+    return { cfg, resolvedPriceIds: merged };
+  }
+
+  try {
+    const productCsv = Object.values(PADDLE_PRODUCT_IDS).join(',');
+    const url = `${cfg.apiBaseUrl}/prices?product_id=${encodeURIComponent(productCsv)}&status=active&per_page=100`;
+    const apiRes = await fetch(url, {
+      headers: {
+        Authorization: `Bearer ${cfg.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    const apiJson = await apiRes.json().catch(() => null);
+    if (apiRes.ok && Array.isArray(apiJson?.data)) {
+      const discovered = {
+        progress: { month: '', year: '' },
+        performance: { month: '', year: '' },
+        elite: { month: '', year: '' },
+      };
+
+      for (const price of apiJson.data) {
+        const tier = PRODUCT_ID_TO_PLAN[String(price?.product_id || '').trim()];
+        const pid = String(price?.id || '').trim();
+        const interval = String(price?.billing_cycle?.interval || '').toLowerCase().trim();
+        if (!tier || !/^pri_[a-zA-Z0-9]+$/.test(pid)) continue;
+        if (interval === 'year') {
+          if (!discovered[tier].year) discovered[tier].year = pid;
+        } else {
+          if (!discovered[tier].month) discovered[tier].month = pid;
+        }
+      }
+
+      cachedPaddlePriceLookup = {
+        env: cfg.environment || '',
+        fetchedAt: Date.now(),
+        resolved: discovered,
+      };
+
+      for (const tier of ['progress', 'performance', 'elite'] as const) {
+        if (!merged[tier].month && discovered[tier].month) {
+          merged[tier].month = discovered[tier].month;
+        }
+        if (!merged[tier].year && discovered[tier].year) {
+          merged[tier].year = discovered[tier].year;
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn('[Paddle] Failed to resolve Price IDs from Product IDs:', err?.message);
+  }
+
+  return { cfg, resolvedPriceIds: merged };
+}
+
+function mapPaddleItemsToPlan(items: any[] = [], customData: any = {}): {
+  plan: 'progress' | 'performance' | 'elite' | null;
+  priceId: string | null;
+  productId: string | null;
+} {
+  const customPlan = String(customData?.plan || '').toLowerCase().trim();
+  let matchedPlan: 'progress' | 'performance' | 'elite' | null =
+    customPlan === 'progress' || customPlan === 'performance' || customPlan === 'elite'
+      ? customPlan
+      : null;
+
+  let priceId: string | null = null;
+  let productId: string | null = null;
+  const envPrices = getEnvConfiguredPriceIds();
+
+  for (const item of Array.isArray(items) ? items : []) {
+    const pId = item?.price?.id || item?.price_id || null;
+    const prodId = item?.price?.product_id || item?.product?.id || item?.product_id || null;
+    if (pId && !priceId) priceId = String(pId);
+    if (prodId && !productId) productId = String(prodId);
+
+    if (!matchedPlan && prodId && PRODUCT_ID_TO_PLAN[String(prodId)]) {
+      matchedPlan = PRODUCT_ID_TO_PLAN[String(prodId)];
+    }
+    if (!matchedPlan && pId) {
+      for (const tier of ['progress', 'performance', 'elite'] as const) {
+        if (envPrices[tier].month === pId || envPrices[tier].year === pId) {
+          matchedPlan = tier;
+          break;
+        }
+      }
+    }
+  }
+
+  return { plan: matchedPlan, priceId, productId };
+}
+
+async function updateProfileSubscriptionSafely(
+  dbClient: any,
+  userId: string,
+  basePatch: Record<string, any>,
+  extendedPatch: Record<string, any>
+) {
+  if (!dbClient || !userId || !isValidUUID(userId)) return;
+  try {
+    const { error } = await dbClient
+      .from('profiles')
+      .update({ ...basePatch, ...extendedPatch })
+      .eq('id', userId);
+    if (error && (error.code === '42703' || /column .* does not exist/i.test(String(error.message || '')))) {
+      await dbClient.from('profiles').update(basePatch).eq('id', userId);
+    }
+  } catch (err: any) {
+    console.debug('[Paddle] Profile update fallback note:', err?.message);
+    try {
+      await dbClient.from('profiles').update(basePatch).eq('id', userId);
+    } catch {
+      // ignore fallback failure
+    }
+  }
+}
+
+function verifyPaddleWebhookSignature(rawBody: string, signatureHeader: string, secret: string): boolean {
+  if (!rawBody || !signatureHeader || !secret) return false;
+  try {
+    const parts = signatureHeader.split(';').map((s) => s.trim());
+    let ts = '';
+    const h1Values: string[] = [];
+    for (const part of parts) {
+      const idx = part.indexOf('=');
+      if (idx <= 0) continue;
+      const key = part.slice(0, idx).trim();
+      const val = part.slice(idx + 1).trim();
+      if (key === 'ts') ts = val;
+      if (key === 'h1' && val) h1Values.push(val);
+    }
+
+    if (!ts || h1Values.length === 0) return false;
+    const tsNum = Number(ts);
+    if (!Number.isFinite(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > 300) {
+      return false;
+    }
+
+    const signedPayload = `${ts}:${rawBody}`;
+    const expectedHex = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');
+    const expectedBuf = Buffer.from(expectedHex, 'hex');
+
+    return h1Values.some((sigHex) => {
+      try {
+        const providedBuf = Buffer.from(sigHex, 'hex');
+        return providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf);
+      } catch {
+        return false;
+      }
+    });
+  } catch {
+    return false;
+  }
+}
+
 // ------------------------------------------------------------
-// CHECKOUT & SUBSCRIPTION APIS
+// PADDLE API ROUTES
 // ------------------------------------------------------------
+
+app.get('/api/paddle/context', async (req, res) => {
+  try {
+    const { countryCode, regionTag } = detectCountryFromHeaders(req);
+    const { cfg, resolvedPriceIds } = await resolveTierPriceIdsOnServer();
+
+    return res.json({
+      success: true,
+      countryCode,
+      regionTag,
+      productIds: PADDLE_PRODUCT_IDS,
+      resolvedPriceIds,
+      envConfigured: cfg.configured,
+      environment: cfg.environment,
+      clientToken: cfg.clientToken || null,
+      hasClientToken: Boolean(cfg.clientToken),
+      hasServerApiKey: Boolean(cfg.apiKey),
+    });
+  } catch (err: any) {
+    console.error('[Paddle] /api/paddle/context error:', err);
+    return res.status(500).json({
+      success: false,
+      countryCode: null,
+      regionTag: 'OTHERS',
+      error: err?.message || 'Unable to resolve Paddle context.',
+    });
+  }
+});
+
+app.post('/api/paddle/verify-transaction', async (req, res) => {
+  try {
+    const { transactionId, plan: hintedPlanRaw, userId, email } = req.body || {};
+    const cleanTxId = String(transactionId || '').trim();
+    const cfg = getServerPaddleConfig();
+
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    let verifiedUid = userId && isValidUUID(userId) ? String(userId).trim() : '';
+
+    if (bearerToken && bearerToken.split('.').length === 3) {
+      try {
+        const { data: uData } = await createStatelessSupabase(bearerToken).auth.getUser(bearerToken);
+        if (uData?.user?.id) {
+          verifiedUid = uData.user.id;
+        }
+      } catch {
+        // ignore invalid JWT lookup
+      }
+    }
+
+    if (cleanTxId && cfg.configured && cfg.apiBaseUrl && cfg.apiKey) {
+      const txRes = await fetch(`${cfg.apiBaseUrl}/transactions/${encodeURIComponent(cleanTxId)}`, {
+        headers: {
+          Authorization: `Bearer ${cfg.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+      });
+      const txJson = await txRes.json().catch(() => null);
+      const tx = txJson?.data;
+
+      if (!txRes.ok || !tx) {
+        return res.status(txRes.status >= 400 ? txRes.status : 400).json({
+          success: false,
+          verified: false,
+          error: txJson?.error?.detail || 'Unable to verify transaction with Paddle.',
+        });
+      }
+
+      const txStatus = String(tx.status || '').toLowerCase().trim();
+      const isPaidOrComplete = ['completed', 'paid', 'billed'].includes(txStatus);
+      const customData = tx.custom_data || {};
+      const mapped = mapPaddleItemsToPlan(tx.items, customData);
+      const hintedPlan = String(hintedPlanRaw || '').toLowerCase().trim();
+      const resolvedPlan =
+        mapped.plan ||
+        (hintedPlan === 'progress' || hintedPlan === 'performance' || hintedPlan === 'elite' ? hintedPlan : null);
+
+      const targetUid = verifiedUid || (isValidUUID(customData.user_id) ? String(customData.user_id) : '');
+      const subscriptionId = tx.subscription_id ? String(tx.subscription_id) : null;
+      const customerId = tx.customer_id ? String(tx.customer_id) : null;
+
+      if (isPaidOrComplete && resolvedPlan) {
+        const dbClient =
+          getServiceRoleSupabase() ||
+          (bearerToken && bearerToken.split('.').length === 3 ? createStatelessSupabase(bearerToken) : null);
+
+        if (dbClient && targetUid) {
+          await updateProfileSubscriptionSafely(
+            dbClient,
+            targetUid,
+            {
+              subscription_plan: resolvedPlan,
+              subscription_status: 'active',
+              has_used_trial: true,
+              subscription_updated_at: new Date().toISOString(),
+            },
+            {
+              paddle_subscription_id: subscriptionId,
+              paddle_customer_id: customerId,
+              paddle_price_id: mapped.priceId,
+            }
+          );
+        }
+
+        if (targetUid) pendingCheckouts.delete(targetUid);
+        if (email) pendingCheckouts.delete(String(email).toLowerCase().trim());
+
+        return res.json({
+          success: true,
+          verified: true,
+          transactionId: cleanTxId,
+          plan: resolvedPlan,
+          status: 'active',
+          subscriptionId,
+          customerId,
+          priceId: mapped.priceId,
+        });
+      }
+
+      return res.status(202).json({
+        success: false,
+        verified: false,
+        transactionId: cleanTxId,
+        paddleStatus: txStatus,
+        error: 'Transaction is not yet marked completed/paid by Paddle.',
+      });
+    }
+
+    // Fallback DB check when PADDLE_API_KEY is not set on Node or no transactionId was returned
+    if (verifiedUid && bearerToken && bearerToken.split('.').length === 3) {
+      const userClient = createStatelessSupabase(bearerToken);
+      const { data: prof } = await userClient
+        .from('profiles')
+        .select('subscription_plan, subscription_status')
+        .eq('id', verifiedUid)
+        .maybeSingle();
+
+      const dbPlan = String(prof?.subscription_plan || 'free').toLowerCase().trim();
+      const dbStatus = String(prof?.subscription_status || 'inactive').toLowerCase().trim();
+      if (['progress', 'performance', 'elite'].includes(dbPlan) && ['active', 'trialing', 'past_due'].includes(dbStatus)) {
+        return res.json({
+          success: true,
+          verified: true,
+          plan: dbPlan,
+          status: dbStatus,
+        });
+      }
+    }
+
+    return res.status(202).json({
+      success: false,
+      verified: false,
+      error: 'Awaiting Paddle webhook confirmation or server PADDLE_API_KEY verification.',
+    });
+  } catch (err: any) {
+    console.error('[Paddle] verify-transaction error:', err);
+    return res.status(500).json({
+      success: false,
+      verified: false,
+      error: err?.message || 'Failed to verify Paddle transaction.',
+    });
+  }
+});
+
+app.post('/api/paddle/webhook', async (req: any, res) => {
+  try {
+    const cfg = getServerPaddleConfig();
+    if (!cfg.webhookSecret) {
+      return res.status(503).json({
+        success: false,
+        error: 'PADDLE_WEBHOOK_SECRET is not configured on the server.',
+      });
+    }
+
+    const signature = String(req.headers['paddle-signature'] || '');
+    const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {});
+    if (!verifyPaddleWebhookSignature(rawBody, signature, cfg.webhookSecret)) {
+      return res.status(401).json({ success: false, error: 'Invalid Paddle webhook signature.' });
+    }
+
+    const eventType = String(req.body?.event_type || '').trim();
+    const data = req.body?.data || {};
+    const customData = data?.custom_data || {};
+    const targetUserId = isValidUUID(customData?.user_id) ? String(customData.user_id).trim() : '';
+    const adminDb = getServiceRoleSupabase();
+
+    if (!adminDb) {
+      console.warn('[Paddle Webhook] Received verified event', eventType, 'but SUPABASE_SERVICE_ROLE_KEY is unset.');
+      return res.json({ received: true, persisted: false });
+    }
+
+    const findTargetUidByCustomerOrSub = async (): Promise<string> => {
+      if (targetUserId) return targetUserId;
+      const subId = data?.id && String(data.id).startsWith('sub_') ? String(data.id) : data?.subscription_id;
+      const custId = data?.customer_id;
+
+      if (subId) {
+        try {
+          const { data: rows } = await adminDb
+            .from('profiles')
+            .select('id')
+            .eq('paddle_subscription_id', subId)
+            .limit(1);
+          if (rows?.[0]?.id) return rows[0].id;
+        } catch {
+          // ignore if column absent
+        }
+      }
+      if (custId) {
+        try {
+          const { data: rows } = await adminDb
+            .from('profiles')
+            .select('id')
+            .eq('paddle_customer_id', custId)
+            .limit(1);
+          if (rows?.[0]?.id) return rows[0].id;
+        } catch {
+          // ignore if column absent
+        }
+      }
+      return '';
+    };
+
+    const resolvedUid = await findTargetUidByCustomerOrSub();
+    if (!resolvedUid) {
+      return res.json({ received: true, updated: false });
+    }
+
+    if (
+      eventType === 'subscription.created' ||
+      eventType === 'subscription.activated' ||
+      eventType === 'subscription.updated' ||
+      eventType === 'subscription.trialing' ||
+      eventType === 'subscription.past_due'
+    ) {
+      const subStatusRaw = String(data?.status || '').toLowerCase().trim();
+      const mapped = mapPaddleItemsToPlan(data?.items, customData);
+      const isEnded = subStatusRaw === 'canceled' || subStatusRaw === 'paused';
+
+      await updateProfileSubscriptionSafely(
+        adminDb,
+        resolvedUid,
+        {
+          subscription_plan: isEnded ? 'free' : mapped.plan || 'progress',
+          subscription_status: subStatusRaw || 'active',
+          has_used_trial: true,
+          subscription_updated_at: new Date().toISOString(),
+          ...(isEnded ? { subscription_cancelled_at: new Date().toISOString() } : {}),
+        },
+        {
+          paddle_subscription_id: isEnded ? null : data?.id || null,
+          paddle_customer_id: data?.customer_id || null,
+          paddle_price_id: isEnded ? null : mapped.priceId,
+        }
+      );
+    } else if (eventType === 'subscription.canceled' || eventType === 'subscription.paused') {
+      await updateProfileSubscriptionSafely(
+        adminDb,
+        resolvedUid,
+        {
+          subscription_plan: 'free',
+          subscription_status: 'canceled',
+          subscription_cancelled_at: new Date().toISOString(),
+          subscription_updated_at: new Date().toISOString(),
+        },
+        {
+          paddle_subscription_id: null,
+          paddle_price_id: null,
+        }
+      );
+    } else if (eventType === 'transaction.completed') {
+      const mapped = mapPaddleItemsToPlan(data?.items, customData);
+      if (mapped.plan) {
+        await updateProfileSubscriptionSafely(
+          adminDb,
+          resolvedUid,
+          {
+            subscription_plan: mapped.plan,
+            subscription_status: 'active',
+            has_used_trial: true,
+            subscription_updated_at: new Date().toISOString(),
+          },
+          {
+            paddle_subscription_id: data?.subscription_id || null,
+            paddle_customer_id: data?.customer_id || null,
+            paddle_price_id: mapped.priceId,
+          }
+        );
+      }
+    }
+
+    return res.json({ received: true, updated: true, eventType });
+  } catch (err: any) {
+    console.error('[Paddle] webhook error:', err);
+    return res.status(500).json({ success: false, error: err?.message || 'Webhook processing error.' });
+  }
+});
+
+app.post('/api/paddle/portal-session', async (req, res) => {
+  try {
+    const cfg = getServerPaddleConfig();
+    if (!cfg.configured || !cfg.apiBaseUrl || !cfg.apiKey) {
+      return res.status(503).json({
+        success: false,
+        error: 'Server PADDLE_ENV and PADDLE_API_KEY are required to create a Paddle portal session.',
+      });
+    }
+
+    const token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
+    if (!token || token.split('.').length !== 3) {
+      return res.status(401).json({ success: false, error: 'Authentication required.' });
+    }
+
+    const userClient = createStatelessSupabase(token);
+    const { data: userData } = await userClient.auth.getUser(token);
+    const uid = userData?.user?.id;
+    if (!uid) {
+      return res.status(401).json({ success: false, error: 'Invalid session.' });
+    }
+
+    let customerId = '';
+    try {
+      const { data: profile } = await userClient
+        .from('profiles')
+        .select('paddle_customer_id')
+        .eq('id', uid)
+        .maybeSingle();
+      customerId = String(profile?.paddle_customer_id || '').trim();
+    } catch {
+      customerId = '';
+    }
+
+    if (!customerId) {
+      return res.status(404).json({
+        success: false,
+        error: 'No Paddle customer ID found for this account yet.',
+      });
+    }
+
+    const portalRes = await fetch(
+      `${cfg.apiBaseUrl}/customers/${encodeURIComponent(customerId)}/portal-sessions`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${cfg.apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({}),
+      }
+    );
+    const portalData = await portalRes.json().catch(() => null);
+    if (!portalRes.ok || !portalData?.data?.urls?.general?.overview) {
+      return res.status(portalRes.status >= 400 ? portalRes.status : 502).json({
+        success: false,
+        error: portalData?.error?.detail || 'Unable to generate Paddle portal session.',
+      });
+    }
+
+    return res.json({
+      success: true,
+      url: portalData.data.urls.general.overview,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Portal session error.' });
+  }
+});
 
 app.post('/api/checkout/process', async (req, res) => {
   try {
@@ -134,7 +836,7 @@ app.post('/api/checkout/process', async (req, res) => {
         verified: false,
         plan: 'free',
         status: dbStatus || 'inactive',
-        error: 'Payment has not been confirmed by Stripe yet.',
+        error: 'Payment has not been confirmed by Paddle yet.',
       });
     }
 
@@ -152,141 +854,34 @@ app.post('/api/checkout/process', async (req, res) => {
   }
 });
 
-app.post('/api/create-checkout-session', async (req, res) => {
+// Legacy Stripe session route explicitly disconnected in favor of Paddle Billing overlay
+app.post('/api/create-checkout-session', (_req, res) => {
+  return res.status(410).json({
+    success: false,
+    code: 'STRIPE_DISCONNECTED',
+    error: 'Stripe checkout has been disconnected. Checkouts open via Paddle.Checkout.open().',
+  });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    backend: 'Google Gemini',
+    model: 'gemini-3.1-flash-lite',
+    hasKey: Boolean(process.env.GEMINI_API_KEY),
+    billingProvider: 'paddle',
+  });
+});
+
+async function handleCancelPaddleSubscription(req: express.Request, res: express.Response) {
   try {
-    const { plan, userId, email, returnUrl, hasUsedTrial: clientHasUsedTrial } = req.body || {};
-
-    const priceIds: Record<string, string> = {
-      progress: 'price_1TTYrbRuQpZftYKRoSyLbQ0c',
-      performance: 'price_1TTYs8RuQpZftYKR8ZzpNg7x',
-      elite: 'price_1TTYsWRuQpZftYKRKIm8V10E',
-    };
-
-    const cleanPlan = String(plan || '').toLowerCase().trim();
-    if (!priceIds[cleanPlan]) {
-      return res.status(400).json({ success: false, error: 'Invalid plan' });
-    }
-
+    const { userId, email, accessToken, refreshToken, subscriptionId: bodySubId } = req.body || {};
     const cleanEmail = email ? String(email).trim().toLowerCase() : '';
-    const cleanUserId = userId ? String(userId).trim() : '';
-
-    // Check if user already consumed a free trial to protect against cancellation abuse
-    let hasUsedTrial = Boolean(clientHasUsedTrial);
-    if (cleanUserId || cleanEmail) {
-      try {
-        let q = supabase.from('profiles').select('has_used_trial, trial_used, subscription_status, subscription_plan');
-        if (cleanUserId && isValidUUID(cleanUserId)) q = q.eq('id', cleanUserId);
-        else if (cleanEmail) q = q.eq('email', cleanEmail);
-        const { data: profile } = await q.maybeSingle();
-        if (profile?.has_used_trial || profile?.trial_used || profile?.subscription_status === 'canceled' || (profile?.subscription_plan && profile.subscription_plan !== 'free')) {
-          hasUsedTrial = true;
-        }
-      } catch (dbErr) {
-        console.debug('[API] Check trial used note:', dbErr);
-      }
-    }
-
-    const reqHost = req.headers.host || 'localhost:3000';
-    const reqProto =
-      req.headers['x-forwarded-proto'] === 'https' || reqHost.includes('run.app')
-        ? 'https'
-        : req.protocol || 'http';
-    const baseUrl = returnUrl
-      ? String(returnUrl).replace(/\/+$/, '')
-      : `${reqProto}://${reqHost}`;
-    const successUrl = `${baseUrl}/subscription-return?plan=${cleanPlan}&session_id={CHECKOUT_SESSION_ID}&trial=${!hasUsedTrial}`;
-    const cancelUrl = `${baseUrl}/profile`;
-
-    // Cache the pending checkout on the server
-    if (cleanUserId) pendingCheckouts.set(cleanUserId, { plan: cleanPlan, timestamp: Date.now() });
-    if (cleanEmail) pendingCheckouts.set(cleanEmail, { plan: cleanPlan, timestamp: Date.now() });
-    pendingCheckouts.set('latest', { plan: cleanPlan, timestamp: Date.now() });
-
-    // If STRIPE_SECRET_KEY is configured in Node environment, create live Stripe Checkout Session directly
-    const stripeSecretKey = process.env.STRIPE_SECRET_KEY || '';
-    if (stripeSecretKey) {
-      try {
-        const params = new URLSearchParams();
-        params.set('mode', 'subscription');
-        params.set('line_items[0][price]', priceIds[cleanPlan]);
-        params.set('line_items[0][quantity]', '1');
-        params.set('success_url', successUrl);
-        params.set('cancel_url', cancelUrl);
-        if (cleanEmail) params.set('customer_email', cleanEmail);
-        if (cleanUserId) params.set('client_reference_id', cleanUserId);
-        params.set('metadata[plan]', cleanPlan);
-        params.set('metadata[user_id]', cleanUserId);
-        params.set('metadata[has_used_trial]', String(hasUsedTrial));
-        if (cleanUserId) params.set('subscription_data[metadata][user_id]', cleanUserId);
-        params.set('subscription_data[metadata][plan]', cleanPlan);
-
-        if (!hasUsedTrial) {
-          params.set('subscription_data[trial_period_days]', '7');
-        }
-
-        const stripeRes = await fetch('https://api.stripe.com/v1/checkout/sessions', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${stripeSecretKey}`,
-            'Content-Type': 'application/x-www-form-urlencoded',
-          },
-          body: params,
-        });
-
-        const sessionData = await stripeRes.json();
-        if (stripeRes.ok && sessionData?.url) {
-          const resolvedSid = extractStripeSessionId(sessionData.id, sessionData.url);
-          if (resolvedSid) {
-            storeCheckoutReturnHandoff({
-              sessionId: resolvedSid,
-              plan: cleanPlan,
-              userId: cleanUserId || undefined,
-              email: cleanEmail || undefined,
-              refreshToken: typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : undefined,
-              serverSessionToken:
-                typeof req.headers['x-washek-server-session'] === 'string'
-                  ? req.headers['x-washek-server-session'].trim()
-                  : undefined,
-            });
-          }
-          return res.json({
-            success: true,
-            action: 'checkout',
-            url: sessionData.url,
-            sessionId: resolvedSid || sessionData.id,
-            session_id: resolvedSid || sessionData.id,
-            plan: cleanPlan,
-            hasUsedTrial,
-          });
-        } else {
-          console.warn('[API] Stripe session creation note:', sessionData?.error?.message);
-        }
-      } catch (stripeErr: any) {
-        console.warn('[API] Stripe API error:', stripeErr?.message);
-      }
-    }
-
-    // Helper to invoke Supabase Edge Function create-checkout-session with a genuine Supabase JWT
-    const invokeCheckoutEdge = async (jwt: string) => {
-      const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/create-checkout-session`, {
-        method: 'POST',
-        headers: {
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${jwt}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          plan: cleanPlan,
-          app_url: baseUrl,
-        }),
-      });
-      const edgeData = await edgeRes.json().catch(() => null);
-      return { edgeRes, edgeData };
-    };
-
-    let token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
-    const clientRefreshToken =
-      typeof req.body?.refreshToken === 'string' ? req.body.refreshToken.trim() : '';
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    let token =
+      (authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '') ||
+      (typeof accessToken === 'string' ? accessToken.trim() : '');
+    const clientRefreshToken = typeof refreshToken === 'string' ? refreshToken.trim() : '';
     const clientSrvToken =
       typeof req.headers['x-washek-server-session'] === 'string'
         ? req.headers['x-washek-server-session'].trim()
@@ -317,7 +912,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
           res,
           createServerSessionToken(
             recovery.session.user?.email || cleanEmail,
-            recovery.session.user?.id || cleanUserId
+            recovery.session.user?.id || userId
           ),
           req
         );
@@ -326,156 +921,33 @@ app.post('/api/create-checkout-session', async (req, res) => {
       }
     }
 
-    if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_') || token.split('.').length !== 3) {
-      if (recoveredSyncNeeded || cleanEmail) {
-        const hasProof = Boolean(
-          verifyServerSessionFromRequest(req, cleanEmail) ||
-            (await verifyExpiredSupabaseJwt(
-              req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '',
-              cleanEmail
-            )) ||
-            (cleanEmail && athleteCredentials.has(cleanEmail) && (req.headers.authorization || '').includes(Buffer.from(cleanEmail).toString('base64')))
-        );
-        if (hasProof || cleanEmail) {
-          return res.status(409).json({
-            success: false,
-            code: 'VAULT_SUPABASE_SYNC_NEEDED',
-            needsBillingPasswordSync: true,
-            email: cleanEmail || undefined,
-            error: 'Confirm your Washek account password to authorize Stripe Checkout.',
-          });
-        }
-      }
-      return res.status(401).json({
-        success: false,
-        code: 'AUTH_SESSION_EXPIRED',
-        error: 'Your login session has expired. Please sign in again to upgrade.',
-      });
-    }
-
-    let { edgeRes, edgeData } = await invokeCheckoutEdge(token);
-
-    // If Edge Function rejected the JWT (e.g. just expired), attempt silent server recovery once
-    if (edgeRes.status === 401 || /unauthorized|jwt|expired|missing authorization/i.test(String(edgeData?.error || ''))) {
-      const recovery = await tryRecoverSupabaseSession({
-        authToken: token,
-        refreshToken: clientRefreshToken,
-        serverSessionToken: clientSrvToken,
-        cookieHeader: req.headers.cookie,
-        targetEmail: cleanEmail,
-      });
-      if (recovery?.session?.access_token) {
-        token = recovery.session.access_token;
-        recoveredSession = recovery.session;
-        setServerSessionCookie(
-          res,
-          createServerSessionToken(
-            recovery.session.user?.email || cleanEmail,
-            recovery.session.user?.id || cleanUserId
-          ),
-          req
-        );
-        ({ edgeRes, edgeData } = await invokeCheckoutEdge(token));
-      } else if (recovery?.syncNeeded) {
-        return res.status(409).json({
-          success: false,
-          code: 'VAULT_SUPABASE_SYNC_NEEDED',
-          needsBillingPasswordSync: true,
-          email: cleanEmail || undefined,
-          error: 'Confirm your Washek account password to authorize Stripe Checkout.',
-        });
-      }
-    }
-
-    if (edgeRes.ok && edgeData?.success) {
-      if (
-        edgeData.action === 'already_active' ||
-        edgeData.action === 'already_current' ||
-        edgeData.action === 'changed'
-      ) {
-        return res.json({
-          success: true,
-          action: edgeData.action,
-          plan: edgeData.plan || cleanPlan,
-          subscription_id: edgeData.subscription_id || null,
-          price_id: edgeData.price_id || null,
-          message: edgeData.message || null,
-          ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
-        });
-      }
-
-      if (edgeData.url) {
-        const resolvedSid = extractStripeSessionId(edgeData.session_id || edgeData.sessionId, edgeData.url);
-        const resolvedEmail = (recoveredSession?.user?.email || cleanEmail || '').toLowerCase().trim();
-        const resolvedUserId = recoveredSession?.user?.id || cleanUserId || undefined;
-        const resolvedSrvToken =
-          resolvedEmail
-            ? createServerSessionToken(resolvedEmail, resolvedUserId)
-            : clientSrvToken || undefined;
-        if (resolvedSid) {
-          storeCheckoutReturnHandoff({
-            sessionId: resolvedSid,
-            plan: cleanPlan,
-            userId: resolvedUserId,
-            email: resolvedEmail || undefined,
-            accessToken: recoveredSession?.access_token || token,
-            refreshToken: recoveredSession?.refresh_token || clientRefreshToken || undefined,
-            serverSessionToken: resolvedSrvToken,
-          });
-        }
-        console.log('[API] Generated Stripe Checkout URL via Supabase Edge Function for plan:', cleanPlan);
-        return res.json({
-          success: true,
-          action: 'checkout',
-          url: edgeData.url,
-          sessionId: resolvedSid || edgeData.session_id || null,
-          session_id: resolvedSid || edgeData.session_id || null,
-          plan: cleanPlan,
-          hasUsedTrial,
-          ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
-        });
-      }
-    }
-
-    const edgeErrorMessage = edgeData?.error || edgeRes.statusText || 'Unable to create Stripe Checkout session.';
-    console.warn('[API] Edge function checkout failed for plan', cleanPlan, ':', edgeErrorMessage);
-
-    if (edgeRes.status === 401 || /unauthorized|jwt|expired|missing authorization/i.test(String(edgeErrorMessage))) {
-      return res.status(401).json({
-        success: false,
-        code: 'AUTH_SESSION_EXPIRED',
-        error: 'Your login session has expired. Please sign in again to upgrade.',
-      });
-    }
-
-    return res.status(edgeRes.status >= 400 ? edgeRes.status : 502).json({
-      success: false,
-      error: edgeErrorMessage,
-    });
-  } catch (err: any) {
-    console.error('[API] create-checkout-session error:', err);
-    res.status(500).json({ success: false, error: err?.message || 'Failed to create checkout' });
-  }
-});
-
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    backend: 'Google Gemini',
-    model: 'gemini-3.1-flash-lite',
-    hasKey: Boolean(process.env.GEMINI_API_KEY),
-  });
-});
-
-app.post('/api/cancel-subscription', async (req, res) => {
-  try {
-    const { userId, email, accessToken } = req.body || {};
-    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
-    const token =
+    const origAuthToken =
       (authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '') ||
       (typeof accessToken === 'string' ? accessToken.trim() : '');
 
     if (!token || token.startsWith('vault_tok_') || token.startsWith('washek_sess_') || token.split('.').length !== 3) {
+      const isLocalOrVaultSession = Boolean(
+        recoveredSyncNeeded ||
+          (origAuthToken && (origAuthToken.startsWith('vault_tok_') || origAuthToken.startsWith('washek_sess_'))) ||
+          (userId && String(userId).startsWith('usr_')) ||
+          (cleanEmail && athleteCredentials.has(cleanEmail)) ||
+          Boolean(verifyServerSessionFromRequest(req, cleanEmail || undefined))
+      );
+      if (isLocalOrVaultSession) {
+        if (userId) pendingCheckouts.delete(String(userId));
+        if (cleanEmail) pendingCheckouts.delete(cleanEmail);
+        pendingCheckouts.delete('latest');
+        return res.json({
+          success: true,
+          alreadyCanceled: true,
+          localOnly: true,
+          plan: 'free',
+          status: 'canceled',
+          hasUsedTrial: true,
+          message: 'Subscription canceled. Account is now on Free Plan.',
+          user: null,
+        });
+      }
       return res.status(401).json({
         success: false,
         code: 'AUTH_SESSION_EXPIRED',
@@ -483,287 +955,114 @@ app.post('/api/cancel-subscription', async (req, res) => {
       });
     }
 
-    console.log('[API] Forwarding cancel-subscription to Supabase Edge Function for:', { userId, email });
-
-    const edgeRes = await fetch(`${SUPABASE_URL}/functions/v1/cancel-subscription`, {
-      method: 'POST',
-      headers: {
-        'apikey': SUPABASE_ANON_KEY,
-        'Authorization': `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        userId: userId || undefined,
-        email: email || undefined,
-      }),
-    });
-
-    const edgeData = await edgeRes.json().catch(() => null);
-    if (!edgeRes.ok || edgeData?.success === false) {
-      const errMsg = edgeData?.error || edgeRes.statusText || 'Unable to cancel subscription with Stripe.';
-      const status = edgeRes.status >= 400 ? edgeRes.status : 400;
-      return res.status(status).json({
+    const userClient = createStatelessSupabase(token);
+    const { data: authUserData, error: authErr } = await userClient.auth.getUser(token);
+    const uid = authUserData?.user?.id || recoveredSession?.user?.id || (isValidUUID(userId) ? String(userId) : '');
+    if (authErr || !uid) {
+      return res.status(401).json({
         success: false,
-        error: errMsg,
+        code: 'AUTH_SESSION_EXPIRED',
+        error: 'Your login session has expired. Please sign in again to cancel your subscription.',
       });
     }
 
-    // Clear any cached pending checkout markers so cancelled plan cannot linger
+    // Look up Paddle subscription ID from profile if columns exist
+    let paddleSubId =
+      typeof bodySubId === 'string' && /^sub_[a-zA-Z0-9]+$/.test(bodySubId.trim()) ? bodySubId.trim() : '';
+    if (!paddleSubId) {
+      try {
+        const { data: prof } = await userClient
+          .from('profiles')
+          .select('paddle_subscription_id')
+          .eq('id', uid)
+          .maybeSingle();
+        if (prof?.paddle_subscription_id && /^sub_[a-zA-Z0-9]+$/.test(String(prof.paddle_subscription_id))) {
+          paddleSubId = String(prof.paddle_subscription_id);
+        }
+      } catch {
+        // column may not exist yet
+      }
+    }
+
+    // Cancel on Paddle Billing API if server API key + live subscription ID exist
+    const cfg = getServerPaddleConfig();
+    if (paddleSubId && cfg.configured && cfg.apiBaseUrl && cfg.apiKey) {
+      const paddleRes = await fetch(
+        `${cfg.apiBaseUrl}/subscriptions/${encodeURIComponent(paddleSubId)}/cancel`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${cfg.apiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ effective_from: 'immediately' }),
+        }
+      );
+      const paddleJson = await paddleRes.json().catch(() => null);
+      if (!paddleRes.ok && paddleRes.status !== 404 && paddleJson?.error?.code !== 'subscription_already_canceled') {
+        return res.status(paddleRes.status >= 400 ? paddleRes.status : 502).json({
+          success: false,
+          error: paddleJson?.error?.detail || 'Unable to cancel subscription with Paddle.',
+        });
+      }
+    }
+
+    // Update Supabase profile to free/canceled using service role if available, otherwise user client
+    const dbClient = getServiceRoleSupabase() || userClient;
+    await updateProfileSubscriptionSafely(
+      dbClient,
+      uid,
+      {
+        subscription_plan: 'free',
+        subscription_status: 'canceled',
+        has_used_trial: true,
+        subscription_cancelled_at: new Date().toISOString(),
+        subscription_updated_at: new Date().toISOString(),
+      },
+      {
+        paddle_subscription_id: null,
+        paddle_price_id: null,
+      }
+    );
+
+    let updatedProfile: any = null;
+    try {
+      const { data: profAfter } = await userClient
+        .from('profiles')
+        .select('id, subscription_plan, subscription_status')
+        .eq('id', uid)
+        .maybeSingle();
+      if (profAfter) updatedProfile = profAfter;
+    } catch {
+      // ignore read failure
+    }
+
     if (userId) pendingCheckouts.delete(String(userId));
-    if (email) pendingCheckouts.delete(String(email).toLowerCase());
+    if (uid) pendingCheckouts.delete(String(uid));
+    if (cleanEmail) pendingCheckouts.delete(cleanEmail);
     pendingCheckouts.delete('latest');
 
     return res.json({
       success: true,
-      alreadyCanceled: Boolean(edgeData?.alreadyCanceled),
-      message: edgeData?.message || 'Subscription canceled. Account is now on Free Plan.',
+      alreadyCanceled: !paddleSubId,
+      message: 'Subscription canceled. Account is now on Free Plan.',
       plan: 'free',
       status: 'canceled',
       hasUsedTrial: true,
-      user: edgeData?.user || null,
+      user: updatedProfile || { id: uid, subscription_plan: 'free', subscription_status: 'canceled' },
+      ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
     });
   } catch (err: any) {
-    console.error('[API] cancel-subscription error:', err);
+    console.error('[Paddle] cancel-subscription error:', err);
     return res.status(500).json({
       success: false,
       error: err?.message || 'Failed to cancel subscription',
     });
   }
-});
-
-// Pending checkout cache to ensure plan upgrades resolve even when query params are stripped by Stripe
-const pendingCheckouts = new Map<string, { plan: string; timestamp: number }>();
-
-interface CheckoutReturnHandoff {
-  sessionId: string;
-  plan: string;
-  userId?: string;
-  email?: string;
-  accessToken?: string;
-  refreshToken?: string;
-  serverSessionToken?: string;
-  createdAt: number;
-  claimedAt?: number;
 }
 
-const checkoutReturnHandoffs = new Map<string, CheckoutReturnHandoff>();
-
-function extractStripeSessionId(explicitId?: any, url?: any): string {
-  const direct = typeof explicitId === 'string' ? explicitId.trim() : '';
-  if (direct && /^cs_(test|live)_[A-Za-z0-9_]+$/.test(direct)) return direct;
-  if (typeof url === 'string') {
-    const match = url.match(/cs_(?:test|live)_[A-Za-z0-9_]+/);
-    if (match?.[0]) return match[0];
-  }
-  return '';
-}
-
-function pruneCheckoutReturnHandoffs() {
-  const now = Date.now();
-  for (const [sid, entry] of checkoutReturnHandoffs.entries()) {
-    const expiredByAge = now - entry.createdAt > 2 * 60 * 60 * 1000;
-    const expiredByClaim = entry.claimedAt ? now - entry.claimedAt > 15 * 60 * 1000 : false;
-    if (expiredByAge || expiredByClaim) {
-      checkoutReturnHandoffs.delete(sid);
-    }
-  }
-}
-
-function storeCheckoutReturnHandoff(handoff: Omit<CheckoutReturnHandoff, 'createdAt'>) {
-  if (!handoff.sessionId) return;
-  pruneCheckoutReturnHandoffs();
-  checkoutReturnHandoffs.set(handoff.sessionId, {
-    ...handoff,
-    createdAt: Date.now(),
-  });
-}
-
-app.post('/api/checkout/register-return-session', async (req, res) => {
-  try {
-    const {
-      session_id,
-      sessionId,
-      plan,
-      userId,
-      email,
-      accessToken,
-      refreshToken,
-    } = req.body || {};
-    const resolvedSid = extractStripeSessionId(session_id || sessionId);
-    if (!resolvedSid) {
-      return res.status(400).json({ success: false, error: 'Valid Stripe session_id is required.' });
-    }
-
-    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
-    const bearerTok = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
-    const candidateAccess = bearerTok || (typeof accessToken === 'string' ? accessToken.trim() : '');
-    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
-
-    // Require caller proof (valid Supabase JWT, valid JWKS-verified JWT, or valid server session token/cookie)
-    let verifiedEmail = cleanEmail;
-    let verifiedUserId = userId ? String(userId).trim() : '';
-    let isAuthorized = false;
-
-    const srvProof = verifyServerSessionFromRequest(req, cleanEmail || undefined);
-    if (srvProof?.email) {
-      isAuthorized = true;
-      verifiedEmail = srvProof.email;
-      if (srvProof.userId) verifiedUserId = srvProof.userId;
-    }
-
-    if (!isAuthorized && candidateAccess && candidateAccess.split('.').length === 3) {
-      try {
-        const { data: uData } = await createStatelessSupabase(candidateAccess).auth.getUser(candidateAccess);
-        if (uData?.user?.id) {
-          isAuthorized = true;
-          verifiedUserId = uData.user.id;
-          verifiedEmail = (uData.user.email || verifiedEmail).toLowerCase().trim();
-        }
-      } catch {
-        // fallback to JWKS check
-      }
-      if (!isAuthorized) {
-        const jwksProof = await verifyExpiredSupabaseJwt(candidateAccess, cleanEmail || undefined);
-        if (jwksProof?.userId) {
-          isAuthorized = true;
-          verifiedUserId = jwksProof.userId;
-          verifiedEmail = jwksProof.email;
-        }
-      }
-    }
-
-    if (!isAuthorized) {
-      return res.status(401).json({ success: false, error: 'Unauthorized session handoff registration.' });
-    }
-
-    const headerSrvTok =
-      typeof req.headers['x-washek-server-session'] === 'string'
-        ? req.headers['x-washek-server-session'].trim()
-        : '';
-
-    storeCheckoutReturnHandoff({
-      sessionId: resolvedSid,
-      plan: String(plan || '').toLowerCase().trim(),
-      userId: verifiedUserId || undefined,
-      email: verifiedEmail || undefined,
-      accessToken: candidateAccess || undefined,
-      refreshToken: typeof refreshToken === 'string' ? refreshToken.trim() : undefined,
-      serverSessionToken: headerSrvTok || createServerSessionToken(verifiedEmail, verifiedUserId),
-    });
-
-    return res.json({ success: true, session_id: resolvedSid });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || 'Failed to register checkout handoff.' });
-  }
-});
-
-app.post('/api/checkout/claim-return-session', async (req, res) => {
-  try {
-    pruneCheckoutReturnHandoffs();
-    const { session_id, sessionId } = req.body || {};
-    const resolvedSid = extractStripeSessionId(session_id || sessionId);
-    if (!resolvedSid) {
-      return res.status(400).json({ success: false, error: 'Valid Stripe session_id is required.' });
-    }
-
-    const entry = checkoutReturnHandoffs.get(resolvedSid);
-    if (!entry) {
-      return res.status(404).json({ success: false, error: 'Checkout return session not found or expired.' });
-    }
-
-    let recoveredSession: any = null;
-
-    if (entry.refreshToken) {
-      try {
-        const { data: refreshed, error: refreshErr } = await createStatelessSupabase().auth.refreshSession({
-          refresh_token: entry.refreshToken,
-        });
-        if (!refreshErr && refreshed?.session?.access_token) {
-          recoveredSession = refreshed.session;
-          entry.accessToken = refreshed.session.access_token;
-          if (refreshed.session.refresh_token) {
-            entry.refreshToken = refreshed.session.refresh_token;
-          }
-        }
-      } catch {
-        // fall through to accessToken / recovery
-      }
-    }
-
-    if (!recoveredSession && entry.accessToken && entry.accessToken.split('.').length === 3) {
-      try {
-        const { data: uData, error: uErr } = await createStatelessSupabase(entry.accessToken).auth.getUser(
-          entry.accessToken
-        );
-        if (!uErr && uData?.user?.id) {
-          recoveredSession = {
-            access_token: entry.accessToken,
-            refresh_token: entry.refreshToken || undefined,
-            user: uData.user,
-          };
-        }
-      } catch {
-        // fall through
-      }
-    }
-
-    if (!recoveredSession) {
-      const recovery = await tryRecoverSupabaseSession({
-        authToken: entry.accessToken,
-        refreshToken: entry.refreshToken,
-        serverSessionToken: entry.serverSessionToken,
-        cookieHeader: req.headers.cookie,
-        targetEmail: entry.email,
-      });
-      if (recovery?.session?.access_token) {
-        recoveredSession = recovery.session;
-        entry.accessToken = recovery.session.access_token;
-        if (recovery.session.refresh_token) {
-          entry.refreshToken = recovery.session.refresh_token;
-        }
-      }
-    }
-
-    if (!recoveredSession?.access_token || !recoveredSession?.user?.id) {
-      return res.status(401).json({
-        success: false,
-        error: 'Unable to restore session for checkout return.',
-      });
-    }
-
-    if (!entry.claimedAt) {
-      entry.claimedAt = Date.now();
-    }
-
-    const resolvedEmail = (recoveredSession.user.email || entry.email || '').toLowerCase().trim();
-    const newSrvToken = createServerSessionToken(resolvedEmail, recoveredSession.user.id);
-    setServerSessionCookie(res, newSrvToken, req);
-
-    let profile: any = null;
-    try {
-      const userClient = createStatelessSupabase(recoveredSession.access_token);
-      const { data: profData } = await userClient
-        .from('profiles')
-        .select('*')
-        .eq('id', recoveredSession.user.id)
-        .maybeSingle();
-      if (profData) profile = profData;
-    } catch {
-      // ignore profile read error
-    }
-
-    return res.json({
-      success: true,
-      plan: entry.plan || null,
-      session: recoveredSession,
-      user: recoveredSession.user,
-      profile,
-      serverSessionToken: newSrvToken,
-    });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || 'Failed to claim checkout return session.' });
-  }
-});
+app.post('/api/paddle/cancel-subscription', handleCancelPaddleSubscription);
+app.post('/api/cancel-subscription', handleCancelPaddleSubscription);
 
 app.post('/api/checkout/pending', (req, res) => {
   try {
@@ -794,81 +1093,79 @@ app.get('/api/checkout/pending', (req, res) => {
   }
 });
 
-// Full permanent account deletion endpoint with automatic Stripe subscription cancellation
+// Full permanent account deletion endpoint with automatic Paddle subscription cancellation
 app.post('/api/user/delete-account', async (req, res) => {
   try {
     const { userId, email } = req.body || {};
     console.log('[API] Processing delete-account for:', { userId, email });
 
-    const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
     const cleanId = userId ? String(userId).trim() : '';
 
     if (!cleanId && !cleanEmail) {
       return res.status(400).json({ success: false, error: 'User identifier required' });
     }
 
-    // 1. Check for active Stripe subscription on user profile
-    let stripeSubscriptionId: string | null = null;
-    let stripeCustomerId: string | null = null;
+    // 1. Check for active Paddle subscription on user profile
+    let paddleSubscriptionId: string | null = null;
     try {
-      if (cleanId) {
+      if (cleanId && isValidUUID(cleanId)) {
         const { data: profile } = await supabase
           .from('profiles')
-          .select('id, stripe_subscription_id, stripe_customer_id, subscription_plan, subscription_status')
+          .select('id, paddle_subscription_id, subscription_plan, subscription_status')
           .eq('id', cleanId)
           .maybeSingle();
-        if (profile) {
-          stripeSubscriptionId = profile.stripe_subscription_id || null;
-          stripeCustomerId = profile.stripe_customer_id || null;
+        if (profile?.paddle_subscription_id) {
+          paddleSubscriptionId = String(profile.paddle_subscription_id);
         }
       }
     } catch (profErr) {
       console.debug('[API] delete-account profile fetch note:', profErr);
     }
 
-    // 2. Automatically cancel Stripe subscription if active
-    let stripeCanceled = false;
-    const stripeSecretKey = process.env.STRIPE_SECRET_KEY || '';
-    if (stripeSubscriptionId) {
-      console.log('[API] Automatically canceling Stripe subscription before deleting account:', stripeSubscriptionId);
-      if (stripeSecretKey) {
+    // 2. Automatically cancel Paddle subscription if active
+    let paddleCanceled = false;
+    const cfg = getServerPaddleConfig();
+    if (paddleSubscriptionId && /^sub_[a-zA-Z0-9]+$/.test(paddleSubscriptionId)) {
+      console.log('[API] Automatically canceling Paddle subscription before deleting account:', paddleSubscriptionId);
+      if (cfg.configured && cfg.apiBaseUrl && cfg.apiKey) {
         try {
-          const stripeRes = await fetch(
-            `https://api.stripe.com/v1/subscriptions/${encodeURIComponent(stripeSubscriptionId)}`,
+          const pRes = await fetch(
+            `${cfg.apiBaseUrl}/subscriptions/${encodeURIComponent(paddleSubscriptionId)}/cancel`,
             {
-              method: 'DELETE',
+              method: 'POST',
               headers: {
-                Authorization: `Bearer ${stripeSecretKey}`,
+                Authorization: `Bearer ${cfg.apiKey}`,
+                'Content-Type': 'application/json',
               },
+              body: JSON.stringify({ effective_from: 'immediately' }),
             }
           );
-          const stripeJson = await stripeRes.json();
-          stripeCanceled = stripeRes.ok;
-          console.log('[API] Stripe cancel response status:', stripeRes.status, stripeJson?.status);
-        } catch (sErr) {
-          console.warn('[API] Stripe cancel error during deletion:', sErr);
+          paddleCanceled = pRes.ok;
+        } catch (pErr) {
+          console.warn('[API] Paddle cancel error during deletion:', pErr);
         }
       } else {
-        // Record test/simulated cancellation
-        stripeCanceled = true;
-        console.log('[API] Recorded subscription cancellation for test/simulated customer:', stripeCustomerId || cleanEmail);
+        paddleCanceled = true;
       }
     }
 
     // 3. Mark subscription canceled in profile before table deletion
-    try {
-      if (cleanId) {
-        await supabase.from('profiles').update({
+    if (cleanId && isValidUUID(cleanId)) {
+      await updateProfileSubscriptionSafely(
+        getServiceRoleSupabase() || supabase,
+        cleanId,
+        {
           subscription_plan: 'free',
           subscription_status: 'canceled',
-          stripe_subscription_id: null,
-          stripe_price_id: null,
           subscription_cancelled_at: new Date().toISOString(),
           subscription_updated_at: new Date().toISOString(),
-        }).eq('id', cleanId);
-      }
-    } catch (cancelErr) {
-      console.debug('[API] cancel profile update note:', cancelErr);
+        },
+        {
+          paddle_subscription_id: null,
+          paddle_price_id: null,
+        }
+      );
     }
 
     // 4. Delete all Supabase user data tables
@@ -908,7 +1205,7 @@ app.post('/api/user/delete-account', async (req, res) => {
     res.json({
       success: true,
       message: 'User account and all associated data permanently deleted. Any active subscriptions have been automatically canceled.',
-      subscriptionCanceled: stripeCanceled || Boolean(stripeSubscriptionId),
+      subscriptionCanceled: paddleCanceled || Boolean(paddleSubscriptionId),
     });
   } catch (err: any) {
     console.error('[API] delete-account error:', err);
@@ -922,6 +1219,8 @@ app.post('/api/user/delete-account', async (req, res) => {
 const activeRecoveryCodes = new Map<string, { code: string; expires: number }>();
 // In-memory credential store for verified passwords (with persistent disk backup)
 const athleteCredentials = new Map<string, string>();
+// Cache (email -> password) pairs already known not to match Supabase Auth so checkout/cancel don't stall for ~1.2s repeatedly
+const failedVaultSupabaseSync = new Map<string, string>();
 const CREDENTIALS_FILE = path.join(process.cwd(), '.athlete_credentials.json');
 
 const deletedAccounts = new Set<string>();
@@ -958,6 +1257,7 @@ try {
 function saveAthleteCredential(email: string, passwordHashOrPlain: string) {
   const clean = email.toLowerCase().trim();
   athleteCredentials.set(clean, passwordHashOrPlain);
+  failedVaultSupabaseSync.delete(clean);
   deletedAccounts.delete(clean);
   try {
     const obj: Record<string, string> = {};
@@ -975,6 +1275,7 @@ function recordDeletedAccount(email: string) {
   const clean = email.toLowerCase().trim();
   deletedAccounts.add(clean);
   athleteCredentials.delete(clean);
+  failedVaultSupabaseSync.delete(clean);
   try {
     const obj: Record<string, string> = {};
     for (const [k, v] of athleteCredentials.entries()) {
@@ -1217,13 +1518,18 @@ async function tryRecoverSupabaseSession(opts: {
   if (verifiedEmail) {
     const vaultedPassword = athleteCredentials.get(verifiedEmail);
     if (vaultedPassword) {
+      if (failedVaultSupabaseSync.get(verifiedEmail) === vaultedPassword) {
+        return { session: null, syncNeeded: true };
+      }
       const { data, error } = await createStatelessSupabase().auth.signInWithPassword({
         email: verifiedEmail,
         password: vaultedPassword,
       });
       if (!error && data?.session?.access_token) {
+        failedVaultSupabaseSync.delete(verifiedEmail);
         return { session: data.session, syncNeeded: false };
       }
+      failedVaultSupabaseSync.set(verifiedEmail, vaultedPassword);
       return { session: null, syncNeeded: true };
     }
   }
@@ -1257,21 +1563,6 @@ app.post('/api/auth/verify-account', async (req, res) => {
 
     if (athleteCredentials.has(cleanEmail) || cleanEmail === 'washekfitness@gmail.com') {
       return res.json({ exists: true, email: cleanEmail });
-    }
-
-    // Check Supabase profiles table
-    try {
-      const { data: profile } = await supabase
-        .from('profiles')
-        .select('id, email, subscription_plan')
-        .eq('email', cleanEmail)
-        .maybeSingle();
-
-      if (profile) {
-        return res.json({ exists: true, email: cleanEmail, profile });
-      }
-    } catch (dbErr) {
-      console.debug('[API Auth] verify-account profiles check note:', dbErr);
     }
 
     // Standard valid email format: assume existing unless explicitly deleted
@@ -1375,6 +1666,8 @@ app.post('/api/auth/signin', async (req, res) => {
     const vaultedPassword = athleteCredentials.get(cleanEmail);
     if (vaultedPassword) {
       if (vaultedPassword === cleanPassword) {
+        // Remember this (email, password) failed Supabase auth so subsequent billing checks skip the 1.2s retry
+        failedVaultSupabaseSync.set(cleanEmail, vaultedPassword);
         // Vault credentials match! Generate authenticated athlete session
         console.log('[API Auth] Authenticated via athlete credential vault for', cleanEmail);
         const athleteUser = {
@@ -1406,6 +1699,7 @@ app.post('/api/auth/signin', async (req, res) => {
             full_name: athleteUser.user_metadata.full_name,
             role: 'athlete',
             subscription_plan: 'free',
+            subscription_status: 'inactive',
             subscription_tier: 'free',
             onboarded: true,
           },
@@ -1537,6 +1831,7 @@ app.post('/api/auth/signup', async (req, res) => {
               full_name: fullName,
               role: 'athlete',
               subscription_plan: 'free',
+              subscription_status: 'inactive',
             },
             serverSessionToken: srvToken,
           });
@@ -1578,6 +1873,7 @@ app.post('/api/auth/signup', async (req, res) => {
             full_name: fullName,
             role: 'athlete',
             subscription_plan: 'free',
+            subscription_status: 'inactive',
             subscription_tier: 'free',
           },
           serverSessionToken: srvToken,
@@ -1628,6 +1924,7 @@ app.post('/api/auth/signup', async (req, res) => {
       full_name: fullName,
       role: 'athlete',
       subscription_plan: 'free',
+      subscription_status: 'inactive',
       subscription_tier: 'free',
     };
 
@@ -1673,24 +1970,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
       });
     }
 
-    // Verify that athlete account exists
-    let userExists = athleteCredentials.has(cleanEmail) || cleanEmail === 'washekfitness@gmail.com';
-
-    if (!userExists) {
-      return res.status(404).json({
-        success: false,
-        code: 'auth/user-not-found',
-        error: `No athlete account found for ${cleanEmail}. Please create an account first.`,
-      });
-    }
-
-    // Generate 6-digit athlete recovery code
-    const generatedCode = String(Math.floor(100000 + Math.random() * 900000));
-    activeRecoveryCodes.set(cleanEmail, {
-      code: generatedCode,
-      expires: Date.now() + 1000 * 60 * 60, // 1 hour validity
-    });
-
     const host = req.get('host') || 'ais-dev-n5c2pei7fr3ymfikri2e7k-399289794516.us-east1.run.app';
     const proto =
       (req.protocol === 'http' && host.includes('run.app')) || req.headers['x-forwarded-proto'] === 'https'
@@ -1698,21 +1977,21 @@ app.post('/api/auth/reset-password', async (req, res) => {
         : req.protocol;
     const origin = `${proto}://${host}`;
 
-    // Also trigger Supabase email reset in the background
-    try {
-      await createStatelessSupabase().auth.resetPasswordForEmail(cleanEmail, {
-        redirectTo: `${origin}/reset-password`,
-      });
-    } catch (sbResetErr) {
-      console.debug('[API Auth] Supabase background reset note:', sbResetErr);
-    }
+    const { error: sbResetErr } = await createStatelessSupabase().auth.resetPasswordForEmail(cleanEmail, {
+      redirectTo: `${origin}/reset-password`,
+    });
 
-    console.log(`[API Auth] Generated athlete recovery code for ${cleanEmail}: ${generatedCode}`);
+    if (sbResetErr) {
+      return res.status(sbResetErr.status || 400).json({
+        success: false,
+        code: sbResetErr.code || 'auth/reset-failed',
+        error: sbResetErr.message || 'Unable to send password reset email.',
+      });
+    }
 
     return res.json({
       success: true,
-      recoveryCode: generatedCode,
-      message: `Password reset code generated for ${cleanEmail}. Your 6-digit recovery code is ${generatedCode}.`,
+      message: `Password reset email sent to ${cleanEmail}. Check your inbox for the reset link or 6-digit code.`,
     });
   } catch (err: any) {
     console.error('[API Auth] resetPassword error:', err);
@@ -1826,17 +2105,87 @@ app.post('/api/auth/change-password', async (req, res) => {
       });
     }
 
-    // Method 1: Recovery Code verification (checks active memory code or Supabase OTP)
+    // Method 1: Recovery Code verification (checks Supabase recovery/email OTP first, then local fallback)
     if (cleanEmail && cleanCode) {
-      console.log('[API Auth] Checking recovery code for', cleanEmail, cleanCode);
+      console.log('[API Auth] Verifying recovery code for', cleanEmail);
+
+      let verifyData: any = null;
+      const recoveryVerify = await createStatelessSupabase().auth.verifyOtp({
+        email: cleanEmail,
+        token: cleanCode,
+        type: 'recovery',
+      });
+      if (!recoveryVerify.error && recoveryVerify.data?.session?.access_token) {
+        verifyData = recoveryVerify.data;
+      } else {
+        const emailOtpVerify = await createStatelessSupabase().auth.verifyOtp({
+          email: cleanEmail,
+          token: cleanCode,
+          type: 'email',
+        });
+        if (!emailOtpVerify.error && emailOtpVerify.data?.session?.access_token) {
+          verifyData = emailOtpVerify.data;
+        }
+      }
+
+      if (verifyData?.session?.access_token) {
+        const updateRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+          method: 'PUT',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${verifyData.session.access_token}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ password: cleanNewPass }),
+        });
+        const updateJson = await updateRes.json().catch(() => ({}));
+        if (!updateRes.ok) {
+          return res.status(updateRes.status || 400).json({
+            success: false,
+            code: 'auth/password-update-failed',
+            error: updateJson?.msg || updateJson?.error_description || updateJson?.error || 'Unable to update cloud password.',
+          });
+        }
+
+        saveAthleteCredential(cleanEmail, cleanNewPass);
+        activeRecoveryCodes.delete(cleanEmail);
+
+        const resolvedUid = verifyData.user?.id || verifyData.session.user?.id;
+        const srvToken = createServerSessionToken(cleanEmail, resolvedUid);
+        setServerSessionCookie(res, srvToken, req);
+
+        return res.json({
+          success: true,
+          message: 'Password updated successfully.',
+          user: updateJson?.id ? updateJson : verifyData.user,
+          session: verifyData.session,
+          serverSessionToken: srvToken,
+        });
+      }
+
       const activeEntry = activeRecoveryCodes.get(cleanEmail);
-      const isCodeValid =
-        (activeEntry && activeEntry.code === cleanCode && activeEntry.expires > Date.now()) ||
-        cleanCode === '998877';
+      const isCodeValid = Boolean(activeEntry && activeEntry.code === cleanCode && activeEntry.expires > Date.now());
 
       if (isCodeValid) {
         saveAthleteCredential(cleanEmail, cleanNewPass);
         activeRecoveryCodes.delete(cleanEmail);
+
+        // Attempt silent cloud login in case the password already matches Supabase
+        const { data: signData } = await createStatelessSupabase().auth.signInWithPassword({
+          email: cleanEmail,
+          password: cleanNewPass,
+        });
+        if (signData?.session?.access_token && signData?.user) {
+          const srvToken = createServerSessionToken(cleanEmail, signData.user.id);
+          setServerSessionCookie(res, srvToken, req);
+          return res.json({
+            success: true,
+            message: 'Password updated successfully.',
+            user: signData.user,
+            session: signData.session,
+            serverSessionToken: srvToken,
+          });
+        }
 
         const athleteUser = {
           id: `usr_${Buffer.from(cleanEmail).toString('hex').substring(0, 16)}`,
@@ -1849,9 +2198,12 @@ app.post('/api/auth/change-password', async (req, res) => {
           },
         };
         const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
+        const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
+        setServerSessionCookie(res, srvToken, req);
         return res.json({
           success: true,
-          message: 'Password changed successfully! You can now sign in with your new password.',
+          isVaultSession: true,
+          message: 'Local password updated. Note: use the 6-digit code sent to your email to sync cloud billing.',
           user: athleteUser,
           session: {
             access_token: token,
@@ -1859,40 +2211,14 @@ app.post('/api/auth/change-password', async (req, res) => {
             expires_in: 604800,
             user: athleteUser,
           },
-        });
-      }
-
-      // Try Supabase OTP verification as well
-      const { data: verifyData, error: verifyErr } = await createStatelessSupabase().auth.verifyOtp({
-        email: cleanEmail,
-        token: cleanCode,
-        type: 'recovery',
-      });
-
-      if (!verifyErr && verifyData?.session?.access_token) {
-        saveAthleteCredential(cleanEmail, cleanNewPass);
-        await fetch(`${SUPABASE_URL}/auth/v1/user`, {
-          method: 'PUT',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${verifyData.session.access_token}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ password: cleanNewPass }),
-        }).catch(() => {});
-
-        return res.json({
-          success: true,
-          message: 'Password updated successfully.',
-          user: verifyData.user,
-          session: verifyData.session,
+          serverSessionToken: srvToken,
         });
       }
 
       return res.status(400).json({
         success: false,
         code: 'auth/invalid-recovery-code',
-        error: 'Invalid or expired 6-digit recovery code. Please generate a new code.',
+        error: 'Invalid or expired 6-digit recovery code. Please request a fresh code from your email.',
       });
     }
 
@@ -1901,7 +2227,7 @@ app.post('/api/auth/change-password', async (req, res) => {
       console.log('[API Auth] Changing password via current password verification for', cleanEmail);
       const vaulted = athleteCredentials.get(cleanEmail);
       let passVerified = Boolean(vaulted && vaulted === String(currentPassword));
-      let verifiedSupabaseToken = '';
+      let verifiedSupabaseSession: any = null;
 
       const { data: signData, error: signErr } = await createStatelessSupabase().auth.signInWithPassword({
         email: cleanEmail,
@@ -1909,7 +2235,7 @@ app.post('/api/auth/change-password', async (req, res) => {
       });
       if (!signErr && signData?.session?.access_token) {
         passVerified = true;
-        verifiedSupabaseToken = signData.session.access_token;
+        verifiedSupabaseSession = signData.session;
       }
 
       if (!passVerified) {
@@ -1920,29 +2246,44 @@ app.post('/api/auth/change-password', async (req, res) => {
         });
       }
 
-      if (verifiedSupabaseToken) {
-        await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      if (verifiedSupabaseSession?.access_token) {
+        const updateRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
           method: 'PUT',
           headers: {
             apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${verifiedSupabaseToken}`,
+            Authorization: `Bearer ${verifiedSupabaseSession.access_token}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({ password: cleanNewPass }),
-        }).catch(() => {});
+        });
+        if (!updateRes.ok) {
+          const updErr = await updateRes.json().catch(() => ({}));
+          return res.status(updateRes.status || 400).json({
+            success: false,
+            error: updErr?.msg || updErr?.error_description || updErr?.error || 'Unable to update cloud password.',
+          });
+        }
       }
 
       saveAthleteCredential(cleanEmail, cleanNewPass);
       return res.json({
         success: true,
         message: 'Password changed successfully.',
+        ...(verifiedSupabaseSession ? { session: verifiedSupabaseSession } : {}),
       });
     }
 
-    // Method 3: Active Bearer token
+    // Method 3: Active Supabase Bearer token (e.g. from email recovery link)
     if (cleanToken) {
-      console.log('[API Auth] Changing password via access token');
-      if (cleanEmail) saveAthleteCredential(cleanEmail, cleanNewPass);
+      if (cleanToken.startsWith('vault_tok_') || cleanToken.startsWith('washek_sess_') || cleanToken.split('.').length !== 3) {
+        return res.status(401).json({
+          success: false,
+          code: 'auth/invalid-token',
+          error: 'Recovery link is invalid or expired. Please request a fresh password reset email.',
+        });
+      }
+
+      console.log('[API Auth] Changing password via Supabase access token');
       const updateRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
         method: 'PUT',
         headers: {
@@ -1952,19 +2293,57 @@ app.post('/api/auth/change-password', async (req, res) => {
         },
         body: JSON.stringify({ password: cleanNewPass }),
       });
-      const updateJson = await updateRes.json();
+      const updateJson = await updateRes.json().catch(() => ({}));
+
+      if (!updateRes.ok) {
+        return res.status(updateRes.status || 400).json({
+          success: false,
+          code: 'auth/password-update-failed',
+          error:
+            updateJson?.msg ||
+            updateJson?.error_description ||
+            updateJson?.error ||
+            'Unable to update password. Please request a fresh recovery link or 6-digit email code.',
+        });
+      }
+
+      const resolvedEmail = (updateJson?.email || cleanEmail || '').toLowerCase().trim();
+      if (resolvedEmail) {
+        saveAthleteCredential(resolvedEmail, cleanNewPass);
+      }
+
+      let freshSession: any = null;
+      if (resolvedEmail) {
+        try {
+          const { data: signData } = await createStatelessSupabase().auth.signInWithPassword({
+            email: resolvedEmail,
+            password: cleanNewPass,
+          });
+          if (signData?.session?.access_token) {
+            freshSession = signData.session;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      const resolvedUid = freshSession?.user?.id || updateJson?.id;
+      const srvToken = resolvedEmail ? createServerSessionToken(resolvedEmail, resolvedUid) : '';
+      if (srvToken) setServerSessionCookie(res, srvToken, req);
 
       return res.json({
         success: true,
         message: 'Password updated successfully.',
-        user: updateJson,
+        user: freshSession?.user || updateJson,
+        ...(freshSession ? { session: freshSession } : {}),
+        ...(srvToken ? { serverSessionToken: srvToken } : {}),
       });
     }
 
     return res.status(400).json({
       success: false,
       code: 'auth/missing-verification',
-      error: 'Please provide either your current password or your 6-digit recovery code.',
+      error: 'Please provide either your current password or the 6-digit recovery code from your email.',
     });
   } catch (err: any) {
     console.error('[API Auth] changePassword error:', err);
@@ -2129,10 +2508,23 @@ app.post('/api/auth/sync-vault-after-otp', async (req, res) => {
     const srvToken = createServerSessionToken(cleanEmail, data.user.id);
     setServerSessionCookie(res, srvToken, req);
 
+    let profile: any = null;
+    try {
+      const { data: profData } = await userClient
+        .from('profiles')
+        .select('*')
+        .eq('id', data.user.id)
+        .maybeSingle();
+      if (profData) profile = profData;
+    } catch {
+      // ignore
+    }
+
     return res.json({
       success: true,
       email: cleanEmail,
       userId: data.user.id,
+      profile,
       serverSessionToken: srvToken,
     });
   } catch (err: any) {
@@ -2165,6 +2557,160 @@ const JSON_TYPES = new Set([
   'live_workout_adjustment',
 ]);
 
+const SERVER_PLAN_HIERARCHY = ['free', 'progress', 'performance', 'elite'] as const;
+const SERVER_ACTIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing', 'past_due']);
+const SERVER_PLAN_LIMITS: Record<string, number> = {
+  free: 100,
+  progress: 300,
+  performance: 800,
+  elite: 2000,
+};
+const AI_TYPE_REQUIRED_PLAN: Record<string, string> = {
+  food_scan: 'progress',
+  food_barcode: 'progress',
+  progress_photo: 'performance',
+  live_workout_adjustment: 'elite',
+  form_analysis: 'elite',
+};
+
+function normalizeServerPlan(raw: any): string {
+  const normalized = String(raw || 'free').toLowerCase().trim();
+  return (SERVER_PLAN_HIERARCHY as readonly string[]).includes(normalized) ? normalized : 'free';
+}
+
+function hasRequiredServerPlan(userPlan: string, requiredPlan: string): boolean {
+  const userIdx = (SERVER_PLAN_HIERARCHY as readonly string[]).indexOf(normalizeServerPlan(userPlan));
+  const reqIdx = (SERVER_PLAN_HIERARCHY as readonly string[]).indexOf(normalizeServerPlan(requiredPlan));
+  return userIdx >= 0 && reqIdx >= 0 && userIdx >= reqIdx;
+}
+
+function getTimezoneMonthKey(tz?: string): string {
+  if (!tz) return new Date().toISOString().slice(0, 7);
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+    }).format(new Date()).slice(0, 7);
+  } catch {
+    return new Date().toISOString().slice(0, 7);
+  }
+}
+
+async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
+  client: any;
+  userId: string | null;
+  email: string | null;
+  effectivePlan: string;
+  profileRow: any | null;
+  isVerifiedJwt: boolean;
+}> {
+  const authHeader = req.headers.authorization;
+  const rawToken =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.replace(/^Bearer\s+/i, '').trim()
+      : '';
+  const isJwt =
+    Boolean(rawToken) &&
+    !rawToken.startsWith('vault_tok_') &&
+    !rawToken.startsWith('washek_sess_');
+
+  if (isJwt) {
+    try {
+      const supabaseUser = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        global: {
+          headers: {
+            Authorization: `Bearer ${rawToken}`,
+          },
+        },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      });
+      const { data: userData, error: userError } = await supabaseUser.auth.getUser(rawToken);
+      if (!userError && userData?.user?.id) {
+        const userId = userData.user.id;
+        const email = userData.user.email ? String(userData.user.email).toLowerCase().trim() : null;
+        const { data: profileRow } = await supabaseUser
+          .from('profiles')
+          .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .eq('id', userId)
+          .maybeSingle();
+
+        const subStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
+        const isActiveSub = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
+        const effectivePlan = isActiveSub ? normalizeServerPlan(profileRow?.subscription_plan) : 'free';
+
+        return {
+          client: supabaseUser,
+          userId,
+          email,
+          effectivePlan,
+          profileRow: profileRow || null,
+          isVerifiedJwt: true,
+        };
+      }
+    } catch (authErr) {
+      console.warn('[server.ts] JWT verification note, checking server session fallback:', authErr);
+    }
+  }
+
+  // Cryptographically verified server session (for vault sessions without Supabase JWT)
+  const srvSession = verifyServerSessionFromRequest(req);
+  if (srvSession) {
+    let profileRow: any = null;
+    if (srvSession.userId && isValidUUID(srvSession.userId)) {
+      try {
+        const { data } = await supabase
+          .from('profiles')
+          .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .eq('id', srvSession.userId)
+          .maybeSingle();
+        profileRow = data;
+      } catch {
+        // ignore lookup error
+      }
+    }
+    if (!profileRow && srvSession.email) {
+      try {
+        const { data } = await supabase
+          .from('profiles')
+          .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .ilike('email', srvSession.email)
+          .maybeSingle();
+        profileRow = data;
+      } catch {
+        // ignore lookup error
+      }
+    }
+    const subStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
+    const isActiveSub = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
+    const effectivePlan = isActiveSub ? normalizeServerPlan(profileRow?.subscription_plan) : 'free';
+
+    return {
+      client: supabase,
+      userId: profileRow?.id || srvSession.userId || null,
+      email: srvSession.email || null,
+      effectivePlan,
+      profileRow: profileRow || null,
+      isVerifiedJwt: false,
+    };
+  }
+
+  // Unauthenticated / anonymous / forged client requests ALWAYS resolve to 'free'
+  const fallbackUserId = req.body?.user_id && isValidUUID(req.body.user_id) ? req.body.user_id : null;
+  const fallbackEmail = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
+  return {
+    client: supabase,
+    userId: fallbackUserId,
+    email: fallbackEmail,
+    effectivePlan: 'free',
+    profileRow: null,
+    isVerifiedJwt: false,
+  };
+}
+
 app.post('/api/ai-generate', async (req, res) => {
   try {
     const {
@@ -2173,13 +2719,26 @@ app.post('/api/ai-generate', async (req, res) => {
       file_urls = [],
       schema = null,
       response_json_schema = null,
-      plan = 'free',
     } = req.body;
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({
         success: false,
         error: 'A prompt string is required.',
+      });
+    }
+
+    // Authoritatively resolve user subscription tier on the server (never trust req.body.plan)
+    const authCtx = await resolveAuthoritativeAiUser(req);
+    let effectivePlan = authCtx.effectivePlan;
+    const requiredTier = AI_TYPE_REQUIRED_PLAN[String(type || 'general')];
+    if (requiredTier && !hasRequiredServerPlan(effectivePlan, requiredTier)) {
+      return res.status(403).json({
+        success: false,
+        error_code: 'SUBSCRIPTION_REQUIRED',
+        required_plan: requiredTier,
+        current_plan: effectivePlan,
+        error: `This feature requires the ${requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1)} plan or higher.`,
       });
     }
 
@@ -2257,6 +2816,7 @@ app.post('/api/ai-generate', async (req, res) => {
     let kaelUserSession: {
       client: any;
       id: string;
+      email?: string | null;
       effectiveTz: string;
       usageLimit: number;
       resolvedPlan: string;
@@ -2269,192 +2829,85 @@ app.post('/api/ai-generate', async (req, res) => {
         plan: string;
       };
     } | null = null;
-    let effectivePlan = String(plan || 'free').toLowerCase();
 
-    // Server-side Kael monthly message limit enforcement for authenticated users
+    // Server-side Kael monthly message limit enforcement
     if (isKael) {
-      const authHeader = req.headers.authorization;
       const clientTimezone = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || '';
+      const effectiveTz = authCtx.profileRow?.timezone || clientTimezone || 'UTC';
+      const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+      const resolvedPlan = normalizeServerPlan(effectivePlan);
+      const usageLimit = SERVER_PLAN_LIMITS[resolvedPlan] || 100;
 
-      const getTimezoneMonthKey = (tz?: string): string => {
-        if (!tz) return new Date().toISOString().slice(0, 7);
+      if (authCtx.isVerifiedJwt && authCtx.userId) {
+        let currentUsage: { used: number; limit: number; remaining: number; monthKey: string; plan: string } | null = null;
         try {
-          return new Intl.DateTimeFormat('en-CA', {
-            timeZone: tz,
-            year: 'numeric',
-            month: '2-digit',
-          }).format(new Date()).slice(0, 7);
-        } catch {
-          return new Date().toISOString().slice(0, 7);
+          let { data: rpcUsage, error: rpcErr } = await authCtx.client.rpc('get_kael_usage');
+          if (rpcErr && rpcErr.code === 'PGRST202') {
+            const fallbackRes = await authCtx.client.rpc('get_kael_usage', {
+              p_timezone: effectiveTz,
+            });
+            if (!fallbackRes.error) {
+              rpcUsage = fallbackRes.data;
+              rpcErr = null;
+            }
+          }
+          if (!rpcErr && rpcUsage && typeof rpcUsage.used === 'number') {
+            currentUsage = {
+              used: rpcUsage.used,
+              limit: usageLimit,
+              remaining: Math.max(0, usageLimit - rpcUsage.used),
+              monthKey: rpcUsage.monthKey || currentMonthKey,
+              plan: resolvedPlan,
+            };
+          }
+        } catch (err) {
+          console.warn('[server.ts] get_kael_usage error:', err);
         }
-      };
 
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-        try {
-          const supabaseUser = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
-            global: {
-              headers: {
-                Authorization: `Bearer ${token}`,
-              },
+        if (!currentUsage) {
+          const isCurrentMonth = authCtx.profileRow?.kael_msg_month === currentMonthKey;
+          const count = isCurrentMonth ? Number(authCtx.profileRow?.kael_msg_count || 0) : 0;
+          currentUsage = {
+            used: count,
+            limit: usageLimit,
+            remaining: Math.max(0, usageLimit - count),
+            monthKey: currentMonthKey,
+            plan: resolvedPlan,
+          };
+        }
+
+        if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+          return res.status(429).json({
+            success: false,
+            error: 'You have reached your monthly message limit for Coach Kael.',
+            error_code: 'KAEL_LIMIT_REACHED',
+            quota: {
+              allowed: false,
+              used: currentUsage.used,
+              limit: currentUsage.limit,
+              remaining: 0,
+              monthKey: currentUsage.monthKey,
+              plan: currentUsage.plan,
+              timezone: effectiveTz,
             },
-            auth: {
-              persistSession: false,
-              autoRefreshToken: false,
-            },
+            type: 'kael',
           });
-
-          // Verify authentic session with Supabase using token
-          const { data: userData, error: userError } = await supabaseUser.auth.getUser(token);
-          if (!userError && userData?.user) {
-            const userId = userData.user.id;
-
-            // Authoritatively resolve user's profile and subscription plan
-            const { data: profileRow } = await supabaseUser
-              .from('profiles')
-              .select('subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
-              .eq('id', userId)
-              .maybeSingle();
-
-            const effectiveTz = clientTimezone || profileRow?.timezone || 'UTC';
-            const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-
-            const PLAN_LIMITS: Record<string, number> = {
-              free: 100,
-              progress: 300,
-              performance: 800,
-              elite: 2000,
-            };
-
-            const rawPlan = String(profileRow?.subscription_plan || effectivePlan || 'free').toLowerCase();
-            const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
-            effectivePlan = resolvedPlan;
-            const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
-
-            // Check current usage BEFORE generating response via get_kael_usage RPC
-            let currentUsage: { used: number; limit: number; remaining: number; monthKey: string; plan: string } | null = null;
-            try {
-              let { data: rpcUsage, error: rpcErr } = await supabaseUser.rpc('get_kael_usage');
-              if (rpcErr && rpcErr.code === 'PGRST202') {
-                const fallbackRes = await supabaseUser.rpc('get_kael_usage', {
-                  p_timezone: effectiveTz,
-                });
-                if (!fallbackRes.error) {
-                  rpcUsage = fallbackRes.data;
-                  rpcErr = null;
-                }
-              }
-              if (!rpcErr && rpcUsage && typeof rpcUsage.used === 'number') {
-                currentUsage = {
-                  used: rpcUsage.used,
-                  limit: rpcUsage.limit || usageLimit,
-                  remaining:
-                    typeof rpcUsage.remaining === 'number'
-                      ? rpcUsage.remaining
-                      : Math.max(0, (rpcUsage.limit || usageLimit) - rpcUsage.used),
-                  monthKey: rpcUsage.monthKey || currentMonthKey,
-                  plan: rpcUsage.plan || resolvedPlan,
-                };
-              }
-            } catch (err) {
-              console.warn('[server.ts] get_kael_usage error:', err);
-            }
-
-            // Profile table fallback calculation
-            if (!currentUsage) {
-              const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
-              const count = isCurrentMonth ? Number(profileRow?.kael_msg_count || 0) : 0;
-              currentUsage = {
-                used: count,
-                limit: usageLimit,
-                remaining: Math.max(0, usageLimit - count),
-                monthKey: currentMonthKey,
-                plan: resolvedPlan,
-              };
-            }
-
-            // STRICT BACKEND ENFORCEMENT: If limit reached (0 remaining), reject immediately without calling Gemini
-            if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
-              return res.status(429).json({
-                success: false,
-                error: 'You have reached your monthly message limit for Coach Kael.',
-                error_code: 'KAEL_LIMIT_REACHED',
-                quota: {
-                  allowed: false,
-                  used: currentUsage.used,
-                  limit: currentUsage.limit,
-                  remaining: 0,
-                  monthKey: currentUsage.monthKey,
-                  plan: currentUsage.plan,
-                  timezone: effectiveTz,
-                },
-                type: 'kael',
-              });
-            }
-
-            // Store verified user context for atomic deduction once Kael actually answers
-            kaelUserSession = {
-              client: supabaseUser,
-              id: userId,
-              effectiveTz,
-              usageLimit,
-              resolvedPlan,
-              currentMonthKey,
-              currentUsage,
-            };
-          }
-        } catch (authErr) {
-          console.warn('[server.ts] Auth verification note, using free baseline:', authErr);
         }
-      }
 
-      // Fallback session handling when token is absent or invalid (e.g. preview mode or local user)
-      if (!kaelUserSession) {
-        const fallbackUserId = req.body?.user_id || null;
-        const fallbackEmail = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
-        const effectiveTz = clientTimezone || 'UTC';
-        const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-        const PLAN_LIMITS: Record<string, number> = {
-          free: 100,
-          progress: 300,
-          performance: 800,
-          elite: 2000,
+        kaelUserSession = {
+          client: authCtx.client,
+          id: authCtx.userId,
+          email: authCtx.email,
+          effectiveTz,
+          usageLimit,
+          resolvedPlan,
+          currentMonthKey,
+          currentUsage,
         };
-
-        let profileRow: any = null;
-        if (fallbackUserId && isValidUUID(fallbackUserId)) {
-          try {
-            const { data } = await supabase
-              .from('profiles')
-              .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
-              .eq('id', fallbackUserId)
-              .maybeSingle();
-            profileRow = data;
-          } catch (profileErr) {
-            console.warn('[server.ts] Fallback profile lookup note:', profileErr);
-          }
-        }
-        if (!profileRow && fallbackEmail) {
-          try {
-            const { data } = await supabase
-              .from('profiles')
-              .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
-              .ilike('email', fallbackEmail)
-              .maybeSingle();
-            profileRow = data;
-          } catch (profileErr) {
-            console.warn('[server.ts] Fallback email profile lookup note:', profileErr);
-          }
-        }
-
-        const rawPlan = String(profileRow?.subscription_plan || req.body?.plan || effectivePlan || 'free').toLowerCase();
-        const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
-        effectivePlan = resolvedPlan;
-        const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
-
-        const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
+      } else {
+        const isCurrentMonth = authCtx.profileRow?.kael_msg_month === currentMonthKey;
         const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
-        const count = isCurrentMonth ? Number(profileRow?.kael_msg_count ?? clientUsed) : clientUsed;
+        const count = isCurrentMonth ? Number(authCtx.profileRow?.kael_msg_count ?? clientUsed) : clientUsed;
 
         const currentUsage = {
           used: count,
@@ -2483,9 +2936,9 @@ app.post('/api/ai-generate', async (req, res) => {
         }
 
         kaelUserSession = {
-          client: supabase,
-          id: profileRow?.id || fallbackUserId || 'guest',
-          email: fallbackEmail || null,
+          client: authCtx.client,
+          id: authCtx.userId || 'guest',
+          email: authCtx.email || null,
           effectiveTz,
           usageLimit,
           resolvedPlan,
@@ -2772,13 +3225,26 @@ app.post('/api/ai-stream', async (req, res) => {
       file_urls = [],
       schema = null,
       response_json_schema = null,
-      plan = 'free',
     } = req.body;
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({
         success: false,
         error: 'A prompt string is required.',
+      });
+    }
+
+    // Authoritatively resolve user subscription tier on the server (never trust req.body.plan)
+    const authCtx = await resolveAuthoritativeAiUser(req);
+    let effectivePlan = authCtx.effectivePlan;
+    const requiredTier = AI_TYPE_REQUIRED_PLAN[String(type || 'general')];
+    if (requiredTier && !hasRequiredServerPlan(effectivePlan, requiredTier)) {
+      return res.status(403).json({
+        success: false,
+        error_code: 'SUBSCRIPTION_REQUIRED',
+        required_plan: requiredTier,
+        current_plan: effectivePlan,
+        error: `This feature requires the ${requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1)} plan or higher.`,
       });
     }
 
@@ -2851,171 +3317,49 @@ app.post('/api/ai-stream', async (req, res) => {
     const isKael = type === 'kael';
     let kaelQuota: any = null;
     let kaelUserSession: any = null;
-    let effectivePlan = String(plan || 'free').toLowerCase();
 
     if (isKael) {
-      const authHeader = req.headers.authorization;
       const clientTimezone = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || '';
+      const effectiveTz = authCtx.profileRow?.timezone || clientTimezone || 'UTC';
+      const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+      const resolvedPlan = normalizeServerPlan(effectivePlan);
+      const usageLimit = SERVER_PLAN_LIMITS[resolvedPlan] || 100;
 
-      const getTimezoneMonthKey = (tz?: string): string => {
-        if (!tz) return new Date().toISOString().slice(0, 7);
-        try {
-          return new Intl.DateTimeFormat('en-CA', {
-            timeZone: tz,
-            year: 'numeric',
-            month: '2-digit',
-          }).format(new Date()).slice(0, 7);
-        } catch {
-          return new Date().toISOString().slice(0, 7);
-        }
+      const isCurrentMonth = authCtx.profileRow?.kael_msg_month === currentMonthKey;
+      const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
+      const count = isCurrentMonth ? Number(authCtx.profileRow?.kael_msg_count ?? 0) : (authCtx.userId && authCtx.isVerifiedJwt ? 0 : clientUsed);
+
+      const currentUsage = {
+        used: count,
+        limit: usageLimit,
+        remaining: Math.max(0, usageLimit - count),
+        monthKey: currentMonthKey,
+        plan: resolvedPlan,
       };
 
-      if (authHeader && authHeader.startsWith('Bearer ')) {
-        const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-        const { data: userData, error: userError } = await supabase.auth.getUser(token);
-
-        if (!userError && userData?.user?.id) {
-          const authUser = userData.user;
-          const { data: profileRow } = await supabase
-            .from('profiles')
-            .select('subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
-            .eq('id', authUser.id)
-            .maybeSingle();
-
-          const activeSub =
-            profileRow?.subscription_status === 'active' ||
-            profileRow?.subscription_status === 'trialing';
-
-          const PLAN_LIMITS: Record<string, number> = {
-            free: 100,
-            progress: 300,
-            performance: 800,
-            elite: 2000,
-          };
-
-          const rawPlan = activeSub ? (profileRow?.subscription_plan || 'free').toLowerCase() : 'free';
-          const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
-          effectivePlan = resolvedPlan;
-          const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
-
-          const effectiveTz = profileRow?.timezone || clientTimezone || 'UTC';
-          const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-          const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
-          const count = isCurrentMonth ? Number(profileRow?.kael_msg_count ?? 0) : 0;
-
-          const currentUsage = {
-            used: count,
-            limit: usageLimit,
-            remaining: Math.max(0, usageLimit - count),
-            monthKey: currentMonthKey,
-            plan: resolvedPlan,
-          };
-
-          if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
-            return res.status(429).json({
-              success: false,
-              error: 'You have reached your monthly message limit for Coach Kael.',
-              error_code: 'KAEL_LIMIT_REACHED',
-              quota: {
-                allowed: false,
-                used: currentUsage.used,
-                limit: currentUsage.limit,
-                remaining: 0,
-                monthKey: currentUsage.monthKey,
-                plan: currentUsage.plan,
-                timezone: effectiveTz,
-              },
-              type: 'kael',
-            });
-          }
-
-          const userScopedClient = createStatelessSupabase(token);
-
-          kaelUserSession = {
-            client: userScopedClient,
-            id: authUser.id,
-            effectiveTz,
-            usageLimit,
-            resolvedPlan,
-            currentMonthKey,
-            currentUsage,
-          };
-        }
+      if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+        return res.status(429).json({
+          success: false,
+          error: 'You have reached your monthly message limit for Coach Kael.',
+          error_code: 'KAEL_LIMIT_REACHED',
+          quota: {
+            allowed: false,
+            used: currentUsage.used,
+            limit: currentUsage.limit,
+            remaining: 0,
+            monthKey: currentUsage.monthKey,
+            plan: currentUsage.plan,
+            timezone: effectiveTz,
+          },
+          type: 'kael',
+        });
       }
 
-      if (!kaelUserSession && (req.body?.user_id || req.body?.email)) {
-        const fallbackUserId = req.body?.user_id || null;
-        const fallbackEmail = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
-        let profileRow: any = null;
-        if (fallbackUserId && isValidUUID(fallbackUserId)) {
-          const { data } = await supabase
-            .from('profiles')
-            .select('id, subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
-            .eq('id', fallbackUserId)
-            .maybeSingle();
-          profileRow = data;
-        }
-        if (!profileRow && fallbackEmail) {
-          const { data } = await supabase
-            .from('profiles')
-            .select('id, subscription_plan, subscription_status, kael_msg_count, kael_msg_month, timezone')
-            .ilike('email', fallbackEmail)
-            .maybeSingle();
-          profileRow = data;
-        }
-
-        const activeSub =
-          profileRow?.subscription_status === 'active' ||
-          profileRow?.subscription_status === 'trialing';
-
-        const PLAN_LIMITS: Record<string, number> = {
-          free: 100,
-          progress: 300,
-          performance: 800,
-          elite: 2000,
-        };
-
-        const rawPlan = activeSub ? (profileRow?.subscription_plan || 'free').toLowerCase() : 'free';
-        const resolvedPlan = PLAN_LIMITS[rawPlan] ? rawPlan : 'free';
-        effectivePlan = resolvedPlan;
-        const usageLimit = PLAN_LIMITS[resolvedPlan] || 100;
-
-        const effectiveTz = profileRow?.timezone || clientTimezone || 'UTC';
-        const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-        const isCurrentMonth = profileRow?.kael_msg_month === currentMonthKey;
-        const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
-        const count = isCurrentMonth ? Number(profileRow?.kael_msg_count ?? clientUsed) : clientUsed;
-
-        const currentUsage = {
-          used: count,
-          limit: usageLimit,
-          remaining: Math.max(0, usageLimit - count),
-          monthKey: currentMonthKey,
-          plan: resolvedPlan,
-        };
-
-        if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
-          return res.status(429).json({
-            success: false,
-            error: 'You have reached your monthly message limit for Coach Kael.',
-            error_code: 'KAEL_LIMIT_REACHED',
-            quota: {
-              allowed: false,
-              used: currentUsage.used,
-              limit: currentUsage.limit,
-              remaining: 0,
-              monthKey: currentUsage.monthKey,
-              plan: currentUsage.plan,
-              timezone: effectiveTz,
-            },
-            type: 'kael',
-          });
-        }
-
+      if (authCtx.userId || authCtx.email) {
         kaelUserSession = {
-          client: supabase,
-          id: profileRow?.id || fallbackUserId || 'guest',
-          email: fallbackEmail || null,
+          client: authCtx.client,
+          id: authCtx.userId || 'guest',
+          email: authCtx.email || null,
           effectiveTz,
           usageLimit,
           resolvedPlan,

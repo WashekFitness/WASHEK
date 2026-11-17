@@ -45,7 +45,9 @@ export default function ProgramWeekBootstrap() {
         if (
           !mounted ||
           !user?.id ||
-          !user?.onboarded
+          !user?.onboarded ||
+          user?._isLocalVault ||
+          String(user.id).startsWith('usr_')
         ) {
           return;
         }
@@ -159,7 +161,9 @@ export default function ProgramWeekBootstrap() {
     }
 
 
-    run();
+    const initialTimer = window.setTimeout(() => {
+      if (mounted) run();
+    }, 1200);
 
 
     /*
@@ -212,6 +216,8 @@ export default function ProgramWeekBootstrap() {
     return () => {
       mounted =
         false;
+
+      window.clearTimeout(initialTimer);
 
       window.clearInterval(
         interval

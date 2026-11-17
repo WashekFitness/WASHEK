@@ -3,6 +3,11 @@ import { getUserTimeZone } from '@/lib/dateUtils';
 import { syncQuotaAcrossApp } from '@/lib/messageLimit';
 import { isLogo } from '@/lib/avatarUtils';
 import {
+  enforceUserSubscriptionState,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+} from '@/lib/subscription';
+import {
   getCachedProgramsList,
   setCachedLogs,
   setCachedLastWorkout,
@@ -100,6 +105,28 @@ export function isUserMarkedOnboarded(userId, email) {
  * ------------------------------------------------------------
  */
 
+function isVaultTokenString(tok) {
+  return Boolean(tok && (tok.startsWith('vault_tok_') || tok.startsWith('washek_sess_')));
+}
+
+function buildCachedUserObject(parsed) {
+  const validId = ensureValidUuid(parsed.id || parsed.uid || parsed.email);
+  return {
+    id: validId,
+    uid: parsed.uid || parsed.id || validId,
+    raw_id: parsed.id || parsed.uid || validId,
+    email: parsed.email || '',
+    _isLocalVault: true,
+    user_metadata: {
+      first_name: parsed.first_name || '',
+      last_name: parsed.last_name || '',
+      full_name: parsed.full_name || parsed.email || 'Athlete',
+      email: parsed.email || '',
+      role: parsed.role || 'athlete',
+    },
+  };
+}
+
 async function requireUser() {
   // 1. Check active Supabase local session
   try {
@@ -111,44 +138,48 @@ async function requireUser() {
     console.warn('[supabaseApi] getSession check warning:', err);
   }
 
-  // 2. Query Supabase server
+  // 2. Fast-path local vault sessions so every entity/me call doesn't wait ~850ms on a doomed remote getUser()
+  let parsedStored = null;
+  let storedTok = '';
   try {
-    const {
-      data,
-      error
-    } = await supabase.auth.getUser();
-
-    if (!error && data?.user) {
-      return data.user;
-    }
-  } catch (err) {
-    console.warn('[supabaseApi] getUser network error:', err);
-  }
-
-
-  // 4. Check cached user in localStorage (washek_user)
-  try {
+    storedTok = localStorage.getItem('washek_auth_token') || '';
     const stored = localStorage.getItem('washek_user');
     if (stored) {
       const parsed = JSON.parse(stored);
       if (parsed?.id || parsed?.uid || parsed?.email) {
-        const validId = ensureValidUuid(parsed.id || parsed.uid || parsed.email);
-        return {
-          id: validId,
-          uid: parsed.uid || parsed.id || validId,
-          email: parsed.email || '',
-          user_metadata: {
-            first_name: parsed.first_name || '',
-            last_name: parsed.last_name || '',
-            full_name: parsed.full_name || parsed.email || 'Athlete',
-            email: parsed.email || '',
-            role: parsed.role || 'athlete',
-          },
-        };
+        parsedStored = parsed;
       }
     }
   } catch (err) {
     console.debug('[supabaseApi] localStorage check note:', err);
+  }
+
+  if (
+    parsedStored &&
+    (isVaultTokenString(storedTok) || !storedTok || String(parsedStored.id || '').startsWith('usr_'))
+  ) {
+    return buildCachedUserObject(parsedStored);
+  }
+
+  // 3. Query Supabase server only when a genuine JWT session may exist
+  if (storedTok && storedTok.split('.').length === 3) {
+    try {
+      const {
+        data,
+        error
+      } = await supabase.auth.getUser();
+
+      if (!error && data?.user) {
+        return data.user;
+      }
+    } catch (err) {
+      console.warn('[supabaseApi] getUser network error:', err);
+    }
+  }
+
+  // 4. Fallback to cached user in localStorage (washek_user)
+  if (parsedStored) {
+    return buildCachedUserObject(parsedStored);
   }
 
   throw new Error(
@@ -210,8 +241,15 @@ function normalizeUser(authUser, profile = {}) {
   const detectedTz = getUserTimeZone();
   const effectiveTz = safeProfile.timezone || detectedTz;
 
-  // Auto-sync detected timezone to profile in background if missing
-  if ((!safeProfile.timezone || safeProfile.timezone === 'UTC') && authUser?.id && detectedTz && detectedTz !== 'UTC') {
+  // Auto-sync detected timezone to profile in background if missing (only for genuine Supabase sessions)
+  if (
+    !authUser?._isLocalVault &&
+    !String(authUser?.id || '').startsWith('usr_') &&
+    (!safeProfile.timezone || safeProfile.timezone === 'UTC') &&
+    authUser?.id &&
+    detectedTz &&
+    detectedTz !== 'UTC'
+  ) {
     supabase
       .from('profiles')
       .update({ timezone: detectedTz })
@@ -222,18 +260,20 @@ function normalizeUser(authUser, profile = {}) {
 
   const cleansedAvatar = safeProfile.avatar_url && !isLogo(safeProfile.avatar_url) ? safeProfile.avatar_url : null;
 
-  return {
+  return enforceUserSubscriptionState({
+    ...safeProfile,
     id: authUser.id,
     email: authUser.email,
     role: safeProfile.role || authUser.user_metadata?.role || 'user',
-    ...safeProfile,
+    subscription_plan: safeProfile.subscription_plan || safeProfile.plan || 'free',
+    subscription_status: safeProfile.subscription_status || 'inactive',
     avatar_url: cleansedAvatar,
     photo_url: cleansedAvatar,
     timezone: effectiveTz,
     first_name: firstName,
     last_name: lastName,
     full_name: fullName,
-  };
+  });
 }
 
 
@@ -242,6 +282,21 @@ function normalizeUser(authUser, profile = {}) {
  * CURRENT USER
  * ------------------------------------------------------------
  */
+
+let inFlightMePromise = null;
+let lastMeResult = null;
+let lastMeFetchedAt = 0;
+const ME_FRESH_TTL_MS = 3000;
+
+export function invalidateCurrentUserCache() {
+  lastMeFetchedAt = 0;
+  lastMeResult = null;
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('washek_subscription_updated', invalidateCurrentUserCache);
+  window.addEventListener('washek_session_recovered', invalidateCurrentUserCache);
+}
 
 async function currentUser(forceFresh = false) {
   try {
@@ -259,19 +314,7 @@ async function currentUser(forceFresh = false) {
   })();
 
   const isLocallyInactive =
-    storedStatus === 'canceled' ||
-    storedStatus === 'cancelled' ||
-    storedStatus === 'inactive';
-
-  const rawLocalPlan = (() => {
-    if (isLocallyInactive) return null;
-    try {
-      const p = localStorage.getItem('washek_subscription_plan');
-      return p && p !== 'free' ? p : null;
-    } catch {
-      return null;
-    }
-  })();
+    Boolean(storedStatus) && !isActiveSubscriptionStatus(storedStatus);
 
   if (isLocallyInactive) {
     try {
@@ -286,7 +329,7 @@ async function currentUser(forceFresh = false) {
     try {
       const stored = localStorage.getItem('washek_user');
       if (stored) {
-        const parsed = JSON.parse(stored);
+        const parsed = enforceUserSubscriptionState(JSON.parse(stored));
         if (parsed?.email) {
           if (isLogo(parsed.avatar_url) || isLogo(parsed.photo_url)) {
             parsed.avatar_url = null;
@@ -299,15 +342,16 @@ async function currentUser(forceFresh = false) {
           ) {
             parsed.onboarded = true;
           }
-          const parsedStatus = String(parsed.subscription_status || '').toLowerCase().trim();
-          const isParsedInactive =
-            isLocallyInactive ||
-            parsedStatus === 'canceled' ||
-            parsedStatus === 'cancelled' ||
-            parsedStatus === 'inactive' ||
-            parsed.subscription_plan === 'free';
+          const parsedStatus = String(parsed.subscription_status || storedStatus || '').toLowerCase().trim();
+          const parsedPlan = normalizePlan(
+            parsed.subscription_plan || parsed.plan || parsed.tier || parsed.subscription_tier || 'free'
+          );
+          const isParsedActive =
+            !isLocallyInactive &&
+            isActiveSubscriptionStatus(parsedStatus) &&
+            parsedPlan !== 'free';
 
-          if (isParsedInactive) {
+          if (!isParsedActive) {
             parsed.subscription_plan = 'free';
             parsed.subscription_status =
               storedStatus === 'canceled' || storedStatus === 'cancelled'
@@ -316,16 +360,6 @@ async function currentUser(forceFresh = false) {
             parsed.tier = 'free';
             parsed.plan = 'free';
             parsed.subscription_tier = 'free';
-          } else if (rawLocalPlan && rawLocalPlan !== 'free' && parsed.subscription_plan !== rawLocalPlan) {
-            parsed.subscription_plan = rawLocalPlan;
-            parsed.tier = rawLocalPlan;
-            parsed.plan = rawLocalPlan;
-            parsed.subscription_tier = rawLocalPlan;
-            try {
-              localStorage.setItem('washek_user', JSON.stringify(parsed));
-            } catch (_err) {
-              // ignore
-            }
           }
           return parsed;
         }
@@ -335,40 +369,72 @@ async function currentUser(forceFresh = false) {
     }
   }
 
-  // Query live Supabase auth user and profile
-  try {
-    const user = await requireUser();
-    let profile = await getProfile(user.id);
+  // Return recently fetched authoritative user within short TTL window unless cache invalidated
+  if (lastMeResult && Date.now() - lastMeFetchedAt < ME_FRESH_TTL_MS) {
+    return lastMeResult;
+  }
 
-    if (!profile) {
-      profile = {
-        id: user.id,
-        email: user.email,
-        first_name: user.user_metadata?.first_name || '',
-        last_name: user.user_metadata?.last_name || '',
-        full_name:
-          user.user_metadata?.full_name ||
-          user.user_metadata?.first_name ||
-          user.email ||
-          'Athlete',
-        role: user.user_metadata?.role || 'athlete',
-        training_type: user.user_metadata?.training_type || 'calisthenics',
-        fitness_level: user.user_metadata?.fitness_level || 'intermediate',
-        subscription_plan: 'free',
-        subscription_status: isLocallyInactive ? (storedStatus || 'inactive') : 'inactive',
-      };
+  // Deduplicate concurrent remote currentUser fetches across mounting components
+  if (inFlightMePromise) {
+    return inFlightMePromise;
+  }
 
-      supabase
-        .from('profiles')
-        .upsert(profile, { onConflict: 'id' })
-        .then(() => {})
-        .catch(() => {});
-    }
+  inFlightMePromise = (async () => {
+    // Query live Supabase auth user and profile (skip remote RTTs on local vault sessions)
+    try {
+      const user = await requireUser();
+      const isLocalVault =
+        Boolean(user?._isLocalVault) || String(user?.uid || user?.id || '').startsWith('usr_');
+
+      let storedProfile = null;
+      try {
+        const rawStored = localStorage.getItem('washek_user');
+        if (rawStored) storedProfile = JSON.parse(rawStored);
+      } catch {
+        storedProfile = null;
+      }
+
+      let profile = isLocalVault
+        ? (storedProfile ? { ...storedProfile } : null)
+        : await getProfile(user.id);
+
+      if (!profile) {
+        const profileInsert = {
+          id: user.id,
+          first_name: user.user_metadata?.first_name || '',
+          last_name: user.user_metadata?.last_name || '',
+          full_name:
+            user.user_metadata?.full_name ||
+            user.user_metadata?.first_name ||
+            user.email ||
+            'Athlete',
+          role: user.user_metadata?.role || 'athlete',
+          training_type: user.user_metadata?.training_type || 'calisthenics',
+          fitness_level: user.user_metadata?.fitness_level || 'intermediate',
+          subscription_plan: 'free',
+          subscription_status: isLocallyInactive ? (storedStatus || 'inactive') : 'inactive',
+        };
+
+        profile = {
+          ...profileInsert,
+          email: user.email,
+        };
+
+        if (!isLocalVault) {
+          supabase
+            .from('profiles')
+            .upsert(profileInsert, { onConflict: 'id', ignoreDuplicates: true })
+            .then(() => {}, () => {});
+        }
+      }
 
     const normalized = normalizeUser(user, profile);
+    if (user?.raw_id) {
+      normalized.id = user.raw_id;
+    }
     const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
-    const dbPlan = String(profile.subscription_plan || 'free').toLowerCase().trim();
-    const dbActive = ['active', 'trialing', 'past_due', 'unpaid'].includes(dbStatus) && dbPlan !== 'free';
+    const dbPlan = normalizePlan(profile.subscription_plan || 'free');
+    const dbActive = isActiveSubscriptionStatus(dbStatus) && dbPlan !== 'free';
 
     if (dbActive) {
       normalized.subscription_plan = dbPlan;
@@ -408,7 +474,7 @@ async function currentUser(forceFresh = false) {
         getLocalEntityRecords('workout_programs', user.id).length > 0 ||
         getCachedProgramsList(user.email || user.id).length > 0;
 
-      if (!hasExistingHistory && user.id) {
+      if (!hasExistingHistory && user.id && !isLocalVault) {
         try {
           const [{ data: progRows }, { data: logRows }] = await Promise.all([
             supabase.from('workout_programs').select('id').eq('user_id', user.id).limit(1),
@@ -425,12 +491,14 @@ async function currentUser(forceFresh = false) {
       if (hasExistingHistory) {
         normalized.onboarded = true;
         markUserOnboarded(user.id, user.email);
-        supabase
-          .from('profiles')
-          .update({ onboarded: true, updated_at: new Date().toISOString() })
-          .eq('id', user.id)
-          .then(() => {})
-          .catch(() => {});
+        if (!isLocalVault) {
+          supabase
+            .from('profiles')
+            .update({ onboarded: true, updated_at: new Date().toISOString() })
+            .eq('id', user.id)
+            .then(() => {})
+            .catch(() => {});
+        }
       }
     }
 
@@ -439,10 +507,17 @@ async function currentUser(forceFresh = false) {
     } catch (_err) {
       // ignore
     }
+    lastMeResult = normalized;
+    lastMeFetchedAt = Date.now();
     return normalized;
-  } catch {
-    return null;
-  }
+    } catch {
+      return null;
+    } finally {
+      inFlightMePromise = null;
+    }
+  })();
+
+  return inFlightMePromise;
 }
 
 
@@ -753,25 +828,27 @@ function entity(table) {
       const localRecords = getLocalEntityRecords(table, validUserId);
       let remoteRecords = [];
 
-      try {
-        const rawColumn = sort.replace(/^-/, '');
-        const column = ORDER_ALIASES[rawColumn] || rawColumn;
-        const ascending = !sort.startsWith('-');
+      if (!user?._isLocalVault) {
+        try {
+          const rawColumn = sort.replace(/^-/, '');
+          const column = ORDER_ALIASES[rawColumn] || rawColumn;
+          const ascending = !sort.startsWith('-');
 
-        let q = supabase.from(table).select('*');
-        if (validUserId) {
-          q = q.eq('user_id', validUserId);
-        }
-        q = q.order(column, { ascending });
-        if (Number.isFinite(limit)) q = q.limit(limit);
+          let q = supabase.from(table).select('*');
+          if (validUserId) {
+            q = q.eq('user_id', validUserId);
+          }
+          q = q.order(column, { ascending });
+          if (Number.isFinite(limit)) q = q.limit(limit);
 
-        const { data, error } = await q;
-        if (!error && Array.isArray(data)) {
-          remoteRecords = data;
-          remoteRecords.forEach((item) => saveLocalEntityRecord(table, validUserId, item));
+          const { data, error } = await q;
+          if (!error && Array.isArray(data)) {
+            remoteRecords = data;
+            remoteRecords.forEach((item) => saveLocalEntityRecord(table, validUserId, item));
+          }
+        } catch (_dbErr) {
+          // Fallback to local and Firestore
         }
-      } catch (_dbErr) {
-        // Fallback to local and Firestore
       }
 
       let firestoreRecords = [];
@@ -851,21 +928,23 @@ function entity(table) {
       });
 
       let remoteRecords = [];
-      try {
-        const rawColumn = sort.replace(/^-/, '');
-        const column = ORDER_ALIASES[rawColumn] || rawColumn;
-        const ascending = !sort.startsWith('-');
+      if (!user?._isLocalVault) {
+        try {
+          const rawColumn = sort.replace(/^-/, '');
+          const column = ORDER_ALIASES[rawColumn] || rawColumn;
+          const ascending = !sort.startsWith('-');
 
-        let q = applyFilters(supabase.from(table).select('*'), filters, validUserId).order(column, { ascending });
-        if (Number.isFinite(limit)) q = q.limit(limit);
+          let q = applyFilters(supabase.from(table).select('*'), filters, validUserId).order(column, { ascending });
+          if (Number.isFinite(limit)) q = q.limit(limit);
 
-        const { data, error } = await q;
-        if (!error && Array.isArray(data)) {
-          remoteRecords = data;
-          remoteRecords.forEach((item) => saveLocalEntityRecord(table, validUserId, item));
+          const { data, error } = await q;
+          if (!error && Array.isArray(data)) {
+            remoteRecords = data;
+            remoteRecords.forEach((item) => saveLocalEntityRecord(table, validUserId, item));
+          }
+        } catch (_dbErr) {
+          // Supabase error fallback
         }
-      } catch (_dbErr) {
-        // Supabase error fallback
       }
 
       let firestoreRecords = [];
@@ -946,7 +1025,11 @@ function entity(table) {
         // Fallback
       }
 
-      const generatedId = payload.id || `${table.slice(0, 4)}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const generatedId =
+        payload.id ||
+        (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `${table.slice(0, 4)}_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`);
       const nowIso = new Date().toISOString();
       const todayDate = nowIso.slice(0, 10);
 
@@ -1187,7 +1270,9 @@ async function createSignedUrl(value, expiresIn = 3600) {
   const { path } = await validateOwnStoragePath(value);
   if (!path) throw new Error('A valid media storage path is required.');
 
-  const bucketsToTry = Array.from(new Set([MEDIA_BUCKET, 'user-media', 'media'].filter(Boolean)));
+  const bucketsToTry = Array.from(
+    new Set([MEDIA_BUCKET, 'user-media', 'washek-media', 'media'].filter(Boolean))
+  );
   let lastErr = null;
 
   for (const bucket of bucketsToTry) {
@@ -1276,21 +1361,75 @@ async function uploadFile(input, folder = 'uploads') {
   const safeName = String(file.name || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_');
   const path = `${user.id}/${actualFolder}/${crypto.randomUUID()}-${safeName}`;
 
-  const { error } = await supabase.storage.from(MEDIA_BUCKET).upload(path, file, {
-    upsert: false,
-    contentType: file.type || 'application/octet-stream',
-  });
+  const bucketsToTry = Array.from(
+    new Set([MEDIA_BUCKET, 'user-media', 'washek-media', 'media'].filter(Boolean))
+  );
 
-  if (error) throw errorFrom(error, 'File upload failed.');
+  let uploadErr = null;
+  let uploadedBucket = null;
+
+  for (const bucket of bucketsToTry) {
+    try {
+      const { error } = await supabase.storage.from(bucket).upload(path, file, {
+        upsert: false,
+        contentType: file.type || 'application/octet-stream',
+      });
+      if (!error) {
+        uploadedBucket = bucket;
+        uploadErr = null;
+        break;
+      }
+      uploadErr = error;
+      const msg = String(error.message || '').toLowerCase();
+      // Only retry next bucket if this bucket does not exist
+      if (!msg.includes('bucket') && !msg.includes('not found') && error.statusCode !== '404' && error.status !== 404) {
+        break;
+      }
+    } catch (err) {
+      uploadErr = err;
+    }
+  }
+
+  if (uploadErr || !uploadedBucket) {
+    throw errorFrom(uploadErr, 'File upload failed.');
+  }
 
   let fileUrl = null;
   try {
-    fileUrl = await createSignedUrl(path, 3600);
+    const { data, error: signErr } = await supabase.storage.from(uploadedBucket).createSignedUrl(path, 3600);
+    if (!signErr && data?.signedUrl) {
+      fileUrl = data.signedUrl;
+    } else {
+      fileUrl = await createSignedUrl(path, 3600);
+    }
   } catch {
     // ignore signing failures
   }
 
-  return { file_url: fileUrl, path };
+  return { file_url: fileUrl, path, bucket: uploadedBucket };
+}
+
+async function deleteFile(value) {
+  const path = getStoragePath(value);
+  if (!path) return false;
+
+  const bucketsToTry = Array.from(
+    new Set([MEDIA_BUCKET, 'user-media', 'washek-media', 'media'].filter(Boolean))
+  );
+
+  for (const bucket of bucketsToTry) {
+    try {
+      let clean = path;
+      if (clean.startsWith(`${bucket}/`)) {
+        clean = clean.slice(bucket.length + 1);
+      }
+      const { error } = await supabase.storage.from(bucket).remove([clean]);
+      if (!error) return true;
+    } catch {
+      // try next bucket
+    }
+  }
+  return false;
 }
 
 /*
@@ -1368,6 +1507,12 @@ async function streamAI({
   if (authToken) {
     headers['Authorization'] = `Bearer ${authToken}`;
   }
+  try {
+    const srvTok = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_srv_session') : '';
+    if (srvTok) headers['x-washek-server-session'] = srvTok;
+  } catch {
+    // ignore
+  }
 
   try {
     const res = await fetch('/api/ai-stream', {
@@ -1387,6 +1532,16 @@ async function streamAI({
         current_used: currentUsed,
       }),
     });
+
+    if (res.status === 403) {
+      const errData = await res.json().catch(() => ({}));
+      return {
+        __ai_error: true,
+        message: errData?.error || 'An upgraded plan is required to access this feature.',
+        code: errData?.error_code || 'SUBSCRIPTION_REQUIRED',
+        details: errData,
+      };
+    }
 
     if (res.status === 429) {
       const errData = await res.json().catch(() => ({}));
@@ -1560,6 +1715,12 @@ async function invokeAI({
     if (authToken) {
       headers['Authorization'] = `Bearer ${authToken}`;
     }
+    try {
+      const srvTok = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_srv_session') : '';
+      if (srvTok) headers['x-washek-server-session'] = srvTok;
+    } catch {
+      // ignore
+    }
 
     let res = await fetch('/api/ai-generate', {
       method: 'POST',
@@ -1600,9 +1761,17 @@ async function invokeAI({
       });
     }
 
-    // Authoritative backend quota enforcement
+    // Authoritative backend tier & quota enforcement
     if (!res.ok) {
       const errData = await res.json().catch(() => ({}));
+      if (res.status === 403 || errData?.error_code === 'SUBSCRIPTION_REQUIRED') {
+        return {
+          __ai_error: true,
+          message: errData?.error || 'An upgraded plan is required to access this feature.',
+          code: 'SUBSCRIPTION_REQUIRED',
+          details: errData,
+        };
+      }
       if (
         res.status === 429 ||
         errData?.error_code === 'KAEL_LIMIT_REACHED'
@@ -1848,9 +2017,9 @@ export const supabaseApi = {
       delete safePatch.user_id;
       delete safePatch.subscription_plan;
       delete safePatch.subscription_status;
-      delete safePatch.stripe_customer_id;
-      delete safePatch.stripe_subscription_id;
-      delete safePatch.stripe_price_id;
+      delete safePatch.paddle_customer_id;
+      delete safePatch.paddle_subscription_id;
+      delete safePatch.paddle_price_id;
       delete safePatch.subscription_cancelled_at;
       delete safePatch.subscription_updated_at;
 
@@ -1861,6 +2030,8 @@ export const supabaseApi = {
       if (updatedUser.onboarded) {
         markUserOnboarded(user.id, user.email);
       }
+      lastMeResult = updatedUser;
+      lastMeFetchedAt = Date.now();
       try {
         localStorage.setItem('washek_user', JSON.stringify(updatedUser));
       } catch {
@@ -2354,6 +2525,7 @@ export const supabaseApi = {
 
   storage: {
     uploadFile,
+    deleteFile,
     createSignedUrl,
     createSignedUrls,
     resolveMediaUrl,

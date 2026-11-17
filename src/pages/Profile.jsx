@@ -47,7 +47,7 @@ import QuickAccess from '@/components/layout/QuickAccess';
 
 import { useAuth } from '@/lib/AuthContext';
 import { isLogo, cleanseAvatarUrl } from '@/lib/avatarUtils';
-import { getCachedActiveProgram } from '@/lib/cacheStore';
+import { getCachedActiveProgram, getCachedLogs } from '@/lib/cacheStore';
 
 import {
   supabaseApi,
@@ -227,7 +227,6 @@ export default function Profile() {
     setAdjustModalOpen(false);
     setImageToAdjust(null);
     window.dispatchEvent(new CustomEvent('washek_avatar_changed', { detail: { avatarUrl: croppedDataUrl } }));
-    toast.success('Profile picture saved successfully!');
   };
 
   const handleRemoveAvatar = (e) => {
@@ -261,15 +260,26 @@ export default function Profile() {
 
     setAvatarUrl(null);
     window.dispatchEvent(new CustomEvent('washek_avatar_changed', { detail: { avatarUrl: null } }));
-    toast.success('Custom picture removed. Default avatar restored.');
   };
 
 
   useEffect(() => {
     let active = true;
 
+    const storedTok = (() => {
+      try {
+        return localStorage.getItem('washek_auth_token') || '';
+      } catch {
+        return '';
+      }
+    })();
+    const isVaultOnly =
+      storedTok.startsWith('vault_tok_') ||
+      storedTok.startsWith('washek_sess_') ||
+      String(authUser?.id || '').startsWith('usr_');
+
     supabaseApi.auth
-      .me(true)
+      .me(!isVaultOnly)
       .then((currentUser) => {
         if (active && currentUser) {
           if (isLogo(currentUser.avatar_url) || isLogo(currentUser.photo_url)) {
@@ -381,7 +391,7 @@ export default function Profile() {
   } = useQuery({
     queryKey: [
       'logs',
-      user?.email,
+      user?.email || userKey,
     ],
 
     queryFn: () =>
@@ -393,6 +403,8 @@ export default function Profile() {
         999
       ),
 
+    initialData: () => getCachedLogs(user?.email || userKey),
+    staleTime: 5 * 60 * 1000,
     enabled: !!user?.email,
   });
 
@@ -410,9 +422,10 @@ export default function Profile() {
     })()
   ).toLowerCase().trim();
 
-  // Resolve plan strictly respecting authoritative user subscription status
+  // Resolve plan strictly respecting authoritative active subscription status
   const plan = (() => {
-    if (currentSubStatus === 'canceled' || currentSubStatus === 'cancelled' || currentSubStatus === 'inactive') {
+    const isActiveSub = ['active', 'trialing', 'past_due'].includes(currentSubStatus);
+    if (!isActiveSub) {
       return 'free';
     }
 
@@ -420,22 +433,13 @@ export default function Profile() {
       return String(user.subscription_plan).toLowerCase().trim() || 'free';
     }
 
-    try {
-      const storedPlan = localStorage.getItem('washek_subscription_plan');
-      if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
-      const storedUser = localStorage.getItem('washek_user');
-      if (storedUser) {
-        const parsed = JSON.parse(storedUser);
-        const parsedStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
-        if (parsedStatus === 'canceled' || parsedStatus === 'cancelled' || parsedStatus === 'inactive') {
-          return 'free';
-        }
-        if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
-          return parsed.subscription_plan.toLowerCase().trim();
-        }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      try {
+        const storedPlan = localStorage.getItem('washek_subscription_plan');
+        if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
+      } catch {
+        // ignore
       }
-    } catch (_err) {
-      // ignore
     }
     return 'free';
   })();
@@ -443,23 +447,25 @@ export default function Profile() {
   // Listen for real-time subscription plan upgrades / cancellations
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const newPlan = e.detail?.plan;
-      const newStatus = e.detail?.status || (newPlan === 'free' ? 'canceled' : 'active');
-      if (newPlan) {
+      const rawPlan = String(e.detail?.plan || 'free').toLowerCase().trim();
+      const rawStatus = String(e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')).toLowerCase().trim();
+      const isActive = rawPlan !== 'free' && ['active', 'trialing', 'past_due'].includes(rawStatus);
+      const effectivePlan = isActive ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status) {
         setUser((prev) => prev ? {
           ...prev,
-          subscription_plan: newPlan,
-          subscription_status: newStatus,
-          tier: newPlan,
-          plan: newPlan,
+          subscription_plan: effectivePlan,
+          subscription_status: rawStatus,
+          tier: effectivePlan,
+          plan: effectivePlan,
         } : prev);
         if (setAuthUser) {
           setAuthUser((prev) => prev ? {
             ...prev,
-            subscription_plan: newPlan,
-            subscription_status: newStatus,
-            tier: newPlan,
-            plan: newPlan,
+            subscription_plan: effectivePlan,
+            subscription_status: rawStatus,
+            tier: effectivePlan,
+            plan: effectivePlan,
           } : prev);
         }
       }
@@ -469,14 +475,15 @@ export default function Profile() {
   }, [setAuthUser]);
 
   const handlePlanChange = useCallback((newPlan) => {
+    const normalized = String(newPlan || 'free').toLowerCase().trim() || 'free';
     setUser((prev) => {
-      if (!prev || prev.subscription_plan === newPlan) return prev;
+      if (!prev || (prev.subscription_plan === normalized && (normalized !== 'free' || prev.subscription_status === 'canceled'))) return prev;
       return {
         ...prev,
-        subscription_plan: newPlan,
-        subscription_status: newPlan === 'free' ? 'canceled' : (prev.subscription_status || 'active'),
-        tier: newPlan,
-        plan: newPlan,
+        subscription_plan: normalized,
+        subscription_status: normalized === 'free' ? 'canceled' : (['active', 'trialing', 'past_due'].includes(String(prev.subscription_status || '').toLowerCase()) ? prev.subscription_status : 'active'),
+        tier: normalized,
+        plan: normalized,
       };
     });
   }, []);
@@ -497,9 +504,8 @@ export default function Profile() {
     },
     initialData: () => immediateCachedStats || undefined,
     enabled: !!user?.id,
-    staleTime: 0,
-    refetchOnMount: 'always',
-    refetchOnWindowFocus: true,
+    staleTime: 10000,
+    refetchOnWindowFocus: false,
   });
 
   // Listen for real-time quota broadcast events from Kael chat or API

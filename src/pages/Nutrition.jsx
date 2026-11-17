@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 
 import {
   useQuery,
@@ -15,6 +15,7 @@ import {
   Sparkles,
   TrendingUp,
   Activity,
+  Lock,
 } from 'lucide-react';
 
 import { toast } from 'sonner';
@@ -29,6 +30,12 @@ import SavedMealsManager from '@/components/nutrition/SavedMealsManager';
 import PageHeader from '@/components/layout/PageHeader';
 
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
+import {
+  canAccess,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
 import {
   getCachedNutrition,
@@ -94,9 +101,24 @@ export default function Nutrition() {
       });
 
     const handleSubUpdated = (e) => {
-      const newPlan = e.detail?.plan;
-      if (newPlan && active) {
-        setUser((prev) => (prev ? { ...prev, subscription_plan: newPlan, plan: newPlan } : prev));
+      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if ((e.detail?.plan || e.detail?.status) && active) {
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+              }
+            : prev
+        );
       }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
@@ -308,7 +330,6 @@ function getSmartDefaultMeal() {
         return updated;
       });
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
-      toast.success(`Saved "${saved.name || saved.food_name || 'meal'}" to your Saved Meals!`);
     },
     onError: (err) => {
       console.error('[Nutrition] Save to meals failed:', err);
@@ -460,10 +481,6 @@ function getSmartDefaultMeal() {
             'nutrition',
           ],
         });
-
-        toast.success(
-          'Food added!'
-        );
       },
     });
 
@@ -582,10 +599,6 @@ function getSmartDefaultMeal() {
             'nutrition',
           ],
         });
-
-        toast.success(
-          'Food updated!'
-        );
       },
     });
 
@@ -689,10 +702,6 @@ function getSmartDefaultMeal() {
             'nutrition',
           ],
         });
-
-        toast.success(
-          'Food removed.'
-        );
       },
     });
 
@@ -882,66 +891,95 @@ function getSmartDefaultMeal() {
           dark:shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05),0_8px_32px_rgba(0,0,0,0.45)]
         ">
 
-          {/* Adaptive Performance Fueling Banner */}
-          <div className="mb-5 p-4 rounded-xl bg-gradient-to-r from-primary/10 via-amber-500/10 to-primary/5 border border-primary/25 dark:border-primary/20 shadow-2xs">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2.5">
-              <div className="flex items-start sm:items-center gap-2.5">
-                <div className="w-8 h-8 rounded-lg bg-primary/20 border border-primary/30 flex items-center justify-center shrink-0 mt-0.5 sm:mt-0">
-                  <TrendingUp className="w-4 h-4 text-primary" />
-                </div>
-                <div>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <span className="font-heading font-bold text-xs uppercase tracking-wider text-primary">
-                      Adaptive Performance Fueling
-                    </span>
-                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary/15 border border-primary/25 text-primary leading-none">
-                      {goals.adaptation?.demandBadge || goals.adaptation?.demandTier || 'Active Output'}
+          {(() => {
+            const hasAdvancedMacros = canAccess(user, 'advanced_macro_tracking');
+            if (hasAdvancedMacros) {
+              return (
+                <div className="mb-5 p-4 rounded-xl bg-gradient-to-r from-primary/10 via-amber-500/10 to-primary/5 border border-primary/25 dark:border-primary/20 shadow-2xs">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2.5">
+                    <div className="flex items-start sm:items-center gap-2.5">
+                      <div className="w-8 h-8 rounded-lg bg-primary/20 border border-primary/30 flex items-center justify-center shrink-0 mt-0.5 sm:mt-0">
+                        <TrendingUp className="w-4 h-4 text-primary" />
+                      </div>
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-heading font-bold text-xs uppercase tracking-wider text-primary">
+                            Adaptive Performance Fueling
+                          </span>
+                          <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-primary/15 border border-primary/25 text-primary leading-none">
+                            {goals.adaptation?.demandBadge || goals.adaptation?.demandTier || 'Active Output'}
+                          </span>
+                        </div>
+                        <h4 className="text-sm font-bold text-foreground font-heading mt-0.5">
+                          {goals.adaptation?.statusTitle || goals.adaptation?.phaseName || 'Performance Fueling'}
+                        </h4>
+                      </div>
+                    </div>
+
+                    {goals.adaptation?.totalCalorieDelta > 0 ? (
+                      <div className="flex items-center gap-2 self-start sm:self-auto px-3 py-1.5 rounded-lg bg-background/80 dark:bg-card/90 border border-border/80 shadow-2xs text-xs font-semibold">
+                        <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                        <span className="text-foreground">
+                          +{goals.adaptation.totalCalorieDelta} kcal
+                        </span>
+                        <span className="text-muted-foreground">•</span>
+                        <span className="text-blue-500 dark:text-blue-400 font-bold">
+                          +{goals.adaptation.totalProteinDelta}g protein
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex items-center gap-1.5 self-start sm:self-auto px-2.5 py-1 rounded-lg bg-background/60 dark:bg-card/70 border border-border/60 text-[11px] text-muted-foreground">
+                        <span>Basal Recovery (0 surplus kcal)</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    {goals.adaptation?.phaseDescription}
+                  </p>
+
+                  <div className="mt-3 pt-2.5 border-t border-border/60 dark:border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                    <div className="flex items-center gap-2.5 flex-wrap">
+                      <span className="inline-flex items-center gap-1.5">
+                        <Activity className="w-3.5 h-3.5 text-emerald-500" />
+                        Actual 7d Output: <strong className="text-foreground font-semibold">{goals.adaptation?.recentWorkoutsCount || 0} sessions ({goals.adaptation?.recentSetsCount || 0} sets{goals.adaptation?.recentMinutes ? `, ${goals.adaptation.recentMinutes}m` : ''})</strong>
+                      </span>
+                      <span>•</span>
+                      <span>
+                        Total completed: <strong className="text-foreground font-semibold">{goals.adaptation?.totalWorkoutsCount || 0} workouts</strong>
+                      </span>
+                    </div>
+                    <span className="text-primary font-semibold text-[10px] uppercase tracking-wider">
+                      Calibrated to actual output, not ideal schedule
                     </span>
                   </div>
-                  <h4 className="text-sm font-bold text-foreground font-heading mt-0.5">
-                    {goals.adaptation?.statusTitle || goals.adaptation?.phaseName || 'Performance Fueling'}
-                  </h4>
                 </div>
-              </div>
-
-              {goals.adaptation?.totalCalorieDelta > 0 ? (
-                <div className="flex items-center gap-2 self-start sm:self-auto px-3 py-1.5 rounded-lg bg-background/80 dark:bg-card/90 border border-border/80 shadow-2xs text-xs font-semibold">
-                  <Sparkles className="w-3.5 h-3.5 text-amber-500 shrink-0" />
-                  <span className="text-foreground">
-                    +{goals.adaptation.totalCalorieDelta} kcal
-                  </span>
-                  <span className="text-muted-foreground">•</span>
-                  <span className="text-blue-500 dark:text-blue-400 font-bold">
-                    +{goals.adaptation.totalProteinDelta}g protein
-                  </span>
+              );
+            }
+            return (
+              <Link
+                to="/profile"
+                className="mb-5 p-3.5 rounded-xl bg-muted/40 dark:bg-background/40 border border-border/80 dark:border-white/10 hover:border-primary/40 transition-colors flex items-center justify-between gap-3"
+              >
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-lg bg-primary/10 border border-primary/20 flex items-center justify-center shrink-0">
+                    <Lock className="w-4 h-4 text-primary" />
+                  </div>
+                  <div className="min-w-0">
+                    <span className="font-heading font-bold text-xs uppercase tracking-wider text-foreground block">
+                      Adaptive Fueling &amp; Macro Targets
+                    </span>
+                    <p className="text-[11px] text-muted-foreground truncate">
+                      Upgrade to Progress+ to unlock individualized macros &amp; training-output fueling
+                    </p>
+                  </div>
                 </div>
-              ) : (
-                <div className="flex items-center gap-1.5 self-start sm:self-auto px-2.5 py-1 rounded-lg bg-background/60 dark:bg-card/70 border border-border/60 text-[11px] text-muted-foreground">
-                  <span>Basal Recovery (0 surplus kcal)</span>
-                </div>
-              )}
-            </div>
-
-            <p className="text-xs text-muted-foreground leading-relaxed">
-              {goals.adaptation?.phaseDescription}
-            </p>
-
-            <div className="mt-3 pt-2.5 border-t border-border/60 dark:border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
-              <div className="flex items-center gap-2.5 flex-wrap">
-                <span className="inline-flex items-center gap-1.5">
-                  <Activity className="w-3.5 h-3.5 text-emerald-500" />
-                  Actual 7d Output: <strong className="text-foreground font-semibold">{goals.adaptation?.recentWorkoutsCount || 0} sessions ({goals.adaptation?.recentSetsCount || 0} sets{goals.adaptation?.recentMinutes ? `, ${goals.adaptation.recentMinutes}m` : ''})</strong>
+                <span className="text-xs font-semibold text-primary shrink-0">
+                  Upgrade →
                 </span>
-                <span>•</span>
-                <span>
-                  Total completed: <strong className="text-foreground font-semibold">{goals.adaptation?.totalWorkoutsCount || 0} workouts</strong>
-                </span>
-              </div>
-              <span className="text-primary font-semibold text-[10px] uppercase tracking-wider">
-                Calibrated to actual output, not ideal schedule
-              </span>
-            </div>
-          </div>
+              </Link>
+            );
+          })()}
 
           {/* Calorie Overview Header */}
           <div className="
@@ -1017,163 +1055,189 @@ function getSmartDefaultMeal() {
           </div>
 
 
-          {/* Macro Bars - spanning the full width of the box */}
-          <div className="w-full space-y-4">
+          {/* Macro Bars - gated on Progress+ (advanced_macro_tracking) */}
+          {canAccess(user, 'advanced_macro_tracking') ? (
+            <div className="w-full space-y-4">
 
-            {[
-              {
-                label: 'Protein',
-                value: totals.protein,
-                goal: goals.protein,
-                icon: Drumstick,
-                barGradient: 'from-blue-600 via-blue-500 to-sky-400',
-                textColor: 'text-blue-400',
-                badgeBg: 'bg-blue-500/15 border-blue-500/25',
-                glow: 'shadow-[0_0_12px_rgba(59,130,246,0.35)]',
-              },
+              {[
+                {
+                  label: 'Protein',
+                  value: totals.protein,
+                  goal: goals.protein,
+                  icon: Drumstick,
+                  barGradient: 'from-blue-600 via-blue-500 to-sky-400',
+                  textColor: 'text-blue-400',
+                  badgeBg: 'bg-blue-500/15 border-blue-500/25',
+                  glow: 'shadow-[0_0_12px_rgba(59,130,246,0.35)]',
+                },
 
-              {
-                label: 'Carbs',
-                value: totals.carbs,
-                goal: goals.carbs,
-                icon: Wheat,
-                barGradient: 'from-emerald-600 via-emerald-500 to-teal-400',
-                textColor: 'text-emerald-400',
-                badgeBg: 'bg-emerald-500/15 border-emerald-500/25',
-                glow: 'shadow-[0_0_12px_rgba(16,185,129,0.35)]',
-              },
+                {
+                  label: 'Carbs',
+                  value: totals.carbs,
+                  goal: goals.carbs,
+                  icon: Wheat,
+                  barGradient: 'from-emerald-600 via-emerald-500 to-teal-400',
+                  textColor: 'text-emerald-400',
+                  badgeBg: 'bg-emerald-500/15 border-emerald-500/25',
+                  glow: 'shadow-[0_0_12px_rgba(16,185,129,0.35)]',
+                },
 
-              {
-                label: 'Fat',
-                value: totals.fat,
-                goal: goals.fat,
-                icon: Droplets,
-                barGradient: 'from-amber-600 via-amber-500 to-orange-400',
-                textColor: 'text-amber-400',
-                badgeBg: 'bg-amber-500/15 border-amber-500/25',
-                glow: 'shadow-[0_0_12px_rgba(245,158,11,0.35)]',
-              },
-            ].map(
-              ({
-                label,
-                value,
-                goal,
-                icon: Icon,
-                barGradient,
-                textColor,
-                badgeBg,
-                glow,
-              }) => {
-                const safeGoal = Math.max(Number(goal) || 1, 1);
-                const roundedVal = Math.round(Number(value) || 0);
-                const macroProgress = Math.min((Number(value) / safeGoal) * 100, 100);
-                const realPercent = Math.round((Number(value) / safeGoal) * 100);
+                {
+                  label: 'Fat',
+                  value: totals.fat,
+                  goal: goals.fat,
+                  icon: Droplets,
+                  barGradient: 'from-amber-600 via-amber-500 to-orange-400',
+                  textColor: 'text-amber-400',
+                  badgeBg: 'bg-amber-500/15 border-amber-500/25',
+                  glow: 'shadow-[0_0_12px_rgba(245,158,11,0.35)]',
+                },
+              ].map(
+                ({
+                  label,
+                  value,
+                  goal,
+                  icon: Icon,
+                  barGradient,
+                  textColor,
+                  badgeBg,
+                  glow,
+                }) => {
+                  const safeGoal = Math.max(Number(goal) || 1, 1);
+                  const roundedVal = Math.round(Number(value) || 0);
+                  const macroProgress = Math.min((Number(value) / safeGoal) * 100, 100);
+                  const realPercent = Math.round((Number(value) / safeGoal) * 100);
 
-                return (
-                  <div
-                    key={label}
-                    className="w-full"
-                  >
+                  return (
+                    <div
+                      key={label}
+                      className="w-full"
+                    >
 
-                    <div className="
-                      flex
-                      items-center
-                      justify-between
-                      mb-1.5
-                    ">
+                      <div className="
+                        flex
+                        items-center
+                        justify-between
+                        mb-1.5
+                      ">
 
-                      <div className="flex items-center gap-2">
-                        <div className={`
-                          w-5
-                          h-5
-                          rounded-md
-                          flex
-                          items-center
-                          justify-center
-                          border
-                          ${badgeBg}
-                        `}>
-                          <Icon className={`w-3 h-3 ${textColor}`} />
+                        <div className="flex items-center gap-2">
+                          <div className={`
+                            w-5
+                            h-5
+                            rounded-md
+                            flex
+                            items-center
+                            justify-center
+                            border
+                            ${badgeBg}
+                          `}>
+                            <Icon className={`w-3 h-3 ${textColor}`} />
+                          </div>
+
+                          <span className="
+                            font-heading
+                            font-semibold
+                            text-sm
+                            text-foreground
+                            tracking-wide
+                          ">
+                            {label}
+                          </span>
                         </div>
 
-                        <span className="
-                          font-heading
-                          font-semibold
-                          text-sm
-                          text-foreground
-                          tracking-wide
-                        ">
-                          {label}
-                        </span>
-                      </div>
 
-
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs">
-                          <strong className="font-bold text-sm text-foreground">
-                            {roundedVal}g
-                          </strong>
-                          <span className="text-muted-foreground font-normal ml-0.5">
-                            / {goal}g
+                        <div className="flex items-center gap-2">
+                          <span className="text-xs">
+                            <strong className="font-bold text-sm text-foreground">
+                              {roundedVal}g
+                            </strong>
+                            <span className="text-muted-foreground font-normal ml-0.5">
+                              / {goal}g
+                            </span>
                           </span>
-                        </span>
 
-                        <span className={`
-                          text-[10px]
-                          font-bold
-                          px-1.5
-                          py-0.5
-                          rounded-full
-                          border
-                          ${badgeBg}
-                          ${textColor}
-                        `}>
-                          {realPercent}%
-                        </span>
+                          <span className={`
+                            text-[10px]
+                            font-bold
+                            px-1.5
+                            py-0.5
+                            rounded-full
+                            border
+                            ${badgeBg}
+                            ${textColor}
+                          `}>
+                            {realPercent}%
+                          </span>
+                        </div>
+
+                      </div>
+
+
+                      {/* Full-width Macro Bar */}
+                      <div className="
+                        relative
+                        h-3
+                        w-full
+                        bg-slate-100
+                        dark:bg-muted/70
+                        rounded-full
+                        overflow-hidden
+                        border
+                        border-slate-200/80
+                        dark:border-white/[0.06]
+                        p-0.5
+                        shadow-inner
+                      ">
+
+                        <div
+                          className={`
+                            h-full
+                            bg-gradient-to-r
+                            ${barGradient}
+                            rounded-full
+                            transition-all
+                            duration-500
+                            ${macroProgress > 0 ? glow : ''}
+                          `}
+                          style={{
+                            width: `${Math.max(macroProgress, roundedVal > 0 ? 3 : 0)}%`,
+                          }}
+                        />
+
                       </div>
 
                     </div>
+                  );
+                }
+              )}
 
-
-                    {/* Full-width Macro Bar */}
-                    <div className="
-                      relative
-                      h-3
-                      w-full
-                      bg-slate-100
-                      dark:bg-muted/70
-                      rounded-full
-                      overflow-hidden
-                      border
-                      border-slate-200/80
-                      dark:border-white/[0.06]
-                      p-0.5
-                      shadow-inner
-                    ">
-
-                      <div
-                        className={`
-                          h-full
-                          bg-gradient-to-r
-                          ${barGradient}
-                          rounded-full
-                          transition-all
-                          duration-500
-                          ${macroProgress > 0 ? glow : ''}
-                        `}
-                        style={{
-                          width: `${Math.max(macroProgress, roundedVal > 0 ? 3 : 0)}%`,
-                        }}
-                      />
-
-                    </div>
-
+            </div>
+          ) : (
+            <div className="grid grid-cols-3 gap-2.5 pt-1">
+              {[
+                { label: 'Protein', icon: Drumstick, color: 'text-blue-400' },
+                { label: 'Carbs', icon: Wheat, color: 'text-emerald-400' },
+                { label: 'Fat', icon: Droplets, color: 'text-amber-400' },
+              ].map(({ label, icon: Icon, color }) => (
+                <div
+                  key={label}
+                  className="rounded-xl border border-border/70 bg-muted/30 p-3 text-center flex flex-col items-center justify-center gap-1 opacity-75"
+                >
+                  <div className="flex items-center gap-1">
+                    <Icon className={`w-3.5 h-3.5 ${color}`} />
+                    <span className="text-[11px] font-semibold text-muted-foreground">
+                      {label}
+                    </span>
                   </div>
-                );
-              }
-            )}
-
-          </div>
+                  <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+                    <Lock className="w-3 h-3" />
+                    <span>Progress+</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
         </div>
 
@@ -1249,18 +1313,8 @@ function getSmartDefaultMeal() {
                 )
             }
             onSaveToMeals={handleSaveToMeals}
-            userPlan={(() => {
-              const s = String(user?.subscription_status || '').toLowerCase().trim();
-              if (s === 'canceled' || s === 'cancelled' || s === 'inactive') return 'free';
-              if (user?.subscription_plan) return String(user.subscription_plan).toLowerCase().trim();
-              try {
-                const storedS = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-                if (storedS === 'canceled' || storedS === 'cancelled' || storedS === 'inactive') return 'free';
-                return localStorage.getItem('washek_subscription_plan') || 'free';
-              } catch {
-                return 'free';
-              }
-            })()}
+            user={user}
+            userPlan={resolveEffectivePlan(user)}
           />
 
 

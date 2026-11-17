@@ -46,7 +46,7 @@ export default function Terms() {
         </CardHeader>
         <CardContent className="text-sm text-muted-foreground space-y-3 leading-relaxed">
           <p>
-            WASHEK offers tiered subscription access (Free, Progress, Performance, and Elite). Paid tiers are billed on a recurring monthly basis through our payment processor, Stripe.
+            WASHEK offers tiered subscription access (Free, Progress, Performance, and Elite). Paid tiers are billed on a recurring monthly basis through our merchant of record and payment processor, Paddle.
           </p>
           <ul className="space-y-1.5 list-disc list-inside text-xs">
             <li><strong>Monthly Message Quotas:</strong> Reset on the 1st of each calendar month according to your timezone.</li>

@@ -78,6 +78,7 @@ import {
 
 import {
   canAccess,
+  resolveEffectivePlan,
 } from '@/lib/subscription';
 
 import {
@@ -716,38 +717,7 @@ export default function ProgressPhotos() {
      PLAN
      ========================================================== */
 
-  const plan = (() => {
-    const subStatus = String(user?.subscription_status || '').toLowerCase().trim();
-    if (subStatus === 'canceled' || subStatus === 'cancelled' || subStatus === 'inactive') {
-      return 'free';
-    }
-    if (user?.subscription_plan) {
-      return user.subscription_plan.toLowerCase().trim();
-    }
-    try {
-      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
-        return 'free';
-      }
-      const storedPlan = localStorage.getItem('washek_subscription_plan');
-      if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
-      const storedUser = localStorage.getItem('washek_user');
-      if (storedUser) {
-        const parsed = JSON.parse(storedUser);
-        const parsedStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
-        if (parsedStatus === 'canceled' || parsedStatus === 'cancelled' || parsedStatus === 'inactive') {
-          return 'free';
-        }
-        if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
-          return parsed.subscription_plan.toLowerCase().trim();
-        }
-      }
-    } catch (_err) {
-      // ignore
-    }
-    return 'free';
-  })();
-
+  const plan = resolveEffectivePlan(user);
 
   const firstName =
     user?.first_name ||
@@ -758,7 +728,7 @@ export default function ProgressPhotos() {
 
   const canCompare =
     canAccess(
-      plan,
+      user || plan,
       'progress_photos'
     );
 
@@ -819,8 +789,19 @@ export default function ProgressPhotos() {
             let resolved = photo?.resolved_photo_url;
             if (!resolved && candidate && (candidate.startsWith('data:') || candidate.startsWith('blob:'))) {
               resolved = candidate;
+            } else if (candidate && !candidate.startsWith('data:') && !candidate.startsWith('blob:') && !candidate.startsWith('http')) {
+              try {
+                resolved = await supabaseApi.storage.resolveMediaUrl(candidate, 3600);
+              } catch {
+                // ignore storage resolve error
+              }
             }
-            const finalUrl = directUrl || resolved || candidate;
+            const finalUrl =
+              (resolved && (resolved.startsWith('data:') || resolved.startsWith('blob:') || resolved.startsWith('http'))
+                ? resolved
+                : null) ||
+              directUrl ||
+              candidate;
             if (photo?.id && finalUrl && (finalUrl.startsWith('data:') || finalUrl.startsWith('blob:'))) {
               try {
                 localStorage.setItem(`washek_photo_${photo.id}`, finalUrl);
@@ -1058,10 +1039,6 @@ export default function ProgressPhotos() {
               ],
             }
           );
-
-          toast.success(
-            'Photo saved!'
-          );
         },
     });
 
@@ -1098,10 +1075,6 @@ export default function ProgressPhotos() {
                 'progress-photos',
               ],
             }
-          );
-
-          toast.success(
-            'Photo deleted.'
           );
         },
 
@@ -1171,6 +1144,11 @@ export default function ProgressPhotos() {
      ========================================================== */
 
   const handleFileSelected = async (event) => {
+    if (!canCompare) {
+      toast.error('Saving progress photos requires a Progress+ plan.');
+      if (event.target) event.target.value = '';
+      return;
+    }
     const file = event.target?.files?.[0];
     if (!file) return;
 
@@ -1201,6 +1179,10 @@ export default function ProgressPhotos() {
   };
 
   const handleSaveNewPhoto = async ({ date, label, custom_label, tags, weight_lbs }) => {
+    if (!canCompare) {
+      toast.error('Saving progress photos requires a Progress+ plan.');
+      return;
+    }
     if (!pendingFile) return;
 
     setUploading(true);
@@ -1215,7 +1197,10 @@ export default function ProgressPhotos() {
         reader.readAsDataURL(fileToUpload);
       });
 
-      const newPhotoId = `prog_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      const newPhotoId =
+        typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+          ? crypto.randomUUID()
+          : `00000000-0000-4000-a000-${Date.now().toString(16).padStart(12, '0').slice(-12)}`;
       const finalPhotoUrl = durableDataUrl || pendingFilePreview;
 
       if (durableDataUrl) {
@@ -1228,17 +1213,24 @@ export default function ProgressPhotos() {
         }
       }
 
-      // Best-effort remote storage upload if available
+      // Upload to Supabase Storage under progress-photos so it persists until deleted by the user
+      let uploadedPath = null;
+      let uploadedUrl = null;
       try {
-        await supabaseApi.storage.uploadFile({ file: fileToUpload });
-      } catch (_uploadErr) {
-        // Safe to ignore since durableDataUrl is persistent in Firestore & local cache
+        const uploaded = await supabaseApi.storage.uploadFile({
+          file: fileToUpload,
+          folder: 'progress-photos',
+        });
+        uploadedPath = uploaded?.path || null;
+        uploadedUrl = uploaded?.file_url || null;
+      } catch (uploadErr) {
+        console.warn('[ProgressPhotos] Remote storage upload note:', uploadErr?.message || uploadErr);
       }
 
       await createMutation.mutateAsync({
         id: newPhotoId,
-        photo_url: finalPhotoUrl,
-        resolved_photo_url: finalPhotoUrl,
+        photo_url: uploadedPath || finalPhotoUrl,
+        resolved_photo_url: uploadedUrl || finalPhotoUrl,
         created_by: userKey,
         date: date || today,
         created_date: date || today,
@@ -1305,7 +1297,6 @@ export default function ProgressPhotos() {
         }
       }
 
-      toast.success('Photo details & weight updated!');
       setEditingPhoto(null);
     } catch (error) {
       toast.error(error?.message || 'Could not update photo details.');
@@ -1314,7 +1305,6 @@ export default function ProgressPhotos() {
 
   const handleDownloadPhoto = async (url, photo) => {
     try {
-      toast.info('Saving photo to device…');
       const response = await fetch(url);
       const blob = await response.blob();
       const blobUrl = window.URL.createObjectURL(blob);
@@ -1326,12 +1316,10 @@ export default function ProgressPhotos() {
       link.click();
       document.body.removeChild(link);
       window.URL.revokeObjectURL(blobUrl);
-      toast.success('Photo saved to your device!');
     } catch (err) {
       console.warn('[ProgressPhotos] Download note:', err);
       // Direct fallback
       window.open(url, '_blank');
-      toast.success('Photo opened to save!');
     }
   };
 
@@ -1602,10 +1590,6 @@ insights must contain personalized coaching analysis.
           ...previous,
           [photo.id]: false,
         }));
-
-        toast.success(
-          'Analysis complete!'
-        );
       } catch (
         error
       ) {
@@ -1682,8 +1666,6 @@ insights must contain personalized coaching analysis.
         ...previous,
         [photo.id]: '',
       }));
-
-      toast.success('Weight logged!');
     } catch (error) {
       toast.error(error?.message || 'Weight could not be saved.');
     }
@@ -1703,7 +1685,8 @@ insights must contain personalized coaching analysis.
 
   const handleConfirmDelete = async () => {
     if (!photoToDelete?.id) return;
-    const id = photoToDelete.id;
+    const target = photoToDelete;
+    const id = target.id;
     setPhotoToDelete(null);
 
     if (lightboxPhoto?.id === id) {
@@ -1722,6 +1705,10 @@ insights must contain personalized coaching analysis.
         delete next[id];
         return next;
       });
+      const remoteCandidate = target.storage_path || target.path || target.photo_url;
+      if (remoteCandidate && !String(remoteCandidate).startsWith('data:') && !String(remoteCandidate).startsWith('blob:')) {
+        supabaseApi.storage.deleteFile?.(remoteCandidate).catch(() => {});
+      }
       await deleteMutation.mutateAsync(id);
     } catch {
       // Handled in onError
@@ -2622,30 +2609,38 @@ insights must contain personalized coaching analysis.
 
             <button
               type="button"
-              className="
-                flex
-                flex-col
-                items-center
-                gap-2
-                p-4
-                rounded-2xl
-                border-2
-                border-dashed
-                border-border
-                bg-card
-                hover:border-primary/50
-                transition-colors
-              "
-              onClick={() =>
-                cameraInputRef.current?.click()
-              }
+              className={cn(
+                `
+                  flex
+                  flex-col
+                  items-center
+                  gap-2
+                  p-4
+                  rounded-2xl
+                  border-2
+                  border-dashed
+                  border-border
+                  bg-card
+                  transition-colors
+                `,
+                canCompare
+                  ? 'hover:border-primary/50'
+                  : 'opacity-70 cursor-pointer'
+              )}
+              onClick={() => {
+                if (!canCompare) {
+                  toast.error('Saving progress photos requires a Progress+ plan. Upgrade in Profile.');
+                  return;
+                }
+                cameraInputRef.current?.click();
+              }}
             >
 
-              <Camera className="
-                w-5
-                h-5
-                text-primary
-              " />
+              {canCompare ? (
+                <Camera className="w-5 h-5 text-primary" />
+              ) : (
+                <Lock className="w-5 h-5 text-muted-foreground" />
+              )}
 
               <span className="
                 font-medium
@@ -2654,35 +2649,49 @@ insights must contain personalized coaching analysis.
                 Take Photo
               </span>
 
+              {!canCompare && (
+                <span className="text-[10px] font-bold text-muted-foreground">
+                  Progress+
+                </span>
+              )}
+
             </button>
 
 
             <button
               type="button"
-              className="
-                flex
-                flex-col
-                items-center
-                gap-2
-                p-4
-                rounded-2xl
-                border-2
-                border-dashed
-                border-border
-                bg-card
-                hover:border-primary/50
-                transition-colors
-              "
-              onClick={() =>
-                galleryInputRef.current?.click()
-              }
+              className={cn(
+                `
+                  flex
+                  flex-col
+                  items-center
+                  gap-2
+                  p-4
+                  rounded-2xl
+                  border-2
+                  border-dashed
+                  border-border
+                  bg-card
+                  transition-colors
+                `,
+                canCompare
+                  ? 'hover:border-primary/50'
+                  : 'opacity-70 cursor-pointer'
+              )}
+              onClick={() => {
+                if (!canCompare) {
+                  toast.error('Saving progress photos requires a Progress+ plan. Upgrade in Profile.');
+                  return;
+                }
+                galleryInputRef.current?.click();
+              }}
             >
 
-              <ImageIcon className="
-                w-5
-                h-5
-                text-accent
-              " />
+              {canCompare ? (
+                <ImageIcon className="w-5 h-5 text-accent" />
+              ) : (
+                <Lock className="w-5 h-5 text-muted-foreground" />
+              )}
 
               <span className="
                 font-medium
@@ -2690,6 +2699,12 @@ insights must contain personalized coaching analysis.
               ">
                 Upload Photo
               </span>
+
+              {!canCompare && (
+                <span className="text-[10px] font-bold text-muted-foreground">
+                  Progress+
+                </span>
+              )}
 
             </button>
 
@@ -2710,7 +2725,7 @@ insights must contain personalized coaching analysis.
             handleFileSelected
           }
           disabled={
-            uploading
+            uploading || !canCompare
           }
         />
 
@@ -2726,7 +2741,7 @@ insights must contain personalized coaching analysis.
             handleFileSelected
           }
           disabled={
-            uploading
+            uploading || !canCompare
           }
         />
 

@@ -31,7 +31,12 @@ import {
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
-import { hasPlan } from '@/lib/subscription';
+import {
+  hasPlan,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { build12WeekMicrocycles, WEEK_CONFIGS } from '@/lib/periodizationEngine';
 import { toast } from 'sonner';
@@ -477,7 +482,6 @@ export default function WeeklyPlan({
         microcycles: full12Weeks,
         duration_weeks: 12,
       });
-      toast.success('Generated full 12-week periodized program!');
       window.location.reload();
     } catch (err) {
       console.error('[WeeklyPlan] Failed to generate 12 weeks:', err);
@@ -544,10 +548,7 @@ export default function WeeklyPlan({
           return;
         }
 
-        setUserPlan(
-          user?.subscription_plan ||
-            'free'
-        );
+        setUserPlan(resolveEffectivePlan(user));
       })
       .catch((error) => {
         console.error(
@@ -563,8 +564,12 @@ export default function WeeklyPlan({
 
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const p = e.detail?.plan;
-      if (p) setUserPlan(p);
+      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      setUserPlan(activeSub ? rawPlan : 'free');
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
     return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);

@@ -497,6 +497,19 @@ async function compressImageForAI(file, maxDimension = 1280, quality = 0.82) {
   });
 }
 
+function readFileAsDataUrl(file) {
+  return new Promise((resolve) => {
+    try {
+      const reader = new FileReader();
+      reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    } catch {
+      resolve(null);
+    }
+  });
+}
+
 /*
  * ============================================================
  * PROMPTS
@@ -607,6 +620,7 @@ ${buildMemoryContext()}
 export default function FoodScanner({
   onFoodDetected,
   onSaveToMeals,
+  user = null,
   userPlan = 'free',
   defaultMealType = 'breakfast',
 }) {
@@ -656,13 +670,13 @@ export default function FoodScanner({
 
   const snapLocked =
     !canAccess(
-      userPlan,
+      user || userPlan,
       'snap_food'
     );
 
   const barcodeLocked =
     !canAccess(
-      userPlan,
+      user || userPlan,
       'scan_barcode'
     );
 
@@ -773,17 +787,10 @@ export default function FoodScanner({
         }
 
 
-        // Fast client compression for instant AI transfer while maintaining 100% nutritional accuracy
-        const fastDataUrl = await compressImageForAI(file, 1280, 0.82);
-
-        let imageUrl = fastDataUrl;
-        if (!imageUrl) {
-          const uploaded = await supabaseApi.storage.uploadFile({ file });
-          imageUrl = uploaded?.file_url;
-        } else {
-          // Asynchronously persist to storage without holding up AI response
-          supabaseApi.storage.uploadFile({ file }).catch((e) => console.warn('[FoodScanner] Background upload:', e));
-        }
+        // Compress in-browser for instant AI analysis; never persist food photos to Supabase Storage
+        const imageUrl =
+          (await compressImageForAI(file, 1280, 0.82)) ||
+          (await readFileAsDataUrl(file));
 
         if (!imageUrl) {
           throw new Error('The food photo could not be prepared.');
@@ -967,17 +974,10 @@ export default function FoodScanner({
         }
 
 
-        // High-clarity client compression for instant package/label recognition
-        const fastDataUrl = await compressImageForAI(file, 1400, 0.85);
-
-        let imageUrl = fastDataUrl;
-        if (!imageUrl) {
-          const uploaded = await supabaseApi.storage.uploadFile({ file });
-          imageUrl = uploaded?.file_url;
-        } else {
-          // Asynchronously persist to storage without holding up AI response
-          supabaseApi.storage.uploadFile({ file }).catch((e) => console.warn('[FoodScanner] Background upload:', e));
-        }
+        // Compress in-browser for instant label analysis; never persist package photos to Supabase Storage
+        const imageUrl =
+          (await compressImageForAI(file, 1400, 0.85)) ||
+          (await readFileAsDataUrl(file));
 
         if (!imageUrl) {
           throw new Error('The package photo could not be prepared.');

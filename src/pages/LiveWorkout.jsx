@@ -2,7 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
-import { canAccess } from '@/lib/subscription';
+import {
+  canAccess,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+} from '@/lib/subscription';
 import { applyPostWorkoutAdaptation } from '@/lib/periodizationEngine';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 import { getCachedActiveProgram, getCachedProgramsList, setCachedProgramsList } from '@/lib/cacheStore';
@@ -349,10 +353,6 @@ function MovementBaseline({ trainingType }) {
       queryKey: ['baselines'],
     });
 
-    toast.success(
-      'Baseline saved! Kael will use this to adjust your workouts.'
-    );
-
     setSaving(false);
   };
 
@@ -687,8 +687,6 @@ Return ONLY JSON:
       );
 
       setFeedback('');
-
-      toast.success('Kael adjusted your workout in real time.');
     } catch (error) {
       console.error(
         'Live workout adjustment failed:',
@@ -1127,8 +1125,30 @@ export default function LiveWorkout() {
     }).catch(() => {});
 
     const handleSubUpdated = (e) => {
-      const p = e.detail?.plan;
-      if (p) setUser((prev) => (prev ? { ...prev, subscription_plan: p } : { subscription_plan: p }));
+      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status) {
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+              }
+            : {
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+              }
+        );
+      }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
     return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
@@ -1341,12 +1361,12 @@ export default function LiveWorkout() {
     Number(exercise?.rest_seconds) || 60;
 
   const canAdjust = canAccess(
-    user?.subscription_plan,
+    user,
     'live_workout_adjustments'
   );
 
   const canAdapt = canAccess(
-    user?.subscription_plan,
+    user,
     'adaptive_programming'
   );
 
@@ -1409,10 +1429,6 @@ export default function LiveWorkout() {
       setExIndex(i => i + 1);
       setSetIndex(0);
       setResting(false);
-
-      toast.success(
-        'Next exercise! 🔥'
-      );
     } else {
       finishWorkout();
     }
@@ -1459,10 +1475,6 @@ export default function LiveWorkout() {
         seconds / 60
       ),
     });
-
-    toast.success(
-      'Workout done! Amazing work. 💪'
-    );
   };
 
   if (!program || days.length === 0) {

@@ -36,7 +36,12 @@ import VideoInput from '@/components/formlab/VideoInput';
 
 import AnalysisResults from '@/components/formlab/AnalysisResults';
 import PageHeader from '@/components/layout/PageHeader';
-import { hasPlan } from '@/lib/subscription';
+import {
+  hasPlan,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
 
 import {
   Input,
@@ -1137,48 +1142,33 @@ export default function FormLab() {
 
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const p = e.detail?.plan;
-      if (p) {
-        setUser((prev) => (prev ? { ...prev, subscription_plan: p } : prev));
+      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status) {
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+              }
+            : prev
+        );
       }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
     return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
   }, []);
 
-  const plan = (() => {
-    const subStatus = String(user?.subscription_status || '').toLowerCase().trim();
-    if (subStatus === 'canceled' || subStatus === 'cancelled' || subStatus === 'inactive') {
-      return 'free';
-    }
-    if (user?.subscription_plan) {
-      return user.subscription_plan.toLowerCase().trim();
-    }
-    try {
-      const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus === 'canceled' || storedStatus === 'cancelled' || storedStatus === 'inactive') {
-        return 'free';
-      }
-      const storedPlan = localStorage.getItem('washek_subscription_plan');
-      if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
-      const storedUser = localStorage.getItem('washek_user');
-      if (storedUser) {
-        const parsed = JSON.parse(storedUser);
-        const parsedStatus = String(parsed?.subscription_status || '').toLowerCase().trim();
-        if (parsedStatus === 'canceled' || parsedStatus === 'cancelled' || parsedStatus === 'inactive') {
-          return 'free';
-        }
-        if (parsed?.subscription_plan && parsed.subscription_plan !== 'free') {
-          return parsed.subscription_plan.toLowerCase().trim();
-        }
-      }
-    } catch (_err) {
-      // ignore
-    }
-    return 'free';
-  })();
+  const plan = resolveEffectivePlan(user);
 
-  const isElite = hasPlan(plan, 'elite');
+  const isElite = hasPlan(user || plan, 'elite');
 
   const selectedEx =
     FORM_EXERCISES.find(
@@ -1297,21 +1287,10 @@ export default function FormLab() {
           );
         }
 
-        // Instant local preview object URL - instantaneous playback and scrub, zero latency, never fails
+        // Instant local preview object URL - instantaneous playback and scrub, zero latency, no cloud video storage
         const localBlobUrl = URL.createObjectURL(file);
         setVideoUrl(localBlobUrl);
         setVideoPath(`local/${file.name}`);
-
-        // Non-blocking background upload for optional cloud storage
-        supabaseApi.storage.uploadFile({ file, folder: 'form-analysis' })
-          .then((uploaded) => {
-            if (uploaded?.path) {
-              setVideoPath(uploaded.path);
-            }
-          })
-          .catch((storageErr) => {
-            console.debug('[FormLab] Optional background video backup note:', storageErr?.message || storageErr);
-          });
 
         const nextParams =
           new URLSearchParams(
@@ -1736,7 +1715,7 @@ export default function FormLab() {
             {
               video_url:
                 videoPath ||
-                videoUrl,
+                null,
 
               exercise_name:
                 exercise,

@@ -23,7 +23,7 @@ import {
 import { Card } from '@/components/ui/card';
 import PageHeader from '@/components/layout/PageHeader';
 import { supabaseApi } from '@/lib/supabaseApi';
-import { canAccess } from '@/lib/subscription';
+import { canAccess, resolveEffectivePlan } from '@/lib/subscription';
 import { calcStreak } from '@/lib/streakUtils';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 import { useAppSettings } from '@/lib/AppSettingsContext';
@@ -105,24 +105,9 @@ export default function Progress() {
   const effectiveUser = user || storedUser;
   const email = effectiveUser?.email;
   const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
-  const plan = (() => {
-    const s = String(effectiveUser?.subscription_status || '').toLowerCase().trim();
-    if (s === 'canceled' || s === 'cancelled' || s === 'inactive') {
-      return 'free';
-    }
-    if (effectiveUser?.subscription_plan) {
-      return String(effectiveUser.subscription_plan).toLowerCase().trim();
-    }
-    try {
-      const storedS = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedS === 'canceled' || storedS === 'cancelled' || storedS === 'inactive') return 'free';
-      return localStorage.getItem('washek_subscription_plan') || 'free';
-    } catch {
-      return 'free';
-    }
-  })();
+  const plan = resolveEffectivePlan(effectiveUser);
   const hasWorkoutAnalytics = canAccess(
-    plan,
+    effectiveUser || plan,
     'workout_analytics'
   );
 

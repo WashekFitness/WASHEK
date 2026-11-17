@@ -135,10 +135,6 @@ export default function Program() {
               ],
             }
           );
-
-          toast.success(
-            'Workout logged! Great job 💪'
-          );
         },
 
       onError:

@@ -83,7 +83,6 @@ export default function SavedMealsManager({
       queryClient.setQueryData(['saved_meals', userKey], updateFn);
       queryClient.setQueryData(['saved_meals'], updateFn);
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
-      toast.success(`Saved "${saved.name || 'meal'}" to your library!`);
       setIsCreating(false);
       resetForm();
     },
@@ -102,7 +101,6 @@ export default function SavedMealsManager({
       queryClient.setQueryData(['saved_meals', userKey], updateFn);
       queryClient.setQueryData(['saved_meals'], updateFn);
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
-      toast.success(`Updated "${updated.name}" macros!`);
       setEditingMeal(null);
       resetForm();
     },
@@ -120,7 +118,6 @@ export default function SavedMealsManager({
       queryClient.setQueryData(['saved_meals', userKey], filterFn);
       queryClient.setQueryData(['saved_meals'], filterFn);
       queryClient.invalidateQueries({ queryKey: ['saved_meals'] });
-      toast.success('Removed from saved meals.');
     },
     onError: (err) => {
       console.error('[SavedMealsManager] Delete error:', err);
@@ -201,7 +198,6 @@ export default function SavedMealsManager({
       carbs_g: Number(meal.carbs_g) || 0,
       fat_g: Number(meal.fat_g) || 0,
     });
-    toast.success(`Logged "${meal.name}" to ${targetMeal}!`);
     if (onClose && isModal) {
       onClose();
     }

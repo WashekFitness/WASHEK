@@ -435,20 +435,6 @@ Deno.serve(
       let profile: any = null;
       if (effectiveUserId) {
         profile = await getProfile(effectiveUserId);
-      } else if (explicitEmail) {
-        const { data: p } = await supabaseAdmin
-          .from('profiles')
-          .select(`
-            id,
-            stripe_customer_id,
-            stripe_subscription_id,
-            stripe_price_id,
-            subscription_plan,
-            subscription_status
-          `)
-          .eq('email', explicitEmail)
-          .maybeSingle();
-        profile = p;
       }
 
       if (!profile) {
@@ -575,15 +561,20 @@ Deno.serve(
        */
 
       const stripeCustomerId =
-        typeof subscription?.customer ===
-        'string'
+        typeof subscription?.customer === 'string'
           ? subscription.customer
-          : null;
+          : subscription?.customer?.id || null;
 
-      if (
-        subscription &&
-        (!stripeCustomerId || stripeCustomerId !== customerId)
-      ) {
+      const metadataUserId =
+        subscription?.metadata?.user_id ||
+        subscription?.metadata?.supabase_user_id ||
+        null;
+
+      const ownershipValid =
+        (stripeCustomerId && stripeCustomerId === customerId) ||
+        (metadataUserId && metadataUserId === profile.id);
+
+      if (subscription && !ownershipValid) {
         console.error(
           '[CANCEL] Stripe ownership mismatch:',
           {
@@ -591,6 +582,7 @@ Deno.serve(
             profileCustomerId:
               customerId,
             stripeCustomerId,
+            metadataUserId,
             subscriptionId,
           }
         );
