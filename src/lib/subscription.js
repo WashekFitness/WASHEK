@@ -263,7 +263,7 @@ export const FEATURE_PLANS = {
     'progress',
 
   /**
-   * Save progress photos.
+   * Compare progress photos side by side.
    */
   progress_photos:
     'progress',
@@ -284,7 +284,7 @@ export const FEATURE_PLANS = {
     'progress',
 
   /**
-   * Macro tracking beyond simple food entry.
+   * Workout-adaptive calorie & macro fueling (beyond basic daily macro logging & targets).
    */
   advanced_macro_tracking:
     'progress',

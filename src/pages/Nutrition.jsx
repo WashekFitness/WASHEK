@@ -777,9 +777,18 @@ function getSmartDefaultMeal() {
     );
 
 
+  const hasAdaptiveMacros = canAccess(
+    user,
+    'advanced_macro_tracking'
+  );
+
+  const effectiveGoals = hasAdaptiveMacros
+    ? goals
+    : (goals?.base || goals);
+
   const calorieGoal =
     Number(
-      goals?.calories
+      effectiveGoals?.calories
     ) || 1;
 
 
@@ -892,8 +901,7 @@ function getSmartDefaultMeal() {
         ">
 
           {(() => {
-            const hasAdvancedMacros = canAccess(user, 'advanced_macro_tracking');
-            if (hasAdvancedMacros) {
+            if (hasAdaptiveMacros) {
               return (
                 <div className="mb-5 p-4 rounded-xl bg-gradient-to-r from-primary/10 via-amber-500/10 to-primary/5 border border-primary/25 dark:border-primary/20 shadow-2xs">
                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-2.5">
@@ -967,10 +975,10 @@ function getSmartDefaultMeal() {
                   </div>
                   <div className="min-w-0">
                     <span className="font-heading font-bold text-xs uppercase tracking-wider text-foreground block">
-                      Adaptive Fueling &amp; Macro Targets
+                      Adaptive Performance Fueling
                     </span>
                     <p className="text-[11px] text-muted-foreground truncate">
-                      Upgrade to Progress+ to unlock individualized macros &amp; training-output fueling
+                      Upgrade to Progress+ for training-output calorie &amp; macro adjustments
                     </p>
                   </div>
                 </div>
@@ -1055,189 +1063,163 @@ function getSmartDefaultMeal() {
           </div>
 
 
-          {/* Macro Bars - gated on Progress+ (advanced_macro_tracking) */}
-          {canAccess(user, 'advanced_macro_tracking') ? (
-            <div className="w-full space-y-4">
+          {/* Macro Bars - visible on all plans (uses baseline targets on Free, workout-adaptive targets on Progress+) */}
+          <div className="w-full space-y-4">
 
-              {[
-                {
-                  label: 'Protein',
-                  value: totals.protein,
-                  goal: goals.protein,
-                  icon: Drumstick,
-                  barGradient: 'from-blue-600 via-blue-500 to-sky-400',
-                  textColor: 'text-blue-400',
-                  badgeBg: 'bg-blue-500/15 border-blue-500/25',
-                  glow: 'shadow-[0_0_12px_rgba(59,130,246,0.35)]',
-                },
+            {[
+              {
+                label: 'Protein',
+                value: totals.protein,
+                goal: effectiveGoals.protein,
+                icon: Drumstick,
+                barGradient: 'from-blue-600 via-blue-500 to-sky-400',
+                textColor: 'text-blue-400',
+                badgeBg: 'bg-blue-500/15 border-blue-500/25',
+                glow: 'shadow-[0_0_12px_rgba(59,130,246,0.35)]',
+              },
 
-                {
-                  label: 'Carbs',
-                  value: totals.carbs,
-                  goal: goals.carbs,
-                  icon: Wheat,
-                  barGradient: 'from-emerald-600 via-emerald-500 to-teal-400',
-                  textColor: 'text-emerald-400',
-                  badgeBg: 'bg-emerald-500/15 border-emerald-500/25',
-                  glow: 'shadow-[0_0_12px_rgba(16,185,129,0.35)]',
-                },
+              {
+                label: 'Carbs',
+                value: totals.carbs,
+                goal: effectiveGoals.carbs,
+                icon: Wheat,
+                barGradient: 'from-emerald-600 via-emerald-500 to-teal-400',
+                textColor: 'text-emerald-400',
+                badgeBg: 'bg-emerald-500/15 border-emerald-500/25',
+                glow: 'shadow-[0_0_12px_rgba(16,185,129,0.35)]',
+              },
 
-                {
-                  label: 'Fat',
-                  value: totals.fat,
-                  goal: goals.fat,
-                  icon: Droplets,
-                  barGradient: 'from-amber-600 via-amber-500 to-orange-400',
-                  textColor: 'text-amber-400',
-                  badgeBg: 'bg-amber-500/15 border-amber-500/25',
-                  glow: 'shadow-[0_0_12px_rgba(245,158,11,0.35)]',
-                },
-              ].map(
-                ({
-                  label,
-                  value,
-                  goal,
-                  icon: Icon,
-                  barGradient,
-                  textColor,
-                  badgeBg,
-                  glow,
-                }) => {
-                  const safeGoal = Math.max(Number(goal) || 1, 1);
-                  const roundedVal = Math.round(Number(value) || 0);
-                  const macroProgress = Math.min((Number(value) / safeGoal) * 100, 100);
-                  const realPercent = Math.round((Number(value) / safeGoal) * 100);
+              {
+                label: 'Fat',
+                value: totals.fat,
+                goal: effectiveGoals.fat,
+                icon: Droplets,
+                barGradient: 'from-amber-600 via-amber-500 to-orange-400',
+                textColor: 'text-amber-400',
+                badgeBg: 'bg-amber-500/15 border-amber-500/25',
+                glow: 'shadow-[0_0_12px_rgba(245,158,11,0.35)]',
+              },
+            ].map(
+              ({
+                label,
+                value,
+                goal,
+                icon: Icon,
+                barGradient,
+                textColor,
+                badgeBg,
+                glow,
+              }) => {
+                const safeGoal = Math.max(Number(goal) || 1, 1);
+                const roundedVal = Math.round(Number(value) || 0);
+                const macroProgress = Math.min((Number(value) / safeGoal) * 100, 100);
+                const realPercent = Math.round((Number(value) / safeGoal) * 100);
 
-                  return (
-                    <div
-                      key={label}
-                      className="w-full"
-                    >
+                return (
+                  <div
+                    key={label}
+                    className="w-full"
+                  >
 
-                      <div className="
-                        flex
-                        items-center
-                        justify-between
-                        mb-1.5
-                      ">
+                    <div className="
+                      flex
+                      items-center
+                      justify-between
+                      mb-1.5
+                    ">
 
-                        <div className="flex items-center gap-2">
-                          <div className={`
-                            w-5
-                            h-5
-                            rounded-md
-                            flex
-                            items-center
-                            justify-center
-                            border
-                            ${badgeBg}
-                          `}>
-                            <Icon className={`w-3 h-3 ${textColor}`} />
-                          </div>
-
-                          <span className="
-                            font-heading
-                            font-semibold
-                            text-sm
-                            text-foreground
-                            tracking-wide
-                          ">
-                            {label}
-                          </span>
+                      <div className="flex items-center gap-2">
+                        <div className={`
+                          w-5
+                          h-5
+                          rounded-md
+                          flex
+                          items-center
+                          justify-center
+                          border
+                          ${badgeBg}
+                        `}>
+                          <Icon className={`w-3 h-3 ${textColor}`} />
                         </div>
 
-
-                        <div className="flex items-center gap-2">
-                          <span className="text-xs">
-                            <strong className="font-bold text-sm text-foreground">
-                              {roundedVal}g
-                            </strong>
-                            <span className="text-muted-foreground font-normal ml-0.5">
-                              / {goal}g
-                            </span>
-                          </span>
-
-                          <span className={`
-                            text-[10px]
-                            font-bold
-                            px-1.5
-                            py-0.5
-                            rounded-full
-                            border
-                            ${badgeBg}
-                            ${textColor}
-                          `}>
-                            {realPercent}%
-                          </span>
-                        </div>
-
+                        <span className="
+                          font-heading
+                          font-semibold
+                          text-sm
+                          text-foreground
+                          tracking-wide
+                        ">
+                          {label}
+                        </span>
                       </div>
 
 
-                      {/* Full-width Macro Bar */}
-                      <div className="
-                        relative
-                        h-3
-                        w-full
-                        bg-slate-100
-                        dark:bg-muted/70
-                        rounded-full
-                        overflow-hidden
-                        border
-                        border-slate-200/80
-                        dark:border-white/[0.06]
-                        p-0.5
-                        shadow-inner
-                      ">
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs">
+                          <strong className="font-bold text-sm text-foreground">
+                            {roundedVal}g
+                          </strong>
+                          <span className="text-muted-foreground font-normal ml-0.5">
+                            / {goal}g
+                          </span>
+                        </span>
 
-                        <div
-                          className={`
-                            h-full
-                            bg-gradient-to-r
-                            ${barGradient}
-                            rounded-full
-                            transition-all
-                            duration-500
-                            ${macroProgress > 0 ? glow : ''}
-                          `}
-                          style={{
-                            width: `${Math.max(macroProgress, roundedVal > 0 ? 3 : 0)}%`,
-                          }}
-                        />
-
+                        <span className={`
+                          text-[10px]
+                          font-bold
+                          px-1.5
+                          py-0.5
+                          rounded-full
+                          border
+                          ${badgeBg}
+                          ${textColor}
+                        `}>
+                          {realPercent}%
+                        </span>
                       </div>
 
                     </div>
-                  );
-                }
-              )}
 
-            </div>
-          ) : (
-            <div className="grid grid-cols-3 gap-2.5 pt-1">
-              {[
-                { label: 'Protein', icon: Drumstick, color: 'text-blue-400' },
-                { label: 'Carbs', icon: Wheat, color: 'text-emerald-400' },
-                { label: 'Fat', icon: Droplets, color: 'text-amber-400' },
-              ].map(({ label, icon: Icon, color }) => (
-                <div
-                  key={label}
-                  className="rounded-xl border border-border/70 bg-muted/30 p-3 text-center flex flex-col items-center justify-center gap-1 opacity-75"
-                >
-                  <div className="flex items-center gap-1">
-                    <Icon className={`w-3.5 h-3.5 ${color}`} />
-                    <span className="text-[11px] font-semibold text-muted-foreground">
-                      {label}
-                    </span>
+
+                    {/* Full-width Macro Bar */}
+                    <div className="
+                      relative
+                      h-3
+                      w-full
+                      bg-slate-100
+                      dark:bg-muted/70
+                      rounded-full
+                      overflow-hidden
+                      border
+                      border-slate-200/80
+                      dark:border-white/[0.06]
+                      p-0.5
+                      shadow-inner
+                    ">
+
+                      <div
+                        className={`
+                          h-full
+                          bg-gradient-to-r
+                          ${barGradient}
+                          rounded-full
+                          transition-all
+                          duration-500
+                          ${macroProgress > 0 ? glow : ''}
+                        `}
+                        style={{
+                          width: `${Math.max(macroProgress, roundedVal > 0 ? 3 : 0)}%`,
+                        }}
+                      />
+
+                    </div>
+
                   </div>
-                  <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-                    <Lock className="w-3 h-3" />
-                    <span>Progress+</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
+                );
+              }
+            )}
+
+          </div>
 
         </div>
 

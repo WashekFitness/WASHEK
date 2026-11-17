@@ -49,7 +49,12 @@ function parseArg(flag: string): string | null {
 
 const cliPort = parseArg('--port') || parseArg('-p');
 const cliHost = parseArg('--host') || parseArg('-h');
-const PORT = parseInt(cliPort || process.env.PORT || '3000', 10);
+const PORT = parseInt(
+  cliPort ||
+    (process.env.NODE_ENV === 'production' ? process.env.PORT : '') ||
+    '3000',
+  10
+);
 const HOST = cliHost || process.env.HOST || '0.0.0.0';
 
 // Body parsers with generous limits + rawBody capture for Paddle webhook signature verification
@@ -3743,6 +3748,7 @@ async function startServer() {
         server: {
           middlewareMode: true,
           hmr: false,
+          ws: false,
         },
         appType: 'spa',
       });

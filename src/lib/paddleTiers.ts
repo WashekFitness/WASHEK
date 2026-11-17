@@ -21,8 +21,8 @@ export const PADDLE_TIERS: Tier[] = [
       'Full custom workout adjustments',
       'Adaptive programming — calibrated from your workout performance',
       'Food & package nutrition scan',
-      'Advanced macro tracking',
-      'Save & compare progress photos',
+      'Adaptive calorie & macro fueling',
+      'Compare progress photos side-by-side',
     ],
     productId: 'pro_01m7j8yvn5p9qk5kpzab25s43d',
     priceId: {

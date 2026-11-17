@@ -1144,11 +1144,6 @@ export default function ProgressPhotos() {
      ========================================================== */
 
   const handleFileSelected = async (event) => {
-    if (!canCompare) {
-      toast.error('Saving progress photos requires a Progress+ plan.');
-      if (event.target) event.target.value = '';
-      return;
-    }
     const file = event.target?.files?.[0];
     if (!file) return;
 
@@ -1179,10 +1174,6 @@ export default function ProgressPhotos() {
   };
 
   const handleSaveNewPhoto = async ({ date, label, custom_label, tags, weight_lbs }) => {
-    if (!canCompare) {
-      toast.error('Saving progress photos requires a Progress+ plan.');
-      return;
-    }
     if (!pendingFile) return;
 
     setUploading(true);
@@ -2484,7 +2475,7 @@ insights must contain personalized coaching analysis.
             ? '✓'
             : '🔒'}{' '}
 
-          Photo save & compare —
+          Compare photos —
           Progress+
 
         </span>
@@ -2609,38 +2600,25 @@ insights must contain personalized coaching analysis.
 
             <button
               type="button"
-              className={cn(
-                `
-                  flex
-                  flex-col
-                  items-center
-                  gap-2
-                  p-4
-                  rounded-2xl
-                  border-2
-                  border-dashed
-                  border-border
-                  bg-card
-                  transition-colors
-                `,
-                canCompare
-                  ? 'hover:border-primary/50'
-                  : 'opacity-70 cursor-pointer'
-              )}
-              onClick={() => {
-                if (!canCompare) {
-                  toast.error('Saving progress photos requires a Progress+ plan. Upgrade in Profile.');
-                  return;
-                }
-                cameraInputRef.current?.click();
-              }}
+              className="
+                flex
+                flex-col
+                items-center
+                gap-2
+                p-4
+                rounded-2xl
+                border-2
+                border-dashed
+                border-border
+                bg-card
+                transition-colors
+                hover:border-primary/50
+                cursor-pointer
+              "
+              onClick={() => cameraInputRef.current?.click()}
             >
 
-              {canCompare ? (
-                <Camera className="w-5 h-5 text-primary" />
-              ) : (
-                <Lock className="w-5 h-5 text-muted-foreground" />
-              )}
+              <Camera className="w-5 h-5 text-primary" />
 
               <span className="
                 font-medium
@@ -2649,49 +2627,30 @@ insights must contain personalized coaching analysis.
                 Take Photo
               </span>
 
-              {!canCompare && (
-                <span className="text-[10px] font-bold text-muted-foreground">
-                  Progress+
-                </span>
-              )}
-
             </button>
 
 
             <button
               type="button"
-              className={cn(
-                `
-                  flex
-                  flex-col
-                  items-center
-                  gap-2
-                  p-4
-                  rounded-2xl
-                  border-2
-                  border-dashed
-                  border-border
-                  bg-card
-                  transition-colors
-                `,
-                canCompare
-                  ? 'hover:border-primary/50'
-                  : 'opacity-70 cursor-pointer'
-              )}
-              onClick={() => {
-                if (!canCompare) {
-                  toast.error('Saving progress photos requires a Progress+ plan. Upgrade in Profile.');
-                  return;
-                }
-                galleryInputRef.current?.click();
-              }}
+              className="
+                flex
+                flex-col
+                items-center
+                gap-2
+                p-4
+                rounded-2xl
+                border-2
+                border-dashed
+                border-border
+                bg-card
+                transition-colors
+                hover:border-accent/50
+                cursor-pointer
+              "
+              onClick={() => galleryInputRef.current?.click()}
             >
 
-              {canCompare ? (
-                <ImageIcon className="w-5 h-5 text-accent" />
-              ) : (
-                <Lock className="w-5 h-5 text-muted-foreground" />
-              )}
+              <ImageIcon className="w-5 h-5 text-accent" />
 
               <span className="
                 font-medium
@@ -2699,12 +2658,6 @@ insights must contain personalized coaching analysis.
               ">
                 Upload Photo
               </span>
-
-              {!canCompare && (
-                <span className="text-[10px] font-bold text-muted-foreground">
-                  Progress+
-                </span>
-              )}
 
             </button>
 
@@ -2725,7 +2678,7 @@ insights must contain personalized coaching analysis.
             handleFileSelected
           }
           disabled={
-            uploading || !canCompare
+            uploading
           }
         />
 
@@ -2741,7 +2694,7 @@ insights must contain personalized coaching analysis.
             handleFileSelected
           }
           disabled={
-            uploading || !canCompare
+            uploading
           }
         />
 
@@ -2751,6 +2704,29 @@ insights must contain personalized coaching analysis.
       {/* =====================================================
           SIDE-BY-SIDE COMPARISON
           ===================================================== */}
+
+      {!canCompare && recentPhotos.length >= 2 && (
+        <Card className="p-4 mb-6 border-dashed">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 rounded-lg bg-muted flex items-center justify-center shrink-0">
+                <Lock className="w-4 h-4 text-muted-foreground" />
+              </div>
+              <div className="min-w-0">
+                <p className="font-heading font-bold text-sm">
+                  Compare Progress
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  Upgrade to Progress+ to compare two different dates side by side.
+                </p>
+              </div>
+            </div>
+            <span className="text-[10px] font-bold px-2 py-1 rounded-full bg-muted border border-border text-muted-foreground shrink-0">
+              Progress+
+            </span>
+          </div>
+        </Card>
+      )}
 
       {canCompare &&
         recentPhotos.length >=
@@ -4413,8 +4389,7 @@ insights must contain personalized coaching analysis.
             leading-relaxed
           ">
 
-            Progress+ lets you save your progress photos and
-            compare two different dates side by side so you can
+            Progress+ lets you compare two different dates side by side so you can
             clearly see how your physique has changed.
 
           </p>
