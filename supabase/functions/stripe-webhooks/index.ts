@@ -341,6 +341,37 @@ function jsonResponse(
  * ============================================================
  */
 
+async function findUserIdByEmail(email: string | null | undefined): Promise<string | null> {
+  if (!email || typeof email !== 'string' || !email.trim()) return null;
+  const cleanEmail = email.trim().toLowerCase();
+  try {
+    const { data: profileByEmail, error: profErr } = await supabase
+      .from('profiles')
+      .select('id')
+      .ilike('email', cleanEmail)
+      .maybeSingle();
+    if (!profErr && profileByEmail?.id) {
+      return profileByEmail.id;
+    }
+  } catch {
+    // fall through to auth admin
+  }
+
+  try {
+    const { data: authData, error: authErr } = await supabase.auth.admin.listUsers();
+    if (!authErr && authData?.users) {
+      const found = authData.users.find(u => u.email && u.email.toLowerCase().trim() === cleanEmail);
+      if (found?.id) {
+        return found.id;
+      }
+    }
+  } catch {
+    // ignore auth admin lookup error
+  }
+
+  return null;
+}
+
 function getMetadataUserId(
   metadata:
     | Stripe.Metadata
@@ -926,16 +957,7 @@ async function handleCheckoutCompleted(
       (typeof session.customer_email === 'string' ? session.customer_email : null);
 
     if (customerEmail) {
-      const { data: profileByEmail } =
-        await supabase
-          .from('profiles')
-          .select('id')
-          .ilike('email', customerEmail.trim())
-          .maybeSingle();
-
-      if (profileByEmail?.id) {
-        userId = profileByEmail.id;
-      }
+      userId = await findUserIdByEmail(customerEmail);
     }
   }
 
@@ -1134,15 +1156,7 @@ async function handleSubscriptionEvent(
     try {
       const cust = await stripe.customers.retrieve(customerId);
       if (cust && !(cust as any).deleted && (cust as any).email) {
-        const { data: profileByEmail } = await supabase
-          .from('profiles')
-          .select('id')
-          .ilike('email', (cust as any).email.trim())
-          .maybeSingle();
-
-        if (profileByEmail?.id) {
-          userId = profileByEmail.id;
-        }
+        userId = await findUserIdByEmail((cust as any).email);
       }
     } catch (custErr) {
       console.warn('[WASHEK WEBHOOK] Customer retrieve note:', custErr);
@@ -1166,14 +1180,7 @@ async function handleSubscriptionEvent(
         } else {
           const sEmail = s.customer_details?.email || (typeof s.customer_email === 'string' ? s.customer_email : null);
           if (sEmail) {
-            const { data: profileByEmail } = await supabase
-              .from('profiles')
-              .select('id')
-              .ilike('email', sEmail.trim())
-              .maybeSingle();
-            if (profileByEmail?.id) {
-              userId = profileByEmail.id;
-            }
+            userId = await findUserIdByEmail(sEmail);
           }
         }
       }
