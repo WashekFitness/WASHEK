@@ -345,7 +345,16 @@ function looksLikeAuthFailure(msg) {
   );
 }
 
-function navigateToStripeUrl(checkoutUrl) {
+function navigateToStripeUrl(checkoutUrl, preOpenedWin = null) {
+  if (preOpenedWin && !preOpenedWin.closed) {
+    try {
+      preOpenedWin.location.href = checkoutUrl;
+      preOpenedWin.focus();
+      return;
+    } catch {
+      // fallback if preOpenedWin was closed or cross-origin restricted
+    }
+  }
   try {
     const newWindow = window.open(checkoutUrl, '_blank');
     if (newWindow) {
@@ -355,15 +364,18 @@ function navigateToStripeUrl(checkoutUrl) {
   } catch {
     // popup blocker fallback
   }
+  // Anchor tag click fallback to ALWAYS open a new tab and NEVER navigate away from the app
   try {
-    if (window.top && window.top !== window.self) {
-      window.top.location.assign(checkoutUrl);
-      return;
-    }
+    const a = document.createElement('a');
+    a.href = checkoutUrl;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   } catch {
-    // Cross-origin parent frame blocked direct window.top navigation
+    // ignore
   }
-  window.location.assign(checkoutUrl);
 }
 
 /**
@@ -374,7 +386,16 @@ export async function startStripeCheckout({
   planKey,
   email = '',
   userId = '',
+  preOpenedWindow = null,
 }) {
+  let preOpenedWin = preOpenedWindow;
+  if (!preOpenedWin) {
+    try {
+      preOpenedWin = window.open('about:blank', '_blank');
+    } catch {
+      // ignore
+    }
+  }
   const cleanPlanKey = getTierKey(planKey);
   const tier = getTierByKey(cleanPlanKey);
   if (!tier) {
@@ -546,7 +567,7 @@ export async function startStripeCheckout({
     // ignore storage errors
   }
 
-  navigateToStripeUrl(data.url);
+  navigateToStripeUrl(data.url, preOpenedWin);
 
   return {
     action: 'checkout',

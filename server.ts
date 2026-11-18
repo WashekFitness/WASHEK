@@ -1084,37 +1084,87 @@ async function handleCancelStripeSubscription(req: express.Request, res: express
       });
     }
 
-    // Look up Stripe subscription ID from profile
-    let stripeSubId =
-      typeof bodySubId === 'string' && /^sub_[a-zA-Z0-9]+$/.test(bodySubId.trim()) ? bodySubId.trim() : '';
-    if (!stripeSubId) {
-      try {
-        const { data: prof } = await userClient
-          .from('profiles')
-          .select('stripe_subscription_id')
-          .eq('id', uid)
-          .maybeSingle();
-        if (prof?.stripe_subscription_id && /^sub_[a-zA-Z0-9]+$/.test(String(prof.stripe_subscription_id))) {
-          stripeSubId = String(prof.stripe_subscription_id);
-        }
-      } catch {
-        // column lookup fallback
-      }
+    // Collect all Stripe subscription IDs to cancel
+    const subscriptionsToCancel = new Set<string>();
+    if (typeof bodySubId === 'string' && /^sub_[a-zA-Z0-9]+$/.test(bodySubId.trim())) {
+      subscriptionsToCancel.add(bodySubId.trim());
     }
 
-    // Cancel on Stripe API if server secret key + live subscription ID exist
+    let customerId = '';
+    try {
+      const { data: prof } = await userClient
+        .from('profiles')
+        .select('stripe_subscription_id, stripe_customer_id')
+        .eq('id', uid)
+        .maybeSingle();
+      if (prof?.stripe_subscription_id && /^sub_[a-zA-Z0-9]+$/.test(String(prof.stripe_subscription_id))) {
+        subscriptionsToCancel.add(String(prof.stripe_subscription_id));
+      }
+      if (prof?.stripe_customer_id && /^cus_[a-zA-Z0-9]+$/.test(String(prof.stripe_customer_id))) {
+        customerId = String(prof.stripe_customer_id);
+      }
+    } catch {
+      // column lookup fallback
+    }
+
     const cfg = getServerStripeConfig();
-    if (stripeSubId && cfg.configured) {
-      try {
-        await stripeApiRequest(`subscriptions/${encodeURIComponent(stripeSubId)}`, cfg.secretKey, {
-          method: 'DELETE',
-        });
-      } catch (stripeErr: any) {
-        if (stripeErr?.status !== 404 && stripeErr?.stripeCode !== 'resource_missing') {
-          return res.status(stripeErr?.status >= 400 ? stripeErr.status : 502).json({
-            success: false,
-            error: stripeErr?.message || 'Unable to cancel subscription with Stripe.',
+    const targetEmail = cleanEmail || authUserData?.user?.email || '';
+
+    if (cfg.configured) {
+      // 1. Look up subscriptions by customerId
+      if (customerId) {
+        try {
+          const custSubs = await stripeApiRequest(`subscriptions?customer=${encodeURIComponent(customerId)}&status=all`, cfg.secretKey);
+          if (Array.isArray(custSubs?.data)) {
+            for (const s of custSubs.data) {
+              if (['active', 'trialing', 'past_due', 'unpaid'].includes(String(s.status || '').toLowerCase())) {
+                subscriptionsToCancel.add(s.id);
+              }
+            }
+          }
+        } catch (cErr) {
+          console.warn('[Stripe] Customer subscriptions lookup note:', cErr);
+        }
+      }
+
+      // 2. Look up subscriptions by email
+      if (targetEmail) {
+        try {
+          const custSearch = await stripeApiRequest(`customers?email=${encodeURIComponent(targetEmail.trim())}&limit=10`, cfg.secretKey);
+          if (Array.isArray(custSearch?.data)) {
+            for (const c of custSearch.data) {
+              if (c?.id) {
+                try {
+                  const sList = await stripeApiRequest(`subscriptions?customer=${encodeURIComponent(c.id)}&status=all`, cfg.secretKey);
+                  if (Array.isArray(sList?.data)) {
+                    for (const s of sList.data) {
+                      if (['active', 'trialing', 'past_due', 'unpaid'].includes(String(s.status || '').toLowerCase())) {
+                        subscriptionsToCancel.add(s.id);
+                      }
+                    }
+                  }
+                } catch {
+                  // ignore individual customer lookup
+                }
+              }
+            }
+          }
+        } catch (eErr) {
+          console.warn('[Stripe] Email customer lookup note:', eErr);
+        }
+      }
+
+      // Cancel all identified Stripe subscriptions
+      for (const sId of subscriptionsToCancel) {
+        try {
+          await stripeApiRequest(`subscriptions/${encodeURIComponent(sId)}`, cfg.secretKey, {
+            method: 'DELETE',
           });
+          console.log('[Stripe] Canceled subscription in Stripe:', sId);
+        } catch (stripeErr: any) {
+          if (stripeErr?.status !== 404 && stripeErr?.stripeCode !== 'resource_missing') {
+            console.warn('[Stripe] Failed to cancel subscription:', sId, stripeErr?.message);
+          }
         }
       }
     }

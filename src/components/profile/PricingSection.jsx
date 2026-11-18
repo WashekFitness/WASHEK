@@ -172,16 +172,15 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   const [currentPlan, setCurrentPlan] = useState(() => {
     try {
       const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-      if (storedStatus && !isActiveStatus(storedStatus)) {
+      const isActive = isActiveStatus(storedStatus);
+      if (!isActive) {
         return 'free';
       }
-      if (currentPlanProp && currentPlanProp !== 'free') {
+      if (currentPlanProp && currentPlanProp !== 'free' && isActive) {
         return normalizePlan(currentPlanProp);
       }
-      if (isActiveStatus(storedStatus)) {
-        const stored = localStorage.getItem('washek_subscription_plan');
-        if (stored && stored !== 'free') return normalizePlan(stored);
-      }
+      const stored = localStorage.getItem('washek_subscription_plan');
+      if (stored && stored !== 'free') return normalizePlan(stored);
       const userObj = JSON.parse(localStorage.getItem('washek_user') || '{}');
       const userStatus = String(userObj?.subscription_status || '').toLowerCase().trim();
       if (
@@ -392,33 +391,18 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       let resolvedStatus = 'inactive';
 
       if (hasRemoteProfile) {
-        const isExplicitCanceled = ['canceled', 'cancelled', 'inactive', 'unpaid', 'expired'].includes(profileStatus);
-        const dbActive = profilePlan !== 'free' && (!isExplicitCanceled);
+        const dbActive = profilePlan !== 'free' && isActiveStatus(profileStatus);
         if (dbActive) {
           resolvedPlan = profilePlan;
           resolvedStatus = profileStatus || 'active';
-        } else if (isExplicitCanceled) {
-          resolvedPlan = 'free';
-          resolvedStatus = profileStatus;
         } else {
-          const localStoredPlan = localPlanRaw || (currentPlanPropRef.current && currentPlanPropRef.current !== 'free' ? normalizePlan(currentPlanPropRef.current) : null);
-          if (localStoredPlan && localStoredPlan !== 'free') {
-            resolvedPlan = localStoredPlan;
-            resolvedStatus = 'active';
-          } else {
-            resolvedPlan = profilePlan;
-            resolvedStatus = profileStatus || 'inactive';
-          }
+          // Remote database shows user is free / canceled / inactive
+          resolvedPlan = 'free';
+          resolvedStatus = profileStatus || 'inactive';
         }
-      } else if (!isLocallyInactive) {
+      } else if (isOffline && !isLocallyInactive) {
         if (localPlanRaw && localPlanRaw !== 'free') {
           resolvedPlan = localPlanRaw;
-          resolvedStatus = 'active';
-        } else if (userObjPlan && userObjPlan !== 'free') {
-          resolvedPlan = userObjPlan;
-          resolvedStatus = 'active';
-        } else if (currentPlanPropRef.current && currentPlanPropRef.current !== 'free') {
-          resolvedPlan = normalizePlan(currentPlanPropRef.current);
           resolvedStatus = 'active';
         }
       }
@@ -438,17 +422,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         }
       } else {
         setSubscription(null);
-        if (hasRemoteProfile || !isOffline) {
-          try {
-            localStorage.removeItem('washek_subscription_plan');
-            localStorage.removeItem('washek_recent_upgrade');
-            if (hasRemoteProfile) {
-              localStorage.setItem('washek_subscription_status', resolvedStatus || 'inactive');
-            }
-          } catch {
-            /* ignore */
-          }
-        }
+        applySubscriptionCancellation();
       }
 
       setCurrentPlan((prev) => {
@@ -604,6 +578,40 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       return;
     }
 
+    // Synchronously open a window directly within user gesture loop to prevent popup blocker
+    let preOpenedWindow = null;
+    try {
+      preOpenedWindow = window.open('about:blank', '_blank');
+      if (preOpenedWindow && !preOpenedWindow.closed) {
+        preOpenedWindow.document.write(`
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <title>WASHEK — Loading Checkout</title>
+              <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+              <style>
+                body { background: #09090b; color: #f4f4f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; text-align: center; }
+                .card { background: #18181b; border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 32px 24px; max-width: 360px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
+                .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.15); border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }
+                h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
+                p { margin: 0; font-size: 14px; color: #a1a1aa; line-height: 1.5; }
+                @keyframes spin { to { transform: rotate(360deg); } }
+              </style>
+            </head>
+            <body>
+              <div class="card">
+                <div class="spinner"></div>
+                <h2>Securing Stripe Checkout</h2>
+                <p>Connecting securely to Stripe...</p>
+              </div>
+            </body>
+          </html>
+        `);
+      }
+    } catch {
+      // ignore
+    }
+
     setLoadingPlan(plan.planKey);
     setError('');
     setCardError(null);
@@ -619,22 +627,25 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       const userEmail = user?.email || latestStoredUser?.email || '';
       const userId = user?.id || latestStoredUser?.id || latestStoredUser?.uid || '';
 
-      localStorage.setItem('washek_pending_checkout_plan', plan.planKey);
-      sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
-      document.cookie = `washek_pending_checkout_plan=${plan.planKey}; path=/; max-age=86400; SameSite=Lax`;
-
       const result = await startStripeCheckout({
         planKey: plan.planKey,
         email: userEmail,
         userId,
+        preOpenedWindow,
       });
 
       if (result?.action === 'already_active') {
+        if (preOpenedWindow && !preOpenedWindow.closed) {
+          preOpenedWindow.close();
+        }
         await checkUserAuth?.().catch(() => {});
         await loadSubscription();
         setLoadingPlan(null);
       }
     } catch (checkoutError) {
+      if (preOpenedWindow && !preOpenedWindow.closed) {
+        preOpenedWindow.close();
+      }
       stopPostCheckoutPolling();
       const msg = checkoutError?.message || 'Unable to open Stripe Checkout.';
       console.error('[PricingSection] Stripe checkout failed:', checkoutError);

@@ -451,229 +451,87 @@ Deno.serve(
         profile.stripe_subscription_id ||
         null;
 
-      /*
-       * We intentionally do NOT search Stripe by email.
-       *
-       * Email-based lookup can select the wrong customer when
-       * an account has multiple Stripe customers or historical
-       * subscriptions.
-       */
-
-      if (!customerId) {
-        console.log(
-          '[CANCEL] No Stripe customer is stored for user:',
-          profile.id
-        );
-
-        const updatedProfile =
-          await supabaseAdmin
-            .from('profiles')
-            .update({
-              subscription_plan:
-                'free',
-
-              subscription_status:
-                'canceled',
-
-              stripe_subscription_id:
-                null,
-
-              stripe_price_id:
-                null,
-
-              subscription_cancelled_at:
-                new Date().toISOString(),
-
-              subscription_updated_at:
-                new Date().toISOString(),
-
-              updated_at:
-                new Date().toISOString(),
-            })
-            .eq('id', profile.id)
-            .select('*')
-            .maybeSingle();
-
-        if (updatedProfile.error) {
-          throw new Error(
-            `Unable to update your Washek profile: ${updatedProfile.error.message}`
-          );
-        }
-
-        return json({
-          success: true,
-          alreadyCanceled: true,
-          plan: 'free',
-          message:
-            'Your account is already on the Free Plan.',
-          user: updatedProfile.data,
-        });
+      // Gather all potential subscription IDs to cancel from Stripe
+      const subscriptionsToCancel = new Set<string>();
+      if (subscriptionId && typeof subscriptionId === 'string' && subscriptionId.startsWith('sub_')) {
+        subscriptionsToCancel.add(subscriptionId);
       }
 
-      /*
-       * ======================================================
-       * 4. IF NO SUBSCRIPTION, ACCOUNT IS ALREADY FREE
-       * ======================================================
-       */
+      const userEmail = profile.email || user?.email || explicitEmail || null;
 
-      if (!subscriptionId) {
-        console.log(
-          '[CANCEL] No Stripe subscription stored for user:',
-          profile.id
-        );
-
-        const updatedProfile =
-          await makeProfileFree(
-            profile.id,
-            customerId
-          );
-
-        return json({
-          success: true,
-          alreadyCanceled: true,
-          plan: 'free',
-          message:
-            'Your account is already on the Free Plan.',
-          user: updatedProfile,
-        });
-      }
-
-      /*
-       * ======================================================
-       * 5. RETRIEVE SUBSCRIPTION
-       * ======================================================
-       */
-
-      let subscription: any = null;
-      try {
-        subscription =
-          await getStripeSubscription(
-            subscriptionId
-          );
-      } catch (stripeLookupErr) {
-        console.warn('[CANCEL] Stripe subscription lookup note:', stripeLookupErr);
-      }
-
-      /*
-       * ======================================================
-       * 6. VERIFY OWNERSHIP (IF STRIPE RECORD RETRIEVED)
-       * ======================================================
-       */
-
-      const stripeCustomerId =
-        typeof subscription?.customer === 'string'
-          ? subscription.customer
-          : subscription?.customer?.id || null;
-
-      const metadataUserId =
-        subscription?.metadata?.user_id ||
-        subscription?.metadata?.supabase_user_id ||
-        null;
-
-      const ownershipValid =
-        (stripeCustomerId && stripeCustomerId === customerId) ||
-        (metadataUserId && metadataUserId === profile.id);
-
-      if (subscription && !ownershipValid) {
-        console.error(
-          '[CANCEL] Stripe ownership mismatch:',
-          {
-            userId: profile.id,
-            profileCustomerId:
-              customerId,
-            stripeCustomerId,
-            metadataUserId,
-            subscriptionId,
+      // 1. Look up any active/trialing subscriptions by customerId
+      if (customerId && typeof customerId === 'string' && customerId.startsWith('cus_')) {
+        try {
+          const custSubs = await stripeRequest(`subscriptions?customer=${encodeURIComponent(customerId)}&status=all`);
+          if (Array.isArray(custSubs?.data)) {
+            for (const s of custSubs.data) {
+              if (['active', 'trialing', 'past_due', 'unpaid'].includes(String(s.status || '').toLowerCase())) {
+                subscriptionsToCancel.add(s.id);
+              }
+            }
           }
-        );
-
-        throw new Error(
-          'The Stripe subscription on this account could not be verified.'
-        );
+        } catch (cSubErr) {
+          console.warn('[CANCEL] Stripe customer subscriptions search note:', cSubErr);
+        }
       }
 
-      /*
-       * ======================================================
-       * 7. CHECK CURRENT STRIPE STATUS
-       * ======================================================
-       */
-
-      const currentStatus =
-        subscription?.status ||
-        null;
-
-      /*
-       * Stripe has already canceled this subscription.
-       * Do not attempt another DELETE.
-       */
-
-      if (
-        currentStatus ===
-          'canceled' ||
-        currentStatus ===
-          'incomplete_expired'
-      ) {
-        console.log(
-          '[CANCEL] Subscription already canceled:',
-          subscriptionId
-        );
-
-        const updatedProfile =
-          await makeProfileFree(
-            profile.id,
-            customerId
-          );
-
-        return json({
-          success: true,
-          alreadyCanceled: true,
-          plan: 'free',
-          message:
-            'Your subscription is already canceled.',
-          user: updatedProfile,
-        });
+      // 2. Also search Stripe customers by email if any exist
+      if (userEmail) {
+        try {
+          const custSearch = await stripeRequest(`customers?email=${encodeURIComponent(userEmail.trim())}&limit=10`);
+          if (Array.isArray(custSearch?.data)) {
+            for (const c of custSearch.data) {
+              if (c?.id) {
+                try {
+                  const sList = await stripeRequest(`subscriptions?customer=${encodeURIComponent(c.id)}&status=all`);
+                  if (Array.isArray(sList?.data)) {
+                    for (const s of sList.data) {
+                      if (['active', 'trialing', 'past_due', 'unpaid'].includes(String(s.status || '').toLowerCase())) {
+                        subscriptionsToCancel.add(s.id);
+                      }
+                    }
+                  }
+                } catch {
+                  // ignore individual customer lookup
+                }
+              }
+            }
+          }
+        } catch (emailCustErr) {
+          console.warn('[CANCEL] Stripe email customer search note:', emailCustErr);
+        }
       }
-
-      /*
-       * ======================================================
-       * 8. CANCEL STRIPE IMMEDIATELY
-       * ======================================================
-       */
 
       console.log(
-        '[CANCEL] Canceling verified Stripe subscription:',
-        {
-          userId: user?.id || profile.id,
-          customerId,
-          subscriptionId,
-          stripeStatus:
-            currentStatus,
-        }
+        '[CANCEL] Found Stripe subscriptions to cancel:',
+        Array.from(subscriptionsToCancel),
+        'for user:',
+        profile.id
       );
 
-      let canceled: any = null;
-      try {
-        canceled = await cancelStripeSubscription(
-          subscriptionId
-        );
-      } catch (stripeErr) {
-        console.warn(
-          '[CANCEL] Stripe API cancellation call note (proceeding to revoke Washek access):',
-          stripeErr
-        );
+      // Cancel every identified Stripe subscription immediately
+      for (const subId of subscriptionsToCancel) {
+        try {
+          await cancelStripeSubscription(subId);
+          console.log('[CANCEL] Successfully canceled Stripe subscription:', subId);
+        } catch (cancelErr: any) {
+          if (cancelErr?.message?.includes('No such subscription') || cancelErr?.message?.includes('already canceled')) {
+            console.log('[CANCEL] Subscription already canceled in Stripe:', subId);
+          } else {
+            console.warn('[CANCEL] Stripe cancellation call note for', subId, cancelErr);
+          }
+        }
       }
 
       /*
        * ======================================================
-       * 9. REVOKE WASHEK PAID ACCESS
+       * Revoke Washek profile paid access to Free
        * ======================================================
        */
-
-      const updatedProfile =
-        await makeProfileFree(
-          profile.id,
-          customerId
-        );
+      const updatedProfile = await makeProfileFree(
+        profile.id,
+        customerId || ''
+      );
 
       /*
        * ======================================================
