@@ -7,9 +7,19 @@ import {
   isActiveSubscriptionStatus,
   normalizePlan,
 } from '@/lib/subscription';
-import { applyPostWorkoutAdaptation } from '@/lib/periodizationEngine';
+import {
+  applyPostWorkoutAdaptation,
+  applyLivePerformanceAdaptation,
+} from '@/lib/periodizationEngine';
+import { hasLearnSkillsGoal, sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
-import { getCachedActiveProgram, getCachedProgramsList, setCachedProgramsList } from '@/lib/cacheStore';
+import { resolveWorkoutDays, extractWeekdayFromDayName } from '@/lib/workoutSchedule';
+import {
+  getCachedActiveProgram,
+  getCachedProgramsList,
+  setCachedActiveProgram,
+  setCachedProgramsList,
+} from '@/lib/cacheStore';
 import DynamicWarmupModal from '@/components/workout/DynamicWarmupModal';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Button } from '@/components/ui/button';
@@ -33,6 +43,7 @@ import {
   Lock,
   MessageSquare,
   Flame,
+  TrendingUp,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useAppSettings } from '@/lib/AppSettingsContext';
@@ -541,6 +552,8 @@ function LiveAdjustmentPanel({
   repsAchieved,
   completedSets,
   trainingType,
+  user,
+  programGoal,
   seconds,
   onApply,
   disabled,
@@ -571,7 +584,36 @@ function LiveAdjustmentPanel({
         hybrid: 'hybrid training',
       }[trainingType] || 'fitness';
 
+      const wantsSkills = hasLearnSkillsGoal({
+        trainingType,
+        fitnessGoals: user?.fitness_goals,
+        weightGoals: user?.weight_goals,
+        goalDescription: programGoal || user?.primary_goal,
+        requirements: user?.training_requirements,
+      });
+
+      const skillPolicyRule =
+        trainingType !== 'weights' && !wantsSkills
+          ? '\n13. SKILLS POLICY: This athlete did NOT select "Learn Skills" as a goal. Do NOT introduce or substitute any calisthenics skills (handstands, muscle-ups, planches, front/back levers, human flags, L-sits, etc.).'
+          : '';
+
+      const athleteGoals = [
+        ...(Array.isArray(user?.fitness_goals) ? user.fitness_goals : []),
+        ...(Array.isArray(user?.weight_goals) ? user.weight_goals : []),
+        programGoal || user?.primary_goal,
+      ]
+        .filter(Boolean)
+        .join(', ');
+
       const prompt = `You are Kael, an elite ${typeLabel} coach providing REAL-TIME coaching during an active workout.
+
+ATHLETE ONBOARDING PROFILE (STRICT CONSTRAINTS):
+- Level: ${user?.fitness_level || 'intermediate'}
+- Age / Gender: ${user?.age || 'not specified'}, ${user?.gender || 'not specified'}
+- Goals: ${athleteGoals || 'General fitness & strength'}
+- Current skills / maxes: ${user?.current_skills || 'Not specified'}
+- Available equipment (STRICT — never suggest equipment they lack): ${user?.available_equipment || 'Standard equipment'}
+- Requirements, injuries & limitations (STRICT): ${user?.training_requirements || 'None specified'}
 
 The athlete is currently performing:
 ${JSON.stringify(exercise, null, 2)}
@@ -591,14 +633,14 @@ RULES:
 2. Preserve the movement's purpose unless the athlete's feedback indicates that a substitution is necessary.
 3. If the exercise feels too easy and performance is strong, increase the challenge appropriately through reps, sets, load, tempo, or a harder variation.
 4. If the exercise feels too hard, fatigue is accumulating, technique is breaking down, or the athlete reports pain/tightness, reduce the training demand or substitute a safer appropriate variation.
-5. Do not encourage training through significant pain.
+5. Do not encourage training through significant pain, and respect all stated injuries/limitations and available equipment.
 6. Do not diagnose injuries or medical conditions.
-7. Keep the adjustment realistic for the athlete's training type.
+7. Keep the adjustment realistic for the athlete's training type and fitness level.
 8. If the athlete reports concerning symptoms, prioritize stopping the movement and seeking appropriate medical evaluation.
 9. Do not make dramatic changes without a reason.
 10. The adjusted sets must be at least the number of sets already completed so the tracker remains consistent.
 11. Give a concise explanation of exactly what changed and why.
-12. Preserve the activation cue whenever possible, but improve it if the current cue is not useful.
+12. Preserve the activation cue whenever possible, but improve it if the current cue is not useful.${skillPolicyRule}
 
 Return ONLY JSON:
 {
@@ -660,7 +702,7 @@ Return ONLY JSON:
         );
       }
 
-      const adjusted = {
+      const rawAdjusted = {
         ...exercise,
         ...result.adjusted_exercise,
         sets: Math.max(
@@ -673,6 +715,24 @@ Return ONLY JSON:
           exercise.rest_seconds ||
           60,
       };
+
+      const sanitizedWrapper = sanitizeMicrocycleExclusions(
+        { days: [{ day_name: 'Live Adjustment', workout_type: 'Strength', exercises: [rawAdjusted] }] },
+        {
+          trainingType,
+          level: user?.fitness_level || 'intermediate',
+          fitnessGoals: user?.fitness_goals,
+          weightGoals: user?.weight_goals,
+          goalDescription: programGoal || user?.primary_goal,
+          requirements: user?.training_requirements,
+          equipment: user?.available_equipment || '',
+          currentSkills: user?.current_skills || '',
+          wantsSkills,
+          skipDayRenaming: true,
+        }
+      );
+
+      const adjusted = sanitizedWrapper?.days?.[0]?.exercises?.[0] || rawAdjusted;
 
       onApply(adjusted);
 
@@ -779,6 +839,7 @@ function PostWorkoutCheckin({
   canAdjust,
   canAdapt,
   program,
+  user,
   onProgramUpdated,
 }) {
   const [checkin, setCheckin] = useState('');
@@ -801,6 +862,21 @@ function PostWorkoutCheckin({
         )
         .join('\n');
 
+      const trainingType =
+        program?.training_type || 'calisthenics';
+      const wantsSkills = hasLearnSkillsGoal({
+        trainingType,
+        fitnessGoals: user?.fitness_goals,
+        weightGoals: user?.weight_goals,
+        goalDescription: program?.goal || user?.primary_goal,
+        requirements: user?.training_requirements,
+      });
+
+      const skillPolicyNote =
+        trainingType !== 'weights' && !wantsSkills
+          ? '\n9. SKILLS POLICY: This athlete did NOT select "Learn Skills" as a goal. Do NOT include or suggest any calisthenics skills (handstands, muscle-ups, planches, levers, human flags, L-sits, etc.) in adjusted_exercises or recommendations.'
+          : '';
+
       if (program && canAdapt) {
         const currentWeek = program.current_week || 1;
 
@@ -808,9 +884,6 @@ function PostWorkoutCheckin({
           program.microcycles?.find(
             m => m.week_number === currentWeek + 1
           ) || null;
-
-        const trainingType =
-          program?.training_type || 'calisthenics';
 
         const typeLabel = {
           calisthenics: 'calisthenics',
@@ -820,7 +893,31 @@ function PostWorkoutCheckin({
           hybrid: 'hybrid training',
         }[trainingType];
 
+        const resolvedWorkoutDays = resolveWorkoutDays({
+          trainingDays: program?.macrocycle?.training_days || user?.training_days,
+          existingDays: nextMicrocycle?.days,
+          requirements: user?.training_requirements || '',
+          goalDescription: program?.goal || user?.primary_goal || '',
+        });
+
+        const athleteGoalsSummary = [
+          ...(Array.isArray(user?.fitness_goals) ? user.fitness_goals : []),
+          ...(Array.isArray(user?.weight_goals) ? user.weight_goals : []),
+          program?.goal || user?.primary_goal,
+        ]
+          .filter(Boolean)
+          .join(', ');
+
         const elitePrompt = `You are Kael, an elite ${typeLabel} coach. An athlete just finished a workout and gave you feedback to adapt their 12-week program and recalibrate their predicted progression.
+
+ATHLETE ONBOARDING PROFILE (STRICT CONSTRAINTS):
+- Fitness level: ${user?.fitness_level || program?.fitness_level || 'intermediate'}
+- Age / Gender: ${user?.age || 'not specified'}, ${user?.gender || 'not specified'}
+- Goals & Timeframe: ${athleteGoalsSummary || 'General fitness'} (Timeframe: ${user?.goal_timeframe || 'not specified'})
+- Workout days: ${resolvedWorkoutDays.join(', ')}
+- Current skills / maxes: ${user?.current_skills || 'Not specified'}
+- Available equipment (STRICT): ${user?.available_equipment || 'Standard equipment'}
+- Training requirements, injuries & notes (STRICT): ${user?.training_requirements || 'None specified'}
 
 POST-WORKOUT FEEDBACK:
 "${checkin}"
@@ -849,12 +946,12 @@ Based on the athlete's feedback AND their actual reps/sets completed today:
 
 1. Give a 1-2 sentence direct, personal human coaching response.
 2. Determine their progress trajectory: "accelerating" (if they crushed targets or felt it was too easy), "steady" (progressing well on track), or "recovering" (if they reported discomfort, fatigue, or missed reps).
-3. If performance was strong/easy, recommend specific progressive overload targets for future weeks.
-4. If fatigue was high, discomfort/pain was reported, or form broke down, reduce stress or substitute safer exercise variations.
+3. If performance was strong/easy, recommend specific progressive overload targets for future weeks aligned with their goals, level, and timeframe.
+4. If fatigue was high, discomfort/pain was reported, or form broke down, reduce stress or substitute safer exercise variations using only their available equipment and respecting stated injuries/requirements.
 5. Provide a 1-sentence projected outlook of what their progress will look like over the upcoming weeks.
 6. Return the calibrated exercises array for this training day to apply across remaining weeks.
 7. Preserve activation cues and clear coaching notes.
-8. Do not diagnose injuries or medical conditions.
+8. Do not diagnose injuries or medical conditions.${skillPolicyNote}
 
 Respond in JSON:
 {
@@ -943,6 +1040,12 @@ Respond in JSON:
             coachResponse: result.coach_response,
             trajectory: result.progress_trajectory || 'steady',
             projectedOutlook: result.projected_outlook || '',
+            fitnessGoals: user?.fitness_goals,
+            weightGoals: user?.weight_goals,
+            requirements: user?.training_requirements || '',
+            equipment: user?.available_equipment || '',
+            currentSkills: user?.current_skills || '',
+            workoutDays: resolvedWorkoutDays,
           });
 
           await supabaseApi.entities.WorkoutProgram.update(
@@ -955,13 +1058,10 @@ Respond in JSON:
           );
 
           if (onProgramUpdated) {
-            onProgramUpdated();
+            await onProgramUpdated(adaptedProgram);
           }
         }
       } else {
-        const trainingType =
-          program?.training_type || 'calisthenics';
-
         const typeLabel = {
           calisthenics: 'calisthenics',
           weighted_calisthenics:
@@ -970,7 +1070,16 @@ Respond in JSON:
           hybrid: 'hybrid training',
         }[trainingType];
 
-        const prompt = `You are Kael, a real-talk ${typeLabel} coach. Based on this post-workout check-in, give a SHORT (2-3 sentence) human response and a concrete note on how to adjust the next workout. Sound like a person, not a bot. Explain things in simple, everyday words that any beginner can easily understand without confusing jargon. If an analogy helps, use it, but never talk down to the athlete or sound childish.
+        const prompt = `You are Kael, a real-talk ${typeLabel} coach. Based on this post-workout check-in, give a SHORT (2-3 sentence) human response and a concrete note on how to adjust the next workout. Sound like a person, not a bot. Explain things in simple, everyday words that any beginner can easily understand without confusing jargon. If an analogy helps, use it, but never talk down to the athlete or sound childish.${
+          trainingType !== 'weights' && !wantsSkills
+            ? '\nIMPORTANT: This athlete did NOT select "Learn Skills" as a goal — do NOT recommend any calisthenics skills (handstands, muscle-ups, planches, levers, L-sits, flags).'
+            : ''
+        }
+
+Athlete Level: ${user?.fitness_level || 'intermediate'}
+Equipment: ${user?.available_equipment || 'Not specified'}
+Requirements/Limitations: ${user?.training_requirements || 'None specified'}
+Goals: ${program?.goal || user?.primary_goal || 'General fitness'}
 
 Check-in: "${checkin}"
 
@@ -1110,6 +1219,7 @@ export default function LiveWorkout() {
     useState(false);
 
   const [savedLog, setSavedLog] = useState(null);
+  const [autoAdaptationResult, setAutoAdaptationResult] = useState(null);
 
   // Local live workout copy.
   // This is what Elite real-time adjustments modify.
@@ -1311,6 +1421,25 @@ export default function LiveWorkout() {
     program?.microcycles?.[0];
 
   const days = microcycle?.days || [];
+  const defaultDayAppliedRef = useRef(false);
+
+  useEffect(() => {
+    if (defaultDayAppliedRef.current || started || days.length === 0) return;
+    defaultDayAppliedRef.current = true;
+    try {
+      const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long' });
+      const idx = days.findIndex(
+        (d) =>
+          extractWeekdayFromDayName(d?.day_name || '') === todayName ||
+          String(d?.day_name || '').toLowerCase().includes(todayName.toLowerCase())
+      );
+      if (idx !== -1) {
+        setDayIndex(idx);
+      }
+    } catch {
+      // ignore locale issues
+    }
+  }, [days, started]);
 
   const day = days[dayIndex];
 
@@ -1338,6 +1467,7 @@ export default function LiveWorkout() {
     setSetIndex(0);
     setResting(false);
     setAdjustedExerciseIndexes({});
+    setAutoAdaptationResult(null);
   }, [
     currentWeekNum,
     dayIndex,
@@ -1361,12 +1491,12 @@ export default function LiveWorkout() {
     Number(exercise?.rest_seconds) || 60;
 
   const canAdjust = canAccess(
-    user,
+    effectiveUser,
     'live_workout_adjustments'
   );
 
   const canAdapt = canAccess(
-    user,
+    effectiveUser,
     'adaptive_programming'
   );
 
@@ -1439,7 +1569,33 @@ export default function LiveWorkout() {
     setSetIndex(s => s + 1);
   };
 
-  const finishWorkout = () => {
+  const persistProgramAdaptation = async (updatedProgram) => {
+    if (!updatedProgram?.id) return;
+    setCachedActiveProgram(updatedProgram, userKey);
+    const existingList = getCachedProgramsList(userKey);
+    const nextList = existingList.some((p) => p.id === updatedProgram.id)
+      ? existingList.map((p) => (p.id === updatedProgram.id ? updatedProgram : p))
+      : [updatedProgram, ...existingList];
+    setCachedProgramsList(nextList, userKey);
+    queryClient.setQueryData(['programs', userKey], (old) =>
+      Array.isArray(old)
+        ? old.map((p) => (p.id === updatedProgram.id ? updatedProgram : p))
+        : nextList
+    );
+
+    try {
+      await supabaseApi.entities.WorkoutProgram.update(updatedProgram.id, {
+        microcycles: updatedProgram.microcycles,
+        adaptation_history: updatedProgram.adaptation_history,
+        last_adapted_by_kael: updatedProgram.last_adapted_by_kael,
+      });
+      queryClient.invalidateQueries({ queryKey: ['programs'] });
+    } catch (err) {
+      console.error('Failed to sync live adaptive program update:', err);
+    }
+  };
+
+  const finishWorkout = async () => {
     triggerHaptic('heavy');
     setRunning(false);
     setWorkoutDone(true);
@@ -1475,6 +1631,21 @@ export default function LiveWorkout() {
         seconds / 60
       ),
     });
+
+    if (canAdapt && program) {
+      const adaptation = applyLivePerformanceAdaptation({
+        currentProgram: program,
+        currentWeek: currentWeekNum,
+        currentDayIndex: dayIndex,
+        dayName: day?.day_name || '',
+        plannedExercises: exercises,
+        completedExercises: exercisesCompleted,
+        elapsedSeconds: seconds,
+        user: effectiveUser,
+      });
+      setAutoAdaptationResult(adaptation);
+      await persistProgramAdaptation(adaptation.updatedProgram);
+    }
   };
 
   if (!program || days.length === 0) {
@@ -1622,17 +1793,92 @@ export default function LiveWorkout() {
                 </p>
               </Card>
 
+              {canAdapt && autoAdaptationResult && (
+                <Card className="p-4 border-primary/30 bg-primary/5 space-y-2.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-2">
+                      <TrendingUp className="w-4 h-4 text-primary shrink-0" />
+                      <p className="font-heading font-bold text-sm">
+                        Adaptive Programming Applied
+                      </p>
+                    </div>
+                    <Badge
+                      variant="secondary"
+                      className="text-[10px] font-semibold bg-primary/15 text-primary border-primary/25"
+                    >
+                      {autoAdaptationResult.evaluation.direction === 'harder'
+                        ? 'Next Session Harder'
+                        : autoAdaptationResult.evaluation.direction === 'easier'
+                          ? 'Next Session Easier'
+                          : 'Progressive Overload'}
+                    </Badge>
+                  </div>
+
+                  <p className="text-xs text-muted-foreground leading-relaxed">
+                    {autoAdaptationResult.evaluation.coachResponse}
+                  </p>
+
+                  {autoAdaptationResult.nextSessionPreview?.length > 0 && (
+                    <div className="space-y-1.5 pt-1">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-primary">
+                        Updated Target · {autoAdaptationResult.nextSessionDayName}
+                      </p>
+                      {autoAdaptationResult.nextSessionPreview.slice(0, 4).map((item, idx) => (
+                        <div
+                          key={idx}
+                          className="flex items-center justify-between text-xs py-1 px-2.5 rounded-lg bg-background/60 border border-border/60"
+                        >
+                          <span className="font-medium truncate pr-2">{item.name}</span>
+                          <span className="font-mono font-semibold text-primary shrink-0">
+                            {item.before} → {item.after}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </Card>
+              )}
+
+              {!canAdapt && (
+                <Card className="p-4 border-border/80 bg-muted/30 flex items-center justify-between gap-3">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <Lock className="w-4 h-4 text-muted-foreground shrink-0 mt-0.5" />
+                    <div className="min-w-0">
+                      <p className="font-heading font-bold text-xs">
+                        Adaptive Programming (Progress+)
+                      </p>
+                      <p className="text-[11px] text-muted-foreground mt-0.5">
+                        Automatically makes your next session easier or harder based on your live sets & reps.
+                      </p>
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="shrink-0 text-xs"
+                    onClick={() => navigate('/pricing')}
+                  >
+                    Upgrade
+                  </Button>
+                </Card>
+              )}
+
               {savedLog && (
                 <PostWorkoutCheckin
                   log={savedLog}
                   canAdjust={canAdjust}
                   canAdapt={canAdapt}
                   program={program}
-                  onProgramUpdated={() =>
-                    queryClient.invalidateQueries({
-                      queryKey: ['programs'],
-                    })
-                  }
+                  user={effectiveUser}
+                  onProgramUpdated={async (adaptedProgram) => {
+                    if (adaptedProgram) {
+                      await persistProgramAdaptation(adaptedProgram);
+                    } else {
+                      queryClient.invalidateQueries({
+                        queryKey: ['programs'],
+                      });
+                    }
+                  }}
                   onSave={async (
                     checkin,
                     aiNote
@@ -1880,6 +2126,8 @@ export default function LiveWorkout() {
                       program?.training_type ||
                       'calisthenics'
                     }
+                    user={effectiveUser}
+                    programGoal={program?.goal}
                     seconds={seconds}
                     onApply={
                       applyLiveAdjustment

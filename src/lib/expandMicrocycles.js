@@ -1,4 +1,13 @@
-import { build12WeekMicrocycles } from './periodizationEngine';
+import { build12WeekMicrocycles } from './periodizationEngine.js';
+import {
+  hasLearnSkillsGoal,
+  isCalisthenicsSkillExercise,
+} from './programExclusions.js';
+import {
+  WEEKDAYS,
+  applyWorkoutDayNames,
+  resolveWorkoutDays,
+} from './workoutSchedule.js';
 
 /**
  * Safely normalizes workout-program microcycle data.
@@ -160,7 +169,15 @@ function normalizeExercise(exercise, exerciseIndex = 0) {
 
     rpe: safeString(source.rpe, ""),
 
-    rir: safeString(source.rir, "")
+    rir: safeString(source.rir, ""),
+
+    ...(source.predicted_progress ? { predicted_progress: safeString(source.predicted_progress, "") } : {}),
+    ...(source.predicted_metrics && typeof source.predicted_metrics === "object"
+      ? { predicted_metrics: source.predicted_metrics }
+      : {}),
+    ...(source.recalibrated_by_kael !== undefined
+      ? { recalibrated_by_kael: Boolean(source.recalibrated_by_kael) }
+      : {}),
   };
 }
 
@@ -188,7 +205,7 @@ function normalizeDay(day, dayIndex = 0) {
           source.name ??
           source.day ??
           source.title,
-        `Day ${dayIndex + 1}`
+        WEEKDAYS[dayIndex % WEEKDAYS.length]
       ),
 
     workout_type:
@@ -228,6 +245,13 @@ function normalizeDay(day, dayIndex = 0) {
         source.focus,
       ""
     ),
+
+    ...(source.recalibrated_by_kael !== undefined
+      ? { recalibrated_by_kael: Boolean(source.recalibrated_by_kael) }
+      : {}),
+    ...(source.kael_recalibration_note
+      ? { kael_recalibration_note: safeString(source.kael_recalibration_note, "") }
+      : {}),
 
     exercises
   };
@@ -331,6 +355,16 @@ export function normalizeWorkoutProgram(program) {
       source.microcycles
     );
 
+    const macrocycle = asObject(
+      source.macrocycle
+    );
+
+    const workoutDays = resolveWorkoutDays({
+      workoutDays: source.training_days ?? macrocycle.training_days,
+      existingDays: microcycles?.[0]?.days,
+      goalDescription: source.goal || '',
+    });
+
     // If fewer than 12 weeks are provided, generate the full 12-week macrocycle
     if (microcycles.length > 0 && microcycles.length < 12) {
       try {
@@ -339,8 +373,28 @@ export function normalizeWorkoutProgram(program) {
           microcycles[0];
 
         if (baseWeek) {
+          const baseWeekHasSkills = (baseWeek.days || []).some((d) =>
+            (d.exercises || []).some((e) => isCalisthenicsSkillExercise(e?.name))
+          );
+          const inferredWantsSkills =
+            source.fitness_goals != null
+              ? hasLearnSkillsGoal({
+                  trainingType: source.training_type || 'calisthenics',
+                  fitnessGoals: source.fitness_goals,
+                  goalDescription: source.goal || '',
+                })
+              : baseWeekHasSkills ||
+                hasLearnSkillsGoal({
+                  trainingType: source.training_type || 'calisthenics',
+                  goalDescription: source.goal || '',
+                });
+
           const full12 = build12WeekMicrocycles(baseWeek, {
             trainingType: source.training_type || 'calisthenics',
+            fitnessGoals: source.fitness_goals,
+            goalDescription: source.goal || '',
+            wantsSkills: inferredWantsSkills,
+            workoutDays,
           });
 
           microcycles = full12.map(w => {
@@ -376,16 +430,22 @@ export function normalizeWorkoutProgram(program) {
       }
     }
 
+    // Ensure every microcycle uses exact workout weekday names (e.g. "Monday - Upper Push") instead of "Day 1"
+    microcycles = microcycles.map((m) => applyWorkoutDayNames(m, workoutDays));
+
     const mesocycles = asArray(
       source.mesocycles
     );
 
-    const macrocycle = asObject(
-      source.macrocycle
-    );
+    const normalizedMacrocycle =
+      workoutDays.length > 0 && !Array.isArray(macrocycle.training_days)
+        ? { ...macrocycle, training_days: workoutDays }
+        : macrocycle;
 
     return {
       ...source,
+
+      training_days: workoutDays,
 
       program_name:
         safeString(
@@ -434,7 +494,7 @@ export function normalizeWorkoutProgram(program) {
           ""
         ),
 
-      macrocycle,
+      macrocycle: normalizedMacrocycle,
 
       mesocycles,
 

@@ -18,7 +18,7 @@ import {
 import {
   resolveValidSupabaseSession,
   getStoredUserEmail,
-} from '@/lib/paddleCheckout';
+} from '@/lib/stripeCheckout';
 import { queryClientInstance } from '@/lib/query-client';
 import { invalidateCurrentUserCache } from '@/lib/supabaseApi';
 
@@ -48,8 +48,8 @@ function clearPendingCheckoutArtifacts() {
   try {
     localStorage.removeItem('washek_pending_checkout_plan');
     sessionStorage.removeItem('washek_pending_checkout_plan');
-    localStorage.removeItem('washek_pending_checkout_tx');
-    sessionStorage.removeItem('washek_pending_checkout_tx');
+    localStorage.removeItem('washek_pending_checkout_session_id');
+    sessionStorage.removeItem('washek_pending_checkout_session_id');
     document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
   } catch {
     // ignore storage cleanup errors
@@ -185,16 +185,14 @@ export default function SubscriptionReturn() {
         setPlanName(PLAN_LABELS[hintedPlan] || hintedPlan);
       }
 
-      // Extract Paddle transaction ID if returned via successUrl, Paddle _ptxn param, or overlay completion event
-      const transactionId =
-        searchParams.get('transaction_id') ||
-        searchParams.get('_ptxn') ||
-        searchParams.get('ptxn') ||
+      // Extract Stripe Checkout Session ID if returned via success_url or pending storage
+      const sessionId =
+        searchParams.get('session_id') ||
         (() => {
           try {
             return (
-              sessionStorage.getItem('washek_pending_checkout_tx') ||
-              localStorage.getItem('washek_pending_checkout_tx') ||
+              sessionStorage.getItem('washek_pending_checkout_session_id') ||
+              localStorage.getItem('washek_pending_checkout_session_id') ||
               ''
             );
           } catch {
@@ -227,12 +225,21 @@ export default function SubscriptionReturn() {
         }
       }
 
-      const resolvedEmail = (authUser?.email || getStoredUserEmail() || '').toLowerCase().trim();
-
-      // If Paddle gave us a transaction ID, ask backend to verify directly with Paddle Billing API first
-      if (transactionId) {
+      const storedUser = (() => {
         try {
-          const verifyRes = await fetch('/api/paddle/verify-transaction', {
+          const raw = localStorage.getItem('washek_user');
+          return raw ? JSON.parse(raw) : null;
+        } catch {
+          return null;
+        }
+      })();
+      const resolvedEmail = (authUser?.email || getStoredUserEmail() || '').toLowerCase().trim();
+      const resolvedUserId = authUser?.id || storedUser?.id || storedUser?.uid || '';
+
+      // If Stripe gave us a Checkout Session ID, ask backend to verify directly with Stripe API first
+      if (sessionId) {
+        try {
+          const verifyRes = await fetch('/api/stripe/verify-session', {
             method: 'POST',
             credentials: 'include',
             headers: {
@@ -240,9 +247,9 @@ export default function SubscriptionReturn() {
               ...(recoveredAccessToken ? { Authorization: `Bearer ${recoveredAccessToken}` } : {}),
             },
             body: JSON.stringify({
-              transactionId,
+              sessionId,
               plan: hintedPlan !== 'free' ? hintedPlan : undefined,
-              userId: authUser?.id || undefined,
+              userId: resolvedUserId || undefined,
               email: resolvedEmail || undefined,
             }),
           });
@@ -257,11 +264,11 @@ export default function SubscriptionReturn() {
             }
           }
         } catch (txErr) {
-          console.debug('[SubscriptionReturn] Direct Paddle transaction verification note:', txErr);
+          console.debug('[SubscriptionReturn] Direct Stripe session verification note:', txErr);
         }
       }
 
-      // Legacy fallback: if opened as a child popup with window.opener and still no local session
+      // Opener fallback: if opened as a child popup with window.opener and still no local session
       if (!authUser?.id && window.opener && !window.opener.closed) {
         let settled = false;
 
@@ -278,7 +285,7 @@ export default function SubscriptionReturn() {
             } else {
               setStatus('error');
               setErrorMessage(
-                'Payment has not been confirmed by Paddle yet. Your plan stays unchanged until Paddle completes payment.'
+                'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment.'
               );
             }
           } else if (event.data?.type === 'WASHEK_CHECKOUT_NOT_CONFIRMED') {
@@ -287,7 +294,7 @@ export default function SubscriptionReturn() {
             clearPendingCheckoutArtifacts();
             setStatus('error');
             setErrorMessage(
-              'Payment has not been confirmed by Paddle yet. Your plan stays unchanged until Paddle completes payment. If you just paid, tap Re-check Payment Status below.'
+              'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
             );
           }
         };
@@ -299,7 +306,7 @@ export default function SubscriptionReturn() {
             openerCleanup?.();
             setStatus('error');
             setErrorMessage(
-              'Still waiting for Paddle payment confirmation. Tap Re-check Payment Status or return to the WASHEK tab.'
+              'Still waiting for Stripe payment confirmation. Tap Re-check Payment Status or return to the WASHEK tab.'
             );
           }
         }, 26000);
@@ -311,7 +318,7 @@ export default function SubscriptionReturn() {
               {
                 type: 'WASHEK_CHECKOUT_RETURN',
                 plan: hintedPlan,
-                transactionId,
+                sessionId,
               },
               window.location.origin
             );
@@ -330,28 +337,65 @@ export default function SubscriptionReturn() {
         return;
       }
 
-      if (!authUser?.id) {
+      if (!authUser?.id && !resolvedEmail && !resolvedUserId) {
         if (cancelledRef.current) return;
-        const hasLocalSignedInUser = (() => {
-          try {
-            const raw = localStorage.getItem('washek_user');
-            const parsed = raw ? JSON.parse(raw) : null;
-            return Boolean(parsed?.email);
-          } catch {
-            return false;
-          }
-        })();
         clearPendingCheckoutArtifacts();
         setStatus('error');
         setErrorMessage(
-          hasLocalSignedInUser
-            ? 'Your account is currently signed in with a local session. Sign in with your verified email account so billing updates sync automatically across devices.'
-            : 'Please sign in to your WASHEK account so we can verify your Paddle payment status.'
+          'Please sign in to your WASHEK account so we can verify your Stripe payment status.'
         );
         return;
       }
 
-      // Poll authoritative Supabase profiles table until Paddle webhook writes an active/trialing paid plan
+      if (!authUser?.id) {
+        // Local/vault signed-in user: poll backend verification endpoint briefly before concluding
+        let confirmedPlan = 'free';
+        let confirmedStatus = 'inactive';
+        for (let attempt = 0; attempt < 10; attempt++) {
+          if (cancelledRef.current) return;
+          try {
+            const verifyRes = await fetch('/api/stripe/verify-session', {
+              method: 'POST',
+              credentials: 'include',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                sessionId: sessionId || undefined,
+                plan: hintedPlan !== 'free' ? hintedPlan : undefined,
+                userId: resolvedUserId || undefined,
+                email: resolvedEmail || undefined,
+              }),
+            });
+            const verifyData = await verifyRes.json().catch(() => null);
+            if (verifyRes.ok && verifyData?.verified) {
+              const p = normalizePlan(verifyData.plan || hintedPlan);
+              const s = String(verifyData.status || 'active').toLowerCase().trim();
+              if (p !== 'free' && ACTIVE_SUB_STATUSES.includes(s)) {
+                confirmedPlan = p;
+                confirmedStatus = s;
+                break;
+              }
+            }
+          } catch {
+            // continue polling
+          }
+          if (attempt < 9) {
+            await new Promise((r) => window.setTimeout(r, 1000));
+          }
+        }
+        if (cancelledRef.current) return;
+        clearPendingCheckoutArtifacts();
+        if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+          completeSuccessFlow(confirmedPlan, confirmedStatus);
+        } else {
+          setStatus('error');
+          setErrorMessage(
+            'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
+          );
+        }
+        return;
+      }
+
+      // Poll authoritative Supabase profiles table until Stripe webhook writes an active/trialing paid plan
       let confirmedPlan = 'free';
       let confirmedStatus = 'inactive';
 
@@ -417,7 +461,7 @@ export default function SubscriptionReturn() {
 
       clearPendingCheckoutArtifacts();
 
-      // Strict payment verification guard: do NOT upgrade unless Postgres profiles or Paddle confirms paid active/trialing
+      // Strict payment verification guard: do NOT upgrade unless Postgres profiles or Stripe confirms paid active/trialing
       if (confirmedPlan === 'free' || !ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
         try {
           localStorage.removeItem('washek_subscription_plan');
@@ -427,7 +471,7 @@ export default function SubscriptionReturn() {
         }
         setStatus('error');
         setErrorMessage(
-          'Payment has not been confirmed by Paddle yet. Your plan stays unchanged until Paddle completes payment. If you just paid, tap Re-check Payment Status below.'
+          'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
         );
         return;
       }
@@ -459,7 +503,7 @@ export default function SubscriptionReturn() {
           </h1>
 
           <p className="text-sm text-muted-foreground leading-relaxed">
-            Checking Paddle payment confirmation with your WASHEK account{planName ? ` for ${planName}` : ''}…
+            Checking Stripe payment confirmation with your WASHEK account{planName ? ` for ${planName}` : ''}…
           </p>
 
           <div className="flex items-center justify-center gap-2 text-primary font-heading font-bold text-sm pt-2">
@@ -549,7 +593,7 @@ export default function SubscriptionReturn() {
         </h1>
 
         <p className="text-muted-foreground text-sm leading-relaxed">
-          {errorMessage || 'No active Paddle payment was confirmed for your account. Your current plan remains unchanged.'}
+          {errorMessage || 'No active Stripe payment was confirmed for your account. Your current plan remains unchanged.'}
         </p>
 
         <div className="pt-2 space-y-2">

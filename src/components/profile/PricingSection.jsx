@@ -25,16 +25,17 @@ import {
   clearRecentUpgradeGrace,
 } from '@/lib/subscription';
 import {
-  PADDLE_TIERS,
+  STRIPE_TIERS,
+  STRIPE_DEFAULT_PRICES,
   getTierKey,
-} from '@/lib/paddleTiers';
+} from '@/lib/stripeTiers';
 import {
-  fetchLocalizedPaddlePrices,
-  openPaddleCheckout,
+  fetchStripeTierPrices,
+  startStripeCheckout,
   resolveValidSupabaseSession,
   extractInvokeErrorMessage,
   isNonJwtToken,
-} from '@/lib/paddleCheckout';
+} from '@/lib/stripeCheckout';
 import { queryClientInstance } from '@/lib/query-client';
 import { invalidateCurrentUserCache } from '@/lib/supabaseApi';
 import { toast } from 'sonner';
@@ -100,15 +101,15 @@ const TIER_VISUALS = {
   },
 };
 
-const plans = PADDLE_TIERS.map((tier) => {
+const plans = STRIPE_TIERS.map((tier) => {
   const planKey = getTierKey(tier.name);
   const visuals = TIER_VISUALS[planKey] || TIER_VISUALS.progress;
   return {
     name: tier.name,
     planKey,
     description: tier.description,
-    productId: tier.productId,
     priceId: tier.priceId,
+    defaultPrice: tier.defaultPrice,
     features: tier.features,
     ...visuals,
   };
@@ -151,7 +152,7 @@ function isActiveStatus(status) {
 }
 
 export default function PricingSection({ onPlanChange, currentPlanProp }) {
-  const { user, checkUserAuth, logout, syncSupabaseSession } = useAuth();
+  const { user, checkUserAuth, syncSupabaseSession } = useAuth();
   const onPlanChangeRef = useRef(onPlanChange);
   useEffect(() => {
     onPlanChangeRef.current = onPlanChange;
@@ -218,41 +219,24 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   const [subscription, setSubscription] = useState(null);
   const [error, setError] = useState('');
   const [cardError, setCardError] = useState(null); // { planKey, message, needsReauth }
-  const [localizedPrices, setLocalizedPrices] = useState({});
-  const [loadingPrices, setLoadingPrices] = useState(true);
-  const [paddlePriceError, setPaddlePriceError] = useState('');
+  const [localizedPrices, setLocalizedPrices] = useState(() => ({ ...STRIPE_DEFAULT_PRICES }));
+  const [loadingPrices, setLoadingPrices] = useState(false);
   const [loadingSubscription, setLoadingSubscription] = useState(true);
   const checkoutPollTimerRef = useRef(null);
   const lastSyncEventRef = useRef(0);
 
   useEffect(() => {
     let active = true;
-    setLoadingPrices(true);
-    setPaddlePriceError('');
 
-    fetchLocalizedPaddlePrices({ interval: 'month' })
+    fetchStripeTierPrices()
       .then((res) => {
         if (!active) return;
-        setLocalizedPrices(res?.pricesByTier || {});
-      })
-      .catch((err) => {
-        if (!active) return;
-        const msg = err?.message || 'Unable to load localized Paddle pricing.';
-        const isConfigErr = [
-          'PADDLE_ENV_MISSING',
-          'PADDLE_TOKEN_MISSING',
-          'PADDLE_TOKEN_ENV_MISMATCH',
-          'PADDLE_PRICE_ID_REQUIRED',
-        ].includes(err?.code);
-        if (isConfigErr) {
-          console.warn('[PricingSection] Paddle configuration required:', msg);
-        } else {
-          console.error('[PricingSection] Paddle PricePreview failed:', err);
+        if (res?.pricesByTier) {
+          setLocalizedPrices(res.pricesByTier);
         }
-        setPaddlePriceError(msg);
       })
-      .finally(() => {
-        if (active) setLoadingPrices(false);
+      .catch(() => {
+        // Keep canonical Stripe tier prices on transient network error
       });
 
     return () => {
@@ -341,7 +325,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           if (authUid && !isNonJwtToken(sessionToken)) {
             const { data: profile, error: profErr } = await supabase
               .from('profiles')
-              .select('subscription_plan, subscription_status, paddle_subscription_id, paddle_price_id')
+              .select('subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id')
               .eq('id', authUid)
               .maybeSingle();
 
@@ -380,8 +364,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           hasRemoteProfile = true;
           profilePlan = normalizePlan(dbProf.subscription_plan);
           profileStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
-          profileSubId = dbProf.paddle_subscription_id || null;
-          profilePriceId = dbProf.paddle_price_id || null;
+          profileSubId = dbProf.stripe_subscription_id || null;
+          profilePriceId = dbProf.stripe_price_id || null;
         }
       } catch (sbErr) {
         console.debug('[PricingSection] Supabase profile lookup note:', sbErr);
@@ -438,7 +422,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           plan: resolvedPlan,
           plan_key: resolvedPlan,
           status: resolvedStatus,
-          paddle_price_id: profilePriceId,
+          stripe_price_id: profilePriceId,
         });
         if (localPlanRaw !== resolvedPlan) {
           applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { syncServer: false });
@@ -602,40 +586,6 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     }
   }, []);
 
-  const startPostCheckoutPolling = useCallback((expectedPlan) => {
-    stopPostCheckoutPolling();
-    const startedAt = Date.now();
-    checkoutPollTimerRef.current = window.setInterval(async () => {
-      if (Date.now() - startedAt > 120000) {
-        stopPostCheckoutPolling();
-        return;
-      }
-      try {
-        const { data: sessionData } = await supabase.auth.getSession();
-        const uid = sessionData?.session?.user?.id || user?.id;
-        if (!uid || String(uid).startsWith('usr_') || isNonJwtToken(sessionData?.session?.access_token)) return;
-        const { data: profile } = await supabase
-          .from('profiles')
-          .select('subscription_plan, subscription_status')
-          .eq('id', uid)
-          .maybeSingle();
-
-        const dbPlan = normalizePlan(profile?.subscription_plan);
-        const dbStatus = String(profile?.subscription_status || '').toLowerCase().trim();
-        if (dbPlan === expectedPlan && isActiveStatus(dbStatus)) {
-          stopPostCheckoutPolling();
-          applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
-          setCurrentPlan(dbPlan);
-          onPlanChangeRef.current?.(dbPlan);
-          checkUserAuth?.().catch(() => {});
-          loadSubscription();
-        }
-      } catch {
-        // ignore transient poll errors
-      }
-    }, 2500);
-  }, [checkUserAuth, loadSubscription, stopPostCheckoutPolling, user?.id]);
-
   const handleCheckout = async (plan) => {
     if (!plan?.planKey || loadingPlan) {
       return;
@@ -664,57 +614,24 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       sessionStorage.setItem('washek_pending_checkout_plan', plan.planKey);
       document.cookie = `washek_pending_checkout_plan=${plan.planKey}; path=/; max-age=86400; SameSite=Lax`;
 
-      const selectedPriceId = localizedPrices[plan.planKey]?.priceId || plan.priceId?.month || '';
-
-      startPostCheckoutPolling(plan.planKey);
-
-      await openPaddleCheckout({
+      const result = await startStripeCheckout({
         planKey: plan.planKey,
-        priceId: selectedPriceId,
         email: userEmail,
         userId,
-        onCompleted: (txData, completedPlanKey) => {
-          stopPostCheckoutPolling();
-          const txId = txData?.transaction_id || txData?.id || '';
-          const params = new URLSearchParams({
-            plan: completedPlanKey || plan.planKey,
-          });
-          if (txId) params.set('transaction_id', txId);
-          window.location.assign(`/welcome?${params.toString()}`);
-        },
-        onError: (formattedErr) => {
-          stopPostCheckoutPolling();
-          setLoadingPlan(null);
-          const msg = formattedErr?.message || 'Unable to open Paddle Checkout.';
-          setError(msg);
-          setCardError({ planKey: plan.planKey, message: msg, needsReauth: false });
-          toast.error(msg);
-        },
-        onClosed: () => {
-          stopPostCheckoutPolling();
-          setLoadingPlan(null);
-        },
       });
-    } catch (checkoutError) {
-      const isAuthErr = checkoutError?.code === 'AUTH_SESSION_EXPIRED';
-      const isConfigErr = [
-        'PADDLE_ENV_MISSING',
-        'PADDLE_TOKEN_MISSING',
-        'PADDLE_TOKEN_ENV_MISMATCH',
-        'PADDLE_PRICE_ID_REQUIRED',
-      ].includes(checkoutError?.code);
-      const msg = isAuthErr
-        ? 'Please sign in to upgrade your plan.'
-        : checkoutError?.message || 'Unable to open Paddle Checkout.';
-      if (isConfigErr || isAuthErr) {
-        console.warn('[PricingSection] Paddle checkout blocked:', msg);
-      } else {
-        console.error('[PricingSection] Paddle checkout failed:', checkoutError);
+
+      if (result?.action === 'already_active') {
+        await checkUserAuth?.().catch(() => {});
+        await loadSubscription();
+        setLoadingPlan(null);
       }
+    } catch (checkoutError) {
+      stopPostCheckoutPolling();
+      const msg = checkoutError?.message || 'Unable to open Stripe Checkout.';
+      console.error('[PricingSection] Stripe checkout failed:', checkoutError);
       setError(msg);
-      setCardError({ planKey: plan.planKey, message: msg, needsReauth: isAuthErr });
+      setCardError({ planKey: plan.planKey, message: msg });
       toast.error(msg);
-    } finally {
       setLoadingPlan(null);
     }
   };
@@ -796,10 +713,44 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       let confirmedCancelProfile = null;
       let data = null;
 
-      // 2. Call Express Paddle cancel-subscription endpoint (cancels via Paddle API or clears local/vault state)
+      // 2. Invoke Supabase cancel-subscription Edge Function first when JWT exists (has Stripe Secret Key)
+      if (!canceledConfirmed && session?.access_token && !isNonJwtToken(session.access_token)) {
+        try {
+          let invokeError = null;
+          ({ data, error: invokeError } = await invokeCancelEdge(session));
+          detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
+
+          if (
+            (invokeError && (looksLikeAuthFailure(invokeError.message) || looksLikeAuthFailure(detailedMessage))) ||
+            (data?.success === false && looksLikeAuthFailure(data?.error))
+          ) {
+            try {
+              session = await resolveValidSupabaseSession(true);
+              if (session?.access_token) {
+                freshToken = session.access_token;
+                ({ data, error: invokeError } = await invokeCancelEdge(session));
+                detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
+              }
+            } catch {
+              // ignore refresh failure
+            }
+          }
+
+          if (!invokeError && data?.success !== false) {
+            canceledConfirmed = true;
+            confirmedCancelProfile = data?.user || null;
+          } else if (data?.error && !detailedMessage) {
+            detailedMessage = data.error;
+          }
+        } catch (edgeErr) {
+          console.debug('[PricingSection] Supabase cancel-subscription edge note:', edgeErr);
+        }
+      }
+
+      // 3. Fallback to Express /api/cancel-subscription endpoint (cancels via Stripe API or clears local/vault state)
       if (!canceledConfirmed) {
         try {
-          const proxyRes = await fetch('/api/paddle/cancel-subscription', {
+          const proxyRes = await fetch('/api/cancel-subscription', {
             method: 'POST',
             credentials: 'include',
             headers: {
@@ -827,37 +778,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
             detailedMessage = proxyData.error;
           }
         } catch (proxyErr) {
-          console.debug('[PricingSection] Paddle cancel note:', proxyErr);
-        }
-      }
-
-      // 3. Fallback to legacy Supabase cancel-subscription Edge Function if still needed and JWT exists
-      if (!canceledConfirmed && session?.access_token && !isNonJwtToken(session.access_token)) {
-        let invokeError = null;
-        ({ data, error: invokeError } = await invokeCancelEdge(session));
-        detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
-
-        if (
-          (invokeError && (looksLikeAuthFailure(invokeError.message) || looksLikeAuthFailure(detailedMessage))) ||
-          (data?.success === false && looksLikeAuthFailure(data?.error))
-        ) {
-          try {
-            session = await resolveValidSupabaseSession(true);
-            if (session?.access_token) {
-              freshToken = session.access_token;
-              ({ data, error: invokeError } = await invokeCancelEdge(session));
-              detailedMessage = invokeError ? await extractInvokeErrorMessage(invokeError) : '';
-            }
-          } catch {
-            // ignore
-          }
-        }
-
-        if (!invokeError && data?.success !== false) {
-          canceledConfirmed = true;
-          confirmedCancelProfile = data?.user || null;
-        } else if (data?.error && !detailedMessage) {
-          detailedMessage = data.error;
+          console.debug('[PricingSection] Stripe cancel note:', proxyErr);
         }
       }
 
@@ -959,12 +880,12 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       <div className="absolute top-1/2 -left-20 w-80 h-80 bg-emerald-500/15 rounded-full blur-[100px] pointer-events-none" />
       <div className="absolute bottom-10 -right-20 w-80 h-80 bg-amber-500/15 rounded-full blur-[100px] pointer-events-none" />
 
-      {(error || paddlePriceError) && (
+      {error && (
         <div className="flex items-start gap-2 rounded-xl border border-destructive/30 bg-destructive/5 p-3 text-sm relative z-10">
           <XCircle className="mt-0.5 h-4 w-4 shrink-0 text-destructive" />
 
           <span>
-            {error || paddlePriceError}
+            {error}
           </span>
         </div>
       )}
@@ -1035,8 +956,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         const isCurrent = currentPlan === plan.planKey;
         const isIncludedInHigherTier = cardTierLevel < currentTierLevel;
 
-        const localizedPrice = localizedPrices[plan.planKey]?.formattedTotal || null;
-        const displayPrice = localizedPrice || (loadingPrices ? '…' : '—');
+        const localizedPrice = localizedPrices[plan.planKey]?.formattedTotal || plan.defaultPrice || null;
+        const displayPrice = localizedPrice || '—';
 
         return (
           <Card
@@ -1118,32 +1039,16 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                   {loadingPlan === plan.planKey ? (
                     <>
                       <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                      Opening Paddle Checkout…
+                      Opening Stripe Checkout…
                     </>
                   ) : (
                     `Subscribe to ${plan.name}`
                   )}
                 </Button>
                 {cardError?.planKey === plan.planKey && cardError?.message && (
-                  <div className="space-y-2 text-center">
-                    <p className="text-[11px] text-destructive font-medium">
-                      {cardError.message}
-                    </p>
-                    {cardError.needsReauth && (
-                      <Button
-                        type="button"
-                        variant="outline"
-                        size="sm"
-                        className="w-full text-xs font-semibold"
-                        onClick={async () => {
-                          await logout?.().catch(() => {});
-                          window.location.assign('/login');
-                        }}
-                      >
-                        Sign In to Continue Upgrade
-                      </Button>
-                    )}
-                  </div>
+                  <p className="text-[11px] text-destructive font-medium text-center">
+                    {cardError.message}
+                  </p>
                 )}
                 <p className="text-[11px] text-center text-muted-foreground font-medium">
                   {localizedPrice

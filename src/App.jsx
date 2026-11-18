@@ -43,7 +43,7 @@ const LiveWorkout = lazy(() => import('@/pages/LiveWorkout'));
 const SubscriptionReturn = lazy(() => import('@/pages/SubscriptionReturn'));
 
 import { supabase } from '@/lib/supabase';
-import { resolveValidSupabaseSession } from '@/lib/paddleCheckout';
+import { resolveValidSupabaseSession } from '@/lib/stripeCheckout';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { applySubscriptionUpgrade, normalizePlan } from '@/lib/subscription';
 

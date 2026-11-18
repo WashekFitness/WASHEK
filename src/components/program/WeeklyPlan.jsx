@@ -25,9 +25,7 @@ import {
   Sparkles,
   Loader2,
   TrendingUp,
-  Shield,
   Lock,
-  Moon,
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
@@ -39,6 +37,11 @@ import {
 } from '@/lib/subscription';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { build12WeekMicrocycles, WEEK_CONFIGS } from '@/lib/periodizationEngine';
+import {
+  hasLearnSkillsGoal,
+  isCalisthenicsSkillExercise,
+} from '@/lib/programExclusions';
+import { WEEKDAYS, resolveWorkoutDays } from '@/lib/workoutSchedule';
 import { toast } from 'sonner';
 
 const weekTypeConfig = {
@@ -399,6 +402,18 @@ export default function WeeklyPlan({
   ] = useState('free');
 
   const [
+    userProfile,
+    setUserProfile,
+  ] = useState(() => {
+    try {
+      const stored = localStorage.getItem('washek_user');
+      return stored ? JSON.parse(stored) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const [
     editingDayIndex,
     setEditingDayIndex,
   ] = useState(null);
@@ -432,8 +447,40 @@ export default function WeeklyPlan({
 
     if (baseWeek) {
       try {
+        const baseHasSkills = (baseWeek.days || []).some((d) =>
+          (d.exercises || []).some((e) => isCalisthenicsSkillExercise(e?.name))
+        );
+        const wantsSkills = userProfile
+          ? hasLearnSkillsGoal({
+              trainingType: program?.training_type || 'calisthenics',
+              fitnessGoals: userProfile.fitness_goals,
+              weightGoals: userProfile.weight_goals,
+              goalDescription: program?.goal || '',
+              requirements: userProfile.training_requirements || '',
+            })
+          : baseHasSkills;
+
+        const workoutDays = resolveWorkoutDays({
+          trainingDays: program?.macrocycle?.training_days || userProfile?.training_days,
+          existingDays: baseWeek.days,
+          requirements: userProfile?.training_requirements || '',
+          goalDescription: program?.goal || '',
+        });
+
         const full12 = build12WeekMicrocycles(baseWeek, {
           trainingType: program?.training_type || 'calisthenics',
+          fitnessLevel: program?.fitness_level || userProfile?.fitness_level || 'intermediate',
+          fitnessGoals: userProfile?.fitness_goals,
+          weightGoals: userProfile?.weight_goals,
+          goalDescription: program?.goal || '',
+          timeframe: userProfile?.goal_timeframe || '',
+          requirements: userProfile?.training_requirements || '',
+          equipment: userProfile?.available_equipment || '',
+          currentSkills: userProfile?.current_skills || '',
+          age: userProfile?.age,
+          gender: userProfile?.gender,
+          workoutDays,
+          wantsSkills,
         });
         return full12.map(w => {
           const existing = rawWeeks.find(
@@ -447,7 +494,7 @@ export default function WeeklyPlan({
     }
 
     return rawWeeks;
-  }, [program]);
+  }, [program, userProfile]);
 
   // Persist 12-week microcycles in the database if the active program only had 1 week
   useEffect(() => {
@@ -475,8 +522,40 @@ export default function WeeklyPlan({
         toast.error('No baseline week found to build progression.');
         return;
       }
+      const baseHasSkills = (baseWeek.days || []).some((d) =>
+        (d.exercises || []).some((e) => isCalisthenicsSkillExercise(e?.name))
+      );
+      const wantsSkills = userProfile
+        ? hasLearnSkillsGoal({
+            trainingType: program.training_type || 'calisthenics',
+            fitnessGoals: userProfile.fitness_goals,
+            weightGoals: userProfile.weight_goals,
+            goalDescription: program.goal || '',
+            requirements: userProfile.training_requirements || '',
+          })
+        : baseHasSkills;
+
+      const workoutDays = resolveWorkoutDays({
+        trainingDays: program?.macrocycle?.training_days || userProfile?.training_days,
+        existingDays: baseWeek.days,
+        requirements: userProfile?.training_requirements || '',
+        goalDescription: program.goal || '',
+      });
+
       const full12Weeks = build12WeekMicrocycles(baseWeek, {
         trainingType: program.training_type || 'calisthenics',
+        fitnessLevel: program.fitness_level || userProfile?.fitness_level || 'intermediate',
+        fitnessGoals: userProfile?.fitness_goals,
+        weightGoals: userProfile?.weight_goals,
+        goalDescription: program.goal || '',
+        timeframe: userProfile?.goal_timeframe || '',
+        requirements: userProfile?.training_requirements || '',
+        equipment: userProfile?.available_equipment || '',
+        currentSkills: userProfile?.current_skills || '',
+        age: userProfile?.age,
+        gender: userProfile?.gender,
+        workoutDays,
+        wantsSkills,
       });
       await supabaseApi.entities.WorkoutProgram.update(program.id, {
         microcycles: full12Weeks,
@@ -548,6 +627,7 @@ export default function WeeklyPlan({
           return;
         }
 
+        setUserProfile(user);
         setUserPlan(resolveEffectivePlan(user));
       })
       .catch((error) => {
@@ -1342,137 +1422,20 @@ export default function WeeklyPlan({
           DAYS
           ====================================================== */}
 
-      {currentMicrocycle && (() => {
-        const rawDays = currentMicrocycle.days || [];
-        // Ensure standard 7-day microcycle structure so rest days are always prominently visible
-        let daysToRender = rawDays;
-        const hasExplicitRest = rawDays.some(
-          d => !d.exercises || d.exercises.length === 0 || d.is_rest_day ||
-               String(d.day_name || '').toLowerCase().includes('rest') ||
-               String(d.workout_type || '').toLowerCase().includes('rest')
-        );
-
-        if (!hasExplicitRest && rawDays.length > 0 && rawDays.length < 7) {
-          // Microcycle was saved with only workout days; weave in designated rest days to complete the 7-day week
-          daysToRender = [];
-          let w = 0;
-          for (let d = 1; d <= 7; d++) {
-            if (d === 3 && rawDays.length <= 5) {
-              daysToRender.push({
-                day_name: `Day 3 - Active Recovery & Mobility`,
-                workout_type: 'Rest & Active Recovery',
-                is_rest_day: true,
-                recovery_focus: 'Connective tissue mobility, hip openers & light cardio flush',
-                exercises: [],
-              });
-            } else if (d === 6 && w >= rawDays.length) {
-              daysToRender.push({
-                day_name: `Day 6 - Mobility & Core Regeneration`,
-                workout_type: 'Active Recovery',
-                is_rest_day: true,
-                recovery_focus: 'Thoracic extension, shoulder capsule decompression & hydration',
-                exercises: [],
-              });
-            } else if (d === 7) {
-              daysToRender.push({
-                day_name: `Day 7 - Complete Rest & CNS Regeneration`,
-                workout_type: 'Rest & Regeneration',
-                is_rest_day: true,
-                recovery_focus: 'Full body restoration, sleep optimization & muscle protein synthesis',
-                exercises: [],
-              });
-            } else if (w < rawDays.length) {
-              daysToRender.push(rawDays[w++]);
-            } else {
-              daysToRender.push({
-                day_name: `Day ${d} - Rest & Active Recovery`,
-                workout_type: 'Rest & Active Recovery',
-                is_rest_day: true,
-                recovery_focus: 'Neuromuscular recovery & parasympathetic restoration',
-                exercises: [],
-              });
-            }
-          }
-        }
-
-        return (
-          <div className="space-y-3">
-            {daysToRender.map((day, dayIndex) => {
+      {currentMicrocycle && (
+        <div className="space-y-3">
+          {(currentMicrocycle.days || []).map(
+            (day, dayIndex) => {
               const exercises = getExercises(day);
+
               const isRestDay =
-                day.is_rest_day ||
                 exercises.length === 0 ||
-                String(day?.workout_type || '').toLowerCase().includes('rest') ||
-                String(day?.day_name || '').toLowerCase().includes('rest');
+                String(day?.workout_type || '')
+                  .toLowerCase()
+                  .includes('rest');
 
-              const estimatedMinutes = getEstimatedMinutes(exercises);
-
-              if (isRestDay) {
-                return (
-                  <Card
-                    key={`${selectedWeek}-${dayIndex}`}
-                    className="overflow-hidden transition-all border border-indigo-500/25 dark:border-indigo-500/35 bg-gradient-to-b from-card via-card to-card/95 shadow-xs rounded-2xl relative"
-                  >
-                    <div className="p-4 sm:p-5">
-                      <div className="flex items-start justify-between gap-3">
-                        <div className="flex items-center gap-3 min-w-0 flex-1">
-                          <div className="w-10 h-10 rounded-xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center shrink-0">
-                            <Moon className="w-5 h-5 text-indigo-400" />
-                          </div>
-                          <div className="min-w-0">
-                            <p className="font-heading font-bold text-foreground text-base truncate">
-                              {day?.day_name || `Day ${dayIndex + 1} - Rest & Active Recovery`}
-                            </p>
-                            <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20">
-                                {day?.workout_type || 'Rest & Active Recovery'}
-                              </span>
-                              <span className="text-[10px] text-muted-foreground flex items-center gap-1 font-medium">
-                                <Shield className="w-3 h-3 text-emerald-400" />
-                                Streak Protected
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="text-right flex-shrink-0">
-                          <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 border border-indigo-500/20 px-2.5 py-1 rounded-lg">
-                            Recovery Protocol
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* Rest day recovery recommendations */}
-                      <div className="mt-4 pt-3 border-t border-border/60 grid grid-cols-1 sm:grid-cols-3 gap-2">
-                        <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/30 border border-border/40 text-xs">
-                          <span className="w-5 h-5 rounded-md bg-indigo-500/15 text-indigo-400 text-[10px] font-bold flex items-center justify-center shrink-0">
-                            1
-                          </span>
-                          <span className="text-foreground font-medium truncate">
-                            7-9 hrs Restorative Sleep
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/30 border border-border/40 text-xs">
-                          <span className="w-5 h-5 rounded-md bg-indigo-500/15 text-indigo-400 text-[10px] font-bold flex items-center justify-center shrink-0">
-                            2
-                          </span>
-                          <span className="text-foreground font-medium truncate">
-                            15-20 min Mobility Flow / Walk
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-2.5 p-2.5 rounded-xl bg-muted/30 border border-border/40 text-xs">
-                          <span className="w-5 h-5 rounded-md bg-indigo-500/15 text-indigo-400 text-[10px] font-bold flex items-center justify-center shrink-0">
-                            3
-                          </span>
-                          <span className="text-foreground font-medium truncate">
-                            Optimal Hydration &amp; Macros
-                          </span>
-                        </div>
-                      </div>
-                    </div>
-                  </Card>
-                );
-              }
+              const estimatedMinutes =
+                getEstimatedMinutes(exercises);
 
               return (
                 <Card
@@ -1487,7 +1450,7 @@ export default function WeeklyPlan({
                     <div className="flex items-start justify-between gap-3">
                       <div className="flex-1 min-w-0">
                         <p className="font-heading font-bold">
-                          {day?.day_name || `Day ${dayIndex + 1}`}
+                          {day?.day_name || WEEKDAYS[dayIndex % WEEKDAYS.length]}
                         </p>
                         <div className="flex items-center gap-2 mt-1 flex-wrap">
                           {day?.workout_type && (
@@ -1670,8 +1633,7 @@ export default function WeeklyPlan({
             }
           )}
         </div>
-      );
-    })()}
+      )}
 
 
       {/* ======================================================

@@ -143,7 +143,6 @@ export default defineConfig({
       "class-variance-authority",
       "date-fns",
       "canvas-confetti",
-      "@paddle/paddle-js",
     ],
   },
 

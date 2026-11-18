@@ -12,7 +12,17 @@
  * performance, RPE, fatigue, and athlete feedback.
  */
 
-import { sanitizeMicrocycleExclusions } from './programExclusions.js';
+import {
+  sanitizeMicrocycleExclusions,
+  hasLearnSkillsGoal,
+} from './programExclusions.js';
+import {
+  applyWorkoutDayNames,
+  extractWeekdayFromDayName,
+  parseOnboardingPreferences,
+  resolveWorkoutDays,
+  stripLeadingDayPrefix,
+} from './workoutSchedule.js';
 
 function parseRepRange(repStr) {
   const str = String(repStr || '').trim();
@@ -44,6 +54,43 @@ function formatRepRange(min, max, unit = '') {
     return `${min}${unit ? (unit.startsWith('s') ? 's' : '') : ''}`;
   }
   return `${min}-${max}${unit ? (unit.startsWith('s') ? 's' : '') : ''}`;
+}
+
+export function bumpRepString(repStr, repDelta = 1, timeDelta = 5) {
+  const str = String(repStr || '').trim();
+  if (!str) return repStr;
+
+  const totalSuffixMatch = str.match(/^(.*?)(\s+(?:total|each(?:\s+(?:leg|arm|side))?|per\s+(?:leg|arm|side)))$/i);
+  if (totalSuffixMatch) {
+    const coreBumped = bumpRepString(totalSuffixMatch[1].trim(), repDelta, timeDelta);
+    return `${coreBumped}${totalSuffixMatch[2]}`;
+  }
+
+  const parsed = parseRepRange(str);
+  if (parsed.min === null) return repStr;
+
+  if (parsed.unit && parsed.unit.toLowerCase().startsWith('s')) {
+    const step = timeDelta;
+    const newMin = Math.max(10, Math.min(120, parsed.min + step));
+    const newMax = Math.max(newMin, Math.min(120, parsed.max + step));
+    return formatRepRange(newMin, newMax, 's');
+  }
+
+  // Range like "15-20s"
+  const timedRangeMatch = str.match(/^(\d+)\s*[-–]\s*(\d+)\s*(s|sec|seconds)$/i);
+  if (timedRangeMatch) {
+    const tMin = Math.max(10, Math.min(120, parseInt(timedRangeMatch[1], 10) + timeDelta));
+    const tMax = Math.max(tMin + 5, Math.min(120, parseInt(timedRangeMatch[2], 10) + timeDelta));
+    return `${tMin}-${tMax}s`;
+  }
+
+  if (parsed.isRange) {
+    const newMin = Math.max(3, Math.min(25, parsed.min + repDelta));
+    const newMax = Math.max(newMin + 1, Math.min(30, parsed.max + repDelta));
+    return formatRepRange(newMin, newMax);
+  }
+
+  return `${Math.max(3, Math.min(30, parsed.min + repDelta))}`;
 }
 
 export function progressRepsForPhase(baseReps, phase, overload = 'baseline') {
@@ -238,6 +285,7 @@ function calculateExerciseProgression({
   weekConfig,
   trainingType = 'calisthenics',
   trajectory = 'steady',
+  wantsSkills = true,
 }) {
   const baseSets = Math.max(1, Number(exercise.sets) || 3);
   const baseReps = String(exercise.reps || '10');
@@ -266,22 +314,22 @@ function calculateExerciseProgression({
 
     case 'volume':
       targetSets = isCompound ? baseSets + 1 : baseSets;
-      targetReps = baseReps;
+      targetReps = isCompound ? baseReps : bumpRepString(baseReps, 1, 5);
       targetRest = baseRest;
       predictedProgress = isCompound
         ? 'Projected +1 set volume (+25% work capacity, 1-2 RIR)'
-        : 'Projected technical perfection across all sets';
-      periodizationNote = 'Volume accumulation: +1 set on primary lifts, maintain 1-2 RIR to avoid CNS fatigue.';
+        : 'Projected +1 rep progressive overload across accessory sets';
+      periodizationNote = 'Volume accumulation: +1 set on primary lifts, +1 rep on accessories (1-2 RIR).';
       break;
 
     case 'intensity':
       targetSets = isCompound ? baseSets + 1 : baseSets;
-      targetReps = baseReps;
+      targetReps = bumpRepString(baseReps, isCompound ? 1 : 2, isCompound ? 5 : 10);
       targetRest = baseRest + 15;
       predictedProgress = isWeights
-        ? 'Projected +2.5-5 lbs load increase or +1 rep per set (1-2 RIR)'
+        ? 'Projected +2.5-5 lbs load or +1-2 reps per set (1-2 RIR)'
         : 'Projected +1-2 reps per set with full range of motion (1-2 RIR)';
-      periodizationNote = 'Phase 1 peak: 1-2 RIR, accelerate goal progression while managing fatigue.';
+      periodizationNote = 'Phase 1 peak: +1-2 reps overload pushing toward 1-2 RIR.';
       break;
 
     case 'recovery':
@@ -294,7 +342,9 @@ function calculateExerciseProgression({
 
     case 'phase2_base':
       targetSets = baseSets;
-      targetReps = progressRepsForPhase(baseReps, 2, overload);
+      targetReps = isCalisthenics && !isCompound
+        ? bumpRepString(baseReps, 2, 10)
+        : progressRepsForPhase(baseReps, 2, overload);
       targetRest = baseRest + 15;
       predictedProgress = isCalisthenics
         ? 'Phase 2: Stricter 3-0-1-0 eccentric tempo or elevated progression leverage (1-2 RIR)'
@@ -304,43 +354,51 @@ function calculateExerciseProgression({
 
     case 'phase2_volume':
       targetSets = isCompound ? baseSets + 1 : baseSets;
-      targetReps = progressRepsForPhase(baseReps, 2, overload);
+      targetReps = isCompound
+        ? progressRepsForPhase(baseReps, 2, overload)
+        : bumpRepString(progressRepsForPhase(baseReps, 2, overload), 1, 5);
       targetRest = baseRest + 15;
       predictedProgress = 'Projected +15% tonnage under stricter Phase 2 tension';
-      periodizationNote = 'Volume overload: 3s eccentric, manage fatigue with 1-2 RIR on all sets.';
+      periodizationNote = 'Volume overload: 3s eccentric, +1 set compounds / +1 rep accessories (1-2 RIR).';
       break;
 
     case 'phase2_peak':
       targetSets = isCompound ? baseSets + 1 : baseSets;
-      targetReps = progressRepsForPhase(baseReps, 2, overload);
+      targetReps = bumpRepString(progressRepsForPhase(baseReps, 2, overload), 1, 5);
       targetRest = baseRest + 30;
-      predictedProgress = 'Phase 2 peak intensity: 1 rep in reserve, top mechanical tension';
-      periodizationNote = 'Phase 2 peak: maximum controlled loading, strictly leaving 1-2 reps in reserve.';
+      predictedProgress = 'Phase 2 peak intensity: +1 rep at heavier Phase 2 loading (1 RIR)';
+      periodizationNote = 'Phase 2 peak: maximum controlled loading pushing upper rep threshold.';
       break;
 
     case 'phase3_base':
       targetSets = baseSets;
-      targetReps = progressRepsForPhase(baseReps, 3, overload);
+      targetReps = isCalisthenics && !isCompound
+        ? bumpRepString(baseReps, 3, 15)
+        : progressRepsForPhase(baseReps, 3, overload);
       targetRest = baseRest + 30;
       predictedProgress = isCalisthenics
-        ? 'Phase 3: Explosive concentric power / advanced skill tier (1-2 RIR)'
+        ? wantsSkills
+          ? 'Phase 3: Explosive concentric power / advanced skill tier (1-2 RIR)'
+          : 'Phase 3: Explosive concentric power / advanced bodyweight progression (1-2 RIR)'
         : 'Phase 3: Heavy power recruitment (85%+ 1RM equivalent, 1-2 RIR)';
       periodizationNote = 'Phase 3 power: explosive intent on concentric phase, 1-2 RIR, full rest recovery.';
       break;
 
     case 'phase3_overload':
       targetSets = isCompound ? baseSets + 1 : baseSets;
-      targetReps = progressRepsForPhase(baseReps, 3, overload);
+      targetReps = isCompound
+        ? progressRepsForPhase(baseReps, 3, overload)
+        : bumpRepString(progressRepsForPhase(baseReps, 3, overload), 1, 5);
       targetRest = baseRest + 30;
-      predictedProgress = 'Projected top-end strength capacity with full recovery';
+      predictedProgress = 'Projected top-end strength capacity (+1 set compounds / +1 rep accessories)';
       periodizationNote = 'Peak capacity: heavy compound work with full 120-180s recovery between sets.';
       break;
 
     case 'phase3_climax':
       targetSets = baseSets;
-      targetReps = progressRepsForPhase(baseReps, 3, overload);
+      targetReps = bumpRepString(progressRepsForPhase(baseReps, 3, overload), 1, 5);
       targetRest = baseRest + 45;
-      predictedProgress = 'Cycle climax: Near-maximal threshold before taper';
+      predictedProgress = 'Cycle climax: Near-maximal threshold (+1 rep peak expression) before taper';
       periodizationNote = 'Cycle climax: express accumulated adaptations across all key movements with fatigue managed.';
       break;
 
@@ -395,6 +453,7 @@ export function buildSingleWeekMicrocycle(baseWeek1, config, options = {}) {
   const { weekNumber, mesoIndex, weekType, overload, predicted_focus, target_rir, volume_delta } = config;
   const trainingType = options.trainingType || 'calisthenics';
   const trajectory = options.trajectory || 'steady';
+  const wantsSkills = hasLearnSkillsGoal({ trainingType, ...options });
 
   if (weekNumber === 1) {
     const week1Days = baseWeek1.days.map((day) => ({
@@ -406,6 +465,7 @@ export function buildSingleWeekMicrocycle(baseWeek1, config, options = {}) {
           weekConfig: config,
           trainingType,
           trajectory,
+          wantsSkills,
         })
       ),
     }));
@@ -457,6 +517,7 @@ export function buildSingleWeekMicrocycle(baseWeek1, config, options = {}) {
         weekConfig: config,
         trainingType,
         trajectory,
+        wantsSkills,
       })
     );
 
@@ -498,11 +559,230 @@ export function build12WeekMicrocycles(baseWeek1, options = {}) {
  * Ensures the program always builds successfully with 100% biomechanical accuracy
  * even if external AI models experience temporary latency or spike outages.
  */
+function tailorDaysToScheduleAndGoals(days, options = {}, prefs = {}) {
+  const workoutDays = resolveWorkoutDays({ ...options, existingDays: days });
+  const targetCount = workoutDays.length;
+  const trainingType = options.trainingType || 'calisthenics';
+  const wantsSkills = hasLearnSkillsGoal({ trainingType, ...options });
+  const goalsText = [
+    ...(Array.isArray(options.fitnessGoals) ? options.fitnessGoals : []),
+    ...(Array.isArray(options.weightGoals) ? options.weightGoals : []),
+    options.goalDescription || '',
+  ]
+    .join(' ')
+    .toLowerCase();
+
+  const isStrengthFocused = /get_stronger|gain_strength|strength|power/.test(goalsText);
+  const isFatLossOrEndurance = /lose_weight|improve_endurance|endurance|fat\s*loss|cut|lean/.test(
+    goalsText
+  );
+  const ageNum = Number(options.age);
+  const isMasters = Number.isFinite(ageNum) && ageNum >= 45;
+
+  // Adjust rep/rest cadence cleanly to reflect goals, age, and session time
+  let tunedDays = days.map((day) => ({
+    ...day,
+    exercises: (day.exercises || []).map((ex) => {
+      let updated = { ...ex };
+      if (isFatLossOrEndurance && !String(ex.reps || '').includes('s')) {
+        updated.rest_seconds = Math.max(45, Math.round((Number(ex.rest_seconds) || 75) * 0.8));
+      } else if (isStrengthFocused && !String(ex.reps || '').includes('s') && (day.exercises || []).indexOf(ex) < 2) {
+        updated.rest_seconds = Math.max(Number(ex.rest_seconds) || 90, 120);
+      }
+      if (isMasters) {
+        updated.notes = `${updated.notes || ''} Focus on smooth joint control (2-3 RIR).`.trim();
+      }
+      return updated;
+    }),
+  }));
+
+  // Adapt split count (1 to 7 exact days)
+  if (targetCount === 1) {
+    const pick = (dIdx, exIdx = 0) => tunedDays[dIdx]?.exercises?.[exIdx];
+    const combo = [pick(0, 0), pick(1, 0), pick(2, 0), pick(3, 0)].filter(Boolean);
+    tunedDays = [
+      {
+        day_name: `${workoutDays[0]} - Full Body Strength & Conditioning`,
+        workout_type: 'Full Body Total Stimulus',
+        exercises: combo.length >= 3 ? combo : tunedDays[0]?.exercises || [],
+      },
+    ];
+  } else if (targetCount === 2) {
+    const upperCombo = [
+      tunedDays[0]?.exercises?.[0],
+      tunedDays[1]?.exercises?.[0],
+      tunedDays[0]?.exercises?.[1],
+      tunedDays[1]?.exercises?.[1],
+    ].filter(Boolean);
+    const lowerCoreCombo = [
+      tunedDays[2]?.exercises?.[0],
+      tunedDays[2]?.exercises?.[1],
+      tunedDays[3]?.exercises?.[0],
+      tunedDays[3]?.exercises?.[tunedDays[3]?.exercises?.length - 1],
+    ].filter(Boolean);
+    tunedDays = [
+      {
+        day_name: `${workoutDays[0]} - Upper Body Strength & Control`,
+        workout_type: 'Upper Body Compound Focus',
+        exercises: upperCombo.length >= 3 ? upperCombo : tunedDays[0]?.exercises || [],
+      },
+      {
+        day_name: `${workoutDays[1]} - Lower Body, Conditioning & Core`,
+        workout_type: 'Lower Body & Core',
+        exercises: lowerCoreCombo.length >= 3 ? lowerCoreCombo : tunedDays[2]?.exercises || [],
+      },
+    ];
+  } else if (targetCount === 3) {
+    // Drop the 4th accessory day so user gets crisp 3-day Push / Pull / Legs (or Full Upper)
+    tunedDays = tunedDays.slice(0, 3);
+  } else if (targetCount >= 5) {
+    const focusAreas = prefs.focusAreas || {};
+    const focusLabel = focusAreas.chest
+      ? 'Chest & Push Hypertrophy'
+      : focusAreas.back
+        ? 'Back & Pulling Width'
+        : focusAreas.arms
+          ? 'Arms & Upper Conditioning'
+          : focusAreas.shoulders
+            ? 'Shoulders & Overhead Stability'
+            : wantsSkills
+              ? 'Skill Mastery & Core Control'
+              : isFatLossOrEndurance
+                ? 'Metabolic Conditioning & Core'
+                : 'Weak-Point Hypertrophy & Core';
+
+    const extraDay5 = {
+      day_name: `${workoutDays[4]} - ${focusLabel}`,
+      workout_type: focusLabel,
+      exercises:
+        trainingType === 'weights'
+          ? [
+              {
+                name: focusAreas.back ? 'Chest-Supported Dumbbell Row' : 'Incline Dumbbell Press',
+                sets: 3,
+                reps: '10-12',
+                rest_seconds: 90,
+                notes: 'Targeted hypertrophy focus with 3s eccentric control, 1-2 RIR.',
+                activation_cue: 'Keep target muscle under tension throughout full ROM.',
+              },
+              {
+                name: 'Pull-ups (or Neutral-Grip Lat Pulldown)',
+                sets: 3,
+                reps: '8-12',
+                rest_seconds: 90,
+                notes: 'Controlled full extension to chest squeeze.',
+                activation_cue: 'Depress shoulder blades first.',
+              },
+              {
+                name: 'Standing Dumbbell Lateral Raises',
+                sets: 3,
+                reps: '12-15',
+                rest_seconds: 60,
+                notes: 'Lead with elbows in scapular plane.',
+                activation_cue: 'Keep traps relaxed and neck long.',
+              },
+              {
+                name: 'Hanging Knee / Leg Raises',
+                sets: 3,
+                reps: '12-15',
+                rest_seconds: 60,
+                notes: 'Curl pelvis smoothly without swinging.',
+                activation_cue: 'Brace core tightly on every rep.',
+              },
+            ]
+          : [
+              {
+                name: focusAreas.back ? 'Inverted Horizontal Rows' : 'Decline / Tempo Push-ups',
+                sets: 3,
+                reps: '10-15',
+                rest_seconds: 75,
+                notes: 'Strict bodyweight hypertrophy tempo, 1-2 RIR.',
+                activation_cue: 'Maintain rigid hollow-body plank.',
+              },
+              {
+                name: 'Neutral-Grip Pull-ups (or Australian Rows)',
+                sets: 3,
+                reps: '8-10',
+                rest_seconds: 90,
+                notes: 'Full dead hang to chest clear.',
+                activation_cue: 'Drive elbows straight toward hips.',
+              },
+              {
+                name: 'Pike Push-ups',
+                sets: 3,
+                reps: '8-10',
+                rest_seconds: 75,
+                notes: 'Controlled overhead shoulder pressing.',
+                activation_cue: 'Push shoulders away from ears at top.',
+              },
+              {
+                name: 'Hollow Body Hold',
+                sets: 3,
+                reps: '30-40s',
+                rest_seconds: 60,
+                notes: 'Press lower back flat into the floor.',
+                activation_cue: 'Posterior pelvic tilt with ribs tucked.',
+              },
+            ],
+    };
+
+    tunedDays = [...tunedDays, extraDay5];
+
+    if (targetCount >= 6) {
+      tunedDays.push({
+        day_name: `${workoutDays[5]} - Posterior Chain, Mobility & Core`,
+        workout_type: 'Lower Posterior & Core',
+        exercises: tunedDays[2]?.exercises?.length
+          ? tunedDays[2].exercises.map((e) => ({ ...e }))
+          : extraDay5.exercises.map((e) => ({ ...e })),
+      });
+    }
+
+    if (targetCount >= 7) {
+      tunedDays.push({
+        day_name: `${workoutDays[6]} - Core Endurance & Joint Conditioning`,
+        workout_type: 'Core & Active Conditioning',
+        exercises: [
+          {
+            name: 'Hollow Body Hold',
+            sets: 3,
+            reps: '30-40s',
+            rest_seconds: 60,
+            notes: 'Strict core tension with lower back flush on floor.',
+            activation_cue: 'Brace abs and squeeze glutes.',
+          },
+          {
+            name: 'Arch Body (Superman) Hold',
+            sets: 3,
+            reps: '30s',
+            rest_seconds: 60,
+            notes: 'Strengthen spinal erectors, glutes, and upper back.',
+            activation_cue: 'Lift chest and thighs smoothly together.',
+          },
+          {
+            name: 'Tempo Bodyweight Deep Squats',
+            sets: 3,
+            reps: '12-15',
+            rest_seconds: 60,
+            notes: 'Promote hip/ankle mobility and blood flow recovery.',
+            activation_cue: 'Control 3s descent with upright chest.',
+          },
+        ],
+      });
+    }
+  }
+
+  return applyWorkoutDayNames({ days: tunedDays }, workoutDays).days;
+}
+
 export function buildScientificBaselineWeekOne(options = {}) {
   const trainingType = options.trainingType || 'calisthenics';
-  const level = options.level || 'intermediate';
+  const level = options.level || options.fitnessLevel || 'intermediate';
   const isBeginner = level === 'beginner';
-  const isAdvanced = level === 'advanced';
+  const isElite = level === 'elite';
+  const isAdvanced = level === 'advanced' || isElite;
+  const wantsSkills = hasLearnSkillsGoal({ trainingType, ...options });
+  const prefs = parseOnboardingPreferences(options);
 
   let baseWeek;
 
@@ -808,36 +1088,75 @@ export function buildScientificBaselineWeekOne(options = {}) {
             },
           ],
         },
-        {
-          day_name: 'Day 4 - Skill Integration & Secondary Volume',
-          workout_type: 'Skill & Joint Resilience',
-          exercises: [
-            {
-              name: 'Chest-to-Wall Handstand Hold',
-              sets: 4,
-              reps: '30s',
-              rest_seconds: 90,
-              notes: 'Nose and toes touch wall, push floor away actively.',
-              activation_cue: 'Posterior pelvic tilt, elevate shoulders to ears.',
+        wantsSkills
+          ? {
+              day_name: 'Day 4 - Skill Integration & Secondary Volume',
+              workout_type: 'Skill & Joint Resilience',
+              exercises: [
+                {
+                  name: 'Chest-to-Wall Handstand Hold',
+                  sets: 4,
+                  reps: '30s',
+                  rest_seconds: 90,
+                  notes: 'Nose and toes touch wall, push floor away actively.',
+                  activation_cue: 'Posterior pelvic tilt, elevate shoulders to ears.',
+                },
+                {
+                  name: 'Ring Dips (Turnout at Lockout)',
+                  sets: 3,
+                  reps: '6-8',
+                  rest_seconds: 90,
+                  notes: 'Turn rings out 45 degrees at top for serratus and chest activation.',
+                  activation_cue: 'Keep rings tucked close against torso.',
+                },
+                {
+                  name: 'L-Sit on Parallel Bars or Floor',
+                  sets: 3,
+                  reps: '15-20s',
+                  rest_seconds: 60,
+                  notes: 'Lock knees, point toes forward, depress shoulders.',
+                  activation_cue: 'Fire hip flexors and quad lockouts.',
+                },
+              ],
+            }
+          : {
+              day_name: 'Day 4 - Upper Hypertrophy & Core Strength',
+              workout_type: 'Hypertrophy & Joint Resilience',
+              exercises: [
+                {
+                  name: 'Ring Dips (Turnout at Lockout)',
+                  sets: 4,
+                  reps: '6-8',
+                  rest_seconds: 90,
+                  notes: 'Turn rings out at top for deep chest and triceps activation, 1-2 RIR.',
+                  activation_cue: 'Keep rings tucked close against torso.',
+                },
+                {
+                  name: 'Weighted / Decline Deficit Push-ups',
+                  sets: 3,
+                  reps: '8-12',
+                  rest_seconds: 90,
+                  notes: 'Control 3s lowering, drive explosively to full lockout, 1-2 RIR.',
+                  activation_cue: 'Push ground away to engage serratus anterior.',
+                },
+                {
+                  name: 'Feet-Elevated Inverted Bodyweight Rows',
+                  sets: 3,
+                  reps: '10-12',
+                  rest_seconds: 75,
+                  notes: 'Pull lower chest to bar or rings with strict body line.',
+                  activation_cue: 'Pinch shoulder blades together at peak squeeze.',
+                },
+                {
+                  name: 'Hollow Body Hold',
+                  sets: 3,
+                  reps: '30s',
+                  rest_seconds: 60,
+                  notes: 'Lower back pressed flat into floor with full abdominal tension.',
+                  activation_cue: 'Tuck pelvis and lock ribs down.',
+                },
+              ],
             },
-            {
-              name: 'Ring Dips (Turnout at Lockout)',
-              sets: 3,
-              reps: '6-8',
-              rest_seconds: 90,
-              notes: 'Turn rings out 45 degrees at top for serratus and chest activation.',
-              activation_cue: 'Keep rings tucked close against torso.',
-            },
-            {
-              name: 'L-Sit on Parallel Bars or Floor',
-              sets: 3,
-              reps: '15-20s',
-              rest_seconds: 60,
-              notes: 'Lock knees, point toes forward, depress shoulders.',
-              activation_cue: 'Fire hip flexors and quad lockouts.',
-            },
-          ],
-        },
       ],
     };
   } else if (trainingType === 'hybrid') {
@@ -850,17 +1169,30 @@ export function buildScientificBaselineWeekOne(options = {}) {
       volume_delta: 'Baseline (100%)',
       days: [
         {
-          day_name: 'Day 1 - Calisthenics Skill + Upper Push',
-          workout_type: 'Skill & Upper Push Strength',
+          day_name: wantsSkills
+            ? 'Day 1 - Calisthenics Skill + Upper Push'
+            : 'Day 1 - Bodyweight Push + Upper Hypertrophy',
+          workout_type: wantsSkills
+            ? 'Skill & Upper Push Strength'
+            : 'Calisthenics & Weight Push Strength',
           exercises: [
-            {
-              name: 'Wall-Assisted Handstand Balance',
-              sets: 4,
-              reps: '30s',
-              rest_seconds: 90,
-              notes: 'Skill practice first while CNS is fresh. Stop 2-3s before breakdown to manage fatigue.',
-              activation_cue: 'Claw floor with fingertips to control balance.',
-            },
+            wantsSkills
+              ? {
+                  name: 'Wall-Assisted Handstand Balance',
+                  sets: 4,
+                  reps: '30s',
+                  rest_seconds: 90,
+                  notes: 'Skill practice first while CNS is fresh. Stop 2-3s before breakdown to manage fatigue.',
+                  activation_cue: 'Claw floor with fingertips to control balance.',
+                }
+              : {
+                  name: 'Decline / Deficit Strict Push-ups',
+                  sets: 4,
+                  reps: '10-12',
+                  rest_seconds: 90,
+                  notes: 'Controlled 3s lowering for upper chest hypertrophy, 1-2 RIR.',
+                  activation_cue: 'Screw hands into the floor and squeeze glutes.',
+                },
             {
               name: 'Parallel Bar Dips',
               sets: 3,
@@ -888,8 +1220,12 @@ export function buildScientificBaselineWeekOne(options = {}) {
           ],
         },
         {
-          day_name: 'Day 2 - Calisthenics Skill + Upper Pull',
-          workout_type: 'Skill & Upper Pull Strength',
+          day_name: wantsSkills
+            ? 'Day 2 - Calisthenics Skill + Upper Pull'
+            : 'Day 2 - Bodyweight Pull + Upper Back Hypertrophy',
+          workout_type: wantsSkills
+            ? 'Skill & Upper Pull Strength'
+            : 'Calisthenics & Weight Pull Strength',
           exercises: [
             {
               name: 'Strict Bodyweight / Weighted Pull-ups',
@@ -1119,41 +1455,102 @@ export function buildScientificBaselineWeekOne(options = {}) {
           },
         ],
       },
-      {
-        day_name: 'Day 4 - Skill Progression & Full Body Integration',
-        workout_type: 'Skill & Core Mastery',
-        exercises: [
-          {
-            name: 'Chest-to-Wall Handstand Hold',
-            sets: 4,
-            reps: '25-35s',
-            rest_seconds: 90,
-            notes: 'Focus on straight alignment without arching lower back.',
-            activation_cue: 'Push floor away vigorously; elevate scapulae.',
+      wantsSkills
+        ? {
+            day_name: 'Day 4 - Skill Progression & Full Body Integration',
+            workout_type: 'Skill & Core Mastery',
+            exercises: [
+              {
+                name: 'Chest-to-Wall Handstand Hold',
+                sets: 4,
+                reps: '25-35s',
+                rest_seconds: 90,
+                notes: 'Focus on straight alignment without arching lower back.',
+                activation_cue: 'Push floor away vigorously; elevate scapulae.',
+              },
+              {
+                name: 'L-Sit / Tucked L-Sit Hold (Floor or Parallelettes)',
+                sets: 3,
+                reps: '15-20s',
+                rest_seconds: 60,
+                notes: 'Depress shoulders downward to elevate hips off floor, knees tucked or straight.',
+                activation_cue: 'Lock triceps and engage lower abdominals.',
+              },
+              {
+                name: 'Arch Body (Superman) Hold',
+                sets: 3,
+                reps: '30s',
+                rest_seconds: 60,
+                notes: 'Lie prone, lift chest and thighs simultaneously using posterior chain.',
+                activation_cue: 'Squeeze glutes, lower back, and hamstrings.',
+              },
+            ],
+          }
+        : {
+            day_name: 'Day 4 - Full Body Strength & Core Conditioning',
+            workout_type: 'Full Body Hypertrophy & Core',
+            exercises: [
+              {
+                name: isBeginner ? 'Incline Push-ups' : 'Close-Grip / Diamond Push-ups',
+                sets: 4,
+                reps: isBeginner ? '10-12' : '8-12',
+                rest_seconds: 75,
+                notes: 'Controlled 3s lowering, full tricep & chest lockout, leave 1-2 RIR.',
+                activation_cue: 'Keep elbows tucked close to ribs and brace core.',
+              },
+              {
+                name: isBeginner ? 'Australian Horizontal Pull-ups' : 'Neutral-Grip / Commando Pull-ups',
+                sets: 3,
+                reps: isBeginner ? '8-10' : '6-8',
+                rest_seconds: 90,
+                notes: 'Full range of motion with controlled lowering, 1-2 RIR.',
+                activation_cue: 'Depress shoulder blades and pull elbows toward hips.',
+              },
+              {
+                name: 'Single-Leg Glute Bridges / Hip Thrusts',
+                sets: 3,
+                reps: '12-15',
+                rest_seconds: 60,
+                notes: 'Pause 1s at top lockout with posterior pelvic tilt.',
+                activation_cue: 'Drive through heel and squeeze glutes without lumbar arch.',
+              },
+              {
+                name: 'Hanging Knee Raises (or Lying Leg Raises)',
+                sets: 3,
+                reps: '10-12',
+                rest_seconds: 60,
+                notes: 'Curl pelvis upward slowly without momentum swing.',
+                activation_cue: 'Engage lower abs before lifting legs.',
+              },
+              {
+                name: 'Arch Body (Superman) Hold',
+                sets: 3,
+                reps: '30s',
+                rest_seconds: 60,
+                notes: 'Lie prone, lift chest and thighs simultaneously using posterior chain.',
+                activation_cue: 'Squeeze glutes, lower back, and hamstrings.',
+              },
+            ],
           },
-          {
-            name: 'L-Sit / Tucked L-Sit Hold (Floor or Parallelettes)',
-            sets: 3,
-            reps: '15-20s',
-            rest_seconds: 60,
-            notes: 'Depress shoulders downward to elevate hips off floor, knees tucked or straight.',
-            activation_cue: 'Lock triceps and engage lower abdominals.',
-          },
-          {
-            name: 'Arch Body (Superman) Hold',
-            sets: 3,
-            reps: '30s',
-            rest_seconds: 60,
-            notes: 'Lie prone, lift chest and thighs simultaneously using posterior chain.',
-            activation_cue: 'Squeeze glutes, lower back, and hamstrings.',
-          },
-        ],
-      },
     ],
   };
   }
 
-  return sanitizeMicrocycleExclusions(baseWeek, options);
+  const adaptedDays = tailorDaysToScheduleAndGoals(baseWeek.days, options, prefs);
+  const focusSummaryParts = [];
+  if (options.timeframe) focusSummaryParts.push(`Timeline: ${options.timeframe}`);
+  if (options.goalDescription) focusSummaryParts.push(options.goalDescription.slice(0, 80));
+
+  const enrichedWeek = {
+    ...baseWeek,
+    predicted_focus:
+      focusSummaryParts.length > 0
+        ? `Week 1 Baseline (${level}): ${focusSummaryParts.join(' · ')}`
+        : baseWeek.predicted_focus,
+    days: adaptedDays,
+  };
+
+  return sanitizeMicrocycleExclusions(enrichedWeek, options);
 }
 
 /**
@@ -1169,18 +1566,35 @@ export function applyPostWorkoutAdaptation({
   coachResponse = '',
   trajectory = 'steady',
   projectedOutlook = '',
+  fitnessGoals = null,
+  weightGoals = null,
+  requirements = '',
+  equipment = '',
+  currentSkills = '',
+  workoutDays = null,
+  currentDayIndex = -1,
 }) {
   if (!currentProgram?.microcycles || !Array.isArray(currentProgram.microcycles)) {
     return currentProgram;
   }
 
   const trainingType = currentProgram?.training_type || 'calisthenics';
+  const wantsSkills = hasLearnSkillsGoal({
+    trainingType,
+    fitnessGoals,
+    weightGoals,
+    goalDescription: currentProgram?.goal,
+    requirements,
+  });
+
+  const targetWeekday = extractWeekdayFromDayName(dayName || '');
+  const targetSuffix = stripLeadingDayPrefix(dayName || '').toLowerCase();
 
   const updatedMicrocycles = currentProgram.microcycles.map((microcycle) => {
     const weekNum = Number(microcycle.week_number);
 
-    // Past weeks and current week are preserved
-    if (weekNum <= currentWeek) {
+    // Past weeks are preserved untouched; in currentWeek, only upcoming same-split days are adapted
+    if (weekNum < currentWeek) {
       return microcycle;
     }
 
@@ -1195,10 +1609,26 @@ export function applyPostWorkoutAdaptation({
         volume_delta: '+15%',
       };
 
-    // Recalibrate matching day across all future weeks using adjusted exercises as new baseline
-    const updatedDays = (microcycle.days || []).map((day) => {
-      if (day.day_name !== dayName) {
-        return day;
+    // Recalibrate matching day across upcoming weeks (and any later identical-focus day in currentWeek)
+    const updatedDays = (microcycle.days || []).map((day, idx) => {
+      if (weekNum === currentWeek) {
+        const isLaterSameSplit =
+          currentDayIndex >= 0 &&
+          idx > currentDayIndex &&
+          targetSuffix &&
+          stripLeadingDayPrefix(day.day_name).toLowerCase() === targetSuffix;
+        if (!isLaterSameSplit) {
+          return day;
+        }
+      } else {
+        const dayMatches =
+          day.day_name === dayName ||
+          (targetWeekday && extractWeekdayFromDayName(day.day_name) === targetWeekday) ||
+          (targetSuffix && stripLeadingDayPrefix(day.day_name).toLowerCase() === targetSuffix);
+
+        if (!dayMatches) {
+          return day;
+        }
       }
 
       const recalibratedExercises = adjustedExercises.map((adjEx, exIdx) => {
@@ -1208,11 +1638,11 @@ export function applyPostWorkoutAdaptation({
           weekConfig,
           trainingType,
           trajectory,
+          wantsSkills,
         });
 
         return {
           ...progressed,
-          // Explicit indicator showing Kael's recalibration
           recalibrated_by_kael: true,
           predicted_progress:
             trajectory === 'accelerated'
@@ -1223,12 +1653,30 @@ export function applyPostWorkoutAdaptation({
         };
       });
 
-      return {
+      const updatedDay = {
         ...day,
         recalibrated_by_kael: true,
         kael_recalibration_note: checkinSummary,
         exercises: recalibratedExercises,
       };
+
+      const sanitized = sanitizeMicrocycleExclusions(
+        { days: [updatedDay] },
+        {
+          trainingType,
+          fitnessGoals,
+          weightGoals,
+          goalDescription: currentProgram?.goal,
+          requirements,
+          equipment,
+          currentSkills,
+          workoutDays: workoutDays || currentProgram?.macrocycle?.training_days,
+          wantsSkills,
+          skipDayRenaming: true,
+        }
+      );
+
+      return sanitized?.days?.[0] || updatedDay;
     });
 
     return {
@@ -1267,5 +1715,250 @@ export function applyPostWorkoutAdaptation({
     microcycles: updatedMicrocycles,
     last_adapted_by_kael: lastAdaptedInfo,
     adaptation_history: [newHistoryEntry, ...currentHistory],
+  };
+}
+
+function parseAchievedNumbers(rawAchieved) {
+  if (rawAchieved === null || rawAchieved === undefined) return [];
+  const str = String(rawAchieved).trim();
+  if (!str) return [];
+  const matches = str.match(/\d+/g);
+  if (!matches) return [];
+  return matches.map((n) => parseInt(n, 10)).filter((n) => Number.isFinite(n));
+}
+
+/**
+ * Evaluates actual completed sets & reps from a live workout session and computes
+ * concrete harder/steady/easier exercise targets for the athlete's next session.
+ */
+export function evaluateLiveWorkoutPerformance({
+  plannedExercises = [],
+  completedExercises = [],
+  elapsedSeconds = 0,
+}) {
+  const safePlanned = Array.isArray(plannedExercises) ? plannedExercises : [];
+  const safeCompleted = Array.isArray(completedExercises) ? completedExercises : [];
+
+  let totalPlannedSets = 0;
+  let totalCompletedSets = 0;
+  let outperformedCount = 0;
+  let underperformedCount = 0;
+
+  const adjustedExercises = safePlanned.map((ex, idx) => {
+    const logged =
+      safeCompleted[idx] ||
+      safeCompleted.find((c) => String(c?.name || '').toLowerCase() === String(ex?.name || '').toLowerCase()) ||
+      {};
+
+    const plannedSets = Math.max(1, Number(ex?.sets) || 3);
+    const setsCompleted = Math.max(0, Number(logged?.sets_completed ?? plannedSets));
+    totalPlannedSets += plannedSets;
+    totalCompletedSets += setsCompleted;
+
+    const plannedRepMeta = parseRepRange(ex?.reps || '8-10');
+    const achievedNums = parseAchievedNumbers(logged?.reps_achieved);
+    const isCustomLoggedReps =
+      logged?.reps_achieved !== undefined &&
+      String(logged.reps_achieved).trim() !== '' &&
+      String(logged.reps_achieved).trim() !== String(ex?.reps || '').trim();
+
+    let exerciseStatus = 'steady';
+    const nextEx = { ...ex };
+
+    if (setsCompleted < plannedSets) {
+      exerciseStatus = 'easier';
+      underperformedCount++;
+    } else if (isCustomLoggedReps && achievedNums.length > 0 && plannedRepMeta.min !== null) {
+      const avgAchieved =
+        achievedNums.reduce((sum, n) => sum + n, 0) / achievedNums.length;
+      if (avgAchieved >= plannedRepMeta.max + 1) {
+        exerciseStatus = 'harder';
+        outperformedCount++;
+      } else if (avgAchieved === plannedRepMeta.max && !plannedRepMeta.isRange) {
+        exerciseStatus = 'harder';
+        outperformedCount++;
+      } else if (avgAchieved < plannedRepMeta.min) {
+        exerciseStatus = 'easier';
+        underperformedCount++;
+      }
+    }
+
+    if (exerciseStatus === 'harder') {
+      const currentMax = plannedRepMeta.max ?? 10;
+      if (!plannedRepMeta.unit && currentMax >= 15 && plannedSets < 4) {
+        nextEx.sets = plannedSets + 1;
+        nextEx.reps = bumpRepString(ex?.reps, 1, 5);
+      } else {
+        nextEx.reps = bumpRepString(ex?.reps, 2, 10);
+        nextEx.sets = plannedSets;
+      }
+      nextEx.notes = `${ex?.notes ? `${ex.notes} • ` : ''}Live adaptation: Increased target after exceeding reps cleanly.`;
+    } else if (exerciseStatus === 'easier') {
+      const missedMultipleSets = plannedSets - setsCompleted >= 2 || (plannedSets >= 3 && setsCompleted <= plannedSets - 1);
+      if (missedMultipleSets && plannedSets > 2) {
+        nextEx.sets = plannedSets - 1;
+        nextEx.reps = bumpRepString(ex?.reps, -1, -5);
+      } else {
+        nextEx.sets = plannedSets;
+        nextEx.reps = bumpRepString(ex?.reps, -1, -5);
+      }
+      nextEx.rest_seconds = Math.min(180, (Number(ex?.rest_seconds) || 75) + 15);
+      nextEx.notes = `${ex?.notes ? `${ex.notes} • ` : ''}Live adaptation: Scaled target down slightly to rebuild clean reps with full recovery.`;
+    } else {
+      // Matched all prescribed sets cleanly -> apply steady progressive overload step
+      nextEx.sets = plannedSets;
+      nextEx.reps = bumpRepString(ex?.reps, 1, 5);
+    }
+
+    return {
+      ...nextEx,
+      _adaptationStatus: exerciseStatus,
+    };
+  });
+
+  const completionRatio =
+    totalPlannedSets > 0 ? totalCompletedSets / totalPlannedSets : 1;
+
+  let trajectory = 'steady';
+  let direction = 'steady';
+
+  if (completionRatio < 0.85 || underperformedCount > outperformedCount) {
+    trajectory = 'recovering';
+    direction = 'easier';
+  } else if (outperformedCount > underperformedCount) {
+    trajectory = 'accelerating';
+    direction = 'harder';
+  }
+
+  const durationMinutes = Math.round((Number(elapsedSeconds) || 0) / 60);
+  const changes = adjustedExercises.map((nextEx, idx) => {
+    const prev = safePlanned[idx] || {};
+    return {
+      name: nextEx.name,
+      previous: `${prev.sets || nextEx.sets}×${prev.reps || nextEx.reps}`,
+      next: `${nextEx.sets}×${nextEx.reps}`,
+      status: nextEx._adaptationStatus,
+    };
+  });
+
+  const cleanAdjustedExercises = adjustedExercises.map(({ _adaptationStatus, ...rest }) => rest);
+
+  let summary = '';
+  let coachResponse = '';
+  let projectedOutlook = '';
+
+  if (direction === 'harder') {
+    summary = `Next session intensified (+reps/volume overload across ${outperformedCount} exceeded movement${outperformedCount === 1 ? '' : 's'}).`;
+    coachResponse = 'You outperformed your prescribed numbers today — your next session is dialed up to push progressive overload.';
+    projectedOutlook = 'Accelerating strength curve: increased target volume/reps locked into upcoming weeks.';
+  } else if (direction === 'easier') {
+    summary = `Next session scaled easier (-sets/-reps & +15s rest) after ${totalCompletedSets}/${totalPlannedSets} completed sets (${durationMinutes}m).`;
+    coachResponse = 'Smart autoregulation: your next session is dialed back slightly so you hit crisp reps without grinding into fatigue.';
+    projectedOutlook = 'Recovery-adjusted curve: rebuilding clean technical momentum before ramping load back up.';
+  } else {
+    summary = `All ${totalCompletedSets}/${totalPlannedSets} sets locked in cleanly — next session nudged +1 rep progressive overload.`;
+    coachResponse = 'Consistent execution today. Your next session bumps targets slightly to guarantee steady week-to-week overload.';
+    projectedOutlook = 'Steady progressive overload trajectory maintained across upcoming sessions.';
+  }
+
+  return {
+    trajectory,
+    direction,
+    completionRatio,
+    totalPlannedSets,
+    totalCompletedSets,
+    adjustedExercises: cleanAdjustedExercises,
+    changes,
+    summary,
+    coachResponse,
+    projectedOutlook,
+  };
+}
+
+/**
+ * Automatically adapts a Progress+ athlete's next session and remaining weeks
+ * immediately when they finish a live workout, based on actual sets & reps performed.
+ */
+export function applyLivePerformanceAdaptation({
+  currentProgram,
+  currentWeek = 1,
+  currentDayIndex = -1,
+  dayName = '',
+  plannedExercises = [],
+  completedExercises = [],
+  elapsedSeconds = 0,
+  user = null,
+}) {
+  const evaluation = evaluateLiveWorkoutPerformance({
+    plannedExercises,
+    completedExercises,
+    elapsedSeconds,
+  });
+
+  if (!currentProgram?.microcycles || !Array.isArray(currentProgram.microcycles)) {
+    return {
+      updatedProgram: currentProgram,
+      evaluation,
+      nextSessionPreview: [],
+    };
+  }
+
+  const updatedProgram = applyPostWorkoutAdaptation({
+    currentProgram,
+    currentWeek,
+    currentDayIndex,
+    dayName,
+    adjustedExercises: evaluation.adjustedExercises,
+    checkinSummary: evaluation.summary,
+    coachResponse: evaluation.coachResponse,
+    trajectory: evaluation.trajectory,
+    projectedOutlook: evaluation.projectedOutlook,
+    fitnessGoals: user?.fitness_goals,
+    weightGoals: user?.weight_goals,
+    requirements: user?.training_requirements || '',
+    equipment: user?.available_equipment || '',
+    currentSkills: user?.current_skills || '',
+    workoutDays: currentProgram?.macrocycle?.training_days || user?.training_days,
+  });
+
+  const targetWeekday = extractWeekdayFromDayName(dayName || '');
+  const targetSuffix = stripLeadingDayPrefix(dayName || '').toLowerCase();
+  const currentWeekCycle = updatedProgram.microcycles?.find(
+    (m) => Number(m.week_number) === Number(currentWeek)
+  );
+  const laterSameSplitDay =
+    currentDayIndex >= 0 && targetSuffix
+      ? (currentWeekCycle?.days || []).find(
+          (d, idx) =>
+            idx > currentDayIndex &&
+            stripLeadingDayPrefix(d.day_name).toLowerCase() === targetSuffix
+        )
+      : null;
+
+  const nextWeekCycle = updatedProgram.microcycles?.find(
+    (m) => Number(m.week_number) === Number(currentWeek) + 1
+  );
+  const nextWeekMatchingDay = nextWeekCycle?.days?.find(
+    (d) =>
+      d.day_name === dayName ||
+      (targetWeekday && extractWeekdayFromDayName(d.day_name) === targetWeekday) ||
+      (targetSuffix && stripLeadingDayPrefix(d.day_name).toLowerCase() === targetSuffix)
+  );
+  const nextDay = laterSameSplitDay || nextWeekMatchingDay;
+
+  const nextSessionPreview = (nextDay?.exercises || evaluation.adjustedExercises).map((ex, idx) => {
+    const prev = plannedExercises[idx] || {};
+    return {
+      name: ex.name,
+      before: `${prev.sets || ex.sets}×${prev.reps || ex.reps}`,
+      after: `${ex.sets}×${ex.reps}`,
+    };
+  });
+
+  return {
+    updatedProgram,
+    evaluation,
+    nextSessionDayName: nextDay?.day_name || dayName,
+    nextSessionPreview,
   };
 }

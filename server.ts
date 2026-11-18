@@ -57,7 +57,7 @@ const PORT = parseInt(
 );
 const HOST = cliHost || process.env.HOST || '0.0.0.0';
 
-// Body parsers with generous limits + rawBody capture for Paddle webhook signature verification
+// Body parsers with generous limits + rawBody capture for Stripe webhook signature verification
 app.use(
   express.json({
     limit: '50mb',
@@ -128,25 +128,75 @@ function getGeminiClient(): GoogleGenAI {
 }
 
 // ------------------------------------------------------------
-// PADDLE BILLING CONFIGURATION & SERVER HELPERS
+// STRIPE BILLING CONFIGURATION & SERVER HELPERS
 // ------------------------------------------------------------
 
-const PADDLE_PRODUCT_IDS: Record<'progress' | 'performance' | 'elite', string> = {
-  progress: 'pro_01m7j8yvn5p9qk5kpzab25s43d',
-  performance: 'pro_01m7j8z8zgpzyxxsjf3agxzh5j',
-  elite: 'pro_01m7j8zjcvphk0vjjt48d3d182',
+type PaidPlanKey = 'progress' | 'performance' | 'elite';
+
+const STRIPE_PRICE_IDS: Record<PaidPlanKey, string> = {
+  progress: 'price_1TTYrbRuQpZftYKRoSyLbQ0c',
+  performance: 'price_1TTYs8RuQpZftYKR8ZzpNg7x',
+  elite: 'price_1TTYsWRuQpZftYKRKIm8V10E',
 };
 
-const PRODUCT_ID_TO_PLAN: Record<string, 'progress' | 'performance' | 'elite'> = {
-  pro_01m7j8yvn5p9qk5kpzab25s43d: 'progress',
-  pro_01m7j8z8zgpzyxxsjf3agxzh5j: 'performance',
-  pro_01m7j8zjcvphk0vjjt48d3d182: 'elite',
+const STRIPE_PRICE_TO_PLAN: Record<string, PaidPlanKey> = {
+  price_1TTYrbRuQpZftYKRoSyLbQ0c: 'progress',
+  price_1TTYs8RuQpZftYKR8ZzpNg7x: 'performance',
+  price_1TTYsWRuQpZftYKRKIm8V10E: 'elite',
 };
+
+const STRIPE_DEFAULT_CATALOG: Record<
+  PaidPlanKey,
+  { priceId: string; unitAmountCents: number; currencyCode: string; formattedTotal: string }
+> = {
+  progress: {
+    priceId: STRIPE_PRICE_IDS.progress,
+    unitAmountCents: 999,
+    currencyCode: 'USD',
+    formattedTotal: '$9.99',
+  },
+  performance: {
+    priceId: STRIPE_PRICE_IDS.performance,
+    unitAmountCents: 1799,
+    currencyCode: 'USD',
+    formattedTotal: '$17.99',
+  },
+  elite: {
+    priceId: STRIPE_PRICE_IDS.elite,
+    unitAmountCents: 3499,
+    currencyCode: 'USD',
+    formattedTotal: '$34.99',
+  },
+};
+
+const STRIPE_PAYMENT_LINKS: Record<PaidPlanKey, string> = {
+  progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
+  performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
+  elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
+};
+
+function toDeterministicUuid(input: string): string {
+  const hex = crypto.createHash('sha256').update(String(input)).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+function buildStripePaymentLinkUrl(plan: PaidPlanKey, userId?: string, email?: string): string {
+  const base = STRIPE_PAYMENT_LINKS[plan];
+  if (!base) return '';
+  try {
+    const url = new URL(base);
+    if (userId) url.searchParams.set('client_reference_id', String(userId).trim());
+    if (email) url.searchParams.set('prefilled_email', String(email).trim().toLowerCase());
+    return url.toString();
+  } catch {
+    return base;
+  }
+}
 
 const pendingCheckouts = new Map<string, { plan: string; timestamp: number }>();
 
 function getServiceRoleSupabase() {
-  const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE_KEY || '').trim();
   if (!serviceKey) return null;
   return createClient(SUPABASE_URL, serviceKey, {
     auth: {
@@ -156,220 +206,83 @@ function getServiceRoleSupabase() {
   });
 }
 
-function getServerPaddleConfig() {
-  const rawEnv = String(process.env.PADDLE_ENV || process.env.VITE_PADDLE_ENV || '')
-    .trim()
-    .toLowerCase();
-  const environment =
-    rawEnv === 'production' || rawEnv === 'sandbox' ? (rawEnv as 'production' | 'sandbox') : null;
-  const apiBaseUrl =
-    environment === 'production'
-      ? 'https://api.paddle.com'
-      : environment === 'sandbox'
-        ? 'https://sandbox-api.paddle.com'
-        : null;
-  const apiKey = String(process.env.PADDLE_API_KEY || '').trim();
-  const webhookSecret = String(process.env.PADDLE_WEBHOOK_SECRET || '').trim();
-  const rawClientToken = String(
-    process.env.VITE_PADDLE_CLIENT_TOKEN || process.env.PADDLE_CLIENT_TOKEN || ''
-  ).trim();
-  const clientToken =
-    rawClientToken.startsWith('live_') || rawClientToken.startsWith('test_')
-      ? rawClientToken
-      : '';
-
+function getServerStripeConfig() {
+  const secretKey = String(process.env.STRIPE_SECRET_KEY || '').trim();
+  const webhookSecret = String(process.env.STRIPE_WEBHOOK_SECRET || '').trim();
+  const appUrl = String(process.env.APP_URL || '').trim();
   return {
-    configured: Boolean(environment && apiBaseUrl),
-    environment,
-    apiBaseUrl,
-    apiKey,
+    configured: Boolean(secretKey),
+    secretKey,
     webhookSecret,
-    clientToken,
+    appUrl,
   };
 }
 
-/**
- * Detects user's 2-letter ISO country code from hosting/CDN headers.
- * Keeps 'OTHERS' strictly as an internal fallback sentinel and returns countryCode: null when absent
- * so client-side Paddle.PricePreview() auto-detects from the visitor's IP without any invalid country code.
- */
-function detectCountryFromHeaders(req: express.Request): {
-  countryCode: string | null;
-  regionTag: string;
-} {
-  const candidateHeaders = [
-    req.headers['x-vercel-ip-country'],
-    req.headers['cf-ipcountry'],
-    req.headers['x-appengine-country'],
-    req.headers['cloudfront-viewer-country'],
-    req.headers['x-country-code'],
-    req.headers['x-forwarded-country'],
-  ];
-
-  for (const raw of candidateHeaders) {
-    const first = Array.isArray(raw) ? raw[0] : raw;
-    const code = String(first || '').trim().toUpperCase();
-    if (
-      /^[A-Z]{2}$/.test(code) &&
-      code !== 'XX' &&
-      code !== 'ZZ' &&
-      code !== 'T1' &&
-      code !== 'OT'
-    ) {
-      return { countryCode: code, regionTag: code };
-    }
-  }
-
-  return { countryCode: null, regionTag: 'OTHERS' };
-}
-
-function getEnvConfiguredPriceIds() {
-  const read = (...names: string[]) => {
-    for (const name of names) {
-      const val = String(process.env[name] || '').trim();
-      if (/^pri_[a-zA-Z0-9]+$/.test(val)) return val;
-    }
-    return '';
-  };
-
-  return {
-    progress: {
-      month: read('VITE_PADDLE_PRICE_PROGRESS_MONTH', 'PADDLE_PRICE_PROGRESS_MONTH') || 'pri_01m7j94jsmj6m6c23fmpx30eb7',
-      year: read('VITE_PADDLE_PRICE_PROGRESS_YEAR', 'PADDLE_PRICE_PROGRESS_YEAR'),
+async function stripeApiRequest(
+  stripePath: string,
+  secretKey: string,
+  options: { method?: string; body?: URLSearchParams } = {}
+) {
+  const response = await fetch(`https://api.stripe.com/v1/${stripePath}`, {
+    method: options.method || 'GET',
+    headers: {
+      Authorization: `Bearer ${secretKey}`,
+      ...(options.body ? { 'Content-Type': 'application/x-www-form-urlencoded' } : {}),
     },
-    performance: {
-      month: read('VITE_PADDLE_PRICE_PERFORMANCE_MONTH', 'PADDLE_PRICE_PERFORMANCE_MONTH') || 'pri_01m7j980nyk4c5sexqs2anj39h',
-      year: read('VITE_PADDLE_PRICE_PERFORMANCE_YEAR', 'PADDLE_PRICE_PERFORMANCE_YEAR'),
-    },
-    elite: {
-      month: read('VITE_PADDLE_PRICE_ELITE_MONTH', 'PADDLE_PRICE_ELITE_MONTH') || 'pri_01m7j995eanq5e99wbwkpb3dz6',
-      year: read('VITE_PADDLE_PRICE_ELITE_YEAR', 'PADDLE_PRICE_ELITE_YEAR'),
-    },
-  };
-}
+    ...(options.body ? { body: options.body } : {}),
+  });
 
-let cachedPaddlePriceLookup: {
-  env: string;
-  fetchedAt: number;
-  resolved: Record<'progress' | 'performance' | 'elite', { month: string; year: string }>;
-} | null = null;
-
-async function resolveTierPriceIdsOnServer() {
-  const envMap = getEnvConfiguredPriceIds();
-  const merged = {
-    progress: { ...envMap.progress },
-    performance: { ...envMap.performance },
-    elite: { ...envMap.elite },
-  };
-
-  const cfg = getServerPaddleConfig();
-  if (!cfg.configured || !cfg.apiBaseUrl || !cfg.apiKey) {
-    return { cfg, resolvedPriceIds: merged };
-  }
-
-  if (
-    cachedPaddlePriceLookup &&
-    cachedPaddlePriceLookup.env === cfg.environment &&
-    Date.now() - cachedPaddlePriceLookup.fetchedAt < 5 * 60 * 1000
-  ) {
-    for (const tier of ['progress', 'performance', 'elite'] as const) {
-      if (!merged[tier].month && cachedPaddlePriceLookup.resolved[tier].month) {
-        merged[tier].month = cachedPaddlePriceLookup.resolved[tier].month;
-      }
-      if (!merged[tier].year && cachedPaddlePriceLookup.resolved[tier].year) {
-        merged[tier].year = cachedPaddlePriceLookup.resolved[tier].year;
-      }
-    }
-    return { cfg, resolvedPriceIds: merged };
-  }
-
+  const rawText = await response.text();
+  let parsed: any = null;
   try {
-    const productCsv = Object.values(PADDLE_PRODUCT_IDS).join(',');
-    const url = `${cfg.apiBaseUrl}/prices?product_id=${encodeURIComponent(productCsv)}&status=active&per_page=100`;
-    const apiRes = await fetch(url, {
-      headers: {
-        Authorization: `Bearer ${cfg.apiKey}`,
-        'Content-Type': 'application/json',
-      },
-    });
-    const apiJson = await apiRes.json().catch(() => null);
-    if (apiRes.ok && Array.isArray(apiJson?.data)) {
-      const discovered = {
-        progress: { month: '', year: '' },
-        performance: { month: '', year: '' },
-        elite: { month: '', year: '' },
-      };
-
-      for (const price of apiJson.data) {
-        const tier = PRODUCT_ID_TO_PLAN[String(price?.product_id || '').trim()];
-        const pid = String(price?.id || '').trim();
-        const interval = String(price?.billing_cycle?.interval || '').toLowerCase().trim();
-        if (!tier || !/^pri_[a-zA-Z0-9]+$/.test(pid)) continue;
-        if (interval === 'year') {
-          if (!discovered[tier].year) discovered[tier].year = pid;
-        } else {
-          if (!discovered[tier].month) discovered[tier].month = pid;
-        }
-      }
-
-      cachedPaddlePriceLookup = {
-        env: cfg.environment || '',
-        fetchedAt: Date.now(),
-        resolved: discovered,
-      };
-
-      for (const tier of ['progress', 'performance', 'elite'] as const) {
-        if (!merged[tier].month && discovered[tier].month) {
-          merged[tier].month = discovered[tier].month;
-        }
-        if (!merged[tier].year && discovered[tier].year) {
-          merged[tier].year = discovered[tier].year;
-        }
-      }
-    }
-  } catch (err: any) {
-    console.warn('[Paddle] Failed to resolve Price IDs from Product IDs:', err?.message);
+    parsed = JSON.parse(rawText);
+  } catch {
+    parsed = { raw: rawText };
   }
 
-  return { cfg, resolvedPriceIds: merged };
-}
-
-function mapPaddleItemsToPlan(items: any[] = [], customData: any = {}): {
-  plan: 'progress' | 'performance' | 'elite' | null;
-  priceId: string | null;
-  productId: string | null;
-} {
-  const customPlan = String(customData?.plan || '').toLowerCase().trim();
-  let matchedPlan: 'progress' | 'performance' | 'elite' | null =
-    customPlan === 'progress' || customPlan === 'performance' || customPlan === 'elite'
-      ? customPlan
-      : null;
-
-  let priceId: string | null = null;
-  let productId: string | null = null;
-  const envPrices = getEnvConfiguredPriceIds();
-
-  for (const item of Array.isArray(items) ? items : []) {
-    const pId = item?.price?.id || item?.price_id || null;
-    const prodId = item?.price?.product_id || item?.product?.id || item?.product_id || null;
-    if (pId && !priceId) priceId = String(pId);
-    if (prodId && !productId) productId = String(prodId);
-
-    if (!matchedPlan && prodId && PRODUCT_ID_TO_PLAN[String(prodId)]) {
-      matchedPlan = PRODUCT_ID_TO_PLAN[String(prodId)];
-    }
-    if (!matchedPlan && pId) {
-      for (const tier of ['progress', 'performance', 'elite'] as const) {
-        if (envPrices[tier].month === pId || envPrices[tier].year === pId) {
-          matchedPlan = tier;
-          break;
-        }
-      }
-    }
+  if (!response.ok) {
+    const err = new Error(parsed?.error?.message || `Stripe API error (${response.status})`);
+    (err as any).status = response.status;
+    (err as any).stripeCode = parsed?.error?.code;
+    throw err;
   }
 
-  return { plan: matchedPlan, priceId, productId };
+  return parsed;
 }
+
+function formatStripeAmount(unitAmountCents: number, currency = 'usd'): string {
+  try {
+    return new Intl.NumberFormat('en-US', {
+      style: 'currency',
+      currency: String(currency || 'usd').toUpperCase(),
+    }).format(unitAmountCents / 100);
+  } catch {
+    return `$${(unitAmountCents / 100).toFixed(2)}`;
+  }
+}
+
+function mapStripePlan(params: {
+  metadataPlan?: any;
+  priceId?: string | null;
+  unitAmountCents?: number | null;
+}): PaidPlanKey | null {
+  const metaPlan = String(params.metadataPlan || '').toLowerCase().trim();
+  if (metaPlan === 'progress' || metaPlan === 'performance' || metaPlan === 'elite') {
+    return metaPlan;
+  }
+  if (params.priceId && STRIPE_PRICE_TO_PLAN[params.priceId]) {
+    return STRIPE_PRICE_TO_PLAN[params.priceId];
+  }
+  if (params.unitAmountCents === 999) return 'progress';
+  if (params.unitAmountCents === 1799) return 'performance';
+  if (params.unitAmountCents === 3499) return 'elite';
+  return null;
+}
+
+let cachedStripePrices: {
+  fetchedAt: number;
+  pricesByTier: Record<PaidPlanKey, { priceId: string; unitAmountCents: number; currencyCode: string; formattedTotal: string }>;
+} | null = null;
 
 async function updateProfileSubscriptionSafely(
   dbClient: any,
@@ -387,7 +300,7 @@ async function updateProfileSubscriptionSafely(
       await dbClient.from('profiles').update(basePatch).eq('id', userId);
     }
   } catch (err: any) {
-    console.debug('[Paddle] Profile update fallback note:', err?.message);
+    console.debug('[Stripe] Profile update fallback note:', err?.message);
     try {
       await dbClient.from('profiles').update(basePatch).eq('id', userId);
     } catch {
@@ -396,32 +309,32 @@ async function updateProfileSubscriptionSafely(
   }
 }
 
-function verifyPaddleWebhookSignature(rawBody: string, signatureHeader: string, secret: string): boolean {
+function verifyStripeWebhookSignature(rawBody: string, signatureHeader: string, secret: string): boolean {
   if (!rawBody || !signatureHeader || !secret) return false;
   try {
-    const parts = signatureHeader.split(';').map((s) => s.trim());
-    let ts = '';
-    const h1Values: string[] = [];
+    const parts = signatureHeader.split(',').map((s) => s.trim());
+    let timestamp = '';
+    const v1Signatures: string[] = [];
     for (const part of parts) {
       const idx = part.indexOf('=');
       if (idx <= 0) continue;
       const key = part.slice(0, idx).trim();
       const val = part.slice(idx + 1).trim();
-      if (key === 'ts') ts = val;
-      if (key === 'h1' && val) h1Values.push(val);
+      if (key === 't') timestamp = val;
+      if (key === 'v1' && val) v1Signatures.push(val);
     }
 
-    if (!ts || h1Values.length === 0) return false;
-    const tsNum = Number(ts);
+    if (!timestamp || v1Signatures.length === 0) return false;
+    const tsNum = Number(timestamp);
     if (!Number.isFinite(tsNum) || Math.abs(Math.floor(Date.now() / 1000) - tsNum) > 300) {
       return false;
     }
 
-    const signedPayload = `${ts}:${rawBody}`;
+    const signedPayload = `${timestamp}.${rawBody}`;
     const expectedHex = crypto.createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex');
     const expectedBuf = Buffer.from(expectedHex, 'hex');
 
-    return h1Values.some((sigHex) => {
+    return v1Signatures.some((sigHex) => {
       try {
         const providedBuf = Buffer.from(sigHex, 'hex');
         return providedBuf.length === expectedBuf.length && crypto.timingSafeEqual(providedBuf, expectedBuf);
@@ -435,42 +348,307 @@ function verifyPaddleWebhookSignature(rawBody: string, signatureHeader: string, 
 }
 
 // ------------------------------------------------------------
-// PADDLE API ROUTES
+// STRIPE API ROUTES
 // ------------------------------------------------------------
 
-app.get('/api/paddle/context', async (req, res) => {
+app.get('/api/stripe/prices', async (_req, res) => {
   try {
-    const { countryCode, regionTag } = detectCountryFromHeaders(req);
-    const { cfg, resolvedPriceIds } = await resolveTierPriceIdsOnServer();
+    const cfg = getServerStripeConfig();
+    if (!cfg.configured) {
+      return res.json({
+        success: true,
+        source: 'catalog',
+        currencyCode: 'USD',
+        pricesByTier: STRIPE_DEFAULT_CATALOG,
+      });
+    }
+
+    if (cachedStripePrices && Date.now() - cachedStripePrices.fetchedAt < 5 * 60 * 1000) {
+      return res.json({
+        success: true,
+        source: 'stripe_cache',
+        currencyCode: 'USD',
+        pricesByTier: cachedStripePrices.pricesByTier,
+      });
+    }
+
+    const nextPrices = { ...STRIPE_DEFAULT_CATALOG };
+    await Promise.all(
+      (['progress', 'performance', 'elite'] as const).map(async (tier) => {
+        try {
+          const priceObj = await stripeApiRequest(
+            `prices/${encodeURIComponent(STRIPE_PRICE_IDS[tier])}`,
+            cfg.secretKey
+          );
+          if (typeof priceObj?.unit_amount === 'number' && priceObj?.currency) {
+            nextPrices[tier] = {
+              priceId: priceObj.id || STRIPE_PRICE_IDS[tier],
+              unitAmountCents: priceObj.unit_amount,
+              currencyCode: String(priceObj.currency).toUpperCase(),
+              formattedTotal: formatStripeAmount(priceObj.unit_amount, priceObj.currency),
+            };
+          }
+        } catch (err: any) {
+          console.warn(`[Stripe] Price lookup fallback for ${tier}:`, err?.message);
+        }
+      })
+    );
+
+    cachedStripePrices = {
+      fetchedAt: Date.now(),
+      pricesByTier: nextPrices,
+    };
 
     return res.json({
       success: true,
-      countryCode,
-      regionTag,
-      productIds: PADDLE_PRODUCT_IDS,
-      resolvedPriceIds,
-      envConfigured: cfg.configured,
-      environment: cfg.environment,
-      clientToken: cfg.clientToken || null,
-      hasClientToken: Boolean(cfg.clientToken),
-      hasServerApiKey: Boolean(cfg.apiKey),
+      source: 'stripe',
+      currencyCode: nextPrices.progress.currencyCode || 'USD',
+      pricesByTier: nextPrices,
     });
   } catch (err: any) {
-    console.error('[Paddle] /api/paddle/context error:', err);
-    return res.status(500).json({
-      success: false,
-      countryCode: null,
-      regionTag: 'OTHERS',
-      error: err?.message || 'Unable to resolve Paddle context.',
+    console.warn('[Stripe] /api/stripe/prices error:', err?.message);
+    return res.json({
+      success: true,
+      source: 'catalog_fallback',
+      currencyCode: 'USD',
+      pricesByTier: STRIPE_DEFAULT_CATALOG,
     });
   }
 });
 
-app.post('/api/paddle/verify-transaction', async (req, res) => {
+app.post('/api/create-checkout-session', async (req, res) => {
   try {
-    const { transactionId, plan: hintedPlanRaw, userId, email } = req.body || {};
-    const cleanTxId = String(transactionId || '').trim();
-    const cfg = getServerPaddleConfig();
+    const cfg = getServerStripeConfig();
+    const { plan: rawPlan, app_url: rawAppUrl, email, userId, refreshToken } = req.body || {};
+    const plan = String(rawPlan || '').toLowerCase().trim() as PaidPlanKey;
+    if (plan !== 'progress' && plan !== 'performance' && plan !== 'elite') {
+      return res.status(400).json({ success: false, error: 'Invalid subscription plan.' });
+    }
+
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+    const cleanRawUserId = userId ? String(userId).trim() : '';
+
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    let token = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const clientSrvToken =
+      typeof req.headers['x-washek-server-session'] === 'string'
+        ? req.headers['x-washek-server-session'].trim()
+        : '';
+
+    const isJwtShape = Boolean(
+      token && !token.startsWith('vault_tok_') && !token.startsWith('washek_sess_') && token.split('.').length === 3
+    );
+
+    if (!isJwtShape) {
+      const recovery = await tryRecoverSupabaseSession({
+        authToken: token,
+        refreshToken: typeof refreshToken === 'string' ? refreshToken.trim() : '',
+        serverSessionToken: clientSrvToken,
+        cookieHeader: req.headers.cookie,
+        targetEmail: cleanEmail,
+      });
+      if (recovery?.session?.access_token) {
+        token = recovery.session.access_token;
+      }
+    }
+
+    const hasValidJwtShape = Boolean(
+      token && !token.startsWith('vault_tok_') && !token.startsWith('washek_sess_') && token.split('.').length === 3
+    );
+    const userClient = hasValidJwtShape ? createStatelessSupabase(token) : null;
+    let verifiedUser: any = null;
+    if (userClient) {
+      try {
+        const { data: userData } = await userClient.auth.getUser(token);
+        if (userData?.user?.id) {
+          verifiedUser = userData.user;
+        }
+      } catch {
+        // fallback cleanly to server session / signed-in profile lookup
+      }
+    }
+
+    const srvProof = verifyServerSessionFromRequest(req, cleanEmail || undefined);
+    const expiredJwtProof =
+      !verifiedUser && hasValidJwtShape
+        ? await verifyExpiredSupabaseJwt(token, cleanEmail || undefined)
+        : null;
+
+    const adminClient = getServiceRoleSupabase();
+    let uid =
+      verifiedUser?.id ||
+      expiredJwtProof?.userId ||
+      (srvProof?.userId && isValidUUID(srvProof.userId) ? srvProof.userId : '') ||
+      (isValidUUID(cleanRawUserId) ? cleanRawUserId : '');
+    const userEmail =
+      verifiedUser?.email ||
+      expiredJwtProof?.email ||
+      srvProof?.email ||
+      cleanEmail ||
+      undefined;
+
+    if (!uid && adminClient && userEmail) {
+      try {
+        const { data: profByEmail } = await adminClient
+          .from('profiles')
+          .select('id')
+          .ilike('email', userEmail)
+          .maybeSingle();
+        if (profByEmail?.id) {
+          uid = profByEmail.id;
+        }
+      } catch {
+        // ignore email lookup fallback error
+      }
+    }
+
+    if (!uid && (cleanRawUserId || userEmail)) {
+      uid = toDeterministicUuid(cleanRawUserId || userEmail || 'athlete');
+    }
+
+    if (!uid && !userEmail) {
+      return res.status(401).json({
+        success: false,
+        code: 'AUTH_SESSION_EXPIRED',
+        error: 'Please sign in to upgrade your plan.',
+      });
+    }
+
+    if (!cfg.configured) {
+      const directUrl = buildStripePaymentLinkUrl(plan, uid, userEmail);
+      if (directUrl) {
+        return res.json({
+          success: true,
+          action: 'checkout',
+          url: directUrl,
+          session_id: null,
+          payment_link: true,
+        });
+      }
+      return res.status(503).json({
+        success: false,
+        code: 'STRIPE_SERVER_KEY_MISSING',
+        error: 'Stripe Checkout is temporarily unavailable.',
+      });
+    }
+
+    const dbClient = adminClient || userClient;
+    let profile: any = null;
+    if (dbClient && isValidUUID(uid)) {
+      try {
+        const { data: profData } = await dbClient
+          .from('profiles')
+          .select(
+            'subscription_plan, subscription_status, stripe_customer_id, stripe_subscription_id, has_used_trial, trial_used'
+          )
+          .eq('id', uid)
+          .maybeSingle();
+        profile = profData || null;
+      } catch {
+        profile = null;
+      }
+    }
+
+    const currentPlan = String(profile?.subscription_plan || 'free').toLowerCase().trim();
+    const currentStatus = String(profile?.subscription_status || '').toLowerCase().trim();
+    if (currentPlan === plan && ['active', 'trialing', 'past_due', 'unpaid'].includes(currentStatus)) {
+      return res.json({
+        success: true,
+        action: 'already_active',
+        plan,
+      });
+    }
+
+    const hasUsedTrial = Boolean(
+      profile?.has_used_trial ||
+        profile?.trial_used ||
+        profile?.subscription_status === 'canceled' ||
+        (profile?.subscription_plan && profile.subscription_plan !== 'free')
+    );
+
+    const originHeader =
+      typeof rawAppUrl === 'string' && rawAppUrl.trim()
+        ? rawAppUrl.trim()
+        : req.headers.origin
+          ? String(req.headers.origin)
+          : cfg.appUrl || `http://localhost:${PORT}`;
+    const baseUrl = originHeader.replace(/\/+$/, '');
+
+    const customerId = profile?.stripe_customer_id ? String(profile.stripe_customer_id).trim() : '';
+    let oldSubscriptionId = '';
+    if (profile?.stripe_subscription_id) {
+      try {
+        const sub = await stripeApiRequest(
+          `subscriptions/${encodeURIComponent(String(profile.stripe_subscription_id))}`,
+          cfg.secretKey
+        );
+        if (['active', 'trialing', 'past_due', 'unpaid'].includes(String(sub?.status || '').toLowerCase())) {
+          oldSubscriptionId = String(sub.id);
+        }
+      } catch {
+        oldSubscriptionId = '';
+      }
+    }
+
+    const body = new URLSearchParams();
+    body.set('mode', 'subscription');
+    body.set('line_items[0][price]', STRIPE_PRICE_IDS[plan]);
+    body.set('line_items[0][quantity]', '1');
+    body.set(
+      'success_url',
+      `${baseUrl}/subscription-return?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}&trial=${!hasUsedTrial}`
+    );
+    body.set('cancel_url', `${baseUrl}/profile`);
+    body.set('client_reference_id', uid);
+    if (customerId) {
+      body.set('customer', customerId);
+    } else if (userEmail) {
+      body.set('customer_email', userEmail);
+    }
+    body.set('metadata[user_id]', uid);
+    body.set('metadata[plan]', plan);
+    body.set('metadata[has_used_trial]', String(hasUsedTrial));
+    body.set('subscription_data[metadata][user_id]', uid);
+    body.set('subscription_data[metadata][plan]', plan);
+    if (!hasUsedTrial) {
+      body.set('subscription_data[trial_period_days]', '7');
+    }
+    if (oldSubscriptionId) {
+      body.set('metadata[old_subscription_id]', oldSubscriptionId);
+      body.set('subscription_data[metadata][old_subscription_id]', oldSubscriptionId);
+    }
+
+    const session = await stripeApiRequest('checkout/sessions', cfg.secretKey, {
+      method: 'POST',
+      body,
+    });
+
+    if (!session?.url) {
+      throw new Error('Stripe did not return a Checkout URL.');
+    }
+
+    return res.json({
+      success: true,
+      action: 'checkout',
+      url: session.url,
+      session_id: session.id,
+      replacing_subscription: Boolean(oldSubscriptionId),
+      old_subscription_id: oldSubscriptionId || null,
+    });
+  } catch (err: any) {
+    console.error('[Stripe] /api/create-checkout-session error:', err);
+    return res.status(err?.status >= 400 ? err.status : 500).json({
+      success: false,
+      error: err?.message || 'Unable to create Stripe Checkout session.',
+    });
+  }
+});
+
+app.post('/api/stripe/verify-session', async (req, res) => {
+  try {
+    const { sessionId, plan: hintedPlanRaw, userId, email } = req.body || {};
+    const cleanSessionId = String(sessionId || '').trim();
+    const cfg = getServerStripeConfig();
 
     const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
     const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
@@ -487,38 +665,44 @@ app.post('/api/paddle/verify-transaction', async (req, res) => {
       }
     }
 
-    if (cleanTxId && cfg.configured && cfg.apiBaseUrl && cfg.apiKey) {
-      const txRes = await fetch(`${cfg.apiBaseUrl}/transactions/${encodeURIComponent(cleanTxId)}`, {
-        headers: {
-          Authorization: `Bearer ${cfg.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-      });
-      const txJson = await txRes.json().catch(() => null);
-      const tx = txJson?.data;
+    if (cleanSessionId && cfg.configured) {
+      const sessionObj = await stripeApiRequest(
+        `checkout/sessions/${encodeURIComponent(cleanSessionId)}?expand[]=subscription`,
+        cfg.secretKey
+      );
 
-      if (!txRes.ok || !tx) {
-        return res.status(txRes.status >= 400 ? txRes.status : 400).json({
+      const sessionUid =
+        (typeof sessionObj?.client_reference_id === 'string' && isValidUUID(sessionObj.client_reference_id)
+          ? sessionObj.client_reference_id.trim()
+          : '') ||
+        (isValidUUID(sessionObj?.metadata?.user_id) ? String(sessionObj.metadata.user_id).trim() : '');
+
+      if (verifiedUid && sessionUid && verifiedUid !== sessionUid) {
+        return res.status(403).json({
           success: false,
           verified: false,
-          error: txJson?.error?.detail || 'Unable to verify transaction with Paddle.',
+          error: 'Checkout session does not belong to the signed-in account.',
         });
       }
 
-      const txStatus = String(tx.status || '').toLowerCase().trim();
-      const isPaidOrComplete = ['completed', 'paid', 'billed'].includes(txStatus);
-      const customData = tx.custom_data || {};
-      const mapped = mapPaddleItemsToPlan(tx.items, customData);
-      const hintedPlan = String(hintedPlanRaw || '').toLowerCase().trim();
+      const targetUid = verifiedUid || sessionUid;
+      const paymentStatus = String(sessionObj?.payment_status || '').toLowerCase().trim();
+      const paymentConfirmed = paymentStatus === 'paid' || paymentStatus === 'no_payment_required';
+      const subObj = typeof sessionObj?.subscription === 'object' ? sessionObj.subscription : null;
+      const subId = typeof sessionObj?.subscription === 'string' ? sessionObj.subscription : subObj?.id || null;
+      const customerId =
+        typeof sessionObj?.customer === 'string' ? sessionObj.customer : sessionObj?.customer?.id || null;
+      const subStatus = String(subObj?.status || (paymentConfirmed ? 'active' : 'incomplete')).toLowerCase().trim();
+      const priceId = subObj?.items?.data?.[0]?.price?.id || null;
+      const unitAmountCents = subObj?.items?.data?.[0]?.price?.unit_amount ?? null;
       const resolvedPlan =
-        mapped.plan ||
-        (hintedPlan === 'progress' || hintedPlan === 'performance' || hintedPlan === 'elite' ? hintedPlan : null);
+        mapStripePlan({
+          metadataPlan: subObj?.metadata?.plan || sessionObj?.metadata?.plan || hintedPlanRaw,
+          priceId,
+          unitAmountCents,
+        }) || null;
 
-      const targetUid = verifiedUid || (isValidUUID(customData.user_id) ? String(customData.user_id) : '');
-      const subscriptionId = tx.subscription_id ? String(tx.subscription_id) : null;
-      const customerId = tx.customer_id ? String(tx.customer_id) : null;
-
-      if (isPaidOrComplete && resolvedPlan) {
+      if (paymentConfirmed && resolvedPlan && ['active', 'trialing', 'past_due'].includes(subStatus)) {
         const dbClient =
           getServiceRoleSupabase() ||
           (bearerToken && bearerToken.split('.').length === 3 ? createStatelessSupabase(bearerToken) : null);
@@ -529,14 +713,14 @@ app.post('/api/paddle/verify-transaction', async (req, res) => {
             targetUid,
             {
               subscription_plan: resolvedPlan,
-              subscription_status: 'active',
+              subscription_status: subStatus,
               has_used_trial: true,
               subscription_updated_at: new Date().toISOString(),
             },
             {
-              paddle_subscription_id: subscriptionId,
-              paddle_customer_id: customerId,
-              paddle_price_id: mapped.priceId,
+              stripe_subscription_id: subId,
+              stripe_customer_id: customerId,
+              stripe_price_id: priceId,
             }
           );
         }
@@ -547,32 +731,44 @@ app.post('/api/paddle/verify-transaction', async (req, res) => {
         return res.json({
           success: true,
           verified: true,
-          transactionId: cleanTxId,
+          sessionId: cleanSessionId,
           plan: resolvedPlan,
-          status: 'active',
-          subscriptionId,
+          status: subStatus,
+          subscriptionId: subId,
           customerId,
-          priceId: mapped.priceId,
+          priceId,
         });
       }
 
       return res.status(202).json({
         success: false,
         verified: false,
-        transactionId: cleanTxId,
-        paddleStatus: txStatus,
-        error: 'Transaction is not yet marked completed/paid by Paddle.',
+        sessionId: cleanSessionId,
+        stripePaymentStatus: paymentStatus,
+        error: 'Checkout session is not yet marked paid by Stripe.',
       });
     }
 
-    // Fallback DB check when PADDLE_API_KEY is not set on Node or no transactionId was returned
-    if (verifiedUid && bearerToken && bearerToken.split('.').length === 3) {
-      const userClient = createStatelessSupabase(bearerToken);
-      const { data: prof } = await userClient
-        .from('profiles')
-        .select('subscription_plan, subscription_status')
-        .eq('id', verifiedUid)
-        .maybeSingle();
+    // Fallback DB check when STRIPE_SECRET_KEY lives in Supabase Edge Functions
+    const adminClient = getServiceRoleSupabase();
+    if ((verifiedUid && bearerToken && bearerToken.split('.').length === 3) || (adminClient && (verifiedUid || email))) {
+      const lookupClient = adminClient || createStatelessSupabase(bearerToken);
+      let prof: any = null;
+      if (verifiedUid) {
+        const { data } = await lookupClient
+          .from('profiles')
+          .select('subscription_plan, subscription_status')
+          .eq('id', verifiedUid)
+          .maybeSingle();
+        prof = data;
+      } else if (adminClient && email) {
+        const { data } = await adminClient
+          .from('profiles')
+          .select('subscription_plan, subscription_status')
+          .ilike('email', String(email).trim())
+          .maybeSingle();
+        prof = data;
+      }
 
       const dbPlan = String(prof?.subscription_plan || 'free').toLowerCase().trim();
       const dbStatus = String(prof?.subscription_status || 'inactive').toLowerCase().trim();
@@ -589,218 +785,144 @@ app.post('/api/paddle/verify-transaction', async (req, res) => {
     return res.status(202).json({
       success: false,
       verified: false,
-      error: 'Awaiting Paddle webhook confirmation or server PADDLE_API_KEY verification.',
+      error: 'Awaiting Stripe webhook confirmation.',
     });
   } catch (err: any) {
-    console.error('[Paddle] verify-transaction error:', err);
+    console.error('[Stripe] verify-session error:', err);
     return res.status(500).json({
       success: false,
       verified: false,
-      error: err?.message || 'Failed to verify Paddle transaction.',
+      error: err?.message || 'Failed to verify Stripe checkout session.',
     });
   }
 });
 
-app.post('/api/paddle/webhook', async (req: any, res) => {
+app.post('/api/stripe/webhook', async (req: any, res) => {
   try {
-    const cfg = getServerPaddleConfig();
+    const cfg = getServerStripeConfig();
     if (!cfg.webhookSecret) {
       return res.status(503).json({
         success: false,
-        error: 'PADDLE_WEBHOOK_SECRET is not configured on the server.',
+        error: 'STRIPE_WEBHOOK_SECRET is not configured on the server.',
       });
     }
 
-    const signature = String(req.headers['paddle-signature'] || '');
+    const signature = String(req.headers['stripe-signature'] || '');
     const rawBody = typeof req.rawBody === 'string' ? req.rawBody : JSON.stringify(req.body || {});
-    if (!verifyPaddleWebhookSignature(rawBody, signature, cfg.webhookSecret)) {
-      return res.status(401).json({ success: false, error: 'Invalid Paddle webhook signature.' });
+    if (!verifyStripeWebhookSignature(rawBody, signature, cfg.webhookSecret)) {
+      return res.status(401).json({ success: false, error: 'Invalid Stripe webhook signature.' });
     }
 
-    const eventType = String(req.body?.event_type || '').trim();
-    const data = req.body?.data || {};
-    const customData = data?.custom_data || {};
-    const targetUserId = isValidUUID(customData?.user_id) ? String(customData.user_id).trim() : '';
+    const event = req.body || {};
+    const eventType = String(event?.type || '').trim();
+    const obj = event?.data?.object || {};
     const adminDb = getServiceRoleSupabase();
 
     if (!adminDb) {
-      console.warn('[Paddle Webhook] Received verified event', eventType, 'but SUPABASE_SERVICE_ROLE_KEY is unset.');
+      console.warn('[Stripe Webhook] Received verified event', eventType, 'but SUPABASE_SERVICE_ROLE_KEY is unset.');
       return res.json({ received: true, persisted: false });
     }
 
-    const findTargetUidByCustomerOrSub = async (): Promise<string> => {
+    const targetUserId = (() => {
+      const uid = obj?.metadata?.user_id || obj?.client_reference_id;
+      return isValidUUID(uid) ? String(uid).trim() : '';
+    })();
+
+    const resolveUid = async (): Promise<string> => {
       if (targetUserId) return targetUserId;
-      const subId = data?.id && String(data.id).startsWith('sub_') ? String(data.id) : data?.subscription_id;
-      const custId = data?.customer_id;
+      const subId =
+        eventType.startsWith('customer.subscription.')
+          ? obj?.id
+          : typeof obj?.subscription === 'string'
+            ? obj.subscription
+            : obj?.subscription?.id;
+      const custId = typeof obj?.customer === 'string' ? obj.customer : obj?.customer?.id;
 
       if (subId) {
-        try {
-          const { data: rows } = await adminDb
-            .from('profiles')
-            .select('id')
-            .eq('paddle_subscription_id', subId)
-            .limit(1);
-          if (rows?.[0]?.id) return rows[0].id;
-        } catch {
-          // ignore if column absent
-        }
+        const { data: rows } = await adminDb
+          .from('profiles')
+          .select('id')
+          .eq('stripe_subscription_id', subId)
+          .limit(1);
+        if (rows?.[0]?.id) return rows[0].id;
       }
       if (custId) {
-        try {
-          const { data: rows } = await adminDb
-            .from('profiles')
-            .select('id')
-            .eq('paddle_customer_id', custId)
-            .limit(1);
-          if (rows?.[0]?.id) return rows[0].id;
-        } catch {
-          // ignore if column absent
-        }
+        const { data: rows } = await adminDb
+          .from('profiles')
+          .select('id')
+          .eq('stripe_customer_id', custId)
+          .limit(1);
+        if (rows?.[0]?.id) return rows[0].id;
       }
       return '';
     };
 
-    const resolvedUid = await findTargetUidByCustomerOrSub();
+    const resolvedUid = await resolveUid();
     if (!resolvedUid) {
       return res.json({ received: true, updated: false });
     }
 
-    if (
-      eventType === 'subscription.created' ||
-      eventType === 'subscription.activated' ||
-      eventType === 'subscription.updated' ||
-      eventType === 'subscription.trialing' ||
-      eventType === 'subscription.past_due'
-    ) {
-      const subStatusRaw = String(data?.status || '').toLowerCase().trim();
-      const mapped = mapPaddleItemsToPlan(data?.items, customData);
-      const isEnded = subStatusRaw === 'canceled' || subStatusRaw === 'paused';
-
-      await updateProfileSubscriptionSafely(
-        adminDb,
-        resolvedUid,
-        {
-          subscription_plan: isEnded ? 'free' : mapped.plan || 'progress',
-          subscription_status: subStatusRaw || 'active',
-          has_used_trial: true,
-          subscription_updated_at: new Date().toISOString(),
-          ...(isEnded ? { subscription_cancelled_at: new Date().toISOString() } : {}),
-        },
-        {
-          paddle_subscription_id: isEnded ? null : data?.id || null,
-          paddle_customer_id: data?.customer_id || null,
-          paddle_price_id: isEnded ? null : mapped.priceId,
-        }
-      );
-    } else if (eventType === 'subscription.canceled' || eventType === 'subscription.paused') {
-      await updateProfileSubscriptionSafely(
-        adminDb,
-        resolvedUid,
-        {
-          subscription_plan: 'free',
-          subscription_status: 'canceled',
-          subscription_cancelled_at: new Date().toISOString(),
-          subscription_updated_at: new Date().toISOString(),
-        },
-        {
-          paddle_subscription_id: null,
-          paddle_price_id: null,
-        }
-      );
-    } else if (eventType === 'transaction.completed') {
-      const mapped = mapPaddleItemsToPlan(data?.items, customData);
-      if (mapped.plan) {
+    if (eventType === 'checkout.session.completed' || eventType === 'checkout.session.async_payment_succeeded') {
+      const paymentStatus = String(obj?.payment_status || '').toLowerCase().trim();
+      if (paymentStatus === 'paid' || paymentStatus === 'no_payment_required') {
+        const plan = mapStripePlan({ metadataPlan: obj?.metadata?.plan }) || 'progress';
+        const subId = typeof obj?.subscription === 'string' ? obj.subscription : obj?.subscription?.id || null;
+        const custId = typeof obj?.customer === 'string' ? obj.customer : obj?.customer?.id || null;
         await updateProfileSubscriptionSafely(
           adminDb,
           resolvedUid,
           {
-            subscription_plan: mapped.plan,
+            subscription_plan: plan,
             subscription_status: 'active',
             has_used_trial: true,
             subscription_updated_at: new Date().toISOString(),
           },
           {
-            paddle_subscription_id: data?.subscription_id || null,
-            paddle_customer_id: data?.customer_id || null,
-            paddle_price_id: mapped.priceId,
+            stripe_subscription_id: subId,
+            stripe_customer_id: custId,
           }
         );
       }
+    } else if (
+      eventType === 'customer.subscription.created' ||
+      eventType === 'customer.subscription.updated' ||
+      eventType === 'customer.subscription.deleted' ||
+      eventType === 'customer.subscription.paused' ||
+      eventType === 'customer.subscription.resumed'
+    ) {
+      const subStatus = String(obj?.status || '').toLowerCase().trim();
+      const priceItem = obj?.items?.data?.[0]?.price;
+      const priceId = priceItem?.id || null;
+      const mappedPlan = mapStripePlan({
+        metadataPlan: obj?.metadata?.plan,
+        priceId,
+        unitAmountCents: priceItem?.unit_amount ?? null,
+      });
+      const isEntitled = ['active', 'trialing', 'past_due', 'unpaid'].includes(subStatus);
+      const isDeleted = eventType === 'customer.subscription.deleted' || subStatus === 'canceled';
+
+      await updateProfileSubscriptionSafely(
+        adminDb,
+        resolvedUid,
+        {
+          subscription_plan: isEntitled && mappedPlan ? mappedPlan : 'free',
+          subscription_status: subStatus || (isDeleted ? 'canceled' : 'inactive'),
+          has_used_trial: true,
+          subscription_updated_at: new Date().toISOString(),
+          ...(isDeleted ? { subscription_cancelled_at: new Date().toISOString() } : {}),
+        },
+        {
+          stripe_subscription_id: isDeleted ? null : obj?.id || null,
+          stripe_customer_id: typeof obj?.customer === 'string' ? obj.customer : obj?.customer?.id || null,
+          stripe_price_id: isDeleted ? null : priceId,
+        }
+      );
     }
 
     return res.json({ received: true, updated: true, eventType });
   } catch (err: any) {
-    console.error('[Paddle] webhook error:', err);
+    console.error('[Stripe] webhook error:', err);
     return res.status(500).json({ success: false, error: err?.message || 'Webhook processing error.' });
-  }
-});
-
-app.post('/api/paddle/portal-session', async (req, res) => {
-  try {
-    const cfg = getServerPaddleConfig();
-    if (!cfg.configured || !cfg.apiBaseUrl || !cfg.apiKey) {
-      return res.status(503).json({
-        success: false,
-        error: 'Server PADDLE_ENV and PADDLE_API_KEY are required to create a Paddle portal session.',
-      });
-    }
-
-    const token = req.headers.authorization ? String(req.headers.authorization).replace(/^Bearer\s+/i, '').trim() : '';
-    if (!token || token.split('.').length !== 3) {
-      return res.status(401).json({ success: false, error: 'Authentication required.' });
-    }
-
-    const userClient = createStatelessSupabase(token);
-    const { data: userData } = await userClient.auth.getUser(token);
-    const uid = userData?.user?.id;
-    if (!uid) {
-      return res.status(401).json({ success: false, error: 'Invalid session.' });
-    }
-
-    let customerId = '';
-    try {
-      const { data: profile } = await userClient
-        .from('profiles')
-        .select('paddle_customer_id')
-        .eq('id', uid)
-        .maybeSingle();
-      customerId = String(profile?.paddle_customer_id || '').trim();
-    } catch {
-      customerId = '';
-    }
-
-    if (!customerId) {
-      return res.status(404).json({
-        success: false,
-        error: 'No Paddle customer ID found for this account yet.',
-      });
-    }
-
-    const portalRes = await fetch(
-      `${cfg.apiBaseUrl}/customers/${encodeURIComponent(customerId)}/portal-sessions`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${cfg.apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({}),
-      }
-    );
-    const portalData = await portalRes.json().catch(() => null);
-    if (!portalRes.ok || !portalData?.data?.urls?.general?.overview) {
-      return res.status(portalRes.status >= 400 ? portalRes.status : 502).json({
-        success: false,
-        error: portalData?.error?.detail || 'Unable to generate Paddle portal session.',
-      });
-    }
-
-    return res.json({
-      success: true,
-      url: portalData.data.urls.general.overview,
-    });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message || 'Portal session error.' });
   }
 });
 
@@ -841,7 +963,7 @@ app.post('/api/checkout/process', async (req, res) => {
         verified: false,
         plan: 'free',
         status: dbStatus || 'inactive',
-        error: 'Payment has not been confirmed by Paddle yet.',
+        error: 'Payment has not been confirmed by Stripe yet.',
       });
     }
 
@@ -859,26 +981,17 @@ app.post('/api/checkout/process', async (req, res) => {
   }
 });
 
-// Legacy Stripe session route explicitly disconnected in favor of Paddle Billing overlay
-app.post('/api/create-checkout-session', (_req, res) => {
-  return res.status(410).json({
-    success: false,
-    code: 'STRIPE_DISCONNECTED',
-    error: 'Stripe checkout has been disconnected. Checkouts open via Paddle.Checkout.open().',
-  });
-});
-
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req, res) => {
   res.json({
     status: 'ok',
     backend: 'Google Gemini',
     model: 'gemini-3.1-flash-lite',
     hasKey: Boolean(process.env.GEMINI_API_KEY),
-    billingProvider: 'paddle',
+    billingProvider: 'stripe',
   });
 });
 
-async function handleCancelPaddleSubscription(req: express.Request, res: express.Response) {
+async function handleCancelStripeSubscription(req: express.Request, res: express.Response) {
   try {
     const { userId, email, accessToken, refreshToken, subscriptionId: bodySubId } = req.body || {};
     const cleanEmail = email ? String(email).trim().toLowerCase() : '';
@@ -971,44 +1084,38 @@ async function handleCancelPaddleSubscription(req: express.Request, res: express
       });
     }
 
-    // Look up Paddle subscription ID from profile if columns exist
-    let paddleSubId =
+    // Look up Stripe subscription ID from profile
+    let stripeSubId =
       typeof bodySubId === 'string' && /^sub_[a-zA-Z0-9]+$/.test(bodySubId.trim()) ? bodySubId.trim() : '';
-    if (!paddleSubId) {
+    if (!stripeSubId) {
       try {
         const { data: prof } = await userClient
           .from('profiles')
-          .select('paddle_subscription_id')
+          .select('stripe_subscription_id')
           .eq('id', uid)
           .maybeSingle();
-        if (prof?.paddle_subscription_id && /^sub_[a-zA-Z0-9]+$/.test(String(prof.paddle_subscription_id))) {
-          paddleSubId = String(prof.paddle_subscription_id);
+        if (prof?.stripe_subscription_id && /^sub_[a-zA-Z0-9]+$/.test(String(prof.stripe_subscription_id))) {
+          stripeSubId = String(prof.stripe_subscription_id);
         }
       } catch {
-        // column may not exist yet
+        // column lookup fallback
       }
     }
 
-    // Cancel on Paddle Billing API if server API key + live subscription ID exist
-    const cfg = getServerPaddleConfig();
-    if (paddleSubId && cfg.configured && cfg.apiBaseUrl && cfg.apiKey) {
-      const paddleRes = await fetch(
-        `${cfg.apiBaseUrl}/subscriptions/${encodeURIComponent(paddleSubId)}/cancel`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${cfg.apiKey}`,
-            'Content-Type': 'application/json',
-          },
-          body: JSON.stringify({ effective_from: 'immediately' }),
-        }
-      );
-      const paddleJson = await paddleRes.json().catch(() => null);
-      if (!paddleRes.ok && paddleRes.status !== 404 && paddleJson?.error?.code !== 'subscription_already_canceled') {
-        return res.status(paddleRes.status >= 400 ? paddleRes.status : 502).json({
-          success: false,
-          error: paddleJson?.error?.detail || 'Unable to cancel subscription with Paddle.',
+    // Cancel on Stripe API if server secret key + live subscription ID exist
+    const cfg = getServerStripeConfig();
+    if (stripeSubId && cfg.configured) {
+      try {
+        await stripeApiRequest(`subscriptions/${encodeURIComponent(stripeSubId)}`, cfg.secretKey, {
+          method: 'DELETE',
         });
+      } catch (stripeErr: any) {
+        if (stripeErr?.status !== 404 && stripeErr?.stripeCode !== 'resource_missing') {
+          return res.status(stripeErr?.status >= 400 ? stripeErr.status : 502).json({
+            success: false,
+            error: stripeErr?.message || 'Unable to cancel subscription with Stripe.',
+          });
+        }
       }
     }
 
@@ -1025,8 +1132,8 @@ async function handleCancelPaddleSubscription(req: express.Request, res: express
         subscription_updated_at: new Date().toISOString(),
       },
       {
-        paddle_subscription_id: null,
-        paddle_price_id: null,
+        stripe_subscription_id: null,
+        stripe_price_id: null,
       }
     );
 
@@ -1049,7 +1156,7 @@ async function handleCancelPaddleSubscription(req: express.Request, res: express
 
     return res.json({
       success: true,
-      alreadyCanceled: !paddleSubId,
+      alreadyCanceled: !stripeSubId,
       message: 'Subscription canceled. Account is now on Free Plan.',
       plan: 'free',
       status: 'canceled',
@@ -1058,7 +1165,7 @@ async function handleCancelPaddleSubscription(req: express.Request, res: express
       ...(recoveredSession ? { refreshedSession: recoveredSession } : {}),
     });
   } catch (err: any) {
-    console.error('[Paddle] cancel-subscription error:', err);
+    console.error('[Stripe] cancel-subscription error:', err);
     return res.status(500).json({
       success: false,
       error: err?.message || 'Failed to cancel subscription',
@@ -1066,8 +1173,7 @@ async function handleCancelPaddleSubscription(req: express.Request, res: express
   }
 }
 
-app.post('/api/paddle/cancel-subscription', handleCancelPaddleSubscription);
-app.post('/api/cancel-subscription', handleCancelPaddleSubscription);
+app.post('/api/cancel-subscription', handleCancelStripeSubscription);
 
 app.post('/api/checkout/pending', (req, res) => {
   try {
@@ -1098,7 +1204,7 @@ app.get('/api/checkout/pending', (req, res) => {
   }
 });
 
-// Full permanent account deletion endpoint with automatic Paddle subscription cancellation
+// Full permanent account deletion endpoint with automatic Stripe subscription cancellation
 app.post('/api/user/delete-account', async (req, res) => {
   try {
     const { userId, email } = req.body || {};
@@ -1111,54 +1217,52 @@ app.post('/api/user/delete-account', async (req, res) => {
       return res.status(400).json({ success: false, error: 'User identifier required' });
     }
 
-    // 1. Check for active Paddle subscription on user profile
-    let paddleSubscriptionId: string | null = null;
+    const adminDb = getServiceRoleSupabase() || supabase;
+
+    // 1. Check for active Stripe subscription on user profile
+    let stripeSubscriptionId: string | null = null;
     try {
       if (cleanId && isValidUUID(cleanId)) {
-        const { data: profile } = await supabase
+        const { data: profile } = await adminDb
           .from('profiles')
-          .select('id, paddle_subscription_id, subscription_plan, subscription_status')
+          .select('id, stripe_subscription_id, subscription_plan, subscription_status')
           .eq('id', cleanId)
           .maybeSingle();
-        if (profile?.paddle_subscription_id) {
-          paddleSubscriptionId = String(profile.paddle_subscription_id);
+        if (profile?.stripe_subscription_id) {
+          stripeSubscriptionId = String(profile.stripe_subscription_id);
         }
       }
     } catch (profErr) {
       console.debug('[API] delete-account profile fetch note:', profErr);
     }
 
-    // 2. Automatically cancel Paddle subscription if active
-    let paddleCanceled = false;
-    const cfg = getServerPaddleConfig();
-    if (paddleSubscriptionId && /^sub_[a-zA-Z0-9]+$/.test(paddleSubscriptionId)) {
-      console.log('[API] Automatically canceling Paddle subscription before deleting account:', paddleSubscriptionId);
-      if (cfg.configured && cfg.apiBaseUrl && cfg.apiKey) {
+    // 2. Automatically cancel Stripe subscription if active
+    let stripeCanceled = false;
+    const cfg = getServerStripeConfig();
+    if (stripeSubscriptionId && /^sub_[a-zA-Z0-9]+$/.test(stripeSubscriptionId)) {
+      console.log('[API] Automatically canceling Stripe subscription before deleting account:', stripeSubscriptionId);
+      if (cfg.configured) {
         try {
-          const pRes = await fetch(
-            `${cfg.apiBaseUrl}/subscriptions/${encodeURIComponent(paddleSubscriptionId)}/cancel`,
-            {
-              method: 'POST',
-              headers: {
-                Authorization: `Bearer ${cfg.apiKey}`,
-                'Content-Type': 'application/json',
-              },
-              body: JSON.stringify({ effective_from: 'immediately' }),
-            }
-          );
-          paddleCanceled = pRes.ok;
-        } catch (pErr) {
-          console.warn('[API] Paddle cancel error during deletion:', pErr);
+          await stripeApiRequest(`subscriptions/${encodeURIComponent(stripeSubscriptionId)}`, cfg.secretKey, {
+            method: 'DELETE',
+          });
+          stripeCanceled = true;
+        } catch (sErr: any) {
+          if (sErr?.status === 404 || sErr?.stripeCode === 'resource_missing') {
+            stripeCanceled = true;
+          } else {
+            console.warn('[API] Stripe cancel error during deletion:', sErr);
+          }
         }
       } else {
-        paddleCanceled = true;
+        stripeCanceled = true;
       }
     }
 
     // 3. Mark subscription canceled in profile before table deletion
     if (cleanId && isValidUUID(cleanId)) {
       await updateProfileSubscriptionSafely(
-        getServiceRoleSupabase() || supabase,
+        adminDb,
         cleanId,
         {
           subscription_plan: 'free',
@@ -1167,8 +1271,8 @@ app.post('/api/user/delete-account', async (req, res) => {
           subscription_updated_at: new Date().toISOString(),
         },
         {
-          paddle_subscription_id: null,
-          paddle_price_id: null,
+          stripe_subscription_id: null,
+          stripe_price_id: null,
         }
       );
     }
@@ -1189,11 +1293,11 @@ app.post('/api/user/delete-account', async (req, res) => {
     for (const table of userTables) {
       try {
         if (cleanId) {
-          await supabase.from(table).delete().eq('user_id', cleanId);
-          await supabase.from(table).delete().eq('id', cleanId);
+          await adminDb.from(table).delete().eq('user_id', cleanId);
+          await adminDb.from(table).delete().eq('id', cleanId);
         }
         if (cleanEmail && table !== 'profiles') {
-          await supabase.from(table).delete().eq('email', cleanEmail);
+          await adminDb.from(table).delete().eq('email', cleanEmail);
         }
       } catch (tableErr) {
         console.debug(`[API] Table ${table} delete note:`, tableErr);
@@ -1210,7 +1314,7 @@ app.post('/api/user/delete-account', async (req, res) => {
     res.json({
       success: true,
       message: 'User account and all associated data permanently deleted. Any active subscriptions have been automatically canceled.',
-      subscriptionCanceled: paddleCanceled || Boolean(paddleSubscriptionId),
+      subscriptionCanceled: stripeCanceled || Boolean(stripeSubscriptionId),
     });
   } catch (err: any) {
     console.error('[API] delete-account error:', err);

@@ -1590,7 +1590,7 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                   <Shield className="w-3.5 h-3.5 text-primary" /> Automatic Subscription Cancellation
                 </span>
                 <p className="text-muted-foreground leading-normal">
-                  If you have an active paid subscription (Progress, Performance, or Elite), it will be automatically canceled with Paddle immediately. You will not be billed again.
+                  If you have an active paid subscription (Progress, Performance, or Elite), it will be automatically canceled with Stripe immediately. You will not be billed again.
                 </p>
               </div>
 

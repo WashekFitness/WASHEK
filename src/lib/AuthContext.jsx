@@ -768,6 +768,21 @@ export const AuthProvider = ({ children }) => {
         // ignore
       }
 
+      // Invoke Supabase delete-account Edge Function first if active JWT session exists (cancels Stripe subscription + cleans storage/auth)
+      try {
+        const { data: sessionData } = await supabase.auth.getSession();
+        const accessToken = sessionData?.session?.access_token;
+        if (accessToken && accessToken.split('.').length === 3) {
+          await supabase.functions.invoke('delete-account', {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          });
+        }
+      } catch (edgeErr) {
+        console.debug('[AUTH] Supabase delete-account edge note:', edgeErr);
+      }
+
       // Purge from backend database and credential vault
       try {
         await fetch('/api/user/delete-account', {

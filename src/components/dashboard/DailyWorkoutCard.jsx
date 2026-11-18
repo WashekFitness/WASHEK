@@ -2,30 +2,88 @@ import { useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { Card } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
-import { Dumbbell, ChevronRight, Clock, Moon, ShieldCheck, Sparkles } from 'lucide-react';
-import { getDayOfWeekName, getUserTimeZone, getLocalDateKey } from '@/lib/dateUtils';
-import { isActualRestDay } from '@/lib/streakUtils';
+import { Dumbbell, ChevronRight, Clock } from 'lucide-react';
+import { getDayOfWeekName, getUserTimeZone } from '@/lib/dateUtils';
+import { WEEKDAYS, extractWeekdayFromDayName } from '@/lib/workoutSchedule';
 import {
   getCachedActiveProgram,
   getCachedLastWorkout,
   setCachedLastWorkout,
 } from '@/lib/cacheStore';
 
+function pickDisplayWorkout(currentWeekData, todayWeekday, userKey) {
+  const days = Array.isArray(currentWeekData?.days) ? currentWeekData.days : [];
+  if (days.length === 0) {
+    return {
+      workout: getCachedLastWorkout(userKey),
+      isToday: true,
+      scheduledWeekday: todayWeekday,
+    };
+  }
+
+  const todayLower = String(todayWeekday || '').toLowerCase();
+  const exactToday = days.find((d) => {
+    const extracted = extractWeekdayFromDayName(d?.day_name || '');
+    return (
+      (extracted && extracted.toLowerCase() === todayLower) ||
+      String(d?.day_name || '').toLowerCase().includes(todayLower)
+    );
+  });
+
+  if (exactToday) {
+    return {
+      workout: exactToday,
+      isToday: true,
+      scheduledWeekday: todayWeekday,
+    };
+  }
+
+  // Find the next upcoming scheduled workout day chronologically starting tomorrow
+  const todayIdx = WEEKDAYS.findIndex((w) => w.toLowerCase() === todayLower);
+  if (todayIdx !== -1) {
+    for (let offset = 1; offset <= 7; offset++) {
+      const candidateWeekday = WEEKDAYS[(todayIdx + offset) % 7];
+      const match = days.find((d) => {
+        const extracted = extractWeekdayFromDayName(d?.day_name || '');
+        return (
+          (extracted && extracted === candidateWeekday) ||
+          String(d?.day_name || '').toLowerCase().includes(candidateWeekday.toLowerCase())
+        );
+      });
+      if (match) {
+        return {
+          workout: match,
+          isToday: false,
+          scheduledWeekday: candidateWeekday,
+        };
+      }
+    }
+  }
+
+  const firstDay = days[0];
+  return {
+    workout: firstDay,
+    isToday: false,
+    scheduledWeekday: extractWeekdayFromDayName(firstDay?.day_name || '') || null,
+  };
+}
+
 export default function DailyWorkoutCard({ program: propProgram, user, timeZone, isLoading = false }) {
   const userKey = user?.email || user?.id || 'athlete';
   const effectiveProgram = propProgram || getCachedActiveProgram(userKey);
   const program = effectiveProgram;
 
-  const currentWeekData = program?.microcycles?.find(m => m.week_number === program.current_week);
+  const currentWeekData =
+    program?.microcycles?.find((m) => m.week_number === program.current_week) ||
+    program?.microcycles?.[0];
   const effectiveTz = timeZone || getUserTimeZone(user);
   const today = getDayOfWeekName(new Date(), effectiveTz);
-  const todayKey = getLocalDateKey(new Date(), effectiveTz);
 
-  const isActualRest = isActualRestDay(todayKey, program, user, effectiveTz);
-
-  const todayWorkout = currentWeekData?.days?.find(d =>
-    d.day_name.toLowerCase().includes(today.toLowerCase())
-  ) || currentWeekData?.days?.[0] || getCachedLastWorkout(userKey);
+  const {
+    workout: todayWorkout,
+    isToday,
+    scheduledWeekday,
+  } = pickDisplayWorkout(currentWeekData, today, userKey);
 
   // Cache the last fetched workout so UI can render immediately even while fresh data is fetching
   const workoutId = todayWorkout ? `${todayWorkout.id || todayWorkout.day_name || todayWorkout.workout_type || 'workout'}_${userKey}` : null;
@@ -55,88 +113,6 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
           <div className="h-10 w-full bg-muted/40 rounded-xl" />
         </div>
         <div className="h-12 w-full bg-muted/60 rounded-xl" />
-      </Card>
-    );
-  }
-
-  // If today is a scheduled rest day, show the Rest & Regeneration protocol automatically
-  if (program && isActualRest) {
-    return (
-      <Card className="p-5 sm:p-6 bg-gradient-to-b from-card via-card to-card/95 border border-indigo-500/30 dark:border-indigo-500/40 shadow-[0_0_40px_rgba(99,102,241,0.15)] dark:shadow-[0_0_50px_rgba(99,102,241,0.2)] hover:border-indigo-500/50 transition-all duration-300 rounded-3xl relative overflow-hidden group">
-        {/* Athletic top ambient recovery glow */}
-        <div className="absolute top-0 right-0 w-72 h-40 bg-indigo-500/15 rounded-full blur-3xl pointer-events-none" />
-
-        <div className="flex items-start justify-between mb-4 relative z-10">
-          <div className="flex items-center gap-3">
-            <div className="w-11 h-11 rounded-2xl bg-indigo-500/15 border border-indigo-500/30 flex items-center justify-center shrink-0 shadow-sm">
-              <Moon className="w-5 h-5 text-indigo-400" />
-            </div>
-            <div>
-              <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest block font-heading">
-                Daily Protocol · {today}
-              </span>
-              <p className="font-heading font-extrabold text-xl sm:text-2xl tracking-tight text-foreground mt-0.5">
-                Rest &amp; Regeneration
-              </p>
-            </div>
-          </div>
-
-          <div className="flex items-center gap-1.5 text-xs font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2.5 py-1 rounded-xl shrink-0">
-            <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-            <span>Streak Protected</span>
-          </div>
-        </div>
-
-        <div className="space-y-2 mb-5 relative z-10">
-          <div className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-indigo-500/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200">
-            <div className="flex items-center gap-3 min-w-0 pr-2">
-              <span className="w-6 h-6 rounded-lg bg-indigo-500/15 text-indigo-400 text-xs font-bold font-heading flex items-center justify-center shrink-0">
-                1
-              </span>
-              <span className="text-foreground font-semibold truncate text-sm">
-                Neuromuscular &amp; CNS Recovery
-              </span>
-            </div>
-            <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums border border-indigo-500/20">
-              Deep Rest
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-indigo-500/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200">
-            <div className="flex items-center gap-3 min-w-0 pr-2">
-              <span className="w-6 h-6 rounded-lg bg-indigo-500/15 text-indigo-400 text-xs font-bold font-heading flex items-center justify-center shrink-0">
-                2
-              </span>
-              <span className="text-foreground font-semibold truncate text-sm">
-                Connective Tissue &amp; Mobility Flow
-              </span>
-            </div>
-            <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums border border-indigo-500/20">
-              Light Stretches
-            </span>
-          </div>
-
-          <div className="flex items-center justify-between py-2.5 px-3.5 rounded-2xl bg-muted/40 dark:bg-white/[0.03] border border-border/60 dark:border-white/[0.06] text-sm hover:border-indigo-500/40 hover:bg-muted/60 dark:hover:bg-white/[0.06] transition-all duration-200">
-            <div className="flex items-center gap-3 min-w-0 pr-2">
-              <span className="w-6 h-6 rounded-lg bg-indigo-500/15 text-indigo-400 text-xs font-bold font-heading flex items-center justify-center shrink-0">
-                3
-              </span>
-              <span className="text-foreground font-semibold truncate text-sm">
-                Electrolytes &amp; Protein Synthesis
-              </span>
-            </div>
-            <span className="text-xs font-bold text-indigo-300 bg-indigo-500/10 px-2.5 py-1 rounded-lg shrink-0 tabular-nums border border-indigo-500/20">
-              Optimal Macros
-            </span>
-          </div>
-        </div>
-
-        <Link to="/program" className="block relative z-10">
-          <Button variant="outline" className="w-full h-12 border-indigo-500/30 hover:bg-indigo-500/10 text-foreground font-heading font-bold text-sm tracking-wide rounded-2xl group/btn flex items-center justify-center gap-2">
-            <span>View Full Program Schedule</span>
-            <ChevronRight className="w-4 h-4 group-hover/btn:translate-x-1 transition-transform duration-200" />
-          </Button>
-        </Link>
       </Card>
     );
   }
@@ -176,6 +152,11 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
 
   const exerciseCount = todayWorkout.exercises?.length || 0;
   const estimatedTime = exerciseCount * 4;
+  const protocolEyebrow = isToday
+    ? `Today's Protocol · ${today}`
+    : scheduledWeekday
+      ? `Up Next · ${scheduledWeekday}`
+      : 'Next Workout';
 
   return (
     <Card className="p-5 sm:p-6 bg-gradient-to-b from-card via-card to-card/95 border border-primary/40 dark:border-primary/50 shadow-[0_0_40px_rgba(37,99,235,0.20)] dark:shadow-[0_0_50px_rgba(37,99,235,0.26)] hover:border-primary/60 transition-all duration-300 rounded-3xl relative overflow-hidden group">
@@ -189,7 +170,7 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
           </div>
           <div>
             <span className="text-[10px] font-bold text-primary uppercase tracking-widest block font-heading">
-              Today's Protocol
+              {protocolEyebrow}
             </span>
             <p className="font-heading font-extrabold text-xl sm:text-2xl tracking-tight text-foreground mt-0.5">
               {todayWorkout.workout_type}
@@ -224,7 +205,7 @@ export default function DailyWorkoutCard({ program: propProgram, user, timeZone,
         ))}
         {exerciseCount > 3 && (
           <p className="text-xs font-medium text-muted-foreground text-center pt-1">
-            +{exerciseCount - 3} more exercises in today's routine
+            +{exerciseCount - 3} more exercises in {isToday ? "today's" : 'this'} routine
           </p>
         )}
       </div>

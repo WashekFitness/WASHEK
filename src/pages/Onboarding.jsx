@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Dumbbell, Scale, Heart, Wind, PersonStanding, Globe, Loader2, Lock } from 'lucide-react';
+import { ChevronRight, ChevronLeft, Zap, Target, Flame, Trophy, Dumbbell, Scale, Heart, Wind, PersonStanding, Globe, Loader2, Lock, CalendarDays } from 'lucide-react';
 import { COUNTRIES, LANGUAGES, getCountryDefaults } from '@/lib/countries';
 import { useAppSettings } from '@/lib/AppSettingsContext';
 import { useAuth } from '@/lib/AuthContext';
@@ -16,6 +16,7 @@ import TrainingTypeSelect from '@/components/onboarding/TrainingTypeSelect';
 import { CALISTHENICS_GOALS, WEIGHT_GOALS, buildWeekPrompt } from '@/lib/trainingTypes';
 import { build12WeekMicrocycles, buildSingleWeekMicrocycle, buildScientificBaselineWeekOne, WEEK_CONFIGS } from '@/lib/periodizationEngine';
 import { sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
+import { WEEKDAYS, WEEKDAY_SHORT, sortWeekdays, parseWorkoutDaysFromText } from '@/lib/workoutSchedule';
 import { useProgramCooldown, recordProgramGenerated, checkProgramGenerationLock } from '@/lib/programCooldown';
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import { setCachedActiveProgram } from '@/lib/cacheStore';
@@ -184,6 +185,8 @@ export default function Onboarding() {
   const [currentSkills, setCurrentSkills] = useState('');
   const [gender, setGender] = useState('');
   const [weightGoals, setWeightGoals] = useState([]);
+  const [workoutDays, setWorkoutDays] = useState(['Monday', 'Tuesday', 'Thursday', 'Friday']);
+  const [hasToggledWorkoutDays, setHasToggledWorkoutDays] = useState(false);
 
   const handleCountryChange = (code) => {
     setCountry(code);
@@ -208,10 +211,22 @@ export default function Onboarding() {
     );
   };
 
+  const toggleWorkoutDay = (day) => {
+    setHasToggledWorkoutDays(true);
+    setWorkoutDays(prev => {
+      const next = prev.includes(day)
+        ? prev.filter(d => d !== day)
+        : [...prev, day];
+      return sortWeekdays(next);
+    });
+  };
+
   const hasSkills =
     trainingType === 'calisthenics' ||
     trainingType === 'weighted_calisthenics' ||
     trainingType === 'hybrid';
+
+  const wantsSkills = hasSkills && fitnessGoals.includes('learn_skills');
 
   const hasWeightGoals =
     trainingType === 'weights' ||
@@ -259,6 +274,12 @@ export default function Onboarding() {
       if (p.current_skills) setCurrentSkills(p.current_skills);
       if (p.available_equipment) setEquipment(p.available_equipment);
       if (p.training_requirements) setRequirements(p.training_requirements);
+      if (Array.isArray(p.training_days) && p.training_days.length > 0) {
+        setWorkoutDays(sortWeekdays(p.training_days));
+      } else if (p.training_requirements) {
+        const parsedDays = parseWorkoutDaysFromText(p.training_requirements);
+        if (parsedDays.length > 0) setWorkoutDays(parsedDays);
+      }
     }).catch((err) => {
       console.debug('[Onboarding] Profile preload note:', err);
     });
@@ -334,6 +355,32 @@ export default function Onboarding() {
           : enteredWeight
         : null;
 
+      const weightKgVal = Number.isFinite(enteredWeight)
+        ? unit === 'metric'
+          ? Math.round(enteredWeight)
+          : Math.round(enteredWeight * 0.453592)
+        : '';
+
+      const weightLbsVal = Number.isFinite(weightStoredLbs)
+        ? Math.round(weightStoredLbs)
+        : '';
+
+      const heightCmVal =
+        unit === 'metric'
+          ? (Number.isFinite(parsedCm) && parsedCm > 0 ? Math.round(parsedCm) : '')
+          : (heightInches > 0 ? Math.round(heightInches * 2.54) : '');
+
+      const textMentionedDays = !hasToggledWorkoutDays
+        ? parseWorkoutDaysFromText(`${requirements} ${goalDescription}`)
+        : [];
+      const resolvedWorkoutDays = sortWeekdays(
+        textMentionedDays.length > 0
+          ? textMentionedDays
+          : workoutDays.length > 0
+            ? workoutDays
+            : ['Monday', 'Tuesday', 'Thursday', 'Friday']
+      );
+
       let existingProfile = null;
       try {
         const { data: ep } = await supabase
@@ -346,9 +393,11 @@ export default function Onboarding() {
         console.debug('[Onboarding] Existing profile fetch note:', epErr);
       }
 
+      const resolvedFirstName = firstName.trim() || existingProfile?.first_name || '';
+
       const profileData = {
         id: validUserId,
-        first_name: firstName.trim() || existingProfile?.first_name || '',
+        first_name: resolvedFirstName,
         last_name: lastName.trim() || existingProfile?.last_name || '',
         training_type: trainingType,
         fitness_level: level || 'intermediate',
@@ -406,6 +455,7 @@ export default function Onboarding() {
           JSON.stringify({
             ...parsedLocal,
             ...profileData,
+            training_days: resolvedWorkoutDays,
             id: validUserId,
             onboarded: true,
           })
@@ -418,21 +468,26 @@ export default function Onboarding() {
       setLoadingPhase('Building your program…');
 
       const promptData = {
+        firstName: resolvedFirstName || 'Athlete',
+        language,
         trainingType,
         gender,
-        level,
-        age,
-        weightLbs,
-        heightFt,
-        heightIn,
+        level: level || 'intermediate',
+        age: Number.isFinite(parsedAge) ? parsedAge : age,
+        weightLbs: weightLbsVal,
+        weightKg: weightKgVal,
+        heightFt: unit === 'imperial' ? heightFt : '',
+        heightIn: unit === 'imperial' ? heightIn : '',
+        heightCm: heightCmVal,
         unit,
-        currentSkills,
-        goalDescription,
-        timeframe,
-        equipment,
-        requirements,
+        currentSkills: currentSkills.trim(),
+        goalDescription: profileData.primary_goal,
+        timeframe: timeframe.trim(),
+        equipment: equipment.trim(),
+        requirements: requirements.trim(),
         fitnessGoals,
         weightGoals,
+        workoutDays: resolvedWorkoutDays,
       };
 
       const mesocycles = [
@@ -560,14 +615,13 @@ export default function Onboarding() {
             trainingType,
             promptData,
             1,
-            null,
             []
           ),
           schema: weekSchema,
         });
 
         const timeoutPromise = new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('AI timeout')), 1200)
+          setTimeout(() => reject(new Error('AI timeout')), 15000)
         );
 
         const parsed = await Promise.race([aiPromise, timeoutPromise]);
@@ -590,15 +644,21 @@ export default function Onboarding() {
       }
 
       const userOptions = {
+        firstName: resolvedFirstName || 'Athlete',
+        language,
         trainingType,
         level: level || 'intermediate',
+        fitnessLevel: level || 'intermediate',
         fitnessGoals,
         weightGoals,
-        goalDescription,
-        equipment,
-        requirements,
-        currentSkills,
-        gender,
+        goalDescription: profileData.primary_goal,
+        timeframe: timeframe.trim(),
+        equipment: equipment.trim(),
+        requirements: requirements.trim(),
+        currentSkills: currentSkills.trim(),
+        gender: gender || null,
+        age: Number.isFinite(parsedAge) ? parsedAge : null,
+        workoutDays: resolvedWorkoutDays,
       };
 
       // High-precision evidence-based calibrated baseline
@@ -626,14 +686,7 @@ export default function Onboarding() {
         };
 
         // Calculate scientific periodized microcycle for week w
-        const weekMicrocycle = buildSingleWeekMicrocycle(weekOne, config, {
-          trainingType,
-          goalDescription,
-          fitnessLevel: level || 'intermediate',
-          requirements,
-          currentSkills,
-          equipment,
-        });
+        const weekMicrocycle = buildSingleWeekMicrocycle(weekOne, config, userOptions);
 
         all12Weeks.push(weekMicrocycle);
 
@@ -663,7 +716,7 @@ export default function Onboarding() {
         created_by: user?.email || user?.id || validUserId,
         created_at: nowIso,
         program_name:
-          `${firstName.trim() || 'Athlete'}'s ${
+          `${resolvedFirstName || 'Athlete'}'s ${
             trainingType === 'weights'
               ? 'Strength'
               : trainingType === 'hybrid'
@@ -674,6 +727,21 @@ export default function Onboarding() {
         macrocycle: {
           overview:
             'A comprehensive 12-week periodized program covering Foundation, Intensification, and Peak performance, updated continuously via post-workout check-ins.',
+          training_days: resolvedWorkoutDays,
+          athlete_profile: {
+            first_name: resolvedFirstName,
+            gender: gender || null,
+            age: Number.isFinite(parsedAge) ? parsedAge : null,
+            unit,
+            language,
+            fitness_goals: fitnessGoals,
+            weight_goals: weightGoals,
+            goal_timeframe: timeframe.trim(),
+            available_equipment: equipment.trim(),
+            training_requirements: requirements.trim(),
+            current_skills: currentSkills.trim(),
+            workout_days: resolvedWorkoutDays,
+          },
           phases: mesocycles.map(m => ({
             name: m.name,
             weeks: `${m.week_start}-${m.week_end}`,
@@ -784,6 +852,7 @@ export default function Onboarding() {
           JSON.stringify({
             ...parsedLocal,
             ...profileData,
+            training_days: resolvedWorkoutDays,
             id: validUserId,
             active_program_id: savedProgram.id,
             training_type: programPayload.training_type,
@@ -865,8 +934,10 @@ export default function Onboarding() {
   // Step 4 (generate) condition
   const step4Valid = hasSkills
     ? goalDescription.trim().length >= 10 &&
-      equipment.trim().length > 0
-    : equipment.trim().length > 0;
+      equipment.trim().length > 0 &&
+      workoutDays.length > 0
+    : equipment.trim().length > 0 &&
+      workoutDays.length > 0;
 
   return (
     <div className="min-h-screen bg-background flex flex-col safe-top safe-bottom">
@@ -1346,7 +1417,17 @@ export default function Onboarding() {
                                   e.target.value
                                 )
                               }
-                              placeholder={placeholder}
+                              placeholder={
+                                wantsSkills
+                                  ? placeholder
+                                  : value === 'beginner'
+                                    ? 'e.g. 10 push-ups, bodyweight squats, a few jumping pull-ups...'
+                                    : value === 'intermediate'
+                                      ? 'e.g. 8 pull-ups, 15 dips, 20 push-ups, split squats...'
+                                      : value === 'advanced'
+                                        ? 'e.g. 15+ pull-ups, weighted dips, deep pistol squats...'
+                                        : 'e.g. 20+ strict pull-ups, heavy weighted dips, high-rep bodyweight mastery...'
+                              }
                               className="text-sm resize-none min-h-[72px] rounded-2xl border-primary/40 bg-primary/5 focus:border-primary leading-relaxed"
                               onClick={e =>
                                 e.stopPropagation()
@@ -1354,7 +1435,9 @@ export default function Onboarding() {
                             />
 
                             <p className="text-xs text-muted-foreground mt-1 pl-1">
-                              What skills & moves can you currently do?
+                              {wantsSkills
+                                ? 'What skills & moves can you currently do?'
+                                : 'What exercises & reps can you currently do?'}
                             </p>
                           </div>
                         )}
@@ -1616,7 +1699,11 @@ export default function Onboarding() {
                         e.target.value
                       )
                     }
-                    placeholder={`e.g. "I want to learn the muscle up and build a strong back. I can currently do 10 pull-ups and 15 dips. I had a shoulder injury last year so I want to take it slow on pressing movements."`}
+                    placeholder={
+                      wantsSkills
+                        ? `e.g. "I want to learn the muscle up and build a strong back. I can currently do 10 pull-ups and 15 dips. I had a shoulder injury last year so I want to take it slow on pressing movements."`
+                        : `e.g. "I want to build muscle and get stronger with bodyweight training. I can currently do 10 pull-ups and 15 dips. I had a shoulder injury last year so I want to take it slow on pressing movements."`
+                    }
                     className="min-h-[140px] text-sm resize-none bg-card border-border focus:border-primary rounded-2xl p-4 leading-relaxed"
                   />
 
@@ -1630,7 +1717,11 @@ export default function Onboarding() {
                       onChange={e =>
                         setTimeframe(e.target.value)
                       }
-                      placeholder={`e.g. "Muscle up in 3 months, handstand in 6 months."`}
+                      placeholder={
+                        wantsSkills
+                          ? `e.g. "Muscle up in 3 months, handstand in 6 months."`
+                          : `e.g. "Add 10 lbs of lean muscle and hit 15 strict pull-ups in 3 months."`
+                      }
                       className="min-h-[60px] text-sm resize-none bg-card border-border focus:border-primary rounded-xl p-3 leading-relaxed"
                     />
                   </div>
@@ -1682,6 +1773,48 @@ export default function Onboarding() {
               )}
 
               <div className="bg-muted/50 rounded-2xl p-4 border border-border">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider flex items-center gap-1.5">
+                    <CalendarDays className="w-3.5 h-3.5 text-primary" />
+                    Exact workout days{' '}
+                    <span className="text-destructive">*</span>
+                  </p>
+                  <span className="text-[11px] font-semibold text-primary">
+                    {workoutDays.length}{' '}
+                    {workoutDays.length === 1 ? 'day' : 'days'}/week
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-7 gap-1.5">
+                  {WEEKDAYS.map((day) => {
+                    const active = workoutDays.includes(day);
+                    return (
+                      <button
+                        key={day}
+                        type="button"
+                        onClick={() => toggleWorkoutDay(day)}
+                        aria-pressed={active}
+                        className={cn(
+                          'h-10 rounded-xl border text-xs font-semibold transition-all',
+                          active
+                            ? 'border-primary bg-primary text-primary-foreground shadow-xs'
+                            : 'border-border bg-card text-muted-foreground hover:border-muted-foreground/40'
+                        )}
+                      >
+                        {WEEKDAY_SHORT[day]}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <p className="text-[10px] text-muted-foreground mt-2">
+                  {workoutDays.length > 0
+                    ? `Your workouts will be scheduled on: ${workoutDays.join(', ')}.`
+                    : 'Select at least one day you want to train.'}
+                </p>
+              </div>
+
+              <div className="bg-muted/50 rounded-2xl p-4 border border-border">
                 <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
                   🏋️ Available equipment{' '}
                   <span className="text-destructive">
@@ -1718,7 +1851,7 @@ export default function Onboarding() {
                   onChange={e =>
                     setRequirements(e.target.value)
                   }
-                  placeholder={`e.g. "I can train 4 days a week, about 60 min per session. I have a history of lower back pain so I want to be careful with heavy deadlifts. I also want to focus on my chest since it's lagging."`}
+                  placeholder={`e.g. "About 60 min per session. I have a history of lower back pain so I want to be careful with heavy deadlifts. I also want to focus on my chest since it's lagging."`}
                   className="min-h-[80px] text-sm resize-none bg-card border-border focus:border-primary rounded-xl p-3 leading-relaxed"
                 />
 

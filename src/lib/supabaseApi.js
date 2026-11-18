@@ -2017,9 +2017,9 @@ export const supabaseApi = {
       delete safePatch.user_id;
       delete safePatch.subscription_plan;
       delete safePatch.subscription_status;
-      delete safePatch.paddle_customer_id;
-      delete safePatch.paddle_subscription_id;
-      delete safePatch.paddle_price_id;
+      delete safePatch.stripe_customer_id;
+      delete safePatch.stripe_subscription_id;
+      delete safePatch.stripe_price_id;
       delete safePatch.subscription_cancelled_at;
       delete safePatch.subscription_updated_at;
 

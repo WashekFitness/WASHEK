@@ -6,8 +6,12 @@ import {
   buildSingleWeekMicrocycle,
   WEEK_CONFIGS,
 } from '@/lib/periodizationEngine';
-import { sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
+import {
+  sanitizeMicrocycleExclusions,
+  hasLearnSkillsGoal,
+} from '@/lib/programExclusions';
 import { buildWeekPrompt } from '@/lib/trainingTypes';
+import { resolveWorkoutDays } from '@/lib/workoutSchedule';
 import {
   checkProgramGenerationLock,
   recordProgramGenerated,
@@ -108,45 +112,134 @@ export async function generateNewProgram(options = {}) {
     console.debug('[ProgramService] Profile fetch note:', pErr);
   }
 
+  let localCachedUser = null;
+  let previousTrainingDays = null;
+  try {
+    const rawUser = localStorage.getItem('washek_user');
+    if (rawUser) localCachedUser = JSON.parse(rawUser);
+  } catch {
+    // ignore storage errors
+  }
+  try {
+    const rawProg = localStorage.getItem('washek_active_program');
+    if (rawProg) {
+      const parsedProg = JSON.parse(rawProg);
+      previousTrainingDays =
+        parsedProg?.training_days || parsedProg?.macrocycle?.training_days || null;
+    }
+  } catch {
+    // ignore storage errors
+  }
+
   const trainingType =
     trainingTypeOverride ||
     profile?.training_type ||
+    localCachedUser?.training_type ||
     user?.training_type ||
     'calisthenics';
 
   const fitnessLevel =
     fitnessLevelOverride ||
     profile?.fitness_level ||
+    localCachedUser?.fitness_level ||
     user?.fitness_level ||
     'intermediate';
+
+  const fitnessGoals = profile?.fitness_goals || localCachedUser?.fitness_goals || [];
+  const weightGoals = profile?.weight_goals || localCachedUser?.weight_goals || [];
+  const requirements =
+    profile?.training_requirements || localCachedUser?.training_requirements || '';
+  const currentSkills = profile?.current_skills || localCachedUser?.current_skills || '';
+  const equipment =
+    profile?.available_equipment || localCachedUser?.available_equipment || '';
+  const timeframe = profile?.goal_timeframe || localCachedUser?.goal_timeframe || '';
+  const gender = profile?.gender || localCachedUser?.gender || null;
+  const age = profile?.age ?? localCachedUser?.age ?? null;
+  const unit = profile?.unit || localCachedUser?.unit || 'imperial';
+  const language = profile?.language || localCachedUser?.language || 'English';
+  const athleteName = (
+    profile?.first_name ||
+    user?.user_metadata?.first_name ||
+    user?.first_name ||
+    localCachedUser?.first_name ||
+    'Athlete'
+  ).trim();
+
+  const wantsSkills = hasLearnSkillsGoal({
+    trainingType,
+    fitnessGoals,
+    weightGoals,
+    goalDescription:
+      primaryGoalOverride ||
+      profile?.primary_goal ||
+      localCachedUser?.primary_goal ||
+      user?.primary_goal,
+    requirements,
+  });
 
   const primaryGoal =
     primaryGoalOverride ||
     profile?.primary_goal ||
+    localCachedUser?.primary_goal ||
     user?.primary_goal ||
     (trainingType === 'weights'
       ? 'Build raw strength and hypertrophy'
       : trainingType === 'hybrid'
-        ? 'Master bodyweight levers and build compound lifting power'
-        : 'Master advanced calisthenics skills and relative strength');
+        ? wantsSkills
+          ? 'Master bodyweight levers and build compound lifting power'
+          : 'Build bodyweight strength and compound lifting power'
+        : wantsSkills
+          ? 'Master advanced calisthenics skills and relative strength'
+          : 'Build lean muscle, relative strength, and bodyweight conditioning');
 
-  const fitnessGoals = profile?.fitness_goals || [];
-  const weightGoals = profile?.weight_goals || [];
-  const currentSkills = profile?.current_skills || '';
-  const equipment = profile?.available_equipment || '';
-  const requirements = profile?.training_requirements || '';
-  const gender = profile?.gender || null;
+  const rawWeightLbs = Number(profile?.weight_lbs ?? localCachedUser?.weight_lbs);
+  const weightLbs = Number.isFinite(rawWeightLbs) && rawWeightLbs > 0 ? Math.round(rawWeightLbs) : '';
+  const weightKg =
+    Number.isFinite(rawWeightLbs) && rawWeightLbs > 0
+      ? Math.round(rawWeightLbs * 0.453592)
+      : '';
+
+  const rawHeightInches = Number(profile?.height_inches ?? localCachedUser?.height_inches);
+  const heightFt =
+    Number.isFinite(rawHeightInches) && rawHeightInches > 0
+      ? Math.floor(rawHeightInches / 12)
+      : '';
+  const heightIn =
+    Number.isFinite(rawHeightInches) && rawHeightInches > 0
+      ? Math.round(rawHeightInches % 12)
+      : '';
+  const rawHeightCm = Number(profile?.height_cm ?? localCachedUser?.height_cm);
+  const heightCm =
+    Number.isFinite(rawHeightCm) && rawHeightCm > 0
+      ? Math.round(rawHeightCm)
+      : Number.isFinite(rawHeightInches) && rawHeightInches > 0
+        ? Math.round(rawHeightInches * 2.54)
+        : '';
+
+  const workoutDays = resolveWorkoutDays({
+    workoutDays: options.workoutDays,
+    trainingDays:
+      profile?.training_days || localCachedUser?.training_days || previousTrainingDays,
+    requirements,
+    goalDescription: primaryGoal,
+  });
 
   const userOptions = {
+    firstName: athleteName,
+    language,
     trainingType,
     level: fitnessLevel,
+    fitnessLevel,
     fitnessGoals,
     weightGoals,
     goalDescription: primaryGoal,
+    timeframe,
     equipment,
     requirements,
     currentSkills,
     gender,
+    age,
+    workoutDays,
   };
 
   // 3. Generate Week 1 microcycle (AI with quick fallback to scientific baseline)
@@ -206,28 +299,36 @@ export async function generateNewProgram(options = {}) {
   let weekOne = null;
   try {
     const promptData = {
+      firstName: athleteName,
+      language,
       trainingType,
       gender,
       level: fitnessLevel,
-      age: profile?.age,
-      weightLbs: profile?.weight_lbs,
-      unit: profile?.unit || 'imperial',
+      age,
+      weightLbs,
+      weightKg,
+      heightFt,
+      heightIn,
+      heightCm,
+      unit,
       currentSkills,
       goalDescription: primaryGoal,
+      timeframe,
       equipment,
       requirements,
       fitnessGoals,
       weightGoals,
+      workoutDays,
     };
 
     const aiPromise = supabaseApi.ai.invoke({
       type: 'microcycle',
-      prompt: buildWeekPrompt(trainingType, promptData, 1, null, []),
+      prompt: buildWeekPrompt(trainingType, promptData, 1, []),
       schema: weekSchema,
     });
 
     const timeoutPromise = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error('AI timeout')), 5000)
+      setTimeout(() => reject(new Error('AI timeout')), 15000)
     );
 
     const parsed = await Promise.race([aiPromise, timeoutPromise]);
@@ -268,14 +369,7 @@ export async function generateNewProgram(options = {}) {
       volume_delta: '+10%',
     };
 
-    const weekMicrocycle = buildSingleWeekMicrocycle(weekOne, config, {
-      trainingType,
-      goalDescription: primaryGoal,
-      fitnessLevel,
-      requirements,
-      currentSkills,
-      equipment,
-    });
+    const weekMicrocycle = buildSingleWeekMicrocycle(weekOne, config, userOptions);
 
     all12Weeks.push(weekMicrocycle);
   }
@@ -311,13 +405,6 @@ export async function generateNewProgram(options = {}) {
     },
   ];
 
-  const athleteName = (
-    profile?.first_name ||
-    user?.user_metadata?.first_name ||
-    user?.first_name ||
-    'Athlete'
-  ).trim();
-
   const programName = `${athleteName}'s ${
     trainingType === 'weights'
       ? 'Strength'
@@ -336,6 +423,21 @@ export async function generateNewProgram(options = {}) {
     macrocycle: {
       overview:
         'A comprehensive 12-week periodized program covering Foundation, Intensification, and Peak performance, updated continuously via post-workout check-ins.',
+      training_days: workoutDays,
+      athlete_profile: {
+        first_name: athleteName,
+        gender,
+        age,
+        unit,
+        language,
+        fitness_goals: fitnessGoals,
+        weight_goals: weightGoals,
+        goal_timeframe: timeframe,
+        available_equipment: equipment,
+        training_requirements: requirements,
+        current_skills: currentSkills,
+        workout_days: workoutDays,
+      },
       phases: mesocycles.map((m) => ({
         name: m.name,
         weeks: `${m.week_start}-${m.week_end}`,
@@ -466,6 +568,7 @@ export async function generateNewProgram(options = {}) {
         active_program_id: savedProgram.id,
         training_type: trainingType,
         fitness_level: fitnessLevel,
+        training_days: workoutDays,
         last_program_generated_at: nowIso,
         calorie_target: personalizedNutrition.calories,
         protein_target: personalizedNutrition.protein,

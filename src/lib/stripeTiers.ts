@@ -2,16 +2,47 @@ export interface Tier {
   name: 'Progress' | 'Performance' | 'Elite';
   description: string;
   features: string[];
-  productId: string;
   priceId: { month: string; year: string };
+  defaultPrice: string;
+  unitAmountCents: number;
 }
 
 export type TierKey = 'progress' | 'performance' | 'elite';
 
-const viteEnv =
-  ((import.meta as unknown as { env?: Record<string, string | undefined> })?.env) || {};
+export const STRIPE_PRICE_IDS: Record<TierKey, string> = {
+  progress: 'price_1TTYrbRuQpZftYKRoSyLbQ0c',
+  performance: 'price_1TTYs8RuQpZftYKR8ZzpNg7x',
+  elite: 'price_1TTYsWRuQpZftYKRKIm8V10E',
+};
 
-export const PADDLE_TIERS: Tier[] = [
+export const STRIPE_PAYMENT_LINKS: Record<TierKey, string> = {
+  progress: 'https://buy.stripe.com/test_9B67sNcsOaiW1ETgLtg3603',
+  performance: 'https://buy.stripe.com/test_8x23cx50m9eS97l52Lg3605',
+  elite: 'https://buy.stripe.com/test_28E3cxboK2Qu3N1cvdg3604',
+};
+
+export const STRIPE_DEFAULT_PRICES: Record<TierKey, { formattedTotal: string; unitAmountCents: number; priceId: string; currencyCode: string }> = {
+  progress: {
+    priceId: STRIPE_PRICE_IDS.progress,
+    formattedTotal: '$9.99',
+    unitAmountCents: 999,
+    currencyCode: 'USD',
+  },
+  performance: {
+    priceId: STRIPE_PRICE_IDS.performance,
+    formattedTotal: '$17.99',
+    unitAmountCents: 1799,
+    currencyCode: 'USD',
+  },
+  elite: {
+    priceId: STRIPE_PRICE_IDS.elite,
+    formattedTotal: '$34.99',
+    unitAmountCents: 3499,
+    currencyCode: 'USD',
+  },
+};
+
+export const STRIPE_TIERS: Tier[] = [
   {
     name: 'Progress',
     description: 'Daily Progression',
@@ -24,11 +55,12 @@ export const PADDLE_TIERS: Tier[] = [
       'Adaptive calorie & macro fueling',
       'Compare progress photos side-by-side',
     ],
-    productId: 'pro_01m7j8yvn5p9qk5kpzab25s43d',
     priceId: {
-      month: (viteEnv.VITE_PADDLE_PRICE_PROGRESS_MONTH || 'pri_01m7j94jsmj6m6c23fmpx30eb7').trim(),
-      year: (viteEnv.VITE_PADDLE_PRICE_PROGRESS_YEAR || '').trim(),
+      month: STRIPE_PRICE_IDS.progress,
+      year: '',
     },
+    defaultPrice: '$9.99',
+    unitAmountCents: 999,
   },
   {
     name: 'Performance',
@@ -41,11 +73,12 @@ export const PADDLE_TIERS: Tier[] = [
       'Nutrition insights & suggestions',
       'Workout analytics dashboard',
     ],
-    productId: 'pro_01m7j8z8zgpzyxxsjf3agxzh5j',
     priceId: {
-      month: (viteEnv.VITE_PADDLE_PRICE_PERFORMANCE_MONTH || 'pri_01m7j980nyk4c5sexqs2anj39h').trim(),
-      year: (viteEnv.VITE_PADDLE_PRICE_PERFORMANCE_YEAR || '').trim(),
+      month: STRIPE_PRICE_IDS.performance,
+      year: '',
     },
+    defaultPrice: '$17.99',
+    unitAmountCents: 1799,
   },
   {
     name: 'Elite',
@@ -60,11 +93,12 @@ export const PADDLE_TIERS: Tier[] = [
       'Elite tips & coaching insights',
       'Deep recovery & deload protocols',
     ],
-    productId: 'pro_01m7j8zjcvphk0vjjt48d3d182',
     priceId: {
-      month: (viteEnv.VITE_PADDLE_PRICE_ELITE_MONTH || 'pri_01m7j995eanq5e99wbwkpb3dz6').trim(),
-      year: (viteEnv.VITE_PADDLE_PRICE_ELITE_YEAR || '').trim(),
+      month: STRIPE_PRICE_IDS.elite,
+      year: '',
     },
+    defaultPrice: '$34.99',
+    unitAmountCents: 3499,
   },
 ];
 
@@ -74,9 +108,9 @@ export function getTierKey(name: Tier['name'] | string): TierKey {
 
 export function getTierByKey(key: string): Tier | undefined {
   const clean = String(key || '').trim().toLowerCase();
-  return PADDLE_TIERS.find((t) => getTierKey(t.name) === clean);
+  return STRIPE_TIERS.find((t) => getTierKey(t.name) === clean);
 }
 
-export function isValidPaddlePriceId(value?: string | null): boolean {
-  return typeof value === 'string' && /^pri_[a-zA-Z0-9]+$/.test(value.trim());
+export function isValidStripePriceId(value?: string | null): boolean {
+  return typeof value === 'string' && /^price_[a-zA-Z0-9]+$/.test(value.trim());
 }

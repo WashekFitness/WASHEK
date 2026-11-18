@@ -2,6 +2,8 @@ import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { buildWeekPrompt } from '@/lib/trainingTypes';
 import { build12WeekMicrocycles } from '@/lib/periodizationEngine';
+import { sanitizeMicrocycleExclusions } from '@/lib/programExclusions';
+import { resolveWorkoutDays } from '@/lib/workoutSchedule';
 import { hasPlan } from '@/lib/subscription';
 
 /*
@@ -214,137 +216,83 @@ function rpcObject(data) {
 
 function buildPromptData(
   profile,
-  originalRequirements,
+  freshProgram,
   previousMicrocycle,
   recentLogs
 ) {
-  const fitnessGoals =
-    asArray(
-      profile?.fitness_goals
-    );
+  const fitnessGoals = asArray(profile?.fitness_goals);
+  const weightGoals = asArray(profile?.weight_goals);
 
-  const weightGoals =
-    asArray(
-      profile?.weight_goals
-    );
-
-  const heightInches =
-    Number(
-      profile?.height_inches
-    );
-
+  const heightInches = Number(profile?.height_inches);
   let heightFt = '';
   let heightIn = '';
-
-  if (
-    Number.isFinite(
-      heightInches
-    ) &&
-    heightInches > 0
-  ) {
-    heightFt =
-      Math.floor(
-        heightInches / 12
-      );
-
-    heightIn =
-      heightInches % 12;
+  if (Number.isFinite(heightInches) && heightInches > 0) {
+    heightFt = Math.floor(heightInches / 12);
+    heightIn = Math.round(heightInches % 12);
   }
+  const rawHeightCm = Number(profile?.height_cm);
+  const heightCm =
+    Number.isFinite(rawHeightCm) && rawHeightCm > 0
+      ? Math.round(rawHeightCm)
+      : Number.isFinite(heightInches) && heightInches > 0
+        ? Math.round(heightInches * 2.54)
+        : '';
 
-  /*
-   * Give the next week's AI useful information about what
-   * actually happened in the previous week.
-   *
-   * Keep this bounded so we don't unnecessarily inflate the
-   * OpenRouter request.
-   */
-
-  const previousWeekSummary =
-    previousMicrocycle
-      ? JSON.stringify(
-          previousMicrocycle
-        ).slice(
-          0,
-          12000
-        )
+  const rawWeightLbs = Number(profile?.weight_lbs);
+  const weightLbs =
+    Number.isFinite(rawWeightLbs) && rawWeightLbs > 0
+      ? Math.round(rawWeightLbs)
       : '';
+  const weightKg =
+    Number.isFinite(rawWeightLbs) && rawWeightLbs > 0
+      ? Math.round(rawWeightLbs * 0.453592)
+      : '';
+
+  const previousWeekSummary = previousMicrocycle
+    ? JSON.stringify(previousMicrocycle).slice(0, 12000)
+    : '';
 
   const workoutLogSummary =
-    Array.isArray(
-      recentLogs
-    ) && recentLogs.length
-      ? JSON.stringify(
-          recentLogs
-        ).slice(
-          0,
-          12000
-        )
+    Array.isArray(recentLogs) && recentLogs.length
+      ? JSON.stringify(recentLogs).slice(0, 12000)
       : '';
 
-  let requirements =
-    originalRequirements || '';
+  const requirements = profile?.training_requirements || '';
+  const goalDescription =
+    profile?.primary_goal || freshProgram?.goal || '';
+  const macrocycle = asObject(freshProgram?.macrocycle);
 
-  if (
-    previousWeekSummary
-  ) {
-    requirements += `
-
-PREVIOUS PROGRAMMED WEEK:
-The athlete's immediately previous programmed week was:
-${previousWeekSummary}
-
-Use this to create appropriate progression. Do not simply duplicate the previous week.`;
-  }
-
-  if (
-    workoutLogSummary
-  ) {
-    requirements += `
-
-RECENT WORKOUT PERFORMANCE:
-These are the available workout logs from the previous week:
-${workoutLogSummary}
-
-Use these logs as performance feedback when deciding progression, recovery, volume, exercise selection, and difficulty.`;
-  }
+  const workoutDays = resolveWorkoutDays({
+    trainingDays: macrocycle?.training_days || profile?.training_days,
+    existingDays: previousMicrocycle?.days,
+    requirements,
+    goalDescription,
+  });
 
   return {
-    gender:
-      profile?.gender,
-
-    level:
-      profile?.fitness_level,
-
-    age:
-      profile?.age,
-
-    weightLbs:
-      profile?.weight_lbs,
-
+    firstName: profile?.first_name || 'Athlete',
+    language: profile?.language || 'English',
+    trainingType:
+      freshProgram?.training_type || profile?.training_type || 'calisthenics',
+    gender: profile?.gender,
+    level: profile?.fitness_level || freshProgram?.fitness_level || 'intermediate',
+    age: profile?.age,
+    weightLbs,
+    weightKg,
     heightFt,
-
     heightIn,
-
-    unit:
-      profile?.unit || 'imperial',
-
-    currentSkills:
-      profile?.current_skills || '',
-
-    goalDescription:
-      profile?.primary_goal || '',
-
-    timeframe:
-      profile?.goal_timeframe || '',
-
-    equipment:
-      profile?.available_equipment || '',
-
+    heightCm,
+    unit: profile?.unit || 'imperial',
+    currentSkills: profile?.current_skills || '',
+    goalDescription,
+    timeframe: profile?.goal_timeframe || '',
+    equipment: profile?.available_equipment || '',
     requirements,
-
     fitnessGoals,
-
     weightGoals,
+    workoutDays,
+    previousWeekSummary,
+    workoutLogSummary,
   };
 }
 
@@ -912,7 +860,7 @@ async function generateOneWeek(
   const promptData =
     buildPromptData(
       profile,
-      profile.training_requirements || '',
+      freshProgram,
       previousMicrocycle,
       recentLogs
     );
@@ -974,21 +922,37 @@ async function generateOneWeek(
    * Never trust the model to choose the correct week number.
    */
 
-  const safeMicrocycle = {
-    ...microcycle,
+  const safeMicrocycle = sanitizeMicrocycleExclusions(
+    {
+      ...microcycle,
 
-    week_number:
-      weekNumber,
+      week_number:
+        weekNumber,
 
-    mesocycle_index:
-      getMesocycleIndex(
-        weekNumber
-      ),
+      mesocycle_index:
+        getMesocycleIndex(
+          weekNumber
+        ),
 
-    week_type:
-      microcycle.week_type ||
-      'Progression',
-  };
+      week_type:
+        microcycle.week_type ||
+        'Progression',
+    },
+    {
+      trainingType,
+      level: promptData.level,
+      fitnessGoals: promptData.fitnessGoals,
+      weightGoals: promptData.weightGoals,
+      goalDescription: promptData.goalDescription,
+      timeframe: promptData.timeframe,
+      requirements: profile?.training_requirements || '',
+      currentSkills: promptData.currentSkills,
+      equipment: promptData.equipment,
+      age: promptData.age,
+      gender: promptData.gender,
+      workoutDays: promptData.workoutDays,
+    }
+  );
 
   try {
     await completeWeek(
@@ -1093,8 +1057,26 @@ export async function ensureCurrentProgramWeek(
 
   if (weekOne && existingWeeks.length < 12) {
     try {
+      const programMacrocycle = asObject(program.macrocycle);
+      const expansionWorkoutDays = resolveWorkoutDays({
+        trainingDays: programMacrocycle?.training_days || user?.training_days,
+        existingDays: weekOne.days,
+        requirements: user?.training_requirements || '',
+        goalDescription: program.goal || user?.primary_goal || '',
+      });
       const full12 = build12WeekMicrocycles(weekOne, {
         trainingType: program.training_type || 'calisthenics',
+        fitnessLevel: program.fitness_level || user?.fitness_level || 'intermediate',
+        fitnessGoals: user?.fitness_goals,
+        weightGoals: user?.weight_goals,
+        goalDescription: program.goal || user?.primary_goal || '',
+        timeframe: user?.goal_timeframe || '',
+        requirements: user?.training_requirements || '',
+        equipment: user?.available_equipment || '',
+        currentSkills: user?.current_skills || '',
+        age: user?.age,
+        gender: user?.gender,
+        workoutDays: expansionWorkoutDays,
       });
 
       const mergedWeeks = full12.map(w => {

@@ -1,3 +1,6 @@
+import { hasLearnSkillsGoal } from './programExclusions.js';
+import { resolveWorkoutDays } from './workoutSchedule.js';
+
 // Training type configurations
 export const TRAINING_TYPES = [
   {
@@ -68,26 +71,50 @@ export const WEIGHT_GOALS = [
 
 function buildAthleteProfile(data = {}) {
   const {
+    firstName,
     gender,
     level,
     age,
     weightLbs,
+    weightKg,
     heightFt,
     heightIn,
+    heightCm,
     unit,
   } = data;
 
-  const heightStr =
-    unit === 'metric'
-      ? `${heightFt || '?'}cm`
-      : `${heightFt || '?'}'${heightIn || 0}"`;
+  let heightStr = '?';
+  if (unit === 'metric') {
+    if (heightCm) {
+      heightStr = `${Math.round(Number(heightCm))}cm`;
+    } else if (heightFt && !heightIn) {
+      heightStr = `${Math.round(Number(heightFt))}cm`;
+    } else if (heightFt || heightIn) {
+      const totalInches = (Number(heightFt) || 0) * 12 + (Number(heightIn) || 0);
+      if (totalInches > 0) heightStr = `${Math.round(totalInches * 2.54)}cm`;
+    }
+  } else if (heightFt || heightIn) {
+    heightStr = `${heightFt || '?'}'${heightIn || 0}"`;
+  } else if (heightCm) {
+    const totalInches = Math.round(Number(heightCm) / 2.54);
+    heightStr = `${Math.floor(totalInches / 12)}'${totalInches % 12}"`;
+  }
 
-  const weightStr =
-    unit === 'metric'
-      ? `${weightLbs || '?'}kg`
-      : `${weightLbs || '?'}lbs`;
+  let weightStr = '?';
+  if (unit === 'metric') {
+    if (weightKg) {
+      weightStr = `${Math.round(Number(weightKg))}kg`;
+    } else if (weightLbs) {
+      weightStr = `${Math.round(Number(weightLbs))}kg`;
+    }
+  } else if (weightLbs) {
+    weightStr = `${Math.round(Number(weightLbs))}lbs`;
+  } else if (weightKg) {
+    weightStr = `${Math.round(Number(weightKg) / 0.453592)}lbs`;
+  }
 
-  return `ATHLETE: ${gender || 'unspecified'}${
+  const namePart = firstName ? `${firstName} — ` : '';
+  return `ATHLETE: ${namePart}${gender || 'unspecified'}${
     level ? `, ${level} level` : ''
   }, age ${age || '?'}, ${weightStr}, ${heightStr}`;
 }
@@ -104,7 +131,7 @@ function buildGenderRules(gender) {
   return 'Gender-neutral: balanced approach, moderate volume, focus on form and progressive overload.';
 }
 
-function buildContext(data = {}) {
+function buildContext(data = {}, wantsSkills = true) {
   const {
     currentSkills,
     goalDescription,
@@ -113,17 +140,27 @@ function buildContext(data = {}) {
     requirements,
     fitnessGoals,
     weightGoals,
+    trainingType,
+    language,
+    previousWeekSummary,
+    workoutLogSummary,
   } = data;
 
+  const workoutDays = resolveWorkoutDays(data);
   const parts = [buildAthleteProfile(data)];
 
+  parts.push(`TRAINING MODALITY: ${trainingType || 'calisthenics'}`);
+  parts.push(
+    `EXACT WORKOUT DAYS (${workoutDays.length} days/week): ${workoutDays.join(', ')}. You MUST create EXACTLY ${workoutDays.length} workout day(s) per week in chronological order, and each day_name MUST start with the exact weekday name (e.g., "${workoutDays[0]} - Upper Push Hypertrophy"). NEVER write "Day 1", "Day 2", etc.`
+  );
+
   if (currentSkills) {
-    parts.push(`CURRENT SKILLS: ${currentSkills}`);
+    parts.push(`CURRENT SKILLS / CURRENT LIFTS & BASELINE: ${currentSkills}`);
   }
 
   if (fitnessGoals?.length) {
     parts.push(
-      `GOALS: ${fitnessGoals.join(', ')}. ${goalDescription || ''}`
+      `SELECTED FITNESS GOALS: ${fitnessGoals.join(', ')}${goalDescription ? ` | Athlete goal details: ${goalDescription}` : ''}`
     );
   } else if (goalDescription) {
     parts.push(`GOALS: ${goalDescription}`);
@@ -135,18 +172,38 @@ function buildContext(data = {}) {
     );
   }
 
+  if (trainingType !== 'weights' && !wantsSkills) {
+    parts.push(
+      `SKILLS POLICY (STRICT): The athlete did NOT choose "Learn Skills" as part of their goals. DO NOT include ANY calisthenics skill progressions, skill holds, or gymnastics skills in their workouts (NO handstands, handstand holds, handstand push-ups, muscle-ups, planches, planche leans, front levers, back levers, elbow levers, human flags, L-sits, V-sits, mannas, or frog stands). Focus 100% on muscle, strength, conditioning, and core exercises aligned with their chosen goals.`
+    );
+  }
+
   if (timeframe) {
-    parts.push(`TIMEFRAME: ${timeframe}`);
+    parts.push(`GOAL TIMEFRAME: ${timeframe} (Calibrate progression pacing and milestones to fit this timeline.)`);
   }
 
   if (equipment) {
-    parts.push(`EQUIPMENT: ${equipment}`);
+    parts.push(`AVAILABLE EQUIPMENT (STRICT): ${equipment} (ONLY program exercises the athlete can actually perform with this equipment.)`);
   }
 
   if (requirements) {
     parts.push(
-      `REQUIREMENTS (time available, injuries, notes): ${requirements}`
+      `REQUIREMENTS, INJURIES, PAIN & MOVEMENT EXCLUSIONS (NON-NEGOTIABLE): ${requirements}\n- STRICT SAFETY RULE: If the athlete mentions ANYTHING that hurts, ANY injury, discomfort, or ANY exercise/movement they say they can't do or want to avoid, DO NOT include that movement OR any biomechanically related exercise that stresses the painful/injured area anywhere in the program. Substitute safe, joint-friendly alternatives.`
     );
+  }
+
+  if (language && language !== 'English') {
+    parts.push(
+      `PREFERRED LANGUAGE: Write coaching notes, workout focus titles, and activation cues in ${language}, while keeping the leading weekday name clear (e.g. "${workoutDays[0]} - ...").`
+    );
+  }
+
+  if (previousWeekSummary) {
+    parts.push(`PREVIOUS PROGRAMMED WEEK:\n${previousWeekSummary}`);
+  }
+
+  if (workoutLogSummary) {
+    parts.push(`RECENT WORKOUT LOGS:\n${workoutLogSummary}`);
   }
 
   parts.push(
@@ -160,7 +217,7 @@ function buildContext(data = {}) {
 // Shared output/schema instructions
 // ------------------------------------------------------------
 
-const OUTPUT_FORMAT = `OUTPUT: Generate ALL 12 microcycles. Each microcycle has week_number (1-12), mesocycle_index (0, 1, or 2), and days array. Each day has day_name, workout_type, and exercises array. Each exercise has name, sets (number), reps (string like "5" or "8-10" or "6s hold"), rest_seconds (number), notes (coaching cue string), and activation_cue (concise activation and form cue string — see Hunter Stein method).`;
+const OUTPUT_FORMAT = `OUTPUT: Generate ALL 12 microcycles. Each microcycle has week_number (1-12), mesocycle_index (0, 1, or 2), and days array matching the athlete's EXACT workout days. Each day has day_name (MUST start with the exact weekday name, e.g., "Monday - Upper Push Hypertrophy", NEVER "Day 1"), workout_type, and exercises array. Each exercise has name, sets (number), reps (string like "5" or "8-10" or "6s hold"), rest_seconds (number), notes (coaching cue string), and activation_cue (concise activation and form cue string — see Hunter Stein method).`;
 
 const SCHEMA_INSTRUCTION = `Respond as a JSON object with this structure:
 {
@@ -252,10 +309,10 @@ const LEG_TRAINING_MANDATE = `── MANDATORY LEG & LOWER BODY TRAINING POLICY 
 2. EXCEPTION — STRICT USER EXCLUSIONS: If and only if the user has explicitly stated anywhere in their typed input (goals, requirements, notes, equipment, or limitations) that they do NOT want to train legs (e.g., "no legs", "skip legs", "upper body only", "don't train legs", "exclude legs", "avoid legs", "no lower body", etc.), you MUST completely exclude all leg and lower-body exercises from the program. Replace those days/slots with upper body push/pull, core, or conditioning tailored to their schedule.
 3. If the user did NOT explicitly state to omit legs, you MUST program dedicated leg training throughout the program. Never omit leg training simply because the user's main goals emphasize upper-body skills or chest/arms.
 
-── ABSOLUTE EXCLUSION & RESTRICTION MANDATE ("SAME GOES FOR ANYTHING ELSE") ──
-If the user typed anywhere in their input to avoid, skip, or not perform any specific exercise, movement pattern, or muscle group (e.g., "no deadlifts", "avoid bench press due to shoulder pain", "no overhead pressing", "wrist pain so no floor pushups", "no dips", "no jumping", etc.):
-- You MUST strictly respect and obey their instruction: DO NOT include that exercise or restricted movement pattern anywhere in the program.
-- Provide premier, safe biomechanical alternatives that fulfill the training stimulus without aggravating the restricted movement.
+── ABSOLUTE EXCLUSION, INJURY & "CAN'T DO" MANDATE ──
+If the user typed anywhere in their onboarding profile that something hurts, that they have an injury or joint sensitivity, or that there is a movement/exercise they cannot do, dislike, or want to avoid (e.g., "my shoulder hurts", "knee pain", "lower back injury", "I can't do pull-ups", "no deadlifts", "avoid dips", "hurts my wrist"):
+- You MUST strictly respect and obey their instruction: NEVER include that exercise, restricted movement pattern, or ANY exercise that loads or might aggravate the painful/injured area anywhere in the program.
+- Always substitute premier, biomechanically safe alternatives that build around the limitation without risking pain or re-injury.
 
 ── PREMIER EXERCISE SELECTION — HIGHEST VALUE, ZERO GIMMICKS OR DANGEROUS LIFTS ──
 - Program ONLY the gold-standard, time-tested, highest-yield exercises that maximize muscular and neural adaptation with optimal joint health.
@@ -264,16 +321,24 @@ If the user typed anywhere in their input to avoid, skip, or not perform any spe
   * Upper Push: Barbell/Dumbbell Flat & Incline Bench Press, Weighted or Strict Parallel Dips, Strict Push-ups, Overhead Barbell/Dumbbell Press, Lateral Raises, Tricep Rope Pushdowns.
   * Upper Pull: Strict Pull-ups/Chin-ups, Lat Pulldowns, Chest-Supported Rows, Barbell Bent-Over Rows, Inverted Rows, Cable Rope Face Pulls, Incline Dumbbell Curls.
   * Lower Body (when legs are trained): Barbell/Dumbbell Back Squats, Romanian Deadlifts (RDLs), Bulgarian Split Squats, Leg Press, Walking Lunges, Goblet Squats, Hamstring Curls, Nordic Hamstring Negatives, Standing Calf Raises.
-  * Core: Hanging Leg/Knee Raises, Ab Wheel Rollouts, Cable Woodchoppers, Hollow Body Holds, L-sits.
+  * Core: Hanging Leg/Knee Raises, Ab Wheel Rollouts, Cable Woodchoppers, Hollow Body Holds.
 - Every exercise must be purposeful, biomechanically sound, and safe for long-term progression.`;
 
 // ------------------------------------------------------------
 // Program construction
 // ------------------------------------------------------------
 
-function getTrainingTypeRules(trainingType) {
+function getTrainingTypeRules(trainingType, wantsSkills = true) {
   switch (trainingType) {
     case 'calisthenics':
+      if (!wantsSkills) {
+        return `TRAINING TYPE: CALISTHENICS (NO SKILL WORK — STRENGTH, HYPERTROPHY & CONDITIONING ONLY)
+- GOAL ACCELERATION: Drive bodyweight muscle growth, raw strength, fat loss/recomp, and conditioning toward the athlete's selected goals as fast as safely possible.
+- ZERO SKILLS MANDATE (STRICT): The athlete did NOT choose "Learn Skills" as a goal. Do NOT program ANY calisthenics skills, skill holds, or gymnastics skill progressions (NO handstands, handstand push-ups, muscle-ups, planches, front levers, back levers, elbow levers, human flags, L-sits, V-sits, mannas, or frog stands).
+- HIGH STIMULUS-TO-FATIGUE (SFR): Use premier compound bodyweight exercises (strict pull-ups, chin-ups, inverted rows, parallel bar dips, push-ups, elevated pike push-ups, squats, lunges, Nordic negatives, hanging leg/knee raises, hollow body holds) with zero junk volume.
+- REST INTERVALS: Prescribe 90-150s rest on primary bodyweight compounds and 60-90s on accessories.
+- BALANCED PUSH/PULL: Equalize horizontal and vertical pulling to protect shoulders from internal rotation.`;
+      }
       return `TRAINING TYPE: CALISTHENICS
 - GOAL ACCELERATION: Drive bodyweight strength, skill acquisition (handstands, planche, levers, muscle-ups), and relative power toward the athlete's goals as fast as safely possible.
 - FATIGUE & TENDON MANAGEMENT: Calisthenics straight-arm holds place severe mechanical strain on distal biceps tendons, wrists, and shoulders. High-demand skills MUST be programmed first while the CNS is completely fresh. Keep all skill attempts at 1-2 RIR (stop 2-3 seconds before failure) to build neural pathways without frying connective tissues.
@@ -282,6 +347,14 @@ function getTrainingTypeRules(trainingType) {
 - BALANCED PUSH/PULL: Equalize horizontal and vertical pulling to protect shoulders from internal rotation.`;
 
     case 'weighted_calisthenics':
+      if (!wantsSkills) {
+        return `TRAINING TYPE: WEIGHTED CALISTHENICS (NO SKILL WORK — LOADED & BODYWEIGHT STRENGTH ONLY)
+- GOAL ACCELERATION: Rapidly build elite relative and absolute pulling, pushing, and lower-body strength through weighted pull-ups, weighted dips, weighted push-ups, and loaded bodyweight variations.
+- ZERO SKILLS MANDATE (STRICT): The athlete did NOT choose "Learn Skills" as a goal. Do NOT include any static gymnastics or calisthenics skills (NO handstands, muscle-ups, planches, front/back levers, human flags, L-sits, or V-sits). Focus 100% on strength, hypertrophy, and conditioning.
+- FATIGUE & JOINT MANAGEMENT: Adding load to bodyweight movements multiplies joint shear forces. Always enforce 1-2 RIR on primary compounds (never grind to failure). Prescribe 120-180s rest on primary weighted compounds to manage systemic fatigue and maintain high force production.
+- PROGRESSION VELOCITY: Use double progression—hit the top of the rep range (e.g. 5-6 reps) with textbook lockout before adding external load (+2.5 to 5 lbs).
+- ACCESSORY RESILIENCE: Include scapular pull-up shrugs, inverted rows, and core work to insulate wrists, elbows, and shoulders.`;
+      }
       return `TRAINING TYPE: WEIGHTED CALISTHENICS
 - GOAL ACCELERATION: Rapidly build elite relative and absolute pulling and pushing strength through weighted pull-ups, weighted dips, and loaded bodyweight variations.
 - FATIGUE & JOINT MANAGEMENT: Adding load to bodyweight movements multiplies joint shear forces. Always enforce 1-2 RIR on primary compounds (never grind to failure). Prescribe 120-180s rest on primary weighted compounds to manage systemic fatigue and maintain high force production.
@@ -298,6 +371,13 @@ function getTrainingTypeRules(trainingType) {
 - AXIAL FATIGUE MANAGEMENT: Prevent spinal overload by balancing axial-loaded lifts with chest-supported and cable movements.`;
 
     case 'hybrid':
+      if (!wantsSkills) {
+        return `TRAINING TYPE: HYBRID TRAINING (BODYWEIGHT STRENGTH + WEIGHT TRAINING — NO SKILL WORK)
+- GOAL ACCELERATION: Synergistically build bodyweight compound strength and raw gym hypertrophy at the fastest safe speed.
+- ZERO SKILLS MANDATE (STRICT): The athlete did NOT choose "Learn Skills" as a goal. Do NOT include any calisthenics skill holds or gymnastics skills (NO handstands, planches, front/back levers, muscle-ups, human flags, or L-sits). Combine foundational bodyweight compounds (pull-ups, dips, push-ups, inverted rows) with heavy weight training compounds and isolation accessories.
+- FATIGUE BUDGET & ORDERING: Strictly budget central nervous system fatigue. Perform primary compound bodyweight and barbell lifts first when the CNS is fresh (1-2 RIR, 90-150s rest), then finish with muscle-building isolation accessories.
+- RECOVERY: Balance total weekly volume across push, pull, legs, and core so performance stays high.`;
+      }
       return `TRAINING TYPE: HYBRID TRAINING
 - GOAL ACCELERATION: Synergistically build calisthenics skill mastery and raw gym hypertrophy at the fastest safe speed.
 - FATIGUE BUDGET & ORDERING: Strictly budget central nervous system fatigue. Calisthenics skill work (handstands, planche/lever progressions) MUST be performed first when the CNS is fresh with 1-2 RIR and 90-150s rest. Follow with heavy weight training compounds, and finish with muscle-building isolation accessories.
@@ -311,12 +391,12 @@ function getTrainingTypeRules(trainingType) {
   }
 }
 
-function buildRecoveryRules() {
+function buildRecoveryRules(wantsSkills = true) {
   return `── GOAL ACCELERATION & SYSTEMIC FATIGUE MANAGEMENT ENGINE (MANDATORY) ──
-Every workout program generated MUST actively manage fatigue while driving the athlete toward their specific goals at the maximum safe velocity. The fastest path to any goal (muscle growth, strength, skill mastery, body recomp, endurance) is consistent, unrelenting stimulus WITHOUT accumulating excessive fatigue, connective tissue breakdown, or central nervous system (CNS) burnout.
+Every workout program generated MUST actively manage fatigue while driving the athlete toward their specific goals at the maximum safe velocity. The fastest path to any goal (muscle growth, strength, ${wantsSkills ? 'skill mastery, ' : ''}body recomp, endurance) is consistent, unrelenting stimulus WITHOUT accumulating excessive fatigue, connective tissue breakdown, or central nervous system (CNS) burnout.
 
 1. PROXIMITY TO FAILURE & RIR DISCIPLINE (1-2 RIR MANDATE):
-   - For all primary compound lifts and heavy skill holds, program working sets at 1-2 Reps In Reserve (RIR / RPE 8-9).
+   - For all primary compound lifts${wantsSkills ? ' and heavy skill holds' : ''}, program working sets at 1-2 Reps In Reserve (RIR / RPE 8-9).
    - NEVER program compounds to grind to absolute muscular failure (0 RIR / failure). Stopping 1-2 reps shy of failure delivers 95-99% of maximal hypertrophy and strength adaptation while cutting CNS and joint fatigue by more than half.
    - Only isolation accessories or final burnout sets may safely approach 0-1 RIR.
 
@@ -325,12 +405,12 @@ Every workout program generated MUST actively manage fatigue while driving the a
    - Eliminate junk volume: 3 to 4 focused, high-intent working sets per exercise create the ideal adaptive stimulus. Excessive sets (5+ sloppy sets) create fatigue debt that halts progress for days without additional growth.
 
 3. NEURAL HIERARCHY & EXERCISE SEQUENCING:
-   - Always place the most neurologically demanding exercises (technical calisthenics skills, heavy compound barbell/weighted lifts, explosive movements) at the very START of the session when the nervous system and stabilizers are fresh.
+   - Always place the most neurologically demanding exercises (${wantsSkills ? 'technical calisthenics skills, ' : ''}heavy compound barbell/weighted lifts, primary bodyweight compounds, explosive movements) at the very START of the session when the nervous system and stabilizers are fresh.
    - Place secondary compound accessories in the middle of the session.
    - Place isolation work, high-rep pump movements, and direct core work at the END of the session.
 
 4. REST INTERVALS FOR COMPLETE METABOLIC & CNS RESTORATION:
-   - Heavy compound lifts (Barbell Squats, Deadlifts/RDLs, Bench Press, Weighted Pull-ups, Weighted Dips, Overhead Press) and advanced skill holds require 120-180 seconds of rest. Rushing rest periods on heavy compounds drops force production, degrades technique, and spikes systemic fatigue without building strength.
+   - Heavy compound lifts (Barbell Squats, Deadlifts/RDLs, Bench Press, Weighted Pull-ups, Weighted Dips, Overhead Press${wantsSkills ? ') and advanced skill holds' : ' and primary bodyweight compounds)'} require 120-180 seconds of rest. Rushing rest periods on heavy compounds drops force production, degrades technique, and spikes systemic fatigue without building strength.
    - Moderate compound movements and antagonist supersets require 90-120 seconds.
    - Isolation accessories and core exercises require 60-90 seconds.
 
@@ -402,7 +482,8 @@ function buildProgramPrompt(
   data = {},
   adaptationHistory = []
 ) {
-  const context = buildContext(data);
+  const wantsSkills = hasLearnSkillsGoal({ trainingType, ...data });
+  const context = buildContext({ ...data, trainingType }, wantsSkills);
 
   return `You are Kael, an expert ${
     trainingType || 'fitness'
@@ -410,7 +491,7 @@ function buildProgramPrompt(
 
 ${context}
 
-${getTrainingTypeRules(trainingType)}
+${getTrainingTypeRules(trainingType, wantsSkills)}
 
 ${LEG_TRAINING_MANDATE}
 
@@ -418,7 +499,7 @@ ${HUNTER_STEIN_METHOD}
 
 ${HUNTER_STEIN_WEIGHTS_NOTE}
 
-${buildRecoveryRules()}
+${buildRecoveryRules(wantsSkills)}
 
 ${buildAdaptationRules(adaptationHistory)}
 
@@ -426,19 +507,19 @@ ${buildAdaptationRules(adaptationHistory)}
 1. GOAL ACCELERATION & FATIGUE MANAGEMENT: Build workouts programmed to manage fatigue and drive towards the athlete's specific goals as fast as safely possible.
 2. Build a coherent 12-week macrocycle, not 12 unrelated weeks.
 3. Proximity to Failure: Enforce 1-2 RIR on primary compounds to protect the CNS and joints while maximizing hypertrophic and strength adaptations.
-4. Neural Sequencing: Place highest skill demands and heavy compound lifts at the beginning of each session when the athlete is fresh.
+4. Neural Sequencing: Place ${wantsSkills ? 'highest skill demands and heavy compound lifts' : 'heavy compound lifts and primary bodyweight movements'} at the beginning of each session when the athlete is fresh.
 5. Prescribe adequate rest periods (90-180s on primary compound lifts, 60-90s on accessories) for complete neuromuscular recovery.
 6. Progress exercise difficulty, load, reps, sets, density, or quality strategically using double progression.
 7. Eliminate junk volume: prescribe 3-4 high-intent sets per exercise; do not inflate volume needlessly.
 8. Include appropriate recovery days and balanced agonist/antagonist volume.
 9. Include deload/reduced-fatigue periods when justified by the program structure and athlete context.
-10. Respect available equipment and stated restrictions.
+10. Respect available equipment and stated restrictions.${!wantsSkills ? ' Do NOT include any calisthenics skill exercises (no handstands, planches, levers, muscle-ups, human flags, L-sits, or V-sits).' : ''}
 11. Every exercise must have a specific activation_cue.
 12. Sets must be numeric.
 13. Reps must be a string.
 14. Rest must be expressed in seconds.
 15. Keep exercise notes concise but useful, reinforcing fatigue discipline and safe progression.
-16. Make the program realistic for the athlete's stated schedule and experience.
+16. ONBOARDING COMPLETENESS MANDATE: You MUST use EVERY SINGLE detail from the athlete's onboarding profile above — exact workout weekdays, session time limits, age, gender, body weight/height, experience level, current lifts/skills, selected fitness & weight goals, goal description, timeframe, available equipment, lagging body-part priorities, and injury/limitation notes. Never use generic "Day 1", "Day 2" labels — use exact weekday names (e.g. "Monday - Upper Push").
 
 ${OUTPUT_FORMAT}
 
@@ -598,7 +679,7 @@ OUTPUT: Generate ONLY ${
 
 Each microcycle has week_number (${weekStart}-${weekEnd}), mesocycle_index (${mesocycleIndex}), week_type, and days array.
 
-Each day has day_name, workout_type, and exercises array.
+Each day has day_name (must start with the exact weekday name, e.g. "Monday - Upper Push", NEVER "Day 1"), workout_type, and exercises array.
 
 Each exercise has name, sets (number), reps (string), rest_seconds (number), notes (coaching cue string), and activation_cue (concise activation and form cue string).
 
@@ -674,6 +755,8 @@ export function buildWeekPrompt(
     week_end: safeWeek,
   };
 
+  const wantsSkills = hasLearnSkillsGoal({ trainingType, ...data });
+
   const baseRules = buildProgramPrompt(
     trainingType,
     data,
@@ -682,19 +765,26 @@ export function buildWeekPrompt(
     .replace(OUTPUT_FORMAT, '')
     .replace(SCHEMA_INSTRUCTION, '');
 
+  const workoutDays = resolveWorkoutDays({ trainingType, ...data });
+
   return `${baseRules}
 
 OUTPUT: Return ONLY a JSON object containing ONE weekly microcycle for week ${safeWeek}.
 The microcycle must use mesocycle_index ${mesocycleIndex} and week_type appropriate for the week.
 
+SCHEDULE & NAMING MANDATE (STRICT):
+- Program EXACTLY ${workoutDays.length} workout day(s) for these exact days: ${workoutDays.join(', ')}.
+- Every day's "day_name" MUST start with the exact weekday name (for example: "${workoutDays[0]} - Upper Push Hypertrophy"), NEVER "Day 1", "Day 2", etc.
+
 FATIGUE MANAGEMENT & GOAL ACCELERATION MANDATE:
 - Program workouts to manage fatigue and drive towards the athlete's goals as fast as safely possible.
 - Enforce 1-2 RIR on primary compounds (never grind to muscular failure) with 90-180s rest to preserve CNS and accelerate strength adaptations.
-- Place highest neural/skill demands first in each workout.
-- Eliminate junk volume (3-4 high-quality sets per exercise).
-- Balance push/pull movements for joint longevity.
+- Place highest ${wantsSkills ? 'neural/skill' : 'compound strength'} demands first in each workout.${!wantsSkills ? '\n- ZERO SKILLS POLICY: The athlete did NOT choose "Learn Skills" as a goal — do NOT include any handstands, muscle-ups, planches, front/back levers, human flags, L-sits, V-sits, or skill holds.' : ''}
+- Eliminate junk volume (3-4 high-quality sets per exercise) and fit any stated session duration budget.
+- Strictly exclude every exercise the athlete said hurts, aggravates a stated injury, or cannot do, along with any biomechanically related movement that could stress that area.
+- Balance push/pull movements for joint longevity while respecting every equipment constraint, focus area, and injury/limitation stated in onboarding.
 
-Each day has day_name, workout_type, and exercises array.
+Each day has day_name (must begin with exact weekday name), workout_type, and exercises array.
 Each exercise has name, sets (number), reps (string), rest_seconds (number), notes (a short coaching cue, 6-10 words focused on fatigue management, RIR, and progression), and activation_cue (a short activation/form cue, 6-10 words). Keep both fields brief on every exercise; this keeps the response fast to generate without losing the cue itself.
 
 Respond with exactly this structure:

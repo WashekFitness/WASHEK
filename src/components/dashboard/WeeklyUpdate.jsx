@@ -23,6 +23,11 @@ import {
   getWeekDaysForDate,
   getUserTimeZone,
 } from '@/lib/dateUtils';
+import {
+  hasLearnSkillsGoal,
+  sanitizeMicrocycleExclusions,
+} from '@/lib/programExclusions';
+import { resolveWorkoutDays } from '@/lib/workoutSchedule';
 
 
 // ============================================================
@@ -955,6 +960,41 @@ export default function WeeklyUpdate({
                   'general fitness'
                 );
 
+      const wantsSkills =
+        hasLearnSkillsGoal({
+          trainingType,
+          fitnessGoals: user?.fitness_goals,
+          weightGoals: user?.weight_goals,
+          goalDescription: goals,
+          requirements: user?.training_requirements,
+        });
+
+      const workoutDays = resolveWorkoutDays({
+        trainingDays:
+          program?.macrocycle?.training_days || user?.training_days,
+        existingDays: currentMicrocycle?.days,
+        requirements: user?.training_requirements || '',
+        goalDescription: goals,
+      });
+
+      const weightDisplay = user?.weight_lbs
+        ? unit === 'metric'
+          ? `${Math.round(Number(user.weight_lbs) * 0.453592)} kg`
+          : `${Math.round(Number(user.weight_lbs))} lbs`
+        : 'Not specified';
+
+      const heightDisplay =
+        unit === 'metric' && user?.height_cm
+          ? `${Math.round(Number(user.height_cm))} cm`
+          : user?.height_inches
+            ? `${Math.floor(Number(user.height_inches) / 12)}'${Math.round(Number(user.height_inches) % 12)}"`
+            : 'Not specified';
+
+      const skillPolicyInstruction =
+        trainingType !== 'weights' && !wantsSkills
+          ? '\nSKILLS POLICY (STRICT):\nThis athlete did NOT select "Learn Skills" as a goal. Do NOT recommend, introduce, or program any calisthenics skills (such as handstands, muscle-ups, planches, front/back levers, human flags, or L-sits) in next_recommendation or adjusted_microcycle.\n'
+          : '';
+
 
       // --------------------------------------------------------
       // FULL CHECK-IN TEXT
@@ -1002,25 +1042,40 @@ ATHLETE
 NAME:
 ${user?.first_name || user?.full_name?.split(' ')[0] || 'Athlete'}
 
+AGE & GENDER:
+Age ${user?.age || 'Not specified'}, Gender ${user?.gender || 'Not specified'}
+
+BODY STATS:
+Weight ${weightDisplay}, Height ${heightDisplay}
+
 FITNESS LEVEL:
-${user?.fitness_level || 'intermediate'}
+${user?.fitness_level || program?.fitness_level || 'intermediate'}
 
 TRAINING TYPE:
 ${typeLabel}
 
-GOALS:
-${goals}
+EXACT WORKOUT DAYS (STRICT SCHEDULE):
+${workoutDays.join(', ')} (${workoutDays.length} days/week — NEVER use "Day 1", "Day 2", etc.; preserve exact weekday names like "${workoutDays[0]} - ...")
+
+FITNESS GOALS:
+${Array.isArray(user?.fitness_goals) && user.fitness_goals.length ? user.fitness_goals.join(', ') : goals}
+
+WEIGHT TRAINING GOALS:
+${Array.isArray(user?.weight_goals) && user.weight_goals.length ? user.weight_goals.join(', ') : 'None'}
+
+PRIMARY GOAL DESCRIPTION:
+${user?.primary_goal || program?.goal || goals}
 
 GOAL TIMEFRAME:
 ${user?.goal_timeframe || 'Not specified'}
 
-CURRENT SKILLS:
+CURRENT SKILLS / MAXES:
 ${user?.current_skills || 'Not specified'}
 
-EQUIPMENT:
+AVAILABLE EQUIPMENT (STRICT):
 ${user?.available_equipment || 'Not specified'}
 
-TRAINING REQUIREMENTS / LIMITATIONS:
+TRAINING REQUIREMENTS / INJURIES / LIMITATIONS (STRICT):
 ${user?.training_requirements || 'None specified'}
 
 MEASUREMENT SYSTEM:
@@ -1337,15 +1392,17 @@ progression you recommend.
 
 Do not make massive changes without evidence.
 
+${skillPolicyInstruction}
+
 5. GOAL CONNECTION
 
 Explain how this week's performance relates to the
 athlete's actual stated goal.
 
-For example:
+For example:${wantsSkills ? `
 If the goal is a muscle-up, explain how the logged pulling,
 dip, transition, or skill work supports that goal.
-
+` : ''}
 If the goal is hypertrophy, discuss actual volume and
 performance.
 
@@ -1631,18 +1688,37 @@ Never diagnose a medical condition.
               }
 
 
-              return {
-                ...result.adjusted_microcycle,
+              const sanitizedAdjusted = sanitizeMicrocycleExclusions(
+                {
+                  ...result.adjusted_microcycle,
 
-                week_number:
-                  nextWeekNumber,
+                  week_number:
+                    nextWeekNumber,
 
-                mesocycle_index:
-                  result
-                    .adjusted_microcycle
-                    ?.mesocycle_index ??
-                  microcycle?.mesocycle_index,
-              };
+                  mesocycle_index:
+                    result
+                      .adjusted_microcycle
+                      ?.mesocycle_index ??
+                    microcycle?.mesocycle_index,
+                },
+                {
+                  trainingType,
+                  level: user?.fitness_level || program?.fitness_level || 'intermediate',
+                  fitnessGoals: user?.fitness_goals,
+                  weightGoals: user?.weight_goals,
+                  goalDescription: goals,
+                  timeframe: user?.goal_timeframe || '',
+                  requirements: user?.training_requirements || '',
+                  currentSkills: user?.current_skills || '',
+                  equipment: user?.available_equipment || '',
+                  age: user?.age,
+                  gender: user?.gender,
+                  workoutDays,
+                  wantsSkills,
+                }
+              );
+
+              return sanitizedAdjusted;
             }
           );
 
