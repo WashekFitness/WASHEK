@@ -392,16 +392,25 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       let resolvedStatus = 'inactive';
 
       if (hasRemoteProfile) {
-        const dbActive = profilePlan !== 'free' && isActiveStatus(profileStatus);
+        const isExplicitCanceled = ['canceled', 'cancelled', 'inactive', 'unpaid', 'expired'].includes(profileStatus);
+        const dbActive = profilePlan !== 'free' && (!isExplicitCanceled);
         if (dbActive) {
           resolvedPlan = profilePlan;
           resolvedStatus = profileStatus || 'active';
-        } else {
-          // DB authoritatively shows free / canceled / inactive
+        } else if (isExplicitCanceled) {
           resolvedPlan = 'free';
-          resolvedStatus = profileStatus || 'inactive';
+          resolvedStatus = profileStatus;
+        } else {
+          const localStoredPlan = localPlanRaw || (currentPlanPropRef.current && currentPlanPropRef.current !== 'free' ? normalizePlan(currentPlanPropRef.current) : null);
+          if (localStoredPlan && localStoredPlan !== 'free') {
+            resolvedPlan = localStoredPlan;
+            resolvedStatus = 'active';
+          } else {
+            resolvedPlan = profilePlan;
+            resolvedStatus = profileStatus || 'inactive';
+          }
         }
-      } else if (isOffline && !isLocallyInactive) {
+      } else if (!isLocallyInactive) {
         if (localPlanRaw && localPlanRaw !== 'free') {
           resolvedPlan = localPlanRaw;
           resolvedStatus = 'active';

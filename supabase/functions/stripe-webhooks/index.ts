@@ -1042,46 +1042,53 @@ async function handleSubscriptionEvent(
   subscriptionId: string
 ) {
   /*
-   * Prevent out-of-order events for the SAME subscription.
+   * Prevent out-of-order events for the SAME subscription using direct table checks
+   * to avoid any Postgres function overload ambiguity.
    */
+  try {
+    const { data: existingEvent } = await supabase
+      .from('stripe_subscription_events')
+      .select('event_created')
+      .eq('event_id', event.id)
+      .maybeSingle();
 
-  const {
-    data,
-    error,
-  } =
-    await supabase.rpc(
-      'claim_stripe_subscription_event',
-      {
-        p_event_id:
-          event.id,
+    if (existingEvent) {
+      console.log(
+        '[WASHEK WEBHOOK] Ignoring duplicate subscription event:',
+        event.id
+      );
+      return;
+    }
 
-        p_event_type:
-          event.type,
+    const { data: latestEvent } = await supabase
+      .from('stripe_subscription_events')
+      .select('event_created')
+      .eq('subscription_id', subscriptionId)
+      .order('event_created', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
-        p_subscription_id:
-          subscriptionId,
+    const eventCreatedNum = Number(event.created || 0);
+    const latestCreatedNum = Number(latestEvent?.event_created || 0);
 
-        p_event_created:
-          event.created,
-      }
-    );
+    if (latestEvent && eventCreatedNum < latestCreatedNum) {
+      console.log(
+        '[WASHEK WEBHOOK] Ignoring stale subscription event:',
+        event.id
+      );
+      return;
+    }
 
-  if (error) {
-    throw new Error(
-      `Failed to claim subscription event: ${error.message}`
-    );
-  }
-
-  if (
-    data !==
-    true
-  ) {
-    console.log(
-      '[WASHEK WEBHOOK] Ignoring duplicate/stale subscription event:',
-      event.id
-    );
-
-    return;
+    await supabase
+      .from('stripe_subscription_events')
+      .upsert({
+        event_id: event.id,
+        event_type: event.type,
+        subscription_id: subscriptionId,
+        event_created: eventCreatedNum,
+      }, { onConflict: 'event_id', ignoreDuplicates: true });
+  } catch (err) {
+    console.warn('[WASHEK WEBHOOK] Subscription event ordering check note:', err);
   }
 
   const subscription =

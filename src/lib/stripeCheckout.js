@@ -347,12 +347,21 @@ function looksLikeAuthFailure(msg) {
 
 function navigateToStripeUrl(checkoutUrl) {
   try {
+    const newWindow = window.open(checkoutUrl, '_blank');
+    if (newWindow) {
+      newWindow.focus();
+      return;
+    }
+  } catch {
+    // popup blocker fallback
+  }
+  try {
     if (window.top && window.top !== window.self) {
       window.top.location.assign(checkoutUrl);
       return;
     }
   } catch {
-    // Cross-origin parent frame blocked direct window.top navigation; fall through to current window assign
+    // Cross-origin parent frame blocked direct window.top navigation
   }
   window.location.assign(checkoutUrl);
 }

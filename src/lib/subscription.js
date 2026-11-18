@@ -46,6 +46,16 @@ export function isActiveSubscriptionStatus(status) {
  * Requires both a paid plan AND an active subscription_status ('active', 'trialing', 'past_due').
  * Missing, 'inactive', 'canceled', 'cancelled', 'paused', 'unpaid', or 'expired' statuses ALWAYS resolve to 'free'.
  */
+export function isExplicitlyCanceled(status) {
+  const norm = String(status || '').toLowerCase().trim();
+  return ['canceled', 'cancelled', 'inactive', 'unpaid', 'expired'].includes(norm);
+}
+
+/**
+ * Resolve the effective subscription plan authoritatively.
+ * Requires both a paid plan AND an active subscription_status ('active', 'trialing', 'past_due').
+ * Missing, 'inactive', 'canceled', 'cancelled', 'paused', 'unpaid', or 'expired' statuses ALWAYS resolve to 'free'.
+ */
 export function resolveEffectivePlan(userOrPlan, explicitStatus) {
   if (userOrPlan && typeof userOrPlan === 'object') {
     const status =
@@ -80,7 +90,7 @@ export function resolveEffectivePlan(userOrPlan, explicitStatus) {
     try {
       if (typeof localStorage !== 'undefined') {
         const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-        if (storedStatus && !isActiveSubscriptionStatus(storedStatus)) {
+        if (!isActiveSubscriptionStatus(storedStatus)) {
           return 'free';
         }
         const storedUser = localStorage.getItem('washek_user');
@@ -98,25 +108,25 @@ export function resolveEffectivePlan(userOrPlan, explicitStatus) {
               parsed.subscription_tier ||
               'free'
             );
-            if (parsedPlan === 'free') {
-              return 'free';
-            }
+            return parsedPlan;
           }
-        } else if (!isActiveSubscriptionStatus(storedStatus)) {
-          return 'free';
         }
+        return isActiveSubscriptionStatus(storedStatus) ? normPlan : 'free';
       }
     } catch {
       return 'free';
     }
 
-    return normPlan;
+    return 'free';
   }
 
-  // Fallback when caller passed null/undefined: only trust localStorage if status is strictly active
+  // Fallback when caller passed null/undefined: strictly require active status in localStorage / stored user
   try {
     if (typeof localStorage !== 'undefined') {
       const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
+      if (!isActiveSubscriptionStatus(storedStatus)) {
+        return 'free';
+      }
       const storedUser = localStorage.getItem('washek_user');
       if (storedUser) {
         const parsed = JSON.parse(storedUser);

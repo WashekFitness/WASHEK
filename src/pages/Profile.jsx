@@ -62,6 +62,7 @@ import {
   getServerMessageStats,
   getPlanLimit,
 } from '@/lib/messageLimit';
+import { resolveEffectivePlan } from '@/lib/subscription';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 import {
@@ -410,39 +411,7 @@ export default function Profile() {
 
   const activeProgram = programs[0] || getCachedActiveProgram(userKey);
 
-  // Resolve subscription status
-  const currentSubStatus = String(
-    user?.subscription_status ||
-    (() => {
-      try {
-        return localStorage.getItem('washek_subscription_status') || '';
-      } catch {
-        return '';
-      }
-    })()
-  ).toLowerCase().trim();
-
-  // Resolve plan strictly respecting authoritative active subscription status
-  const plan = (() => {
-    const isActiveSub = ['active', 'trialing', 'past_due'].includes(currentSubStatus);
-    if (!isActiveSub) {
-      return 'free';
-    }
-
-    if (user?.subscription_plan) {
-      return String(user.subscription_plan).toLowerCase().trim() || 'free';
-    }
-
-    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
-      try {
-        const storedPlan = localStorage.getItem('washek_subscription_plan');
-        if (storedPlan && storedPlan !== 'free') return storedPlan.toLowerCase().trim();
-      } catch {
-        // ignore
-      }
-    }
-    return 'free';
-  })();
+  const plan = resolveEffectivePlan(user);
 
   // Listen for real-time subscription plan upgrades / cancellations
   useEffect(() => {

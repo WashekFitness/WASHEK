@@ -35,6 +35,13 @@ drop function if exists public.claim_stripe_subscription_event(
   bigint
 );
 
+drop function if exists public.claim_stripe_subscription_event(
+  text,
+  text,
+  bigint,
+  text
+);
+
 create or replace function public.claim_stripe_subscription_event(
   p_event_id text,
   p_event_type text,
