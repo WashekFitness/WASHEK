@@ -1132,6 +1132,18 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                 <Check className="w-4 h-4 text-emerald-400" />
                 Current Plan · Active
               </div>
+            ) : currentPlan !== 'free' ? (
+              <div className="space-y-2">
+                <Button
+                  className="w-full h-11 rounded-xl font-heading font-semibold text-xs tracking-wide bg-muted text-muted-foreground opacity-60 cursor-not-allowed border border-border/60"
+                  disabled={true}
+                >
+                  Cancel Current Plan First
+                </Button>
+                <p className="text-[11px] text-center text-amber-400 font-medium leading-relaxed">
+                  You have an active subscription. Please cancel your current plan below before changing plans to prevent double billing.
+                </p>
+              </div>
             ) : isIncludedInHigherTier ? (
               <div className="w-full h-11 rounded-xl bg-muted/40 border border-border/40 flex items-center justify-center font-heading font-medium text-xs text-muted-foreground tracking-wider uppercase">
                 Included with your {currentPlan.charAt(0).toUpperCase() + currentPlan.slice(1)} plan
@@ -1160,8 +1172,8 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
                 <p className="text-[11px] text-center text-muted-foreground font-medium">
                   {localizedPrice
                     ? hasUsedTrial
-                      ? `Billed today: ${localizedPrice}/mo · Cancel anytime`
-                      : `7 days free, then ${localizedPrice}/mo · Cancel anytime`
+                      ? `${localizedPrice}/mo · Cancel anytime`
+                      : `7-day free trial ($0 today), then ${localizedPrice}/mo · Cancel anytime`
                     : loadingPrices
                       ? 'Loading localized price…'
                       : 'Cancel anytime'}

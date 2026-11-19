@@ -49,9 +49,8 @@ export const STRIPE_TIERS: Tier[] = [
     features: [
       '300 Coach Kael messages/month (3x Free)',
       'In-depth Coach Kael — biomechanical rationale & progression milestones',
-      'Full custom workout adjustments',
-      'Adaptive programming — calibrated from your workout performance',
-      'Food & package nutrition scan',
+      'Full custom workout adjustments & adaptive programming',
+      'Food & package nutrition barcode scan',
       'Adaptive calorie & macro fueling',
       'Compare progress photos side-by-side',
     ],
@@ -67,11 +66,10 @@ export const STRIPE_TIERS: Tier[] = [
     description: 'High Performance',
     features: [
       '800 Coach Kael messages/month (8x Free)',
-      'High-performance coaching — tempo breakdowns, activation cues & fueling synergy',
-      'Everything in Progress',
-      'Body composition scanner*',
-      'Nutrition insights & suggestions',
-      'Workout analytics dashboard',
+      'Everything included in Progress',
+      'AI Body composition scanner*',
+      'Advanced nutrition insights & suggestions',
+      'Complete workout analytics dashboard',
     ],
     priceId: {
       month: STRIPE_PRICE_IDS.performance,
@@ -85,12 +83,9 @@ export const STRIPE_TIERS: Tier[] = [
     description: 'Masterclass Athlete',
     features: [
       '2,000 Coach Kael messages/month (20x Free)',
-      'Masterclass coaching — kinetic chain mastery & recovery diagnostics',
-      'Everything in Performance',
+      'Everything included in Performance',
       'Live workout adjustments (real-time coaching while training)',
-      'Form Lab video analysis',
-      'Technical form scoring, rep/hold counting & corrective drills',
-      'Elite tips & coaching insights',
+      'Form Lab video analysis (technical form scoring & rep counting)',
       'Deep recovery & deload protocols',
     ],
     priceId: {
