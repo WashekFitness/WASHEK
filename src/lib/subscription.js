@@ -496,6 +496,8 @@ export function getPlanLabel(
  * UI components unlock instantly.
  */
 const RECENT_UPGRADE_KEY = 'washek_recent_upgrade';
+const REDIRECT_RECEIPT_KEY = 'washek_redirect_upgrade_receipt';
+const REDIRECT_RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 
 export function getRecentUpgradeGrace() {
   clearRecentUpgradeGrace();
@@ -511,6 +513,84 @@ export function clearRecentUpgradeGrace() {
   }
 }
 
+export function setRedirectUpgradeReceipt(plan, status = 'active', details = {}) {
+  if (typeof localStorage === 'undefined') return null;
+  const normPlan = normalizePlan(plan);
+  const normStatus = String(status || 'active').toLowerCase().trim();
+  if (normPlan === 'free' || !isActiveSubscriptionStatus(normStatus)) {
+    return null;
+  }
+  const receipt = {
+    plan: normPlan,
+    status: normStatus,
+    timestamp: Date.now(),
+    verifiedBy: details?.verifiedBy || 'stripe_redirect',
+  };
+  try {
+    localStorage.setItem(REDIRECT_RECEIPT_KEY, JSON.stringify(receipt));
+  } catch {
+    // ignore storage errors
+  }
+  return receipt;
+}
+
+export function clearRedirectUpgradeReceipt() {
+  if (typeof localStorage === 'undefined') return;
+  try {
+    localStorage.removeItem(REDIRECT_RECEIPT_KEY);
+  } catch {
+    // ignore
+  }
+}
+
+export function getRedirectUpgradeReceipt(profileOrCancelInfo = null) {
+  if (typeof localStorage === 'undefined') return null;
+  try {
+    const raw = localStorage.getItem(REDIRECT_RECEIPT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    const plan = normalizePlan(parsed?.plan);
+    const status = String(parsed?.status || 'active').toLowerCase().trim();
+    const ts = Number(parsed?.timestamp || 0);
+
+    if (plan === 'free' || !isActiveSubscriptionStatus(status) || !ts) {
+      clearRedirectUpgradeReceipt();
+      return null;
+    }
+
+    if (Date.now() - ts > REDIRECT_RECEIPT_MAX_AGE_MS) {
+      clearRedirectUpgradeReceipt();
+      return null;
+    }
+
+    // Invalidate if user canceled either locally OR in Postgres strictly AFTER this receipt was issued
+    const localCancelIso = localStorage.getItem('washek_subscription_cancelled_at');
+    const dbCancelIso =
+      profileOrCancelInfo && typeof profileOrCancelInfo === 'object'
+        ? profileOrCancelInfo.subscription_cancelled_at || null
+        : typeof profileOrCancelInfo === 'string'
+          ? profileOrCancelInfo
+          : null;
+
+    const localCancelMs = localCancelIso ? Date.parse(localCancelIso) : 0;
+    const dbCancelMs = dbCancelIso ? Date.parse(String(dbCancelIso)) : 0;
+
+    if ((localCancelMs && localCancelMs > ts) || (dbCancelMs && dbCancelMs > ts)) {
+      clearRedirectUpgradeReceipt();
+      return null;
+    }
+
+    return {
+      plan,
+      status,
+      timestamp: ts,
+      verifiedBy: parsed?.verifiedBy || 'stripe_redirect',
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function applySubscriptionUpgrade(plan, status = 'active', details = {}) {
   const normPlan = normalizePlan(plan);
   const normStatus = String(status || 'active').toLowerCase().trim();
@@ -522,6 +602,13 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     localStorage.setItem('washek_subscription_status', normStatus);
     localStorage.removeItem('washek_subscription_cancelled_at');
     localStorage.removeItem(RECENT_UPGRADE_KEY);
+    localStorage.setItem('washek_has_used_trial', 'true');
+
+    if (details?.dbConfirmed) {
+      clearRedirectUpgradeReceipt();
+    } else if (details?.persistReceipt) {
+      setRedirectUpgradeReceipt(normPlan, normStatus, details);
+    }
 
     const storedUser = localStorage.getItem('washek_user');
     let userObj = {};
@@ -538,6 +625,9 @@ export function applySubscriptionUpgrade(plan, status = 'active', details = {}) 
     userObj.tier = normPlan;
     userObj.plan = normPlan;
     userObj.subscription_tier = normPlan;
+    userObj.has_used_trial = true;
+    userObj.trial_used = true;
+    delete userObj.subscription_cancelled_at;
 
     localStorage.setItem('washek_user', JSON.stringify(userObj));
   } catch (err) {
@@ -578,7 +668,10 @@ export function applySubscriptionCancellation(details = {}) {
   try {
     localStorage.removeItem('washek_subscription_plan');
     localStorage.removeItem(RECENT_UPGRADE_KEY);
+    localStorage.removeItem(REDIRECT_RECEIPT_KEY);
     localStorage.removeItem('washek_pending_checkout_plan');
+    localStorage.removeItem('washek_pending_checkout_session_id');
+    localStorage.removeItem('washek_pending_checkout_started_at');
     localStorage.removeItem('washek_subscription_success_event');
     localStorage.setItem('washek_subscription_status', 'canceled');
     localStorage.setItem('washek_subscription_cancelled_at', cancelledAt);
@@ -586,6 +679,8 @@ export function applySubscriptionCancellation(details = {}) {
 
     try {
       sessionStorage.removeItem('washek_pending_checkout_plan');
+      sessionStorage.removeItem('washek_pending_checkout_session_id');
+      sessionStorage.removeItem('washek_pending_checkout_started_at');
     } catch {
       // ignore sessionStorage error
     }

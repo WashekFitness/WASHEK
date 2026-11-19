@@ -193,7 +193,150 @@ function buildStripePaymentLinkUrl(plan: PaidPlanKey, userId?: string, email?: s
   }
 }
 
-const pendingCheckouts = new Map<string, { plan: string; timestamp: number }>();
+interface PendingCheckoutRecord {
+  plan: string;
+  userId?: string;
+  email?: string;
+  sessionId?: string | null;
+  trial?: boolean;
+  serverSessionToken?: string;
+  refreshToken?: string;
+  timestamp: number;
+}
+
+interface ConfirmedRedirectRecord {
+  plan: string;
+  status: string;
+  verifiedBy?: string;
+  timestamp: number;
+}
+
+const PENDING_CHECKOUT_TTL_MS = 30 * 60 * 1000;
+const CONFIRMED_REDIRECT_TTL_MS = 24 * 60 * 60 * 1000;
+const pendingCheckouts = new Map<string, PendingCheckoutRecord>();
+const confirmedRedirectSubscriptions = new Map<string, ConfirmedRedirectRecord>();
+const CONFIRMED_SUBSCRIPTIONS_FILE = path.join(process.cwd(), '.confirmed_subscriptions.json');
+
+try {
+  if (fs.existsSync(CONFIRMED_SUBSCRIPTIONS_FILE)) {
+    const raw = fs.readFileSync(CONFIRMED_SUBSCRIPTIONS_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed)) {
+        const rec = v as ConfirmedRedirectRecord;
+        if (rec?.plan && rec?.timestamp && Date.now() - Number(rec.timestamp) <= CONFIRMED_REDIRECT_TTL_MS) {
+          confirmedRedirectSubscriptions.set(k, rec);
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.debug('[Stripe] Confirmed subscriptions init note:', e);
+}
+
+function persistConfirmedSubscriptionsToDisk() {
+  try {
+    const obj: Record<string, ConfirmedRedirectRecord> = {};
+    for (const [k, v] of confirmedRedirectSubscriptions.entries()) {
+      if (v && Date.now() - Number(v.timestamp || 0) <= CONFIRMED_REDIRECT_TTL_MS) {
+        obj[k] = v;
+      }
+    }
+    fs.writeFileSync(CONFIRMED_SUBSCRIPTIONS_FILE, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch {
+    // ignore disk persistence note
+  }
+}
+
+function recordPendingCheckoutEntry(entry: PendingCheckoutRecord) {
+  if (!entry?.plan) return;
+  if (entry.userId) pendingCheckouts.set(entry.userId, entry);
+  if (entry.email) pendingCheckouts.set(entry.email.toLowerCase().trim(), entry);
+  pendingCheckouts.set('latest', entry);
+}
+
+function clearPendingCheckoutForUser(userId?: string | null, email?: string | null) {
+  const cleanUid = userId ? String(userId).trim() : '';
+  const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+  if (cleanUid) pendingCheckouts.delete(cleanUid);
+  if (cleanEmail) pendingCheckouts.delete(cleanEmail);
+  const latest = pendingCheckouts.get('latest');
+  if (
+    !latest ||
+    (!cleanUid && !cleanEmail) ||
+    (cleanUid && latest.userId === cleanUid) ||
+    (cleanEmail && latest.email?.toLowerCase().trim() === cleanEmail)
+  ) {
+    pendingCheckouts.delete('latest');
+  }
+}
+
+function getFreshPendingCheckoutEntry(userId?: string, email?: string): PendingCheckoutRecord | null {
+  const cleanUid = userId ? String(userId).trim() : '';
+  const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+  const candidates = [
+    cleanUid ? pendingCheckouts.get(cleanUid) : undefined,
+    cleanEmail ? pendingCheckouts.get(cleanEmail) : undefined,
+    pendingCheckouts.get('latest'),
+  ];
+  for (const c of candidates) {
+    if (c && Date.now() - c.timestamp <= PENDING_CHECKOUT_TTL_MS) {
+      return c;
+    }
+  }
+  return null;
+}
+
+function getConfirmedRedirectRecord(
+  userId?: string | null,
+  email?: string | null,
+  cancelledAtIso?: string | null
+): ConfirmedRedirectRecord | null {
+  const cleanUid = userId ? String(userId).trim() : '';
+  const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+  const rec =
+    (cleanUid && confirmedRedirectSubscriptions.get(cleanUid)) ||
+    (cleanEmail && confirmedRedirectSubscriptions.get(cleanEmail)) ||
+    null;
+  if (!rec) return null;
+
+  const cancelMs = cancelledAtIso ? Date.parse(String(cancelledAtIso)) : 0;
+  const isExpired = Date.now() - rec.timestamp > CONFIRMED_REDIRECT_TTL_MS;
+  const isSupersededByCancel = Number.isFinite(cancelMs) && cancelMs > 0 && cancelMs > rec.timestamp;
+
+  if (isExpired || isSupersededByCancel) {
+    if (cleanUid) confirmedRedirectSubscriptions.delete(cleanUid);
+    if (cleanEmail) confirmedRedirectSubscriptions.delete(cleanEmail);
+    persistConfirmedSubscriptionsToDisk();
+    return null;
+  }
+
+  return rec;
+}
+
+function getConfirmedRedirectEntitlement(
+  userId?: string | null,
+  email?: string | null,
+  cancelledAtIso?: string | null
+): string | null {
+  const rec = getConfirmedRedirectRecord(userId, email, cancelledAtIso);
+  return rec?.plan || null;
+}
+
+function clearCheckoutEntitlementsForUser(userId?: string | null, email?: string | null) {
+  const cleanUid = userId ? String(userId).trim() : '';
+  const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+  if (cleanUid) {
+    pendingCheckouts.delete(cleanUid);
+    confirmedRedirectSubscriptions.delete(cleanUid);
+  }
+  if (cleanEmail) {
+    pendingCheckouts.delete(cleanEmail);
+    confirmedRedirectSubscriptions.delete(cleanEmail);
+  }
+  pendingCheckouts.delete('latest');
+  persistConfirmedSubscriptionsToDisk();
+}
 
 function getServiceRoleSupabase() {
   const serviceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SERVICE_ROLE_KEY || '').trim();
@@ -517,6 +660,18 @@ app.post('/api/create-checkout-session', async (req, res) => {
     if (!cfg.configured) {
       const directUrl = buildStripePaymentLinkUrl(plan, uid, userEmail);
       if (directUrl) {
+        const srvToken =
+          clientSrvToken ||
+          (userEmail ? createServerSessionToken(userEmail, uid) : '');
+        recordPendingCheckoutEntry({
+          plan,
+          userId: uid || undefined,
+          email: userEmail || undefined,
+          sessionId: null,
+          trial: undefined,
+          serverSessionToken: srvToken || undefined,
+          timestamp: Date.now(),
+        });
         return res.json({
           success: true,
           action: 'checkout',
@@ -598,7 +753,7 @@ app.post('/api/create-checkout-session', async (req, res) => {
       'success_url',
       `${baseUrl}/subscription-return?plan=${encodeURIComponent(plan)}&session_id={CHECKOUT_SESSION_ID}&trial=${!hasUsedTrial}`
     );
-    body.set('cancel_url', `${baseUrl}/profile`);
+    body.set('cancel_url', `${baseUrl}/profile?checkout=canceled`);
     body.set('client_reference_id', uid);
     if (customerId) {
       body.set('customer', customerId);
@@ -626,6 +781,19 @@ app.post('/api/create-checkout-session', async (req, res) => {
     if (!session?.url) {
       throw new Error('Stripe did not return a Checkout URL.');
     }
+
+    const srvToken =
+      clientSrvToken ||
+      (userEmail ? createServerSessionToken(userEmail, uid) : '');
+    recordPendingCheckoutEntry({
+      plan,
+      userId: uid || undefined,
+      email: userEmail || undefined,
+      sessionId: session.id || null,
+      trial: !hasUsedTrial,
+      serverSessionToken: srvToken || undefined,
+      timestamp: Date.now(),
+    });
 
     return res.json({
       success: true,
@@ -703,10 +871,12 @@ app.post('/api/stripe/verify-session', async (req, res) => {
         }) || null;
 
       if (paymentConfirmed && resolvedPlan && ['active', 'trialing', 'past_due'].includes(subStatus)) {
+        const adminClient = getServiceRoleSupabase();
         const dbClient =
-          getServiceRoleSupabase() ||
+          adminClient ||
           (bearerToken && bearerToken.split('.').length === 3 ? createStatelessSupabase(bearerToken) : null);
 
+        let dbSynced = false;
         if (dbClient && targetUid) {
           await updateProfileSubscriptionSafely(
             dbClient,
@@ -715,6 +885,7 @@ app.post('/api/stripe/verify-session', async (req, res) => {
               subscription_plan: resolvedPlan,
               subscription_status: subStatus,
               has_used_trial: true,
+              subscription_cancelled_at: null,
               subscription_updated_at: new Date().toISOString(),
             },
             {
@@ -723,14 +894,33 @@ app.post('/api/stripe/verify-session', async (req, res) => {
               stripe_price_id: priceId,
             }
           );
+          if (adminClient) {
+            dbSynced = true;
+          } else {
+            try {
+              const { data: verifyProf } = await dbClient
+                .from('profiles')
+                .select('subscription_plan, subscription_status')
+                .eq('id', targetUid)
+                .maybeSingle();
+              if (
+                verifyProf?.subscription_plan === resolvedPlan &&
+                ['active', 'trialing', 'past_due'].includes(String(verifyProf?.subscription_status || '').toLowerCase().trim())
+              ) {
+                dbSynced = true;
+              }
+            } catch {
+              dbSynced = false;
+            }
+          }
         }
 
-        if (targetUid) pendingCheckouts.delete(targetUid);
-        if (email) pendingCheckouts.delete(String(email).toLowerCase().trim());
+        clearPendingCheckoutForUser(targetUid, email ? String(email) : undefined);
 
         return res.json({
           success: true,
           verified: true,
+          dbSynced,
           sessionId: cleanSessionId,
           plan: resolvedPlan,
           status: subStatus,
@@ -747,6 +937,152 @@ app.post('/api/stripe/verify-session', async (req, res) => {
         stripePaymentStatus: paymentStatus,
         error: 'Checkout session is not yet marked paid by Stripe.',
       });
+    }
+
+    // Direct Stripe Customer & Subscription lookup when sessionId is omitted and server has STRIPE_SECRET_KEY
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+    if (cfg.configured && (verifiedUid || cleanEmail)) {
+      const candidateCustomerIds = new Set<string>();
+      const adminClient = getServiceRoleSupabase();
+      const dbClient =
+        adminClient ||
+        (bearerToken && bearerToken.split('.').length === 3 ? createStatelessSupabase(bearerToken) : null);
+
+      let profileCancelledAtMs = 0;
+      if (dbClient && verifiedUid) {
+        try {
+          const { data: profCust } = await dbClient
+            .from('profiles')
+            .select('stripe_customer_id, stripe_subscription_id, subscription_cancelled_at, subscription_plan, subscription_status')
+            .eq('id', verifiedUid)
+            .maybeSingle();
+          if (profCust?.stripe_customer_id?.startsWith('cus_')) {
+            candidateCustomerIds.add(profCust.stripe_customer_id);
+          }
+          if (
+            profCust?.subscription_cancelled_at &&
+            (profCust.subscription_plan === 'free' || profCust.subscription_status === 'canceled')
+          ) {
+            const parsedMs = Date.parse(String(profCust.subscription_cancelled_at));
+            if (Number.isFinite(parsedMs)) profileCancelledAtMs = parsedMs;
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (cleanEmail) {
+        try {
+          const searchRes = await stripeApiRequest(
+            `customers/search?query=${encodeURIComponent(`email:"${cleanEmail}"`)}&limit=10`,
+            cfg.secretKey
+          );
+          for (const c of searchRes?.data || []) {
+            if (c?.id && !c.deleted) candidateCustomerIds.add(c.id);
+          }
+        } catch {
+          // ignore search error
+        }
+        try {
+          const listRes = await stripeApiRequest(
+            `customers?email=${encodeURIComponent(cleanEmail)}&limit=10`,
+            cfg.secretKey
+          );
+          for (const c of listRes?.data || []) {
+            if (c?.id && !c.deleted) candidateCustomerIds.add(c.id);
+          }
+        } catch {
+          // ignore list error
+        }
+      }
+
+      const entitledSubs: any[] = [];
+      for (const custId of candidateCustomerIds) {
+        try {
+          const subsRes = await stripeApiRequest(
+            `subscriptions?customer=${encodeURIComponent(custId)}&status=all&limit=20`,
+            cfg.secretKey
+          );
+          for (const sub of subsRes?.data || []) {
+            const st = String(sub?.status || '').toLowerCase().trim();
+            const createdMs = Number(sub?.created || 0) * 1000;
+            if (profileCancelledAtMs > 0 && createdMs > 0 && createdMs <= profileCancelledAtMs) {
+              continue;
+            }
+            if (['active', 'trialing', 'past_due'].includes(st)) {
+              entitledSubs.push(sub);
+            }
+          }
+        } catch {
+          // ignore per-customer failure
+        }
+      }
+
+      if (entitledSubs.length > 0) {
+        entitledSubs.sort((a, b) => Number(b?.created || 0) - Number(a?.created || 0));
+        const bestSub = entitledSubs[0];
+        const subStatus = String(bestSub?.status || 'active').toLowerCase().trim();
+        const priceId = bestSub?.items?.data?.[0]?.price?.id || null;
+        const unitAmountCents = bestSub?.items?.data?.[0]?.price?.unit_amount ?? null;
+        const custId =
+          typeof bestSub?.customer === 'string' ? bestSub.customer : bestSub?.customer?.id || null;
+        const resolvedPlan =
+          mapStripePlan({
+            metadataPlan: bestSub?.metadata?.plan || hintedPlanRaw,
+            priceId,
+            unitAmountCents,
+          }) || 'progress';
+
+        let dbSynced = false;
+        if (dbClient && verifiedUid) {
+          await updateProfileSubscriptionSafely(
+            dbClient,
+            verifiedUid,
+            {
+              subscription_plan: resolvedPlan,
+              subscription_status: subStatus,
+              has_used_trial: true,
+              subscription_cancelled_at: null,
+              subscription_updated_at: new Date().toISOString(),
+            },
+            {
+              stripe_subscription_id: bestSub.id,
+              stripe_customer_id: custId,
+              stripe_price_id: priceId,
+            }
+          );
+          if (adminClient) {
+            dbSynced = true;
+          } else {
+            try {
+              const { data: verifyProf } = await dbClient
+                .from('profiles')
+                .select('subscription_plan, subscription_status')
+                .eq('id', verifiedUid)
+                .maybeSingle();
+              if (
+                verifyProf?.subscription_plan === resolvedPlan &&
+                ['active', 'trialing', 'past_due'].includes(String(verifyProf?.subscription_status || '').toLowerCase().trim())
+              ) {
+                dbSynced = true;
+              }
+            } catch {
+              dbSynced = false;
+            }
+          }
+        }
+
+        return res.json({
+          success: true,
+          verified: true,
+          dbSynced,
+          plan: resolvedPlan,
+          status: subStatus,
+          subscriptionId: bestSub.id,
+          customerId: custId,
+          priceId,
+        });
+      }
     }
 
     // Fallback DB check when STRIPE_SECRET_KEY lives in Supabase Edge Functions
@@ -776,6 +1112,7 @@ app.post('/api/stripe/verify-session', async (req, res) => {
         return res.json({
           success: true,
           verified: true,
+          dbSynced: true,
           plan: dbPlan,
           status: dbStatus,
         });
@@ -846,11 +1183,20 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
           .limit(1);
         if (rows?.[0]?.id) return rows[0].id;
       }
-      if (custId) {
+      if (custId && adminDb) {
         const { data: rows } = await adminDb
           .from('profiles')
           .select('id')
           .eq('stripe_customer_id', custId)
+          .limit(1);
+        if (rows?.[0]?.id) return rows[0].id;
+      }
+      const custEmail = obj?.customer_details?.email || (typeof obj?.customer_email === 'string' ? obj.customer_email : '');
+      if (custEmail && adminDb) {
+        const { data: rows } = await adminDb
+          .from('profiles')
+          .select('id')
+          .ilike('email', custEmail.trim())
           .limit(1);
         if (rows?.[0]?.id) return rows[0].id;
       }
@@ -868,12 +1214,13 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
         const plan = mapStripePlan({ metadataPlan: obj?.metadata?.plan }) || 'progress';
         const subId = typeof obj?.subscription === 'string' ? obj.subscription : obj?.subscription?.id || null;
         const custId = typeof obj?.customer === 'string' ? obj.customer : obj?.customer?.id || null;
+        const derivedStatus = paymentStatus === 'no_payment_required' ? 'trialing' : 'active';
         await updateProfileSubscriptionSafely(
           adminDb,
           resolvedUid,
           {
             subscription_plan: plan,
-            subscription_status: 'active',
+            subscription_status: derivedStatus,
             has_used_trial: true,
             subscription_updated_at: new Date().toISOString(),
           },
@@ -1052,9 +1399,7 @@ async function handleCancelStripeSubscription(req: express.Request, res: express
           Boolean(verifyServerSessionFromRequest(req, cleanEmail || undefined))
       );
       if (isLocalOrVaultSession) {
-        if (userId) pendingCheckouts.delete(String(userId));
-        if (cleanEmail) pendingCheckouts.delete(cleanEmail);
-        pendingCheckouts.delete('latest');
+        clearCheckoutEntitlementsForUser(userId ? String(userId) : undefined, cleanEmail);
         return res.json({
           success: true,
           alreadyCanceled: true,
@@ -1199,14 +1544,14 @@ async function handleCancelStripeSubscription(req: express.Request, res: express
       // ignore read failure
     }
 
-    if (userId) pendingCheckouts.delete(String(userId));
-    if (uid) pendingCheckouts.delete(String(uid));
-    if (cleanEmail) pendingCheckouts.delete(cleanEmail);
-    pendingCheckouts.delete('latest');
+    clearCheckoutEntitlementsForUser(
+      userId ? String(userId) : uid ? String(uid) : undefined,
+      cleanEmail
+    );
 
     return res.json({
       success: true,
-      alreadyCanceled: !stripeSubId,
+      alreadyCanceled: subscriptionsToCancel.size === 0,
       message: 'Subscription canceled. Account is now on Free Plan.',
       plan: 'free',
       status: 'canceled',
@@ -1227,14 +1572,45 @@ app.post('/api/cancel-subscription', handleCancelStripeSubscription);
 
 app.post('/api/checkout/pending', (req, res) => {
   try {
-    const { userId, email, plan } = req.body || {};
+    const { userId, email, plan, sessionId, trial, serverSessionToken, refreshToken } = req.body || {};
     const cleanPlan = String(plan || '').toLowerCase().trim();
-    if (cleanPlan) {
-      if (userId) pendingCheckouts.set(userId, { plan: cleanPlan, timestamp: Date.now() });
-      if (email) pendingCheckouts.set(email.toLowerCase(), { plan: cleanPlan, timestamp: Date.now() });
-      pendingCheckouts.set('latest', { plan: cleanPlan, timestamp: Date.now() });
+    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
+    const cleanUid = userId ? String(userId).trim() : '';
+    const hdrSrvTok =
+      typeof req.headers['x-washek-server-session'] === 'string'
+        ? req.headers['x-washek-server-session'].trim()
+        : '';
+    const cookies = parseCookies(req.headers.cookie);
+    const resolvedSrvToken =
+      (typeof serverSessionToken === 'string' && serverSessionToken.trim()) ||
+      hdrSrvTok ||
+      cookies['washek_srv_sess'] ||
+      '';
+    const cleanRefresh = typeof refreshToken === 'string' ? refreshToken.trim() : '';
+
+    if (cleanPlan && ['progress', 'performance', 'elite'].includes(cleanPlan)) {
+      recordPendingCheckoutEntry({
+        plan: cleanPlan,
+        userId: cleanUid || undefined,
+        email: cleanEmail || undefined,
+        sessionId: sessionId ? String(sessionId).trim() : null,
+        trial: typeof trial === 'boolean' ? trial : undefined,
+        serverSessionToken: resolvedSrvToken || undefined,
+        refreshToken: cleanRefresh || undefined,
+        timestamp: Date.now(),
+      });
     }
-    res.json({ success: true, plan: cleanPlan });
+    res.json({ success: true, plan: cleanPlan || null });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+app.post('/api/checkout/pending/clear', (req, res) => {
+  try {
+    const { userId, email } = req.body || {};
+    clearPendingCheckoutForUser(userId ? String(userId) : null, email ? String(email) : null);
+    res.json({ success: true });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message });
   }
@@ -1242,15 +1618,111 @@ app.post('/api/checkout/pending', (req, res) => {
 
 app.get('/api/checkout/pending', (req, res) => {
   try {
-    const userId = req.query.userId ? String(req.query.userId) : '';
-    const email = req.query.email ? String(req.query.email).toLowerCase() : '';
-    const found =
-      (userId && pendingCheckouts.get(userId)) ||
-      (email && pendingCheckouts.get(email)) ||
-      pendingCheckouts.get('latest');
-    res.json({ success: true, plan: found?.plan || null });
+    const userId = req.query.userId ? String(req.query.userId).trim() : '';
+    const email = req.query.email ? String(req.query.email).toLowerCase().trim() : '';
+    const found = getFreshPendingCheckoutEntry(userId, email);
+    res.json({
+      success: true,
+      plan: found?.plan || null,
+      sessionId: found?.sessionId || null,
+      trial: typeof found?.trial === 'boolean' ? found.trial : null,
+      userId: found?.userId || null,
+      email: found?.email || null,
+      serverSessionToken: found?.serverSessionToken || null,
+      timestamp: found?.timestamp || null,
+    });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+app.get('/api/stripe/entitlement', (req, res) => {
+  try {
+    const queryUid = req.query.userId ? String(req.query.userId).trim() : '';
+    const queryEmail = req.query.email ? String(req.query.email).toLowerCase().trim() : '';
+    const queryCancelledAt = req.query.cancelledAt ? String(req.query.cancelledAt).trim() : null;
+    const srvProof = verifyServerSessionFromRequest(req, queryEmail || undefined);
+    const effectiveUid = srvProof?.userId || queryUid || '';
+    const effectiveEmail = srvProof?.email || queryEmail || '';
+
+    if (!effectiveUid && !effectiveEmail) {
+      return res.json({ active: false, plan: 'free', status: 'inactive' });
+    }
+
+    const rec = getConfirmedRedirectRecord(effectiveUid, effectiveEmail, queryCancelledAt);
+    if (!rec) {
+      return res.json({ active: false, plan: 'free', status: 'inactive' });
+    }
+
+    return res.json({
+      active: true,
+      plan: rec.plan,
+      status: rec.status,
+      timestamp: rec.timestamp,
+      verifiedBy: rec.verifiedBy || 'stripe_redirect',
+    });
+  } catch (err: any) {
+    return res.status(500).json({ active: false, plan: 'free', error: err?.message });
+  }
+});
+
+app.post('/api/stripe/confirm-redirect', async (req, res) => {
+  try {
+    const { plan, status = 'trialing', userId, email, sessionId, verifiedBy = 'stripe_redirect' } = req.body || {};
+    const cleanPlan = String(plan || '').toLowerCase().trim();
+    const cleanStatus = String(status || 'trialing').toLowerCase().trim();
+    const cleanUid = userId ? String(userId).trim() : '';
+    const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+
+    if (!['progress', 'performance', 'elite'].includes(cleanPlan)) {
+      return res.status(400).json({ success: false, error: 'Valid paid plan is required.' });
+    }
+
+    const effectiveStatus = ['active', 'trialing', 'past_due'].includes(cleanStatus)
+      ? cleanStatus
+      : 'trialing';
+
+    const entry: ConfirmedRedirectRecord = {
+      plan: cleanPlan,
+      status: effectiveStatus,
+      verifiedBy: String(verifiedBy || 'stripe_redirect'),
+      timestamp: Date.now(),
+    };
+
+    if (cleanUid) confirmedRedirectSubscriptions.set(cleanUid, entry);
+    if (cleanEmail) confirmedRedirectSubscriptions.set(cleanEmail, entry);
+    persistConfirmedSubscriptionsToDisk();
+
+    clearPendingCheckoutForUser(cleanUid || null, cleanEmail || null);
+
+    // If Node has service role + Stripe session wasn't already persisted, write to profiles cleanly
+    let dbSynced = false;
+    const adminDb = getServiceRoleSupabase();
+    if (adminDb && cleanUid && isValidUUID(cleanUid)) {
+      await updateProfileSubscriptionSafely(
+        adminDb,
+        cleanUid,
+        {
+          subscription_plan: cleanPlan,
+          subscription_status: effectiveStatus,
+          has_used_trial: true,
+          trial_used: true,
+          subscription_cancelled_at: null,
+          subscription_updated_at: new Date().toISOString(),
+        },
+        sessionId ? { stripe_checkout_session_id: String(sessionId) } : {}
+      );
+      dbSynced = true;
+    }
+
+    return res.json({
+      success: true,
+      plan: cleanPlan,
+      status: effectiveStatus,
+      dbSynced,
+    });
+  } catch (err: any) {
+    return res.status(500).json({ success: false, error: err?.message || 'Confirm redirect failed.' });
   }
 });
 
@@ -1355,9 +1827,8 @@ app.post('/api/user/delete-account', async (req, res) => {
     }
 
     // Clear any pending checkout and purge credentials from vault
-    if (cleanId) pendingCheckouts.delete(cleanId);
+    clearCheckoutEntitlementsForUser(cleanId, cleanEmail);
     if (cleanEmail) {
-      pendingCheckouts.delete(cleanEmail);
       deleteAthleteCredential(cleanEmail);
     }
 
@@ -2517,7 +2988,9 @@ app.post('/api/auth/change-password', async (req, res) => {
 // Silent Supabase session recovery for active signed-in users whose JWT expired or refresh token raced
 app.post('/api/auth/refresh-supabase-session', async (req, res) => {
   try {
-    const { email, refreshToken } = req.body || {};
+    const { email, userId, refreshToken } = req.body || {};
+    const cleanEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+    const cleanUid = typeof userId === 'string' ? userId.trim() : '';
     const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
     const token = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
     const srvToken =
@@ -2525,13 +2998,30 @@ app.post('/api/auth/refresh-supabase-session', async (req, res) => {
         ? req.headers['x-washek-server-session'].trim()
         : '';
 
+    let effectiveRefreshToken = typeof refreshToken === 'string' ? refreshToken.trim() : '';
+    let pendingEntryForRefresh: PendingCheckoutRecord | null = null;
+    if (!effectiveRefreshToken) {
+      const pendingMatch = getFreshPendingCheckoutEntry(cleanUid, cleanEmail);
+      if (
+        pendingMatch?.refreshToken &&
+        (!srvToken || !pendingMatch.serverSessionToken || pendingMatch.serverSessionToken === srvToken)
+      ) {
+        effectiveRefreshToken = pendingMatch.refreshToken;
+        pendingEntryForRefresh = pendingMatch;
+      }
+    }
+
     const recovery = await tryRecoverSupabaseSession({
       authToken: token,
-      refreshToken: typeof refreshToken === 'string' ? refreshToken.trim() : '',
+      refreshToken: effectiveRefreshToken,
       serverSessionToken: srvToken,
       cookieHeader: req.headers.cookie,
-      targetEmail: typeof email === 'string' ? email.trim().toLowerCase() : '',
+      targetEmail: cleanEmail,
     });
+
+    if (pendingEntryForRefresh) {
+      delete pendingEntryForRefresh.refreshToken;
+    }
 
     if (recovery?.session?.access_token) {
       const resolvedEmail = (recovery.session.user?.email || email || '').toLowerCase().trim();
@@ -2793,13 +3283,18 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
         const email = userData.user.email ? String(userData.user.email).toLowerCase().trim() : null;
         const { data: profileRow } = await supabaseUser
           .from('profiles')
-          .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
           .eq('id', userId)
           .maybeSingle();
 
         const subStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
         const isActiveSub = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
-        const effectivePlan = isActiveSub ? normalizeServerPlan(profileRow?.subscription_plan) : 'free';
+        const redirectPlan = !isActiveSub
+          ? getConfirmedRedirectEntitlement(userId, email, profileRow?.subscription_cancelled_at)
+          : null;
+        const effectivePlan = isActiveSub
+          ? normalizeServerPlan(profileRow?.subscription_plan)
+          : redirectPlan || 'free';
 
         return {
           client: supabaseUser,
@@ -2823,7 +3318,7 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
       try {
         const { data } = await supabase
           .from('profiles')
-          .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
           .eq('id', srvSession.userId)
           .maybeSingle();
         profileRow = data;
@@ -2835,7 +3330,7 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
       try {
         const { data } = await supabase
           .from('profiles')
-          .select('id, subscription_plan, subscription_status, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
           .ilike('email', srvSession.email)
           .maybeSingle();
         profileRow = data;
@@ -2845,11 +3340,17 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
     }
     const subStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
     const isActiveSub = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
-    const effectivePlan = isActiveSub ? normalizeServerPlan(profileRow?.subscription_plan) : 'free';
+    const resolvedUid = profileRow?.id || srvSession.userId || null;
+    const redirectPlan = !isActiveSub
+      ? getConfirmedRedirectEntitlement(resolvedUid, srvSession.email, profileRow?.subscription_cancelled_at)
+      : null;
+    const effectivePlan = isActiveSub
+      ? normalizeServerPlan(profileRow?.subscription_plan)
+      : redirectPlan || 'free';
 
     return {
       client: supabase,
-      userId: profileRow?.id || srvSession.userId || null,
+      userId: resolvedUid,
       email: srvSession.email || null,
       effectivePlan,
       profileRow: profileRow || null,

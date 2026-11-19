@@ -6,7 +6,10 @@ import {
   enforceUserSubscriptionState,
   isActiveSubscriptionStatus,
   normalizePlan,
+  getRedirectUpgradeReceipt,
+  clearRedirectUpgradeReceipt,
 } from '@/lib/subscription';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 import {
   getCachedProgramsList,
   setCachedLogs,
@@ -342,6 +345,7 @@ async function currentUser(forceFresh = false) {
           ) {
             parsed.onboarded = true;
           }
+          const redirectReceipt = getRedirectUpgradeReceipt(parsed);
           const parsedStatus = String(parsed.subscription_status || storedStatus || '').toLowerCase().trim();
           const parsedPlan = normalizePlan(
             parsed.subscription_plan || parsed.plan || parsed.tier || parsed.subscription_tier || 'free'
@@ -351,7 +355,13 @@ async function currentUser(forceFresh = false) {
             isActiveSubscriptionStatus(parsedStatus) &&
             parsedPlan !== 'free';
 
-          if (!isParsedActive) {
+          if (!isParsedActive && redirectReceipt) {
+            parsed.subscription_plan = redirectReceipt.plan;
+            parsed.subscription_status = redirectReceipt.status;
+            parsed.tier = redirectReceipt.plan;
+            parsed.plan = redirectReceipt.plan;
+            parsed.subscription_tier = redirectReceipt.plan;
+          } else if (!isParsedActive) {
             parsed.subscription_plan = 'free';
             parsed.subscription_status =
               storedStatus === 'canceled' || storedStatus === 'cancelled'
@@ -394,11 +404,23 @@ async function currentUser(forceFresh = false) {
         storedProfile = null;
       }
 
-      let profile = isLocalVault
-        ? (storedProfile ? { ...storedProfile } : null)
-        : await getProfile(user.id);
+      let hasRemoteProfile = false;
+      let profile = null;
+      if (isLocalVault) {
+        profile = storedProfile ? { ...storedProfile } : null;
+      } else {
+        profile = await getProfile(user.id);
+        hasRemoteProfile = Boolean(profile);
+      }
 
       if (!profile) {
+        const storedMatchesUser =
+          storedProfile &&
+          ((storedProfile.id && storedProfile.id === user.id) ||
+            (storedProfile.email &&
+              user.email &&
+              String(storedProfile.email).toLowerCase().trim() === String(user.email).toLowerCase().trim()));
+
         const profileInsert = {
           id: user.id,
           first_name: user.user_metadata?.first_name || '',
@@ -411,19 +433,32 @@ async function currentUser(forceFresh = false) {
           role: user.user_metadata?.role || 'athlete',
           training_type: user.user_metadata?.training_type || 'calisthenics',
           fitness_level: user.user_metadata?.fitness_level || 'intermediate',
-          subscription_plan: 'free',
-          subscription_status: isLocallyInactive ? (storedStatus || 'inactive') : 'inactive',
+          subscription_plan: storedMatchesUser && storedProfile?.subscription_plan ? storedProfile.subscription_plan : 'free',
+          subscription_status:
+            storedMatchesUser && storedProfile?.subscription_status
+              ? storedProfile.subscription_status
+              : isLocallyInactive
+                ? storedStatus || 'inactive'
+                : 'inactive',
         };
 
         profile = {
+          ...(storedMatchesUser ? storedProfile : {}),
           ...profileInsert,
           email: user.email,
         };
 
-        if (!isLocalVault) {
+        if (!isLocalVault && !storedMatchesUser) {
           supabase
             .from('profiles')
-            .upsert(profileInsert, { onConflict: 'id', ignoreDuplicates: true })
+            .upsert(
+              {
+                ...profileInsert,
+                subscription_plan: 'free',
+                subscription_status: 'inactive',
+              },
+              { onConflict: 'id', ignoreDuplicates: true }
+            )
             .then(() => {}, () => {});
         }
       }
@@ -434,9 +469,13 @@ async function currentUser(forceFresh = false) {
     }
     const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
     const dbPlan = normalizePlan(profile.subscription_plan || 'free');
-    const dbActive = isActiveSubscriptionStatus(dbStatus) && dbPlan !== 'free';
+    const dbActive =
+      (hasRemoteProfile || isLocalVault) &&
+      isActiveSubscriptionStatus(dbStatus) &&
+      dbPlan !== 'free';
 
     if (dbActive) {
+      clearRedirectUpgradeReceipt();
       normalized.subscription_plan = dbPlan;
       normalized.subscription_status = dbStatus;
       normalized.tier = dbPlan;
@@ -449,18 +488,77 @@ async function currentUser(forceFresh = false) {
         // ignore
       }
     } else {
-      // Authoritative DB shows free / canceled / inactive
-      normalized.subscription_plan = 'free';
-      normalized.subscription_status = dbStatus || 'inactive';
-      normalized.tier = 'free';
-      normalized.plan = 'free';
-      normalized.subscription_tier = 'free';
-      try {
-        localStorage.removeItem('washek_subscription_plan');
-        localStorage.removeItem('washek_recent_upgrade');
-        localStorage.setItem('washek_subscription_status', dbStatus || 'inactive');
-      } catch {
-        // ignore
+      let redirectReceipt = getRedirectUpgradeReceipt(profile);
+      if (!redirectReceipt && !dbActive) {
+        try {
+          const serverEnt = await fetchServerEntitlement({
+            userId: user.id,
+            email: user.email,
+            cancelledAtIso: profile?.subscription_cancelled_at || null,
+          });
+          if (serverEnt?.active) {
+            redirectReceipt = {
+              plan: serverEnt.plan,
+              status: serverEnt.status,
+              timestamp: serverEnt.timestamp,
+              verifiedBy: serverEnt.verifiedBy,
+            };
+          }
+        } catch {
+          // ignore server entitlement lookup error
+        }
+      }
+
+      if (redirectReceipt) {
+        normalized.subscription_plan = redirectReceipt.plan;
+        normalized.subscription_status = redirectReceipt.status;
+        normalized.tier = redirectReceipt.plan;
+        normalized.plan = redirectReceipt.plan;
+        normalized.subscription_tier = redirectReceipt.plan;
+        try {
+          localStorage.setItem('washek_subscription_plan', redirectReceipt.plan);
+          localStorage.setItem('washek_subscription_status', redirectReceipt.status);
+          localStorage.removeItem('washek_subscription_cancelled_at');
+        } catch {
+          // ignore
+        }
+      } else if (!isLocalVault && !hasRemoteProfile) {
+        // Remote profile fetch failed transiently: preserve valid cached active subscription instead of flashing Free
+        const cachedPlan = normalizePlan(
+          storedProfile?.subscription_plan || localStorage.getItem('washek_subscription_plan') || 'free'
+        );
+        const cachedStatus = String(
+          storedProfile?.subscription_status || localStorage.getItem('washek_subscription_status') || ''
+        )
+          .toLowerCase()
+          .trim();
+        if (!isLocallyInactive && cachedPlan !== 'free' && isActiveSubscriptionStatus(cachedStatus)) {
+          normalized.subscription_plan = cachedPlan;
+          normalized.subscription_status = cachedStatus;
+          normalized.tier = cachedPlan;
+          normalized.plan = cachedPlan;
+          normalized.subscription_tier = cachedPlan;
+        } else {
+          normalized.subscription_plan = 'free';
+          normalized.subscription_status = cachedStatus || 'inactive';
+          normalized.tier = 'free';
+          normalized.plan = 'free';
+          normalized.subscription_tier = 'free';
+        }
+      } else {
+        // Authoritative DB shows free / canceled / inactive
+        normalized.subscription_plan = 'free';
+        normalized.subscription_status = dbStatus || 'inactive';
+        normalized.tier = 'free';
+        normalized.plan = 'free';
+        normalized.subscription_tier = 'free';
+        try {
+          localStorage.removeItem('washek_subscription_plan');
+          localStorage.removeItem('washek_recent_upgrade');
+          localStorage.setItem('washek_subscription_status', dbStatus || 'inactive');
+        } catch {
+          // ignore
+        }
       }
     }
 

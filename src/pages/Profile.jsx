@@ -62,7 +62,7 @@ import {
   getServerMessageStats,
   getPlanLimit,
 } from '@/lib/messageLimit';
-import { resolveEffectivePlan } from '@/lib/subscription';
+import { resolveEffectivePlan, isActiveSubscriptionStatus, normalizePlan } from '@/lib/subscription';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
 
 import {
@@ -296,16 +296,36 @@ export default function Profile() {
             }
           }
           setUser((prev) => {
+            if (!prev) return currentUser;
+            const prevPlan = normalizePlan(prev.subscription_plan);
+            const nextPlan = normalizePlan(currentUser.subscription_plan);
+            const prevActive = prevPlan !== 'free' && isActiveSubscriptionStatus(prev.subscription_status);
+            const nextActive = nextPlan !== 'free' && isActiveSubscriptionStatus(currentUser.subscription_status);
+            const explicitCancel =
+              currentUser.subscription_status === 'canceled' ||
+              Boolean(currentUser.subscription_cancelled_at);
+            // Keep existing active plan if fetched user defaulted transiently to free/inactive without explicit cancel
+            const mergedSub =
+              prevActive && !nextActive && !explicitCancel
+                ? {
+                    subscription_plan: prev.subscription_plan,
+                    subscription_status: prev.subscription_status,
+                    tier: prev.subscription_plan,
+                    plan: prev.subscription_plan,
+                    subscription_tier: prev.subscription_plan,
+                  }
+                : {};
+            const nextUser = { ...currentUser, ...mergedSub };
             if (
-              prev &&
-              prev.id === currentUser.id &&
-              prev.avatar_url === currentUser.avatar_url &&
-              prev.subscription_plan === currentUser.subscription_plan &&
-              prev.full_name === currentUser.full_name
+              prev.id === nextUser.id &&
+              prev.avatar_url === nextUser.avatar_url &&
+              prev.subscription_plan === nextUser.subscription_plan &&
+              prev.subscription_status === nextUser.subscription_status &&
+              prev.full_name === nextUser.full_name
             ) {
               return prev;
             }
-            return currentUser;
+            return nextUser;
           });
         }
       })
@@ -445,7 +465,7 @@ export default function Profile() {
 
   const handlePlanChange = useCallback((newPlan) => {
     const normalized = String(newPlan || 'free').toLowerCase().trim() || 'free';
-    setUser((prev) => {
+    const patchUser = (prev) => {
       if (!prev || (prev.subscription_plan === normalized && (normalized !== 'free' || prev.subscription_status === 'canceled'))) return prev;
       return {
         ...prev,
@@ -453,9 +473,14 @@ export default function Profile() {
         subscription_status: normalized === 'free' ? 'canceled' : (['active', 'trialing', 'past_due'].includes(String(prev.subscription_status || '').toLowerCase()) ? prev.subscription_status : 'active'),
         tier: normalized,
         plan: normalized,
+        subscription_tier: normalized,
       };
-    });
-  }, []);
+    };
+    setUser(patchUser);
+    if (setAuthUser) {
+      setAuthUser(patchUser);
+    }
+  }, [setAuthUser]);
 
   // Immediate local-cached stats + live server-authoritative Kael monthly quota stats
   const immediateCachedStats = user ? getCachedMessageStats(user, plan, timeZone) : null;

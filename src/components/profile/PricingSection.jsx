@@ -23,6 +23,8 @@ import {
   applySubscriptionUpgrade,
   applySubscriptionCancellation,
   clearRecentUpgradeGrace,
+  getRedirectUpgradeReceipt,
+  clearRedirectUpgradeReceipt,
 } from '@/lib/subscription';
 import {
   STRIPE_TIERS,
@@ -32,9 +34,12 @@ import {
 import {
   fetchStripeTierPrices,
   startStripeCheckout,
+  syncStripeSubscription,
   resolveValidSupabaseSession,
   extractInvokeErrorMessage,
   isNonJwtToken,
+  fetchServerEntitlement,
+  clearPendingCheckoutOnServer,
 } from '@/lib/stripeCheckout';
 import { queryClientInstance } from '@/lib/query-client';
 import { invalidateCurrentUserCache } from '@/lib/supabaseApi';
@@ -196,22 +201,42 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     return 'free';
   });
 
+  const currentPlanRef = useRef(currentPlan);
+  useEffect(() => {
+    currentPlanRef.current = currentPlan;
+  }, [currentPlan]);
+
   useEffect(() => {
     try {
       if (sessionStorage.getItem('washek_just_canceled') === '1') {
         sessionStorage.removeItem('washek_just_canceled');
       }
+      if (typeof window !== 'undefined' && window.location.search) {
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('checkout') === 'canceled') {
+          localStorage.removeItem('washek_pending_checkout_plan');
+          sessionStorage.removeItem('washek_pending_checkout_plan');
+          localStorage.removeItem('washek_pending_checkout_session_id');
+          sessionStorage.removeItem('washek_pending_checkout_session_id');
+          localStorage.removeItem('washek_pending_checkout_started_at');
+          sessionStorage.removeItem('washek_pending_checkout_started_at');
+          document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
+          clearPendingCheckoutOnServer(user?.id, user?.email);
+          params.delete('checkout');
+          const nextSearch = params.toString();
+          const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash || ''}`;
+          window.history.replaceState({}, '', nextUrl);
+        }
+      }
     } catch {
-      // ignore sessionStorage error
+      // ignore storage/URL cleanup error
     }
-  }, []);
+  }, [user?.id, user?.email]);
 
   useEffect(() => {
     if (!hasLoadedOnceRef.current && currentPlanProp) {
       const safe = normalizePlan(currentPlanProp);
       setCurrentPlan(safe);
-    } else if (hasLoadedOnceRef.current && currentPlanProp === 'free') {
-      setCurrentPlan('free');
     }
   }, [currentPlanProp]);
 
@@ -223,6 +248,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
   const [loadingSubscription, setLoadingSubscription] = useState(true);
   const checkoutPollTimerRef = useRef(null);
   const lastSyncEventRef = useRef(0);
+  const autoSyncAttemptedRef = useRef(false);
 
   useEffect(() => {
     let active = true;
@@ -296,6 +322,10 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
       let profileStatus = '';
       let profileSubId = null;
       let profilePriceId = null;
+      let profileCancelledAt = null;
+      let resolvedAuthEmail = user?.email || storedUser?.email || '';
+      let effectiveUid = '';
+
       try {
         const storedTok = (() => {
           try {
@@ -315,16 +345,19 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
         const { data: sessionData } = await supabase.auth.getSession();
         const authUid = sessionData?.session?.user?.id || '';
+        if (sessionData?.session?.user?.email) {
+          resolvedAuthEmail = sessionData.session.user.email;
+        }
         const sessionToken = sessionData?.session?.access_token || '';
         const bearer = !isNonJwtToken(sessionToken) ? sessionToken : !isNonJwtToken(storedTok) ? storedTok : '';
-        const effectiveUid = authUid && !String(authUid).startsWith('usr_') ? authUid : storedUid;
+        effectiveUid = authUid && !String(authUid).startsWith('usr_') ? authUid : storedUid;
         let dbProf = null;
 
         if (bearer && effectiveUid) {
           if (authUid && !isNonJwtToken(sessionToken)) {
             const { data: profile, error: profErr } = await supabase
               .from('profiles')
-              .select('subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id')
+              .select('subscription_plan, subscription_status, stripe_subscription_id, stripe_price_id, subscription_cancelled_at')
               .eq('id', authUid)
               .maybeSingle();
 
@@ -344,7 +377,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
           if (!dbProf) {
             const restRes = await fetch(
-              `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(effectiveUid)}&select=subscription_plan,subscription_status&limit=1`,
+              `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(effectiveUid)}&select=subscription_plan,subscription_status,subscription_cancelled_at&limit=1`,
               {
                 headers: {
                   apikey: supabaseAnonKey,
@@ -365,45 +398,79 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           profileStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
           profileSubId = dbProf.stripe_subscription_id || null;
           profilePriceId = dbProf.stripe_price_id || null;
+          profileCancelledAt = dbProf.subscription_cancelled_at || null;
         }
       } catch (sbErr) {
         console.debug('[PricingSection] Supabase profile lookup note:', sbErr);
       }
 
-      // 3. Check stored user object fallback (only used when offline)
+      // 3. Check stored user object fallback (only used when offline or transient profile miss)
       let userObjPlan = null;
+      let userObjStatus = '';
       if (!isLocallyInactive) {
         try {
           const u = JSON.parse(localStorage.getItem('washek_user') || '{}');
           const uStatus = String(u?.subscription_status || '').toLowerCase().trim();
           if (isActiveStatus(uStatus) && u?.subscription_plan) {
             userObjPlan = normalizePlan(u.subscription_plan);
+            userObjStatus = uStatus;
           }
         } catch {
           /* ignore */
         }
       }
 
-      const isOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      let redirectReceipt = getRedirectUpgradeReceipt(
+        hasRemoteProfile
+          ? {
+              subscription_plan: profilePlan,
+              subscription_status: profileStatus,
+              subscription_cancelled_at: profileCancelledAt,
+            }
+          : null
+      );
 
-      // Resolve the true active plan (Postgres profiles is authoritative whenever online)
+      // Resolve the true active plan (Postgres profiles is authoritative whenever active; redirect receipt / server entitlement bridges iframe partition until DB/webhook catches up)
       let resolvedPlan = 'free';
       let resolvedStatus = 'inactive';
 
-      if (hasRemoteProfile) {
-        const dbActive = profilePlan !== 'free' && isActiveStatus(profileStatus);
-        if (dbActive) {
-          resolvedPlan = profilePlan;
-          resolvedStatus = profileStatus || 'active';
-        } else {
-          // Remote database shows user is free / canceled / inactive
+      const dbActive = hasRemoteProfile && profilePlan !== 'free' && isActiveStatus(profileStatus);
+      if (dbActive) {
+        clearRedirectUpgradeReceipt();
+        resolvedPlan = profilePlan;
+        resolvedStatus = profileStatus || 'active';
+      } else {
+        if (!redirectReceipt) {
+          try {
+            const serverEnt = await fetchServerEntitlement({
+              userId: effectiveUid || user?.id || storedUser?.id || '',
+              email: resolvedAuthEmail || '',
+              cancelledAtIso: profileCancelledAt,
+            });
+            if (serverEnt?.active) {
+              redirectReceipt = {
+                plan: serverEnt.plan,
+                status: serverEnt.status,
+                timestamp: serverEnt.timestamp,
+                verifiedBy: serverEnt.verifiedBy,
+              };
+            }
+          } catch {
+            // ignore server entitlement note
+          }
+        }
+
+        if (redirectReceipt) {
+          resolvedPlan = redirectReceipt.plan;
+          resolvedStatus = redirectReceipt.status;
+        } else if (hasRemoteProfile) {
+          // Authoritative remote DB confirms user is free / canceled / inactive
           resolvedPlan = 'free';
           resolvedStatus = profileStatus || 'inactive';
-        }
-      } else if (isOffline && !isLocallyInactive) {
-        if (localPlanRaw && localPlanRaw !== 'free') {
-          resolvedPlan = localPlanRaw;
-          resolvedStatus = 'active';
+        } else if (!isLocallyInactive && (localPlanRaw || userObjPlan)) {
+          // Transient profile miss (e.g., session hydrating): preserve cached paid plan rather than flashing Free
+          resolvedPlan = localPlanRaw || userObjPlan || 'free';
+          resolvedStatus = storedStatusRaw || userObjStatus || 'active';
         }
       }
 
@@ -417,27 +484,90 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           status: resolvedStatus,
           stripe_price_id: profilePriceId,
         });
-        if (localPlanRaw !== resolvedPlan) {
-          applySubscriptionUpgrade(resolvedPlan, resolvedStatus, { syncServer: false });
+        if (localPlanRaw !== resolvedPlan || redirectReceipt) {
+          applySubscriptionUpgrade(resolvedPlan, resolvedStatus, {
+            ...(dbActive ? { dbConfirmed: true } : redirectReceipt ? { persistReceipt: true } : {}),
+            syncServer: false,
+          });
         }
       } else {
         setSubscription(null);
-        applySubscriptionCancellation();
+        // Only overwrite localStorage cache when remote profile authoritatively returned free/canceled
+        if (hasRemoteProfile) {
+          try {
+            localStorage.removeItem('washek_subscription_plan');
+            if (resolvedStatus) {
+              localStorage.setItem('washek_subscription_status', resolvedStatus);
+            }
+            const rawUser = localStorage.getItem('washek_user');
+            if (rawUser) {
+              const parsedUser = JSON.parse(rawUser);
+              if (parsedUser && typeof parsedUser === 'object' && parsedUser.subscription_plan !== 'free') {
+                parsedUser.subscription_plan = 'free';
+                parsedUser.plan = 'free';
+                parsedUser.tier = 'free';
+                parsedUser.subscription_tier = 'free';
+                parsedUser.subscription_status = resolvedStatus || 'inactive';
+                localStorage.setItem('washek_user', JSON.stringify(parsedUser));
+              }
+            }
+          } catch {
+            // ignore storage errors
+          }
+        }
       }
 
-      setCurrentPlan((prev) => {
-        if (prev !== resolvedPlan) {
-          onPlanChangeRef.current?.(resolvedPlan);
-        }
-        return resolvedPlan;
-      });
+      const prevPlan = currentPlanRef.current;
+      currentPlanRef.current = resolvedPlan;
+      setCurrentPlan(resolvedPlan);
+
+      if (prevPlan !== resolvedPlan || resolvedPlan !== normalizePlan(currentPlanPropRef.current)) {
+        onPlanChangeRef.current?.(resolvedPlan);
+        invalidateCurrentUserCache();
+        checkUserAuth?.().catch(() => {});
+      }
+
+      // Only background-reconcile Postgres with Stripe if user has a redirect receipt awaiting DB confirmation —
+      // NEVER scrape Stripe passively for a normal Free user (prevents premature upgrades before subscribing).
+      if (
+        redirectReceipt &&
+        !dbActive &&
+        !autoSyncAttemptedRef.current &&
+        typeof navigator !== 'undefined' &&
+        navigator.onLine !== false
+      ) {
+        autoSyncAttemptedRef.current = true;
+        syncStripeSubscription({ planKey: redirectReceipt.plan })
+          .then((syncRes) => {
+            if (syncRes?.verified && syncRes.plan && syncRes.plan !== 'free') {
+              const verifiedPlan = normalizePlan(syncRes.plan);
+              const verifiedStatus = String(syncRes.status || 'active').toLowerCase().trim();
+              applySubscriptionUpgrade(verifiedPlan, verifiedStatus, {
+                ...(syncRes.dbSynced ? { dbConfirmed: true } : { persistReceipt: true }),
+                syncServer: false,
+              });
+              currentPlanRef.current = verifiedPlan;
+              setCurrentPlan(verifiedPlan);
+              setSubscription({
+                id: syncRes.subscriptionId || `sub_${verifiedPlan}`,
+                plan: verifiedPlan,
+                plan_key: verifiedPlan,
+                status: verifiedStatus,
+              });
+              onPlanChangeRef.current?.(verifiedPlan);
+              invalidateCurrentUserCache();
+              checkUserAuth?.().catch(() => {});
+            }
+          })
+          .catch(() => {});
+      }
     } catch (loadError) {
       console.error('[PricingSection] Failed to load subscription:', loadError);
-      setCurrentPlan('free');
+      hasLoadedOnceRef.current = true;
     } finally {
       setLoadingSubscription(false);
     }
-  }, []);
+  }, [checkUserAuth, user?.id, user?.email, storedUser?.id, storedUser?.email]);
 
   // Listen for payment signals from checkout return tab and verify against Postgres before unlocking
   useEffect(() => {
@@ -458,22 +588,20 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           .eq('id', uid)
           .maybeSingle();
 
-        if (profErr || !profile) return;
-        const dbPlan = normalizePlan(profile.subscription_plan);
-        const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
-        if (dbPlan === 'free' || !isActiveStatus(dbStatus)) {
-          return;
+        if (!profErr && profile) {
+          const dbPlan = normalizePlan(profile.subscription_plan);
+          const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
+          if (dbPlan !== 'free' && isActiveStatus(dbStatus)) {
+            if (checkoutPollTimerRef.current) {
+              clearInterval(checkoutPollTimerRef.current);
+              checkoutPollTimerRef.current = null;
+            }
+            applySubscriptionUpgrade(dbPlan, dbStatus, { dbConfirmed: true, syncServer: false });
+            setCurrentPlan(dbPlan);
+            onPlanChangeRef.current?.(dbPlan);
+            await checkUserAuth?.().catch(() => {});
+          }
         }
-
-        if (checkoutPollTimerRef.current) {
-          clearInterval(checkoutPollTimerRef.current);
-          checkoutPollTimerRef.current = null;
-        }
-
-        applySubscriptionUpgrade(dbPlan, dbStatus, { syncServer: false });
-        setCurrentPlan(dbPlan);
-        onPlanChangeRef.current?.(dbPlan);
-        await checkUserAuth?.().catch(() => {});
         await loadSubscription();
       } catch {
         // ignore transient verification errors
@@ -531,11 +659,18 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
     const handleFocus = () => {
       if (!active) return;
-      if (Date.now() - lastLoadAtRef.current < 15000) return;
+      if (!checkoutPollTimerRef.current && Date.now() - lastLoadAtRef.current < 15000) return;
+      loadSubscription();
+    };
+
+    const handlePageShow = () => {
+      if (!active) return;
+      setLoadingPlan(null);
       loadSubscription();
     };
 
     window.addEventListener('focus', handleFocus);
+    window.addEventListener('pageshow', handlePageShow);
     const handleVisChange = () => {
       if (document.visibilityState === 'visible' && active) {
         handleFocus();
@@ -557,59 +692,19 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
     return () => {
       active = false;
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('pageshow', handlePageShow);
       document.removeEventListener('visibilitychange', handleVisChange);
       authListener?.subscription?.unsubscribe();
     };
   }, [loadSubscription]);
-
-  const stopPostCheckoutPolling = useCallback(() => {
-    if (checkoutPollTimerRef.current) {
-      clearInterval(checkoutPollTimerRef.current);
-      checkoutPollTimerRef.current = null;
-    }
-  }, []);
 
   const handleCheckout = async (plan) => {
     if (!plan?.planKey || loadingPlan) {
       return;
     }
 
-    if (currentPlan === plan.planKey && subscription?.status === 'active') {
+    if (currentPlan === plan.planKey && isActiveStatus(subscription?.status)) {
       return;
-    }
-
-    // Synchronously open a window directly within user gesture loop to prevent popup blocker
-    let preOpenedWindow = null;
-    try {
-      preOpenedWindow = window.open('about:blank', '_blank');
-      if (preOpenedWindow && !preOpenedWindow.closed) {
-        preOpenedWindow.document.write(`
-          <!DOCTYPE html>
-          <html>
-            <head>
-              <title>WASHEK — Loading Checkout</title>
-              <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-              <style>
-                body { background: #09090b; color: #f4f4f5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; text-align: center; }
-                .card { background: #18181b; border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 32px 24px; max-width: 360px; width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.5); }
-                .spinner { width: 36px; height: 36px; border: 3px solid rgba(255,255,255,0.15); border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }
-                h2 { margin: 0 0 8px; font-size: 18px; font-weight: 600; }
-                p { margin: 0; font-size: 14px; color: #a1a1aa; line-height: 1.5; }
-                @keyframes spin { to { transform: rotate(360deg); } }
-              </style>
-            </head>
-            <body>
-              <div class="card">
-                <div class="spinner"></div>
-                <h2>Securing Stripe Checkout</h2>
-                <p>Connecting securely to Stripe...</p>
-              </div>
-            </body>
-          </html>
-        `);
-      }
-    } catch {
-      // ignore
     }
 
     setLoadingPlan(plan.planKey);
@@ -631,22 +726,14 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
         planKey: plan.planKey,
         email: userEmail,
         userId,
-        preOpenedWindow,
       });
 
       if (result?.action === 'already_active') {
-        if (preOpenedWindow && !preOpenedWindow.closed) {
-          preOpenedWindow.close();
-        }
         await checkUserAuth?.().catch(() => {});
         await loadSubscription();
         setLoadingPlan(null);
       }
     } catch (checkoutError) {
-      if (preOpenedWindow && !preOpenedWindow.closed) {
-        preOpenedWindow.close();
-      }
-      stopPostCheckoutPolling();
       const msg = checkoutError?.message || 'Unable to open Stripe Checkout.';
       console.error('[PricingSection] Stripe checkout failed:', checkoutError);
       setError(msg);

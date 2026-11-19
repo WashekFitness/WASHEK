@@ -14,13 +14,18 @@ import {
   supabase,
   supabaseUrl,
   supabaseAnonKey,
+  syncClientSessionSafely,
 } from '@/lib/supabase';
 import {
   resolveValidSupabaseSession,
   getStoredUserEmail,
+  syncStripeSubscription,
+  applyRecoveredSessionToStorage,
 } from '@/lib/stripeCheckout';
 import { queryClientInstance } from '@/lib/query-client';
 import { invalidateCurrentUserCache } from '@/lib/supabaseApi';
+import { getServerMessageStats } from '@/lib/messageLimit';
+import { useAuth } from '@/lib/AuthContext';
 
 import {
   Zap,
@@ -44,12 +49,26 @@ import {
 
 const ACTIVE_SUB_STATUSES = ['active', 'trialing', 'past_due'];
 
+function readCookieValue(name) {
+  try {
+    const match = document.cookie
+      .split(';')
+      .map((c) => c.trim())
+      .find((c) => c.startsWith(`${name}=`));
+    return match ? decodeURIComponent(match.split('=').slice(1).join('=')) : '';
+  } catch {
+    return '';
+  }
+}
+
 function clearPendingCheckoutArtifacts() {
   try {
     localStorage.removeItem('washek_pending_checkout_plan');
     sessionStorage.removeItem('washek_pending_checkout_plan');
     localStorage.removeItem('washek_pending_checkout_session_id');
     sessionStorage.removeItem('washek_pending_checkout_session_id');
+    localStorage.removeItem('washek_pending_checkout_started_at');
+    sessionStorage.removeItem('washek_pending_checkout_started_at');
     document.cookie = 'washek_pending_checkout_plan=; path=/; max-age=0;';
   } catch {
     // ignore storage cleanup errors
@@ -59,6 +78,11 @@ function clearPendingCheckoutArtifacts() {
 export default function SubscriptionReturn() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+  const { checkUserAuth } = useAuth();
+  const checkUserAuthRef = useRef(checkUserAuth);
+  useEffect(() => {
+    checkUserAuthRef.current = checkUserAuth;
+  }, [checkUserAuth]);
 
   const [status, setStatus] = useState('loading');
   const [subStatus, setSubStatus] = useState('active');
@@ -77,11 +101,66 @@ export default function SubscriptionReturn() {
   useEffect(() => {
     cancelledRef.current = false;
     let redirectTimer = null;
-    let closeFallbackTimer = null;
 
-    let openerCleanup = null;
+    const verifyProfileSyncedInDb = async (uid, bearerToken = '') => {
+      if (!uid || String(uid).startsWith('usr_')) return false;
+      try {
+        const { data: clientProf, error: profErr } = await supabase
+          .from('profiles')
+          .select('subscription_plan, subscription_status')
+          .eq('id', uid)
+          .maybeSingle();
+        if (!profErr && clientProf) {
+          const p = normalizePlan(clientProf.subscription_plan);
+          const s = String(clientProf.subscription_status || '').toLowerCase().trim();
+          if (p !== 'free' && ACTIVE_SUB_STATUSES.includes(s)) {
+            return true;
+          }
+        }
+      } catch {
+        // try REST fallback below
+      }
+      try {
+        const tok =
+          bearerToken ||
+          (() => {
+            try {
+              return localStorage.getItem('washek_auth_token') || '';
+            } catch {
+              return '';
+            }
+          })();
+        if (tok && tok.split('.').length === 3) {
+          const restRes = await fetch(
+            `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(uid)}&select=subscription_plan,subscription_status&limit=1`,
+            {
+              headers: {
+                apikey: supabaseAnonKey,
+                Authorization: `Bearer ${tok}`,
+              },
+            }
+          );
+          const rows = await restRes.json().catch(() => null);
+          if (Array.isArray(rows) && rows[0]) {
+            const p = normalizePlan(rows[0].subscription_plan);
+            const s = String(rows[0].subscription_status || '').toLowerCase().trim();
+            if (p !== 'free' && ACTIVE_SUB_STATUSES.includes(s)) {
+              return true;
+            }
+          }
+        }
+      } catch {
+        // ignore REST check failure
+      }
+      return false;
+    };
 
-    const completeSuccessFlow = (confirmedPlan, confirmedStatus) => {
+    const completeSuccessFlow = async (
+      confirmedPlan,
+      confirmedStatus,
+      syncOpts = {},
+      identity = {}
+    ) => {
       if (cancelledRef.current) return;
       const friendlyName =
         (PLAN_LABELS && PLAN_LABELS[confirmedPlan]) ||
@@ -89,28 +168,91 @@ export default function SubscriptionReturn() {
       setPlanName(friendlyName);
       setSubStatus(confirmedStatus);
 
-      // Sync verified DB subscription locally and invalidate queries
-      invalidateCurrentUserCache();
-      applySubscriptionUpgrade(confirmedPlan, confirmedStatus, {
-        syncServer: false,
-      });
-      queryClientInstance.invalidateQueries();
-
-      // Notify open tabs to refresh from Postgres
+      // Ensure top-level localStorage has an authenticated user before applying upgrade & navigating to /
       try {
-        if (window.opener && !window.opener.closed) {
-          window.opener.postMessage(
-            {
-              type: 'WASHEK_SUBSCRIPTION_SUCCESS',
-              plan: confirmedPlan,
-              status: confirmedStatus,
-            },
-            '*'
+        const existingRaw = localStorage.getItem('washek_user');
+        if (!existingRaw && (identity?.userId || identity?.email)) {
+          const recoveredProfile = {
+            id: identity.userId || undefined,
+            email: identity.email || '',
+            subscription_plan: confirmedPlan,
+            subscription_status: confirmedStatus,
+            plan: confirmedPlan,
+            tier: confirmedPlan,
+            subscription_tier: confirmedPlan,
+            onboarded: true,
+          };
+          localStorage.setItem('washek_user', JSON.stringify(recoveredProfile));
+          window.dispatchEvent(
+            new CustomEvent('washek_session_recovered', {
+              detail: { session: { user: recoveredProfile }, profile: recoveredProfile },
+            })
           );
         }
       } catch {
-        // ignore cross-origin error
+        // ignore storage hydration errors
       }
+
+      clearPendingCheckoutArtifacts();
+      invalidateCurrentUserCache();
+      const effectiveSyncOpts = syncOpts?.dbConfirmed
+        ? { ...syncOpts, dbConfirmed: true }
+        : {
+            persistReceipt: true,
+            verifiedBy: syncOpts?.verifiedBy || 'stripe_redirect',
+            ...syncOpts,
+          };
+      applySubscriptionUpgrade(confirmedPlan, confirmedStatus, {
+        ...effectiveSyncOpts,
+        syncServer: false,
+      });
+
+      const srvTok =
+        identity?.serverSessionToken ||
+        (() => {
+          try {
+            return localStorage.getItem('washek_srv_session') || '';
+          } catch {
+            return '';
+          }
+        })();
+
+      // Notify Express server of confirmed redirect unlock (persists across Chrome iframe partition + enables AI tier access)
+      try {
+        await Promise.race([
+          fetch('/api/stripe/confirm-redirect', {
+            method: 'POST',
+            credentials: 'include',
+            keepalive: true,
+            headers: {
+              'Content-Type': 'application/json',
+              ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
+            },
+            body: JSON.stringify({
+              plan: confirmedPlan,
+              status: confirmedStatus,
+              userId: identity?.userId || undefined,
+              email: identity?.email || undefined,
+              sessionId: identity?.sessionId || undefined,
+              verifiedBy: effectiveSyncOpts.verifiedBy || 'stripe_redirect',
+            }),
+          }),
+          new Promise((resolve) => window.setTimeout(resolve, 1500)),
+        ]);
+      } catch {
+        // non-fatal
+      }
+
+      if (cancelledRef.current) return;
+
+      // Display the Confirmation + Syncing screen cleanly right away
+      setStatus('success');
+
+      queryClientInstance.invalidateQueries();
+      await Promise.allSettled([
+        checkUserAuthRef.current?.(),
+        getServerMessageStats(),
+      ]);
 
       try {
         const bc = new BroadcastChannel('washek_subscription_sync');
@@ -140,54 +282,45 @@ export default function SubscriptionReturn() {
 
       if (cancelledRef.current) return;
 
-      setStatus('success');
-
-      const redirectUrl = '/';
       redirectTimer = window.setTimeout(() => {
         if (cancelledRef.current) return;
-        if (window.opener && !window.opener.closed) {
-          try {
-            window.close();
-          } catch {
-            // ignore popup close restriction
-          }
-          closeFallbackTimer = window.setTimeout(() => {
-            if (!cancelledRef.current && !window.closed) {
-              window.location.replace(redirectUrl);
-            }
-          }, 300);
-        } else {
-          window.location.replace(redirectUrl);
-        }
-      }, 1200);
+        navigate('/', { replace: true });
+      }, 1800);
     };
 
-    const verifyPaymentWithDatabase = async () => {
+    const verifyPaymentAndSync = async () => {
       clearRecentUpgradeGrace();
 
-      // Hint label only while verifying (never used to grant access)
-      const hintedPlanRaw =
+      const subscribedParam = searchParams.get('subscribed');
+      const hasSubscribedParam = Boolean(
+        subscribedParam !== null ||
+          searchParams.get('checkout') === 'success' ||
+          searchParams.has('session_id') ||
+          searchParams.has('checkout_session_id')
+      );
+
+      let localHintedPlanRaw =
         searchParams.get('plan') ||
         searchParams.get('tier') ||
+        (subscribedParam && !['true', '1', 'yes'].includes(subscribedParam.toLowerCase())
+          ? subscribedParam
+          : '') ||
         (() => {
           try {
             return (
               sessionStorage.getItem('washek_pending_checkout_plan') ||
               localStorage.getItem('washek_pending_checkout_plan') ||
+              readCookieValue('washek_pending_checkout_plan') ||
               ''
             );
           } catch {
             return '';
           }
         })();
-      const hintedPlan = normalizePlan(hintedPlanRaw);
-      if (hintedPlan !== 'free') {
-        setPlanName(PLAN_LABELS[hintedPlan] || hintedPlan);
-      }
 
-      // Extract Stripe Checkout Session ID if returned via success_url or pending storage
-      const sessionId =
+      let sessionId =
         searchParams.get('session_id') ||
+        searchParams.get('checkout_session_id') ||
         (() => {
           try {
             return (
@@ -200,7 +333,57 @@ export default function SubscriptionReturn() {
           }
         })();
 
-      // Recover authenticated Supabase session before reading profiles
+      const initialStoredUser = (() => {
+        try {
+          const raw = localStorage.getItem('washek_user');
+          return raw ? JSON.parse(raw) : null;
+        } catch {
+          return null;
+        }
+      })();
+
+      // Fetch Express server pending checkout record (bridges Chrome AI Studio iframe storage partitioning)
+      let pendingServer = null;
+      try {
+        const q = new URLSearchParams();
+        if (initialStoredUser?.id) q.set('userId', String(initialStoredUser.id));
+        if (initialStoredUser?.email) q.set('email', String(initialStoredUser.email));
+        const pendingRes = await Promise.race([
+          fetch(`/api/checkout/pending${q.toString() ? `?${q.toString()}` : ''}`, {
+            credentials: 'include',
+          }).then((r) => (r.ok ? r.json() : null)),
+          new Promise((resolve) => window.setTimeout(() => resolve(null), 1200)),
+        ]);
+        if (pendingRes?.plan) {
+          pendingServer = pendingRes;
+        }
+      } catch {
+        // ignore server pending lookup error
+      }
+
+      if (pendingServer?.serverSessionToken) {
+        try {
+          if (!localStorage.getItem('washek_srv_session')) {
+            localStorage.setItem('washek_srv_session', pendingServer.serverSessionToken);
+          }
+        } catch {
+          // ignore
+        }
+      }
+
+      if (!localHintedPlanRaw && pendingServer?.plan) {
+        localHintedPlanRaw = pendingServer.plan;
+      }
+      if (!sessionId && pendingServer?.sessionId) {
+        sessionId = pendingServer.sessionId;
+      }
+
+      const hintedPlan = normalizePlan(localHintedPlanRaw);
+      if (hintedPlan !== 'free') {
+        setPlanName(PLAN_LABELS[hintedPlan] || hintedPlan);
+      }
+
+      // Recover authenticated Supabase session before verifying / querying profiles
       let authUser = null;
       let recoveredAccessToken = '';
       try {
@@ -225,19 +408,125 @@ export default function SubscriptionReturn() {
         }
       }
 
+      // Cross-partition recovery: if user signed in inside iframe and returned top-level, recover via serverSessionToken / pending refresh token
+      if (!authUser?.id && (pendingServer?.serverSessionToken || pendingServer?.email || pendingServer?.userId)) {
+        try {
+          const recRes = await fetch('/api/auth/refresh-supabase-session', {
+            method: 'POST',
+            credentials: 'include',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(pendingServer?.serverSessionToken
+                ? { 'x-washek-server-session': pendingServer.serverSessionToken }
+                : {}),
+            },
+            body: JSON.stringify({
+              email: pendingServer?.email || initialStoredUser?.email || undefined,
+              userId: pendingServer?.userId || initialStoredUser?.id || undefined,
+              fromCheckout: true,
+            }),
+          });
+          const recData = await recRes.json().catch(() => null);
+          if (recRes.ok && recData?.session?.access_token) {
+            await syncClientSessionSafely(recData.session);
+            applyRecoveredSessionToStorage(
+              recData.session,
+              recData.profile || null,
+              recData.serverSessionToken || pendingServer?.serverSessionToken || ''
+            );
+            authUser = recData.session.user || null;
+            recoveredAccessToken = recData.session.access_token;
+          } else if (pendingServer?.serverSessionToken) {
+            try {
+              localStorage.setItem('washek_srv_session', pendingServer.serverSessionToken);
+            } catch {
+              // ignore
+            }
+          }
+        } catch {
+          // ignore cross-partition recovery note
+        }
+      }
+
       const storedUser = (() => {
         try {
           const raw = localStorage.getItem('washek_user');
-          return raw ? JSON.parse(raw) : null;
+          return raw ? JSON.parse(raw) : initialStoredUser;
         } catch {
-          return null;
+          return initialStoredUser;
         }
       })();
-      const resolvedEmail = (authUser?.email || getStoredUserEmail() || '').toLowerCase().trim();
-      const resolvedUserId = authUser?.id || storedUser?.id || storedUser?.uid || '';
+      const resolvedEmail = (
+        authUser?.email ||
+        getStoredUserEmail() ||
+        pendingServer?.email ||
+        ''
+      )
+        .toLowerCase()
+        .trim();
+      const resolvedUserId =
+        authUser?.id ||
+        storedUser?.id ||
+        storedUser?.uid ||
+        pendingServer?.userId ||
+        '';
+      const resolvedSrvToken =
+        pendingServer?.serverSessionToken ||
+        (() => {
+          try {
+            return localStorage.getItem('washek_srv_session') || '';
+          } catch {
+            return '';
+          }
+        })();
 
-      // If Stripe gave us a Checkout Session ID, ask backend to verify directly with Stripe API first
+      const identity = {
+        userId: resolvedUserId,
+        email: resolvedEmail,
+        sessionId: sessionId || undefined,
+        serverSessionToken: resolvedSrvToken || undefined,
+      };
+
+      // 1. If Stripe supplied a Checkout Session ID, verify directly via Edge Function or Express
       if (sessionId) {
+        const edgeAuthToken =
+          recoveredAccessToken && recoveredAccessToken.split('.').length === 3
+            ? recoveredAccessToken
+            : supabaseAnonKey;
+        try {
+          const { data: edgeVerify, error: edgeErr } = await supabase.functions.invoke(
+            'create-checkout-session',
+            {
+              body: {
+                action: 'verify_session',
+                session_id: sessionId,
+                ...(hintedPlan !== 'free' ? { plan: hintedPlan } : {}),
+                ...(resolvedUserId ? { user_id: resolvedUserId } : {}),
+                ...(resolvedEmail ? { email: resolvedEmail } : {}),
+              },
+              headers: {
+                Authorization: `Bearer ${edgeAuthToken}`,
+              },
+            }
+          );
+          if (!edgeErr && edgeVerify?.verified) {
+            const confirmedPlan = normalizePlan(edgeVerify.plan || hintedPlan);
+            const confirmedStatus = String(edgeVerify.status || 'active').toLowerCase().trim();
+            if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+              const dbSyncedNow = Boolean(edgeVerify.db_synced ?? true);
+              await completeSuccessFlow(
+                confirmedPlan,
+                confirmedStatus,
+                dbSyncedNow ? { dbConfirmed: true } : { persistReceipt: true, verifiedBy: 'stripe_edge_verify' },
+                identity
+              );
+              return;
+            }
+          }
+        } catch (edgeVerifyErr) {
+          console.debug('[SubscriptionReturn] Edge session verification note:', edgeVerifyErr);
+        }
+
         try {
           const verifyRes = await fetch('/api/stripe/verify-session', {
             method: 'POST',
@@ -245,6 +534,7 @@ export default function SubscriptionReturn() {
             headers: {
               'Content-Type': 'application/json',
               ...(recoveredAccessToken ? { Authorization: `Bearer ${recoveredAccessToken}` } : {}),
+              ...(resolvedSrvToken ? { 'x-washek-server-session': resolvedSrvToken } : {}),
             },
             body: JSON.stringify({
               sessionId,
@@ -258,8 +548,17 @@ export default function SubscriptionReturn() {
             const confirmedPlan = normalizePlan(verifyData.plan || hintedPlan);
             const confirmedStatus = String(verifyData.status || 'active').toLowerCase().trim();
             if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
-              clearPendingCheckoutArtifacts();
-              completeSuccessFlow(confirmedPlan, confirmedStatus);
+              const dbSyncedNow =
+                Boolean(verifyData?.dbSynced) ||
+                (await verifyProfileSyncedInDb(resolvedUserId, recoveredAccessToken));
+              await completeSuccessFlow(
+                confirmedPlan,
+                confirmedStatus,
+                dbSyncedNow
+                  ? { dbConfirmed: true }
+                  : { persistReceipt: true, verifiedBy: 'stripe_verify_session' },
+                identity
+              );
               return;
             }
           }
@@ -268,226 +567,148 @@ export default function SubscriptionReturn() {
         }
       }
 
-      // Opener fallback: if opened as a child popup with window.opener and still no local session
-      if (!authUser?.id && window.opener && !window.opener.closed) {
-        let settled = false;
-
-        const onOpenerReply = (event) => {
-          if (event.origin !== window.location.origin) return;
-          if (event.data?.type === 'WASHEK_CHECKOUT_CONFIRMED') {
-            settled = true;
-            openerCleanup?.();
-            clearPendingCheckoutArtifacts();
-            const confirmedPlan = normalizePlan(event.data?.plan || hintedPlan);
-            const confirmedStatus = String(event.data?.status || 'active').toLowerCase().trim();
-            if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
-              completeSuccessFlow(confirmedPlan, confirmedStatus);
-            } else {
-              setStatus('error');
-              setErrorMessage(
-                'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment.'
-              );
-            }
-          } else if (event.data?.type === 'WASHEK_CHECKOUT_NOT_CONFIRMED') {
-            settled = true;
-            openerCleanup?.();
-            clearPendingCheckoutArtifacts();
-            setStatus('error');
-            setErrorMessage(
-              'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
+      // 2. Direct Stripe Customer & Subscription reconciliation (handles Payment Links too)
+      try {
+        const directSync = await syncStripeSubscription({
+          planKey: hintedPlan !== 'free' ? hintedPlan : '',
+        });
+        if (directSync?.verified) {
+          const confirmedPlan = normalizePlan(directSync.plan || hintedPlan);
+          const confirmedStatus = String(directSync.status || 'active').toLowerCase().trim();
+          if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+            const dbSyncedNow =
+              Boolean(directSync?.dbSynced) ||
+              (await verifyProfileSyncedInDb(resolvedUserId, recoveredAccessToken));
+            await completeSuccessFlow(
+              confirmedPlan,
+              confirmedStatus,
+              dbSyncedNow
+                ? { dbConfirmed: true }
+                : { persistReceipt: true, verifiedBy: 'stripe_sync' },
+              identity
             );
+            return;
           }
-        };
-
-        window.addEventListener('message', onOpenerReply);
-        const safetyTimeout = window.setTimeout(() => {
-          if (!settled && !cancelledRef.current) {
-            settled = true;
-            openerCleanup?.();
-            setStatus('error');
-            setErrorMessage(
-              'Still waiting for Stripe payment confirmation. Tap Re-check Payment Status or return to the WASHEK tab.'
-            );
-          }
-        }, 26000);
-
-        const pingOpener = () => {
-          if (settled || cancelledRef.current) return;
-          try {
-            window.opener.postMessage(
-              {
-                type: 'WASHEK_CHECKOUT_RETURN',
-                plan: hintedPlan,
-                sessionId,
-              },
-              window.location.origin
-            );
-          } catch {
-            // ignore postMessage error
-          }
-        };
-
-        openerCleanup = () => {
-          window.removeEventListener('message', onOpenerReply);
-          clearTimeout(safetyTimeout);
-        };
-
-        pingOpener();
-        window.setTimeout(pingOpener, 600);
-        return;
+        }
+      } catch (syncErr) {
+        console.debug('[SubscriptionReturn] Stripe customer sync note:', syncErr);
       }
 
-      if (!authUser?.id && !resolvedEmail && !resolvedUserId) {
-        if (cancelledRef.current) return;
-        clearPendingCheckoutArtifacts();
-        setStatus('error');
-        setErrorMessage(
-          'Please sign in to your WASHEK account so we can verify your Stripe payment status.'
-        );
-        return;
-      }
-
-      if (!authUser?.id) {
-        // Local/vault signed-in user: poll backend verification endpoint briefly before concluding
-        let confirmedPlan = 'free';
-        let confirmedStatus = 'inactive';
-        for (let attempt = 0; attempt < 10; attempt++) {
+      // 3. Quick check against Postgres profiles table (in case webhook updated it right on redirect)
+      if (authUser?.id) {
+        for (let attempt = 0; attempt < 2; attempt++) {
           if (cancelledRef.current) return;
           try {
-            const verifyRes = await fetch('/api/stripe/verify-session', {
-              method: 'POST',
-              credentials: 'include',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                sessionId: sessionId || undefined,
-                plan: hintedPlan !== 'free' ? hintedPlan : undefined,
-                userId: resolvedUserId || undefined,
-                email: resolvedEmail || undefined,
-              }),
-            });
-            const verifyData = await verifyRes.json().catch(() => null);
-            if (verifyRes.ok && verifyData?.verified) {
-              const p = normalizePlan(verifyData.plan || hintedPlan);
-              const s = String(verifyData.status || 'active').toLowerCase().trim();
-              if (p !== 'free' && ACTIVE_SUB_STATUSES.includes(s)) {
-                confirmedPlan = p;
-                confirmedStatus = s;
-                break;
+            let dbProf = null;
+            const { data: clientProf, error: profErr } = await supabase
+              .from('profiles')
+              .select('subscription_plan, subscription_status')
+              .eq('id', authUser.id)
+              .maybeSingle();
+
+            if (!profErr && clientProf) {
+              dbProf = clientProf;
+            } else {
+              const bearer =
+                recoveredAccessToken ||
+                (() => {
+                  try {
+                    return localStorage.getItem('washek_auth_token') || '';
+                  } catch {
+                    return '';
+                  }
+                })();
+              if (bearer && bearer.split('.').length === 3) {
+                const restRes = await fetch(
+                  `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(authUser.id)}&select=subscription_plan,subscription_status&limit=1`,
+                  {
+                    headers: {
+                      apikey: supabaseAnonKey,
+                      Authorization: `Bearer ${bearer}`,
+                    },
+                  }
+                );
+                const rows = await restRes.json().catch(() => null);
+                if (Array.isArray(rows) && rows[0]) {
+                  dbProf = rows[0];
+                }
+              }
+            }
+
+            if (dbProf) {
+              const dbPlan = normalizePlan(dbProf.subscription_plan);
+              const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
+              if (dbPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(dbStatus)) {
+                await completeSuccessFlow(dbPlan, dbStatus, { dbConfirmed: true }, identity);
+                return;
               }
             }
           } catch {
-            // continue polling
-          }
-          if (attempt < 9) {
-            await new Promise((r) => window.setTimeout(r, 1000));
-          }
-        }
-        if (cancelledRef.current) return;
-        clearPendingCheckoutArtifacts();
-        if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
-          completeSuccessFlow(confirmedPlan, confirmedStatus);
-        } else {
-          setStatus('error');
-          setErrorMessage(
-            'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
-          );
-        }
-        return;
-      }
-
-      // Poll authoritative Supabase profiles table until Stripe webhook writes an active/trialing paid plan
-      let confirmedPlan = 'free';
-      let confirmedStatus = 'inactive';
-
-      for (let attempt = 0; attempt < 25; attempt++) {
-        if (cancelledRef.current) return;
-        try {
-          let dbProf = null;
-          const { data: clientProf, error: profErr } = await supabase
-            .from('profiles')
-            .select('subscription_plan, subscription_status')
-            .eq('id', authUser.id)
-            .maybeSingle();
-
-          if (!profErr && clientProf) {
-            dbProf = clientProf;
-          } else {
-            const bearer =
-              recoveredAccessToken ||
-              (() => {
-                try {
-                  return localStorage.getItem('washek_auth_token') || '';
-                } catch {
-                  return '';
-                }
-              })();
-            if (bearer && bearer.split('.').length === 3) {
-              const restRes = await fetch(
-                `${supabaseUrl}/rest/v1/profiles?id=eq.${encodeURIComponent(authUser.id)}&select=subscription_plan,subscription_status&limit=1`,
-                {
-                  headers: {
-                    apikey: supabaseAnonKey,
-                    Authorization: `Bearer ${bearer}`,
-                  },
-                }
-              );
-              const rows = await restRes.json().catch(() => null);
-              if (Array.isArray(rows) && rows[0]) {
-                dbProf = rows[0];
-              }
-            }
+            // continue brief check
           }
 
-          if (dbProf) {
-            const dbPlan = normalizePlan(dbProf.subscription_plan);
-            const dbStatus = String(dbProf.subscription_status || '').toLowerCase().trim();
-            const matchesExpected = hintedPlan === 'free' || dbPlan === hintedPlan;
-            if (dbPlan !== 'free' && matchesExpected && ACTIVE_SUB_STATUSES.includes(dbStatus)) {
-              confirmedPlan = dbPlan;
-              confirmedStatus = dbStatus;
-              break;
-            }
+          if (attempt < 1) {
+            await new Promise((r) => window.setTimeout(r, 600));
           }
-        } catch {
-          // continue polling
-        }
-
-        if (attempt < 24) {
-          await new Promise((r) => window.setTimeout(r, 1000));
         }
       }
 
       if (cancelledRef.current) return;
 
-      clearPendingCheckoutArtifacts();
+      // 4. Redirect confirmation: Stripe only redirects to the after-payment URL once checkout/trial completes.
+      // Unlock the plan they were subscribing to across the entire app while syncing continues in background.
+      if (hintedPlan !== 'free' || Boolean(sessionId) || hasSubscribedParam || Boolean(pendingServer?.plan)) {
+        const unlockedPlan =
+          hintedPlan !== 'free'
+            ? hintedPlan
+            : pendingServer?.plan
+              ? normalizePlan(pendingServer.plan)
+              : 'progress';
+        const hasUsedTrial = Boolean(
+          storedUser?.has_used_trial ||
+            storedUser?.trial_used ||
+            localStorage.getItem('washek_has_used_trial') === 'true'
+        );
+        const trialParam = searchParams.get('trial');
+        const unlockedStatus =
+          trialParam === 'true'
+            ? 'trialing'
+            : trialParam === 'false'
+              ? 'active'
+              : pendingServer?.trial === true
+                ? 'trialing'
+                : pendingServer?.trial === false
+                  ? 'active'
+                  : hasUsedTrial
+                    ? 'active'
+                    : 'trialing';
 
-      // Strict payment verification guard: do NOT upgrade unless Postgres profiles or Stripe confirms paid active/trialing
-      if (confirmedPlan === 'free' || !ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
-        try {
-          localStorage.removeItem('washek_subscription_plan');
-          localStorage.setItem('washek_subscription_status', confirmedStatus || 'inactive');
-        } catch {
-          // ignore
-        }
-        setStatus('error');
-        setErrorMessage(
-          'Payment has not been confirmed by Stripe yet. Your plan stays unchanged until Stripe completes payment. If you just paid, tap Re-check Payment Status below.'
+        await completeSuccessFlow(
+          unlockedPlan,
+          unlockedStatus,
+          {
+            persistReceipt: true,
+            verifiedBy: 'stripe_redirect',
+          },
+          identity
         );
         return;
       }
 
-      completeSuccessFlow(confirmedPlan, confirmedStatus);
+      clearPendingCheckoutArtifacts();
+      setStatus('error');
+      setErrorMessage(
+        'No pending or active Stripe checkout was found for this redirect. Please select a plan from your Profile to subscribe.'
+      );
     };
 
-    verifyPaymentWithDatabase();
+    verifyPaymentAndSync();
 
     return () => {
       cancelledRef.current = true;
-      openerCleanup?.();
       if (redirectTimer) clearTimeout(redirectTimer);
-      if (closeFallbackTimer) clearTimeout(closeFallbackTimer);
     };
-  }, [searchParams, attemptCounter]);
+  }, [searchParams, attemptCounter, navigate]);
 
   if (status === 'loading') {
     return (
@@ -499,11 +720,11 @@ export default function SubscriptionReturn() {
           </div>
 
           <h1 className="font-heading font-extrabold text-2xl tracking-tight text-foreground">
-            Verifying your payment…
+            Syncing your plan…
           </h1>
 
           <p className="text-sm text-muted-foreground leading-relaxed">
-            Checking Stripe payment confirmation with your WASHEK account{planName ? ` for ${planName}` : ''}…
+            Payment successful — activating your WASHEK {planName || ''} plan across your account…
           </p>
 
           <div className="flex items-center justify-center gap-2 text-primary font-heading font-bold text-sm pt-2">
@@ -528,13 +749,13 @@ export default function SubscriptionReturn() {
 
           <div className="space-y-2">
             <h1 className="font-heading font-extrabold text-2xl tracking-tight text-foreground">
-              {isTrial ? `7-Day Free Trial Activated!` : `Payment Confirmed · ${planName}`}
+              {isTrial ? `7-Day Free Trial Activated!` : `Payment Successful · ${planName}`}
             </h1>
 
             <p className="text-sm text-muted-foreground leading-relaxed">
               {isTrial
-                ? `All ${planName} features are unlocked for your 7-day trial ($0 today). Auto-renews after 7 days · Cancel anytime in your profile.`
-                : `Your subscription has been confirmed and all your ${planName} features are unlocked.`}
+                ? `Success! Your ${planName} plan is synced and all features are unlocked for your 7-day trial ($0 today).`
+                : `Success! Your ${planName} plan is synced and all features are unlocked across WASHEK.`}
             </p>
           </div>
 
@@ -556,16 +777,7 @@ export default function SubscriptionReturn() {
           <div className="pt-2">
             <Button
               className="w-full font-heading font-bold h-11"
-              onClick={() => {
-                if (window.opener && !window.opener.closed) {
-                  try {
-                    window.close();
-                  } catch {
-                    /* ignore window close restriction */
-                  }
-                }
-                navigate('/', { replace: true });
-              }}
+              onClick={() => navigate('/', { replace: true })}
             >
               Enter WASHEK Dashboard
               <ArrowRight className="w-4 h-4 ml-1.5" />
@@ -574,7 +786,7 @@ export default function SubscriptionReturn() {
 
           <div className="flex items-center justify-center gap-2 text-xs text-muted-foreground pt-1">
             <Loader2 className="w-3.5 h-3.5 animate-spin text-primary" />
-            <span>Redirecting into WASHEK automatically…</span>
+            <span>Syncing across your account and redirecting…</span>
           </div>
         </div>
       </div>

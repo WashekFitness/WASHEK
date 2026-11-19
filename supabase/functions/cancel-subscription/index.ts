@@ -299,40 +299,44 @@ async function makeProfileFree(
   const now =
     new Date().toISOString();
 
-  const {
-    data,
-    error,
-  } =
-    await supabaseAdmin
+  const corePatch = {
+    subscription_plan: 'free',
+    subscription_status: 'canceled',
+    stripe_customer_id: customerId || null,
+    stripe_subscription_id: null,
+    stripe_price_id: null,
+    updated_at: now,
+  };
+
+  const fullPatch = {
+    ...corePatch,
+    subscription_cancelled_at: now,
+    subscription_updated_at: now,
+    subscription_grace_until: null,
+    has_used_trial: true,
+    trial_used: true,
+  };
+
+  let { data, error } = await supabaseAdmin
+    .from('profiles')
+    .update(fullPatch)
+    .eq('id', userId)
+    .select('*')
+    .maybeSingle();
+
+  if (
+    error &&
+    (error.code === '42703' || /column .* does not exist/i.test(String(error.message || '')))
+  ) {
+    const retry = await supabaseAdmin
       .from('profiles')
-      .update({
-        subscription_plan:
-          'free',
-
-        subscription_status:
-          'canceled',
-
-        stripe_customer_id:
-          customerId,
-
-        stripe_subscription_id:
-          null,
-
-        stripe_price_id:
-          null,
-
-        subscription_cancelled_at:
-          now,
-
-        subscription_updated_at:
-          now,
-
-        updated_at:
-          now,
-      })
+      .update(corePatch)
       .eq('id', userId)
       .select('*')
       .maybeSingle();
+    data = retry.data;
+    error = retry.error;
+  }
 
   if (error) {
     throw new Error(
@@ -545,20 +549,17 @@ Deno.serve(
           userId: user?.id || profile.id,
           customerId,
           subscriptionId,
-          stripeStatus:
-            canceled?.status ||
-            'canceled',
+          canceledCount: subscriptionsToCancel.size,
+          stripeStatus: 'canceled',
         }
       );
 
       return json({
         success: true,
-        alreadyCanceled: false,
+        alreadyCanceled: subscriptionsToCancel.size === 0,
         message:
           'Your subscription has been canceled immediately. Your account is now on the Free Plan.',
-        stripe_status:
-          canceled?.status ||
-          'canceled',
+        stripe_status: 'canceled',
         subscription_id:
           subscriptionId,
         user: updatedProfile,

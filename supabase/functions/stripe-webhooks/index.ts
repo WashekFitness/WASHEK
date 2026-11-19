@@ -344,6 +344,7 @@ function jsonResponse(
 async function findUserIdByEmail(email: string | null | undefined): Promise<string | null> {
   if (!email || typeof email !== 'string' || !email.trim()) return null;
   const cleanEmail = email.trim().toLowerCase();
+
   try {
     const { data: profileByEmail, error: profErr } = await supabase
       .from('profiles')
@@ -354,16 +355,34 @@ async function findUserIdByEmail(email: string | null | undefined): Promise<stri
       return profileByEmail.id;
     }
   } catch {
-    // fall through to auth admin
+    // fall through
   }
 
   try {
-    const { data: authData, error: authErr } = await supabase.auth.admin.listUsers();
-    if (!authErr && authData?.users) {
-      const found = authData.users.find(u => u.email && u.email.toLowerCase().trim() === cleanEmail);
+    const { data: rpcUserId, error: rpcErr } = await supabase.rpc('get_user_id_by_email', {
+      p_email: cleanEmail,
+    });
+    if (!rpcErr && typeof rpcUserId === 'string' && rpcUserId.trim()) {
+      return rpcUserId.trim();
+    }
+  } catch {
+    // fall through to auth.admin pagination
+  }
+
+  try {
+    for (let page = 1; page <= 10; page++) {
+      const { data: authData, error: authErr } = await supabase.auth.admin.listUsers({
+        page,
+        perPage: 1000,
+      });
+      if (authErr || !authData?.users || authData.users.length === 0) break;
+      const found = authData.users.find(
+        (u) => u.email && u.email.toLowerCase().trim() === cleanEmail
+      );
       if (found?.id) {
         return found.id;
       }
+      if (authData.users.length < 1000) break;
     }
   } catch {
     // ignore auth admin lookup error
@@ -491,6 +510,15 @@ function getSubscriptionPlan(
   if (unitAmount === 1799) return 'performance';
   if (unitAmount === 3499) return 'elite';
 
+  const productObj = priceItem?.product;
+  const productName =
+    typeof productObj === 'object' && productObj && 'name' in productObj
+      ? String((productObj as any).name || '').toLowerCase()
+      : '';
+  if (productName.includes('elite')) return 'elite';
+  if (productName.includes('performance')) return 'performance';
+  if (productName.includes('progress')) return 'progress';
+
   return null;
 }
 
@@ -588,25 +616,30 @@ async function syncSubscriptionToProfile(
    * recovery (clear the deadline).
    */
 
+  let priorProfile: any = null;
   const {
-    data: priorProfile,
-    error: priorProfileError,
-  } =
-    await supabase
-      .from('profiles')
-      .select(
-        'subscription_status, subscription_grace_until'
-      )
-      .eq(
-        'id',
-        userId
-      )
-      .maybeSingle();
+    data: priorWithGrace,
+    error: priorGraceError,
+  } = await supabase
+    .from('profiles')
+    .select('subscription_status, subscription_grace_until')
+    .eq('id', userId)
+    .maybeSingle();
 
-  if (priorProfileError) {
-    throw new Error(
-      `Failed to load existing profile before sync: ${priorProfileError.message}`
-    );
+  if (!priorGraceError) {
+    priorProfile = priorWithGrace;
+  } else {
+    const { data: priorBasic, error: priorBasicError } = await supabase
+      .from('profiles')
+      .select('subscription_status')
+      .eq('id', userId)
+      .maybeSingle();
+    if (priorBasicError) {
+      throw new Error(
+        `Failed to load existing profile before sync: ${priorBasicError.message}`
+      );
+    }
+    priorProfile = priorBasic;
   }
 
   const previousStatus =
@@ -639,45 +672,70 @@ async function syncSubscriptionToProfile(
     })
   );
 
-  const {
-    data,
-    error,
-  } =
-    await supabase
+  const nowIso = new Date().toISOString();
+
+  // Clear conflicting unique index holders on other profile rows before upsert
+  if (subscription.id) {
+    try {
+      await supabase
+        .from('profiles')
+        .update({ stripe_subscription_id: null, updated_at: nowIso })
+        .eq('stripe_subscription_id', subscription.id)
+        .neq('id', userId);
+    } catch {
+      // ignore unique index release note
+    }
+  }
+  if (customerId) {
+    try {
+      await supabase
+        .from('profiles')
+        .update({ stripe_customer_id: null, updated_at: nowIso })
+        .eq('stripe_customer_id', customerId)
+        .neq('id', userId);
+    } catch {
+      // ignore unique index release note
+    }
+  }
+
+  const corePayload = {
+    subscription_plan: profilePlan,
+    subscription_status: status,
+    stripe_subscription_id: subscription.id,
+    stripe_customer_id: customerId,
+    stripe_price_id: priceId,
+    updated_at: nowIso,
+  };
+
+  const fullPayload = {
+    ...corePayload,
+    subscription_grace_until: graceUntil,
+    subscription_updated_at: nowIso,
+    ...(entitled
+      ? { has_used_trial: true, trial_used: true, subscription_cancelled_at: null }
+      : status === 'canceled' || status === 'incomplete_expired'
+        ? { subscription_cancelled_at: nowIso }
+        : {}),
+  };
+
+  let { data, error } = await supabase
+    .from('profiles')
+    .upsert({ id: userId, ...fullPayload }, { onConflict: 'id' })
+    .select('id, subscription_plan, subscription_status, stripe_subscription_id, stripe_customer_id, stripe_price_id')
+    .maybeSingle();
+
+  if (
+    error &&
+    (error.code === '42703' || /column .* does not exist/i.test(String(error.message || '')))
+  ) {
+    const fallbackRes = await supabase
       .from('profiles')
-      .update({
-        subscription_plan:
-          profilePlan,
-
-        subscription_status:
-          status,
-
-        stripe_subscription_id:
-          subscription.id,
-
-        stripe_customer_id:
-          customerId,
-
-        stripe_price_id:
-          priceId,
-
-        subscription_grace_until:
-          graceUntil,
-
-        subscription_updated_at:
-          new Date().toISOString(),
-
-        updated_at:
-          new Date().toISOString(),
-      })
-      .eq(
-        'id',
-        userId
-      )
-      .select(
-        'id, subscription_plan, subscription_status, stripe_subscription_id, stripe_customer_id, stripe_price_id, subscription_grace_until'
-      )
+      .upsert({ id: userId, ...corePayload }, { onConflict: 'id' })
+      .select('id, subscription_plan, subscription_status, stripe_subscription_id, stripe_customer_id, stripe_price_id')
       .maybeSingle();
+    data = fallbackRes.data;
+    error = fallbackRes.error;
+  }
 
   if (error) {
     throw new Error(
@@ -685,15 +743,9 @@ async function syncSubscriptionToProfile(
     );
   }
 
-  if (!data) {
-    throw new Error(
-      `Washek profile ${userId} was not found`
-    );
-  }
-
   console.log(
     '[WASHEK SYNC] Profile successfully updated:',
-    JSON.stringify(data)
+    JSON.stringify(data || { id: userId, ...corePayload })
   );
 
   /*
@@ -932,7 +984,8 @@ async function handleCheckoutCompleted(
 
   const newSubscription =
     await stripe.subscriptions.retrieve(
-      subscriptionId
+      subscriptionId,
+      { expand: ['items.data.price.product'] }
     );
 
   const sessionUserId =
@@ -952,6 +1005,24 @@ async function handleCheckoutCompleted(
     sessionUserId;
 
   if (!userId) {
+    const customerId =
+      typeof session.customer === 'string'
+        ? session.customer
+        : (session.customer as any)?.id || null;
+
+    if (customerId) {
+      const { data: profileByCust } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('stripe_customer_id', customerId)
+        .maybeSingle();
+      if (profileByCust?.id) {
+        userId = profileByCust.id;
+      }
+    }
+  }
+
+  if (!userId) {
     const customerEmail =
       session.customer_details?.email ||
       (typeof session.customer_email === 'string' ? session.customer_email : null);
@@ -961,9 +1032,26 @@ async function handleCheckoutCompleted(
     }
   }
 
+  if (!userId && session.customer) {
+    try {
+      const custId =
+        typeof session.customer === 'string'
+          ? session.customer
+          : (session.customer as any)?.id;
+      if (custId) {
+        const cust = await stripe.customers.retrieve(custId);
+        if (cust && !(cust as any).deleted && (cust as any).email) {
+          userId = await findUserIdByEmail((cust as any).email);
+        }
+      }
+    } catch {
+      // ignore customer retrieve fallback note
+    }
+  }
+
   if (!userId) {
     throw new Error(
-      `New subscription ${subscriptionId} is missing metadata.user_id or client_reference_id`
+      `New subscription ${subscriptionId} is missing metadata.user_id, client_reference_id, and matching account email`
     );
   }
 
@@ -1115,7 +1203,8 @@ async function handleSubscriptionEvent(
 
   const subscription =
     await stripe.subscriptions.retrieve(
-      subscriptionId
+      subscriptionId,
+      { expand: ['items.data.price.product'] }
     );
 
   let userId =
@@ -1196,15 +1285,20 @@ async function handleSubscriptionEvent(
     return;
   }
 
-  // Backfill metadata onto Stripe subscription so future events contain metadata.user_id
+  // Backfill metadata onto Stripe subscription only when missing/mismatched
   try {
-    const plan = getSubscriptionPlan(subscription) || 'progress';
-    await stripe.subscriptions.update(subscriptionId, {
-      metadata: {
-        user_id: userId,
-        plan,
-      },
-    });
+    const resolvedPlan = getSubscriptionPlan(subscription) || 'progress';
+    if (
+      subscription.metadata?.user_id !== userId ||
+      subscription.metadata?.plan !== resolvedPlan
+    ) {
+      await stripe.subscriptions.update(subscriptionId, {
+        metadata: {
+          user_id: userId,
+          plan: resolvedPlan,
+        },
+      });
+    }
   } catch (updErr) {
     console.warn('[WASHEK WEBHOOK] Subscription metadata backfill note:', updErr);
   }
@@ -1239,6 +1333,31 @@ async function handleSubscriptionEvent(
     return;
   }
 
+  // Even if stripe_subscription_id matched or was unset, check Stripe customer for a newer active/trialing subscription before downgrading
+  if (event.type === 'customer.subscription.deleted' && customerId) {
+    try {
+      const custSubs = await stripe.subscriptions.list({
+        customer: customerId,
+        status: 'all',
+        limit: 10,
+        expand: ['data.items.data.price.product'],
+      });
+      const newerEntitled = (custSubs?.data || []).find(
+        (s) => s.id !== subscriptionId && PAID_STATUSES.has(String(s.status || '').toLowerCase().trim())
+      );
+      if (newerEntitled) {
+        console.log(
+          '[WASHEK REPLACEMENT] Found newer active subscription on customer; syncing instead of downgrading:',
+          JSON.stringify({ userId, deletedSubscriptionId: subscriptionId, newerSubscriptionId: newerEntitled.id })
+        );
+        await syncSubscriptionToProfile(newerEntitled, userId);
+        return;
+      }
+    } catch (custCheckErr) {
+      console.warn('[WASHEK WEBHOOK] Customer replacement check note:', custCheckErr);
+    }
+  }
+
   /*
    * For created/updated events, a new replacement subscription
    * is allowed to become the current subscription.
@@ -1261,13 +1380,19 @@ async function handleInvoiceEvent(
 ) {
   const invoice =
     event.data
-      .object as Stripe.Invoice;
+      .object as any;
+
+  const rawSub =
+    invoice.subscription ||
+    invoice.parent?.subscription_details?.subscription ||
+    invoice.lines?.data?.[0]?.subscription ||
+    null;
 
   const subscriptionId =
-    typeof invoice.subscription ===
+    typeof rawSub ===
     'string'
-      ? invoice.subscription
-      : invoice.subscription?.id ||
+      ? rawSub
+      : rawSub?.id ||
         null;
 
   if (!subscriptionId) {
@@ -1299,32 +1424,64 @@ async function handleInvoiceEvent(
 async function claimWebhookEvent(
   event: Stripe.Event
 ) {
-  const {
-    data,
-    error,
-  } =
-    await supabase.rpc(
-      'claim_stripe_webhook_event',
-      {
-        p_event_id:
-          event.id,
+  try {
+    const {
+      data,
+      error,
+    } =
+      await supabase.rpc(
+        'claim_stripe_webhook_event',
+        {
+          p_event_id:
+            event.id,
 
-        p_event_type:
-          event.type,
+          p_event_type:
+            event.type,
 
-        p_event_created:
-          event.created,
-      }
+          p_event_created:
+            event.created,
+        }
+      );
+
+    if (!error) {
+      return data === true;
+    }
+
+    console.warn(
+      '[WASHEK WEBHOOK] claim_stripe_webhook_event RPC fallback:',
+      error.message
     );
-
-  if (error) {
-    throw new Error(
-      `Failed to claim webhook event: ${error.message}`
-    );
+  } catch (rpcErr) {
+    console.warn('[WASHEK WEBHOOK] Idempotency RPC note:', rpcErr);
   }
 
-  return data ===
-    true;
+  try {
+    const { data: existing } = await supabase
+      .from('stripe_webhook_events')
+      .select('event_id, status')
+      .eq('event_id', event.id)
+      .maybeSingle();
+
+    if (existing?.status === 'succeeded') {
+      return false;
+    }
+
+    await supabase
+      .from('stripe_webhook_events')
+      .upsert(
+        {
+          event_id: event.id,
+          event_type: event.type,
+          event_created: event.created,
+          status: 'processing',
+        },
+        { onConflict: 'event_id' }
+      );
+  } catch (fallbackErr) {
+    console.warn('[WASHEK WEBHOOK] Table idempotency fallback skipped:', fallbackErr);
+  }
+
+  return true;
 }
 
 /*
@@ -1566,6 +1723,7 @@ Deno.serve(
          */
 
         case 'invoice.paid':
+        case 'invoice.payment_succeeded':
         case 'invoice.payment_failed':
         case 'invoice.finalization_failed': {
           await handleInvoiceEvent(

@@ -10,6 +10,7 @@ import {
   getTierByKey,
   getTierKey,
 } from '@/lib/stripeTiers';
+import { setRedirectUpgradeReceipt, normalizePlan, isActiveSubscriptionStatus } from '@/lib/subscription';
 
 function makeAuthExpiredError(message = 'Your login session has expired. Please sign in again to upgrade.') {
   const err = new Error(message);
@@ -345,57 +346,44 @@ function looksLikeAuthFailure(msg) {
   );
 }
 
-function navigateToStripeUrl(checkoutUrl, preOpenedWin = null) {
-  if (preOpenedWin && !preOpenedWin.closed) {
-    try {
-      preOpenedWin.location.href = checkoutUrl;
-      preOpenedWin.focus();
-      return;
-    } catch {
-      // fallback if preOpenedWin was closed or cross-origin restricted
-    }
-  }
+function navigateToStripeUrl(checkoutUrl) {
   try {
-    const newWindow = window.open(checkoutUrl, '_blank');
-    if (newWindow) {
-      newWindow.focus();
-      return;
+    if (typeof window !== 'undefined' && window.top && window.top !== window.self) {
+      try {
+        window.top.location.href = checkoutUrl;
+        return;
+      } catch {
+        // Cross-origin iframe: try _top anchor before same-window assign
+        try {
+          const a = document.createElement('a');
+          a.href = checkoutUrl;
+          a.target = '_top';
+          a.rel = 'noopener noreferrer';
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          return;
+        } catch {
+          // fall through
+        }
+      }
     }
   } catch {
-    // popup blocker fallback
+    // fall through
   }
-  // Anchor tag click fallback to ALWAYS open a new tab and NEVER navigate away from the app
-  try {
-    const a = document.createElement('a');
-    a.href = checkoutUrl;
-    a.target = '_blank';
-    a.rel = 'noopener noreferrer';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  } catch {
-    // ignore
-  }
+
+  window.location.assign(checkoutUrl);
 }
 
 /**
- * Starts Stripe Checkout for the selected tier cleanly for any signed-in user.
+ * Starts Stripe Checkout in the same browser tab for any signed-in user.
  * Never prompts for re-verification or extra sign-in when the athlete is already logged in.
  */
 export async function startStripeCheckout({
   planKey,
   email = '',
   userId = '',
-  preOpenedWindow = null,
 }) {
-  let preOpenedWin = preOpenedWindow;
-  if (!preOpenedWin) {
-    try {
-      preOpenedWin = window.open('about:blank', '_blank');
-    } catch {
-      // ignore
-    }
-  }
   const cleanPlanKey = getTierKey(planKey);
   const tier = getTierByKey(cleanPlanKey);
   if (!tier) {
@@ -555,19 +543,74 @@ export async function startStripeCheckout({
     throw new Error('Stripe did not return a checkout URL.');
   }
 
+  const srvTok = (() => {
+    try {
+      return localStorage.getItem('washek_srv_session') || '';
+    } catch {
+      return '';
+    }
+  })();
+
   try {
+    const startedAt = String(Date.now());
     sessionStorage.setItem('washek_pending_checkout_plan', cleanPlanKey);
+    sessionStorage.setItem('washek_pending_checkout_started_at', startedAt);
     localStorage.setItem('washek_pending_checkout_plan', cleanPlanKey);
+    localStorage.setItem('washek_pending_checkout_started_at', startedAt);
     if (data.session_id) {
       sessionStorage.setItem('washek_pending_checkout_session_id', data.session_id);
       localStorage.setItem('washek_pending_checkout_session_id', data.session_id);
+    } else {
+      sessionStorage.removeItem('washek_pending_checkout_session_id');
+      localStorage.removeItem('washek_pending_checkout_session_id');
     }
     document.cookie = `washek_pending_checkout_plan=${cleanPlanKey}; path=/; max-age=86400; SameSite=Lax`;
   } catch {
     // ignore storage errors
   }
 
-  navigateToStripeUrl(data.url, preOpenedWin);
+  // Persist pending checkout server-side so cross-partition iframe -> top-level redirects never lose the plan or user identity
+  try {
+    const hasUsedTrialLocal = Boolean(
+      storedUser?.has_used_trial ||
+        storedUser?.trial_used ||
+        localStorage.getItem('washek_has_used_trial') === 'true'
+    );
+    const pendingRefreshTok =
+      session?.refresh_token ||
+      (() => {
+        try {
+          return localStorage.getItem('washek_refresh_token') || '';
+        } catch {
+          return '';
+        }
+      })();
+    await Promise.race([
+      fetch('/api/checkout/pending', {
+        method: 'POST',
+        credentials: 'include',
+        keepalive: true,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
+        },
+        body: JSON.stringify({
+          plan: cleanPlanKey,
+          userId: effectiveUserId || undefined,
+          email: effectiveEmail || undefined,
+          sessionId: data.session_id || null,
+          trial: !hasUsedTrialLocal,
+          serverSessionToken: srvTok || undefined,
+          refreshToken: pendingRefreshTok || undefined,
+        }),
+      }),
+      new Promise((resolve) => window.setTimeout(resolve, 900)),
+    ]);
+  } catch {
+    // non-fatal
+  }
+
+  navigateToStripeUrl(data.url);
 
   return {
     action: 'checkout',
@@ -576,3 +619,244 @@ export async function startStripeCheckout({
     sessionId: data.session_id || null,
   };
 }
+
+/**
+ * Reconciles the signed-in user's Stripe Customer & active/trialing Subscription directly with Supabase.
+ * Safe against abandoned checkouts: only unlocks when Stripe confirms an active/trialing subscription
+ * or a completed paid/no_payment_required Checkout Session on that customer.
+ */
+export async function syncStripeSubscription({ planKey = '' } = {}) {
+  const hintedPlan = planKey ? getTierKey(planKey) : '';
+  let session = null;
+  try {
+    session = await resolveValidSupabaseSession(false);
+  } catch {
+    session = null;
+  }
+
+  const storedUser = getStoredUserObject();
+  const effectiveEmail = String(session?.user?.email || storedUser?.email || '').trim().toLowerCase();
+  const effectiveUserId = String(session?.user?.id || storedUser?.id || storedUser?.uid || '').trim();
+
+  if (session?.access_token && !isNonJwtToken(session.access_token)) {
+    const invokeSync = (activeSession) =>
+      supabase.functions.invoke('create-checkout-session', {
+        body: {
+          action: 'sync_subscription',
+          ...(hintedPlan ? { plan: hintedPlan } : {}),
+        },
+        headers: {
+          Authorization: `Bearer ${activeSession.access_token}`,
+        },
+      });
+
+    try {
+      let { data, error } = await invokeSync(session);
+      const detailedMessage = error ? await extractInvokeErrorMessage(error) : '';
+
+      if (
+        (error && (looksLikeAuthFailure(error.message) || looksLikeAuthFailure(detailedMessage))) ||
+        (data?.success === false && looksLikeAuthFailure(data?.error))
+      ) {
+        const refreshed = await resolveValidSupabaseSession(true).catch(() => null);
+        if (refreshed?.access_token && !isNonJwtToken(refreshed.access_token)) {
+          session = refreshed;
+          ({ data, error } = await invokeSync(session));
+        }
+      }
+
+      if (!error && data?.verified) {
+        return {
+          verified: true,
+          dbSynced: Boolean(data?.db_synced ?? true),
+          plan: data.plan,
+          status: data.status || 'active',
+          customerFound: Boolean(data.customer_found ?? true),
+          customerId: data.customer_id || null,
+          subscriptionId: data.subscription_id || null,
+        };
+      }
+
+      if (!error && data && data.verified === false) {
+        return {
+          verified: false,
+          customerFound: Boolean(data.customer_found),
+          reason: data.reason || '',
+        };
+      }
+    } catch {
+      // fall through to Express fallback
+    }
+  }
+
+  try {
+    const bearerToken = session?.access_token || localStorage.getItem('washek_auth_token') || '';
+    const srvTok = localStorage.getItem('washek_srv_session') || '';
+    const res = await fetch('/api/stripe/verify-session', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
+        ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
+      },
+      body: JSON.stringify({
+        plan: hintedPlan || undefined,
+        userId: effectiveUserId || undefined,
+        email: effectiveEmail || undefined,
+      }),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok && data?.verified) {
+      return {
+        verified: true,
+        dbSynced: Boolean(data?.dbSynced),
+        plan: data.plan,
+        status: data.status || 'active',
+        customerFound: true,
+      };
+    }
+  } catch {
+    // ignore fallback error
+  }
+
+  return {
+    verified: false,
+    dbSynced: false,
+    customerFound: false,
+    reason: 'Could not confirm an active Stripe subscription or trial yet.',
+  };
+}
+
+let inFlightEntitlementPromise = null;
+let lastEntitlementResult = null;
+let lastEntitlementFetchedAt = 0;
+const ENTITLEMENT_TTL_MS = 3000;
+
+export function invalidateServerEntitlementCache() {
+  lastEntitlementResult = null;
+  lastEntitlementFetchedAt = 0;
+}
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('washek_subscription_updated', invalidateServerEntitlementCache);
+}
+
+export async function clearPendingCheckoutOnServer(userId = '', email = '') {
+  try {
+    const storedUser = getStoredUserObject();
+    const uid = String(userId || storedUser?.id || storedUser?.uid || '').trim();
+    const cleanEmail = String(email || storedUser?.email || '').trim().toLowerCase();
+    await fetch('/api/checkout/pending/clear', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        userId: uid || undefined,
+        email: cleanEmail || undefined,
+      }),
+    });
+  } catch {
+    // non-fatal cleanup error
+  }
+}
+
+/**
+ * Queries Express server for a confirmed redirect subscription entitlement so
+ * Chrome-partitioned iframes stay seamlessly synced with top-level /subscription-return completions.
+ */
+export async function fetchServerEntitlement({ userId = '', email = '', cancelledAtIso = null } = {}) {
+  const storedUser = getStoredUserObject();
+  const uid = String(userId || storedUser?.id || storedUser?.uid || '').trim();
+  const cleanEmail = String(email || storedUser?.email || '').trim().toLowerCase();
+  if (!uid && !cleanEmail) {
+    return { active: false, plan: 'free', status: 'inactive' };
+  }
+
+  const checkNotSupersededByCancel = (entTimestamp) => {
+    const ts = Number(entTimestamp || 0);
+    let localCancelMs = 0;
+    try {
+      const localIso = localStorage.getItem('washek_subscription_cancelled_at');
+      if (localIso) localCancelMs = Date.parse(localIso) || 0;
+    } catch {
+      // ignore
+    }
+    const dbCancelMs = cancelledAtIso ? Date.parse(String(cancelledAtIso)) || 0 : 0;
+    if ((localCancelMs && ts && localCancelMs > ts) || (dbCancelMs && ts && dbCancelMs > ts)) {
+      return false;
+    }
+    return true;
+  };
+
+  if (lastEntitlementResult && Date.now() - lastEntitlementFetchedAt < ENTITLEMENT_TTL_MS) {
+    if (lastEntitlementResult.active && !checkNotSupersededByCancel(lastEntitlementResult.timestamp)) {
+      return { active: false, plan: 'free', status: 'canceled' };
+    }
+    return lastEntitlementResult;
+  }
+
+  if (inFlightEntitlementPromise) {
+    return inFlightEntitlementPromise;
+  }
+
+  inFlightEntitlementPromise = (async () => {
+    try {
+      const srvTok = (() => {
+        try {
+          return localStorage.getItem('washek_srv_session') || '';
+        } catch {
+          return '';
+        }
+      })();
+      const params = new URLSearchParams();
+      if (uid) params.set('userId', uid);
+      if (cleanEmail) params.set('email', cleanEmail);
+      if (cancelledAtIso) params.set('cancelledAt', String(cancelledAtIso));
+
+      const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const timerId = controller ? window.setTimeout(() => controller.abort(), 1600) : null;
+      const res = await fetch(`/api/stripe/entitlement?${params.toString()}`, {
+        method: 'GET',
+        credentials: 'include',
+        headers: {
+          ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
+        },
+        ...(controller ? { signal: controller.signal } : {}),
+      });
+      if (timerId) window.clearTimeout(timerId);
+      const data = await res.json().catch(() => null);
+      if (res.ok && data?.active) {
+        const plan = normalizePlan(data.plan);
+        const status = String(data.status || 'trialing').toLowerCase().trim();
+        const ts = Number(data.timestamp || Date.now());
+        if (plan !== 'free' && isActiveSubscriptionStatus(status) && checkNotSupersededByCancel(ts)) {
+          setRedirectUpgradeReceipt(plan, status, {
+            verifiedBy: data.verifiedBy || 'stripe_redirect',
+          });
+          const result = {
+            active: true,
+            plan,
+            status,
+            timestamp: ts,
+            verifiedBy: data.verifiedBy || 'stripe_redirect',
+          };
+          lastEntitlementResult = result;
+          lastEntitlementFetchedAt = Date.now();
+          return result;
+        }
+      }
+      const fallback = { active: false, plan: 'free', status: 'inactive' };
+      lastEntitlementResult = fallback;
+      lastEntitlementFetchedAt = Date.now();
+      return fallback;
+    } catch {
+      return { active: false, plan: 'free', status: 'inactive' };
+    } finally {
+      inFlightEntitlementPromise = null;
+    }
+  })();
+
+  return inFlightEntitlementPromise;
+}
+

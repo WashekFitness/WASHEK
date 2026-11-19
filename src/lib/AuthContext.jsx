@@ -24,7 +24,10 @@ import {
   enforceUserSubscriptionState,
   isActiveSubscriptionStatus,
   normalizePlan,
+  getRedirectUpgradeReceipt,
+  applySubscriptionUpgrade,
 } from '@/lib/subscription';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 
 const AuthContext = createContext(null);
 
@@ -33,7 +36,7 @@ export const AuthProvider = ({ children }) => {
     try {
       const saved = localStorage.getItem('washek_user');
       if (!saved) return null;
-      const parsed = enforceUserSubscriptionState(JSON.parse(saved));
+      let parsed = enforceUserSubscriptionState(JSON.parse(saved));
       let modified = false;
       if (parsed && isLogo(parsed.avatar_url)) {
         parsed.avatar_url = null;
@@ -41,12 +44,25 @@ export const AuthProvider = ({ children }) => {
         modified = true;
       }
       if (parsed && !isActiveSubscriptionStatus(parsed.subscription_status)) {
-        try {
-          localStorage.removeItem('washek_subscription_plan');
-        } catch (_err) {
-          // ignore
+        const receipt = getRedirectUpgradeReceipt(parsed);
+        if (receipt) {
+          parsed = {
+            ...parsed,
+            subscription_plan: receipt.plan,
+            subscription_status: receipt.status,
+            plan: receipt.plan,
+            tier: receipt.plan,
+            subscription_tier: receipt.plan,
+          };
+          modified = true;
+        } else {
+          try {
+            localStorage.removeItem('washek_subscription_plan');
+          } catch (_err) {
+            // ignore
+          }
+          modified = true;
         }
-        modified = true;
       }
       if (parsed && modified) {
         try {
@@ -285,14 +301,16 @@ export const AuthProvider = ({ children }) => {
     let mounted = true;
 
     // Initial check
-    loadSupabaseSessionUser().then((loaded) => {
+    loadSupabaseSessionUser().then(async (loaded) => {
       if (!mounted) return;
-      if (!loaded) {
+      let resolvedUser = loaded;
+      if (!resolvedUser) {
         const stored = localStorage.getItem('washek_user');
         if (stored) {
           try {
             const parsed = JSON.parse(stored);
             if (parsed?.email) {
+              resolvedUser = parsed;
               setUser(parsed);
               setIsAuthenticated(true);
 
@@ -319,8 +337,47 @@ export const AuthProvider = ({ children }) => {
           }
         }
       }
-      setAuthChecked(true);
-      setIsLoadingAuth(false);
+
+      // Cross-partition entitlement check when user is loaded on Free tier
+      if (
+        mounted &&
+        resolvedUser &&
+        (normalizePlan(resolvedUser.subscription_plan) === 'free' ||
+          !isActiveSubscriptionStatus(resolvedUser.subscription_status))
+      ) {
+        try {
+          const ent = await fetchServerEntitlement({
+            userId: resolvedUser.id,
+            email: resolvedUser.email,
+            cancelledAtIso: resolvedUser.subscription_cancelled_at || null,
+          });
+          if (mounted && ent?.active && ent.plan && ent.plan !== 'free') {
+            applySubscriptionUpgrade(ent.plan, ent.status, {
+              persistReceipt: true,
+              syncServer: false,
+            });
+            setUser((prev) =>
+              prev
+                ? {
+                    ...prev,
+                    subscription_plan: ent.plan,
+                    subscription_status: ent.status,
+                    tier: ent.plan,
+                    plan: ent.plan,
+                    subscription_tier: ent.plan,
+                  }
+                : prev
+            );
+          }
+        } catch {
+          // ignore server entitlement probe error
+        }
+      }
+
+      if (mounted) {
+        setAuthChecked(true);
+        setIsLoadingAuth(false);
+      }
     });
 
     const { data: supaListener } = supabase.auth.onAuthStateChange(
@@ -888,6 +945,10 @@ export const AuthProvider = ({ children }) => {
         localStorage.removeItem('washek_subscription_plan');
         localStorage.removeItem('washek_subscription_status');
         localStorage.removeItem('washek_recent_upgrade');
+        localStorage.removeItem('washek_redirect_upgrade_receipt');
+        localStorage.removeItem('washek_pending_checkout_plan');
+        localStorage.removeItem('washek_pending_checkout_session_id');
+        localStorage.removeItem('washek_pending_checkout_started_at');
       } catch (err) {
         console.debug('[AUTH] Storage cleanup error:', err);
       }

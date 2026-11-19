@@ -238,15 +238,35 @@ async function getProfile(userId: string) {
         'stripe_price_id',
         'has_used_trial',
         'trial_used',
+        'subscription_cancelled_at',
       ].join(','),
     )
     .eq('id', userId)
     .maybeSingle()
 
   if (error) {
-    throw new Error(
-      `Failed to load profile: ${error.message}`,
-    )
+    // Graceful fallback if optional trial columns are not yet present in profiles
+    const { data: baseData, error: baseError } = await supabaseAdmin
+      .from('profiles')
+      .select(
+        [
+          'subscription_plan',
+          'subscription_status',
+          'stripe_subscription_id',
+          'stripe_customer_id',
+          'stripe_price_id',
+        ].join(','),
+      )
+      .eq('id', userId)
+      .maybeSingle()
+
+    if (baseError) {
+      throw new Error(
+        `Failed to load profile: ${baseError.message}`,
+      )
+    }
+
+    return baseData
   }
 
   return data
@@ -364,7 +384,7 @@ async function createCheckoutSession(params: {
 
   body.set(
     'cancel_url',
-    `${baseUrl}/profile`,
+    `${baseUrl}/profile?checkout=canceled`,
   )
 
   body.set(
@@ -438,13 +458,502 @@ async function createCheckoutSession(params: {
    * Checkout will handle the payment collection itself.
    */
 
-  return await stripeRequest(
-    'checkout/sessions',
-    {
-      method: 'POST',
-      body,
-    },
+  body.set('payment_method_collection', 'always')
+
+  try {
+    return await stripeRequest(
+      'checkout/sessions',
+      {
+        method: 'POST',
+        body,
+      },
+    )
+  } catch (err: any) {
+    const errMsg = String(err?.message || '')
+    if (customerId && email && /no such customer/i.test(errMsg)) {
+      body.delete('customer')
+      body.set('customer_email', email)
+      return await stripeRequest(
+        'checkout/sessions',
+        {
+          method: 'POST',
+          body,
+        },
+      )
+    }
+    throw err
+  }
+}
+
+async function resolvePlanFromStripeObjects(
+  session: any,
+  subscription: any,
+  fallbackPlan?: string | null,
+): Promise<Plan | null> {
+  const metaPlan = String(
+    subscription?.metadata?.plan ||
+      session?.metadata?.plan ||
+      '',
   )
+    .toLowerCase()
+    .trim()
+  if (VALID_PLANS.has(metaPlan)) {
+    return metaPlan as Plan
+  }
+
+  const priceObj =
+    subscription?.items?.data?.[0]?.price ||
+    session?.line_items?.data?.[0]?.price ||
+    null
+  const priceId = typeof priceObj === 'string' ? priceObj : priceObj?.id
+  const fromId = getPlanFromPriceId(priceId)
+  if (fromId) return fromId
+
+  const unitAmount = priceObj?.unit_amount
+  if (unitAmount === 999) return 'progress'
+  if (unitAmount === 1799) return 'performance'
+  if (unitAmount === 3499) return 'elite'
+
+  let productObj = priceObj?.product
+  if (typeof productObj === 'string' && productObj.startsWith('prod_')) {
+    try {
+      productObj = await stripeRequest(`products/${encodeURIComponent(productObj)}`)
+    } catch {
+      productObj = null
+    }
+  }
+
+  const productMetaPlan = String(productObj?.metadata?.plan || '').toLowerCase().trim()
+  if (VALID_PLANS.has(productMetaPlan)) {
+    return productMetaPlan as Plan
+  }
+
+  const productName = String(
+    productObj?.name ||
+      priceObj?.nickname ||
+      priceObj?.lookup_key ||
+      '',
+  )
+    .toLowerCase()
+    .trim()
+  if (productName.includes('elite')) return 'elite'
+  if (productName.includes('performance')) return 'performance'
+  if (productName.includes('progress')) return 'progress'
+
+  const cleanFallback = String(fallbackPlan || '').toLowerCase().trim()
+  if (VALID_PLANS.has(cleanFallback)) {
+    return cleanFallback as Plan
+  }
+
+  return null
+}
+
+async function saveVerifiedProfileSubscription(params: {
+  userId: string
+  email?: string | null
+  plan: Plan
+  subStatus: string
+  customerId: string | null
+  subscriptionId: string | null
+  priceId: string | null
+}) {
+  const { userId, email, plan, subStatus, customerId, subscriptionId, priceId } = params
+  const now = new Date().toISOString()
+
+  // Clear conflicting unique index holders on other profile rows before upsert
+  if (subscriptionId) {
+    try {
+      await supabaseAdmin
+        .from('profiles')
+        .update({ stripe_subscription_id: null, updated_at: now })
+        .eq('stripe_subscription_id', subscriptionId)
+        .neq('id', userId)
+    } catch {
+      // ignore unique index release fallback
+    }
+  }
+  if (customerId) {
+    try {
+      await supabaseAdmin
+        .from('profiles')
+        .update({ stripe_customer_id: null, updated_at: now })
+        .eq('stripe_customer_id', customerId)
+        .neq('id', userId)
+    } catch {
+      // ignore unique index release fallback
+    }
+  }
+
+  const baseUpdate: Record<string, unknown> = {
+    subscription_plan: plan,
+    subscription_status: subStatus,
+    stripe_customer_id: customerId,
+    stripe_subscription_id: subscriptionId,
+    stripe_price_id: priceId,
+    updated_at: now,
+  }
+
+  const fullUpdate: Record<string, unknown> = {
+    ...baseUpdate,
+    ...(email ? { email: String(email).toLowerCase().trim() } : {}),
+    has_used_trial: true,
+    trial_used: true,
+    subscription_grace_until: null,
+    subscription_cancelled_at: null,
+    subscription_updated_at: now,
+  }
+
+  let { error: upErr } = await supabaseAdmin
+    .from('profiles')
+    .upsert({ id: userId, ...fullUpdate }, { onConflict: 'id' })
+
+  if (upErr && (upErr.code === '42703' || /column .* does not exist/i.test(upErr.message || ''))) {
+    const retry = await supabaseAdmin
+      .from('profiles')
+      .upsert({ id: userId, ...baseUpdate }, { onConflict: 'id' })
+    upErr = retry.error
+  }
+
+  if (upErr) {
+    throw new Error(`Failed to save verified subscription: ${upErr.message}`)
+  }
+}
+
+async function syncProfileFromCheckoutSession(
+  userId: string | null,
+  email: string | undefined,
+  sessionId: string,
+  hintedPlan?: string | null,
+) {
+  const session = await stripeRequest(
+    `checkout/sessions/${encodeURIComponent(sessionId)}?expand[]=subscription&expand[]=line_items`,
+  )
+
+  const sessionUid =
+    (typeof session?.client_reference_id === 'string' && session.client_reference_id.trim()) ||
+    (typeof session?.metadata?.user_id === 'string' && session.metadata.user_id.trim()) ||
+    ''
+  const sessionEmail = String(
+    session?.customer_details?.email || session?.customer_email || '',
+  )
+    .toLowerCase()
+    .trim()
+  const userEmail = String(email || '').toLowerCase().trim()
+
+  if (userId && sessionUid && sessionUid !== userId) {
+    throw new Error('Checkout session does not belong to this Washek account.')
+  }
+
+  let targetUid = userId || sessionUid || ''
+  if (!targetUid && (sessionEmail || userEmail)) {
+    const lookupEmail = sessionEmail || userEmail
+    const { data: profByEmail } = await supabaseAdmin
+      .from('profiles')
+      .select('id')
+      .ilike('email', lookupEmail)
+      .maybeSingle()
+    if (profByEmail?.id) {
+      targetUid = profByEmail.id
+    }
+  }
+
+  if (!targetUid) {
+    throw new Error('Could not match Checkout Session to a Washek profile.')
+  }
+
+  const paymentStatus = String(session?.payment_status || '').toLowerCase().trim()
+  const paymentConfirmed =
+    paymentStatus === 'paid' || paymentStatus === 'no_payment_required'
+
+  const subObj =
+    typeof session?.subscription === 'object' && session?.subscription
+      ? session.subscription
+      : typeof session?.subscription === 'string'
+        ? await stripeRequest(
+            `subscriptions/${encodeURIComponent(session.subscription)}?expand[]=items.data.price.product`,
+          )
+        : null
+
+  const subStatus = String(
+    subObj?.status || (paymentConfirmed ? 'active' : 'incomplete'),
+  )
+    .toLowerCase()
+    .trim()
+  const isEntitledStatus =
+    subStatus === 'active' ||
+    subStatus === 'trialing' ||
+    subStatus === 'past_due'
+
+  const resolvedPlan = await resolvePlanFromStripeObjects(
+    session,
+    subObj,
+    hintedPlan,
+  )
+
+  if (!paymentConfirmed || !isEntitledStatus || !resolvedPlan) {
+    return {
+      verified: false,
+      db_synced: false,
+      payment_status: paymentStatus,
+      subscription_status: subStatus,
+      plan: resolvedPlan,
+    }
+  }
+
+  const customerId =
+    typeof session?.customer === 'string'
+      ? session.customer
+      : session?.customer?.id || null
+  const subscriptionId = subObj?.id || (typeof session?.subscription === 'string' ? session.subscription : null)
+  const priceId = subObj?.items?.data?.[0]?.price?.id || session?.line_items?.data?.[0]?.price?.id || null
+
+  await saveVerifiedProfileSubscription({
+    userId: targetUid,
+    email: userEmail || sessionEmail || null,
+    plan: resolvedPlan,
+    subStatus,
+    customerId,
+    subscriptionId,
+    priceId,
+  })
+
+  const oldSubId = String(
+    session?.metadata?.old_subscription_id || subObj?.metadata?.old_subscription_id || '',
+  ).trim()
+  if (oldSubId && oldSubId !== subscriptionId) {
+    try {
+      await stripeRequest(`subscriptions/${encodeURIComponent(oldSubId)}`, {
+        method: 'DELETE',
+      })
+    } catch {
+      // ignore if already canceled
+    }
+  }
+
+  return {
+    verified: true,
+    db_synced: true,
+    plan: resolvedPlan,
+    status: subStatus,
+    subscription_id: subscriptionId,
+    customer_id: customerId,
+  }
+}
+
+async function syncUserSubscriptionFromStripe(
+  userId: string,
+  email: string | undefined,
+  hintedPlan?: string | null,
+) {
+  const profile = await getProfile(userId)
+  const cleanEmail = String(email || '').toLowerCase().trim()
+  const rawEmail = String(email || '').trim()
+  const cancelledAtMs = profile?.subscription_cancelled_at
+    ? Date.parse(String(profile.subscription_cancelled_at)) || 0
+    : 0
+  const isCreatedAfterCancellation = (createdEpochSeconds: unknown) => {
+    if (!cancelledAtMs) return true
+    const createdMs = Number(createdEpochSeconds || 0) * 1000
+    return createdMs > cancelledAtMs
+  }
+
+  const candidateCustomerIds = new Set<string>()
+  if (profile?.stripe_customer_id && String(profile.stripe_customer_id).startsWith('cus_')) {
+    candidateCustomerIds.add(String(profile.stripe_customer_id).trim())
+  }
+
+  const entitledSubscriptions: any[] = []
+
+  if (profile?.stripe_subscription_id && String(profile.stripe_subscription_id).startsWith('sub_')) {
+    try {
+      const directSub = await stripeRequest(
+        `subscriptions/${encodeURIComponent(profile.stripe_subscription_id)}?expand[]=items.data.price.product`,
+      )
+      const directCustId =
+        typeof directSub?.customer === 'string' ? directSub.customer : directSub?.customer?.id
+      if (directCustId) {
+        candidateCustomerIds.add(directCustId)
+      }
+      const st = String(directSub?.status || '').toLowerCase().trim()
+      if ((st === 'active' || st === 'trialing' || st === 'past_due') && isCreatedAfterCancellation(directSub?.created)) {
+        entitledSubscriptions.push(directSub)
+      }
+    } catch {
+      // ignore stale subscription lookup
+    }
+  }
+
+  if (cleanEmail) {
+    try {
+      const searchRes = await stripeRequest(
+        `customers/search?query=${encodeURIComponent(`email:"${cleanEmail}"`)}&limit=10`,
+      )
+      for (const cust of searchRes?.data || []) {
+        if (cust?.id && !cust.deleted) {
+          candidateCustomerIds.add(cust.id)
+        }
+      }
+    } catch {
+      // fall through to exact customers list lookup
+    }
+
+    for (const emailVariant of Array.from(new Set([cleanEmail, rawEmail].filter(Boolean)))) {
+      try {
+        const listRes = await stripeRequest(
+          `customers?email=${encodeURIComponent(emailVariant)}&limit=10`,
+        )
+        for (const cust of listRes?.data || []) {
+          if (cust?.id && !cust.deleted) {
+            candidateCustomerIds.add(cust.id)
+          }
+        }
+      } catch {
+        // ignore list failure
+      }
+    }
+  }
+
+  for (const custId of candidateCustomerIds) {
+    try {
+      const subsRes = await stripeRequest(
+        `subscriptions?customer=${encodeURIComponent(custId)}&status=all&limit=20&expand[]=data.items.data.price.product`,
+      )
+      for (const sub of subsRes?.data || []) {
+        const st = String(sub?.status || '').toLowerCase().trim()
+        if ((st === 'active' || st === 'trialing' || st === 'past_due') && isCreatedAfterCancellation(sub?.created)) {
+          entitledSubscriptions.push(sub)
+        }
+      }
+    } catch {
+      // ignore per-customer lookup failure
+    }
+  }
+
+  // Fallback: inspect recent Stripe Checkout Sessions for matching userId / client_reference_id / email
+  // (covers Payment Links where customer email might differ or webhook didn't run)
+  if (entitledSubscriptions.length === 0) {
+    try {
+      const sessionsRes = await stripeRequest('checkout/sessions?limit=30')
+      const matchingPaidSessions = (sessionsRes?.data || []).filter((s: any) => {
+        if (!isCreatedAfterCancellation(s?.created)) {
+          return false
+        }
+        const paymentStatus = String(s?.payment_status || '').toLowerCase().trim()
+        if (paymentStatus !== 'paid' && paymentStatus !== 'no_payment_required') {
+          return false
+        }
+        const sUid = String(s?.client_reference_id || s?.metadata?.user_id || '').trim()
+        const sEmail = String(s?.customer_details?.email || s?.customer_email || '')
+          .toLowerCase()
+          .trim()
+        const sCust = typeof s?.customer === 'string' ? s.customer : s?.customer?.id || ''
+        return (
+          (sUid && sUid === userId) ||
+          (cleanEmail && sEmail && sEmail === cleanEmail) ||
+          (sCust && candidateCustomerIds.has(sCust))
+        )
+      })
+
+      for (const s of matchingPaidSessions) {
+        if (s?.customer) {
+          const sCust = typeof s.customer === 'string' ? s.customer : s.customer?.id
+          if (sCust) candidateCustomerIds.add(sCust)
+        }
+        if (s?.subscription) {
+          const subId = typeof s.subscription === 'string' ? s.subscription : s.subscription?.id
+          if (subId) {
+            try {
+              const fetchedSub = await stripeRequest(
+                `subscriptions/${encodeURIComponent(subId)}?expand[]=items.data.price.product`,
+              )
+              const st = String(fetchedSub?.status || '').toLowerCase().trim()
+              if (
+                (st === 'active' || st === 'trialing' || st === 'past_due') &&
+                isCreatedAfterCancellation(fetchedSub?.created)
+              ) {
+                entitledSubscriptions.push(fetchedSub)
+              }
+            } catch {
+              // ignore missing subscription
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore checkout session scan failure
+    }
+  }
+
+  if (entitledSubscriptions.length > 0) {
+    const statusPriority: Record<string, number> = {
+      active: 3,
+      trialing: 2,
+      past_due: 1,
+    }
+    entitledSubscriptions.sort((a, b) => {
+      const prioDiff =
+        (statusPriority[String(b?.status || '').toLowerCase()] || 0) -
+        (statusPriority[String(a?.status || '').toLowerCase()] || 0)
+      if (prioDiff !== 0) return prioDiff
+      return Number(b?.created || 0) - Number(a?.created || 0)
+    })
+
+    const bestSub = entitledSubscriptions[0]
+    const subStatus = String(bestSub?.status || 'active').toLowerCase().trim()
+    const customerId =
+      typeof bestSub?.customer === 'string'
+        ? bestSub.customer
+        : bestSub?.customer?.id || Array.from(candidateCustomerIds)[0] || null
+    const priceId = bestSub?.items?.data?.[0]?.price?.id || null
+    const resolvedPlan =
+      (await resolvePlanFromStripeObjects(null, bestSub, hintedPlan)) || 'progress'
+
+    await saveVerifiedProfileSubscription({
+      userId,
+      email: cleanEmail || null,
+      plan: resolvedPlan,
+      subStatus,
+      customerId,
+      subscriptionId: bestSub.id,
+      priceId,
+    })
+
+    return {
+      verified: true,
+      db_synced: true,
+      customer_found: true,
+      plan: resolvedPlan,
+      status: subStatus,
+      subscription_id: bestSub.id,
+      customer_id: customerId,
+    }
+  }
+
+  // If Stripe customer exists (even if customer row was created before subscription finished), save stripe_customer_id
+  // without unlocking paid access unless an active/trialing subscription actually exists.
+  const firstCustomerId = Array.from(candidateCustomerIds)[0] || null
+  if (firstCustomerId && !profile?.stripe_customer_id) {
+    try {
+      await supabaseAdmin
+        .from('profiles')
+        .upsert(
+          { id: userId, stripe_customer_id: firstCustomerId, updated_at: new Date().toISOString() },
+          { onConflict: 'id' },
+        )
+    } catch {
+      // non-fatal
+    }
+  }
+
+  return {
+    verified: false,
+    customer_found: candidateCustomerIds.size > 0,
+    customer_id: firstCustomerId,
+    reason:
+      candidateCustomerIds.size > 0
+        ? 'Stripe customer exists, but no active or trialing subscription was found yet.'
+        : 'No Stripe customer found for this account yet.',
+  }
 }
 
 Deno.serve(async (req) => {
@@ -471,11 +980,65 @@ Deno.serve(async (req) => {
       )
     }
 
+    const requestBody =
+      await req.json().catch(() => null)
+
+    const action =
+      typeof requestBody?.action === 'string'
+        ? requestBody.action.toLowerCase().trim()
+        : 'create'
+
+    if (action === 'verify_session') {
+      const sessionId =
+        typeof requestBody?.session_id === 'string'
+          ? requestBody.session_id.trim()
+          : ''
+      if (!sessionId) {
+        return jsonResponse(
+          { success: false, verified: false, error: 'Missing session_id' },
+          400,
+        )
+      }
+      const optionalUser = await getAuthenticatedUser(req).catch(() => null)
+      const fallbackUid =
+        optionalUser?.id ||
+        (typeof requestBody?.user_id === 'string' ? requestBody.user_id.trim() : null)
+      const fallbackEmail =
+        optionalUser?.email ||
+        (typeof requestBody?.email === 'string' ? requestBody.email.trim() : undefined)
+      if (!optionalUser && !sessionId.startsWith('cs_')) {
+        throw new Error('Unauthorized')
+      }
+      const hintedPlan =
+        typeof requestBody?.plan === 'string' ? requestBody.plan.trim() : null
+      const verified = await syncProfileFromCheckoutSession(
+        fallbackUid,
+        fallbackEmail,
+        sessionId,
+        hintedPlan,
+      )
+      return jsonResponse({
+        success: verified.verified,
+        ...verified,
+      })
+    }
+
     const user =
       await getAuthenticatedUser(req)
 
-    const requestBody =
-      await req.json().catch(() => null)
+    if (action === 'sync_subscription') {
+      const hintedPlan =
+        typeof requestBody?.plan === 'string' ? requestBody.plan.trim() : null
+      const synced = await syncUserSubscriptionFromStripe(
+        user.id,
+        user.email,
+        hintedPlan,
+      )
+      return jsonResponse({
+        success: synced.verified,
+        ...synced,
+      })
+    }
 
     const requestedPlan =
       typeof requestBody?.plan === 'string'

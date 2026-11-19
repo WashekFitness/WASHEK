@@ -9,6 +9,7 @@ import {
 import {
   isActiveSubscriptionStatus,
   resolveEffectivePlan,
+  getRedirectUpgradeReceipt,
 } from '@/lib/subscription';
 
 export const PLAN_LIMITS = {
@@ -244,12 +245,15 @@ export async function getServerMessageStats(timeZone = null) {
       }
 
       if (!error && data && typeof data.used === 'number') {
+        const rpcPlan = String(data.plan || 'free').toLowerCase().trim();
+        const redirectReceipt = rpcPlan === 'free' ? getRedirectUpgradeReceipt(cachedUser) : null;
+        const effectiveRpcPlan = redirectReceipt ? redirectReceipt.plan : rpcPlan;
+        const effectiveRpcLimit = redirectReceipt ? getPlanLimit(effectiveRpcPlan) : (data.limit || 100);
         const stats = {
           ...data,
-          remaining:
-            typeof data.remaining === 'number'
-              ? data.remaining
-              : Math.max(0, (data.limit || 100) - data.used),
+          plan: effectiveRpcPlan,
+          limit: effectiveRpcLimit,
+          remaining: Math.max(0, effectiveRpcLimit - data.used),
           timezone: effectiveTz,
           forceAuthoritative: true,
         };
@@ -269,7 +273,12 @@ export async function getServerMessageStats(timeZone = null) {
             const monthKey = getCurrentMonthKey(new Date(), effectiveTz || profile.timezone);
             const dbStatus = String(profile.subscription_status || '').toLowerCase().trim();
             const isSubActive = isActiveSubscriptionStatus(dbStatus);
-            const effectivePlan = isSubActive ? resolveEffectivePlan(profile) : 'free';
+            const redirectReceipt = !isSubActive ? getRedirectUpgradeReceipt(profile) : null;
+            const effectivePlan = isSubActive
+              ? resolveEffectivePlan(profile)
+              : redirectReceipt
+                ? redirectReceipt.plan
+                : 'free';
             const effectiveLimit = getPlanLimit(effectivePlan);
 
             let effectiveCount = Number(profile.kael_msg_month === monthKey ? profile.kael_msg_count || 0 : 0);

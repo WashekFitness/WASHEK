@@ -5,6 +5,7 @@ import {
   Routes,
   Navigate,
   useLocation,
+  useNavigate,
 } from 'react-router-dom';
 import { QueryClientProvider } from '@tanstack/react-query';
 
@@ -63,6 +64,7 @@ function GlobalMidnightWatcher() {
 
 function SubscriptionWatcher() {
   const location = useLocation();
+  const navigate = useNavigate();
   const { checkUserAuth } = useAuth();
   const lastAppliedRef = React.useRef(0);
 
@@ -91,22 +93,29 @@ function SubscriptionWatcher() {
       }
     };
 
-    // Strip any ?subscribed= / ?plan= query parameters on non-return routes without trusting URL params
     const isReturnRoute =
       location.pathname.startsWith('/subscription') ||
-      location.pathname.startsWith('/welcome');
+      location.pathname.startsWith('/checkout') ||
+      location.pathname.startsWith('/welcome') ||
+      location.pathname === '/success';
     const params = new URLSearchParams(location.search);
-    if (!isReturnRoute && (params.has('subscribed') || params.has('plan') || params.has('sub_status'))) {
-      const hasSubHint = params.has('subscribed');
-      params.delete('subscribed');
+    if (
+      !isReturnRoute &&
+      (params.has('subscribed') ||
+        params.has('session_id') ||
+        params.has('checkout_session_id') ||
+        params.get('checkout') === 'success')
+    ) {
+      navigate(`/subscription-return${location.search}`, { replace: true });
+      return;
+    }
+
+    if (!isReturnRoute && (params.has('plan') || params.has('sub_status'))) {
       params.delete('plan');
       params.delete('sub_status');
       const nextSearch = params.toString();
       const cleanUrl = nextSearch ? `${location.pathname}?${nextSearch}` : location.pathname;
       window.history.replaceState({}, document.title, cleanUrl);
-      if (hasSubHint) {
-        verifyAndSyncFromServer(true);
-      }
     }
 
     const handleOpenerCheckoutReturn = async (sourceWindow, expectedPlanRaw = '') => {
@@ -242,6 +251,10 @@ function AuthenticatedApp() {
     location.pathname !== '/reset-password' &&
     location.pathname !== '/subscription-return' &&
     location.pathname !== '/subscription/return' &&
+    location.pathname !== '/subscription-success' &&
+    location.pathname !== '/checkout/success' &&
+    location.pathname !== '/checkout/return' &&
+    location.pathname !== '/success' &&
     location.pathname !== '/welcome' &&
     location.pathname !== '/terms' &&
     location.pathname !== '/privacy'
@@ -279,6 +292,22 @@ function AuthenticatedApp() {
             />
             <Route
               path="/subscription/return"
+              element={<SubscriptionReturn />}
+            />
+            <Route
+              path="/subscription-success"
+              element={<SubscriptionReturn />}
+            />
+            <Route
+              path="/checkout/success"
+              element={<SubscriptionReturn />}
+            />
+            <Route
+              path="/checkout/return"
+              element={<SubscriptionReturn />}
+            />
+            <Route
+              path="/success"
               element={<SubscriptionReturn />}
             />
             <Route
