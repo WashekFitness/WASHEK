@@ -3656,9 +3656,9 @@ app.post('/api/ai-generate', async (req, res) => {
 
     // High visual intelligence & fast generative models with rock-solid fallback
     const modelsToTry = [
+      'gemini-4-hydrogen',
       'gemini-3.1-flash-lite',
-      'gemini-3-flash-preview',
-      'gemini-3.8-flash',
+      'gemini-4-neon',
     ];
     let lastError: any = null;
     let response: any = null;
@@ -3666,8 +3666,8 @@ app.post('/api/ai-generate', async (req, res) => {
 
     for (const currentModel of modelsToTry) {
       const callConfig = { ...config };
-      // Omit prohibited sampling parameters for gemini-3.8-flash per gemini-api guidelines
-      if (currentModel === 'gemini-3.8-flash' || currentModel.includes('3.8')) {
+      // Omit prohibited sampling parameters for gemini-4 and 3.8 series per gemini-api guidelines
+      if (currentModel.includes('gemini-4') || currentModel.includes('3.8')) {
         delete (callConfig as any).temperature;
         delete (callConfig as any).topP;
         delete (callConfig as any).topK;
@@ -4078,9 +4078,9 @@ app.post('/api/ai-stream', async (req, res) => {
     }
 
     const modelsToTry = [
+      'gemini-4-hydrogen',
       'gemini-3.1-flash-lite',
-      'gemini-3-flash-preview',
-      'gemini-3.8-flash',
+      'gemini-4-neon',
     ];
 
     res.setHeader('Content-Type', 'text/event-stream');
@@ -4096,6 +4096,13 @@ app.post('/api/ai-stream', async (req, res) => {
     let lastError: any = null;
 
     for (const currentModel of modelsToTry) {
+      const callConfig = { ...config };
+      if (currentModel.includes('gemini-4') || currentModel.includes('3.8')) {
+        delete (callConfig as any).temperature;
+        delete (callConfig as any).topP;
+        delete (callConfig as any).topK;
+      }
+
       let attempts = 0;
       while (attempts < 2) {
         attempts++;
@@ -4104,15 +4111,15 @@ app.post('/api/ai-stream', async (req, res) => {
           const timeoutMs = 45000;
           const timer = setTimeout(() => controller.abort(), timeoutMs);
 
-          const callConfig = {
-            ...config,
+          const fullCallConfig = {
+            ...callConfig,
             abortSignal: controller.signal,
           };
 
           streamResponse = await ai.models.generateContentStream({
             model: currentModel,
             contents: { parts },
-            config: callConfig,
+            config: fullCallConfig,
           });
           clearTimeout(timer);
           break;
@@ -4157,13 +4164,19 @@ app.post('/api/ai-stream', async (req, res) => {
       console.warn('[Gemini Stream] Stream output empty or failed, running reliable unary fallback...');
       for (const fallbackModel of modelsToTry) {
         try {
+          const fallbackConfig: any = {
+            ...config,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          };
+          if (fallbackModel.includes('gemini-4') || fallbackModel.includes('3.8')) {
+            delete fallbackConfig.temperature;
+            delete fallbackConfig.topP;
+            delete fallbackConfig.topK;
+          }
           const unaryRes = await ai.models.generateContent({
             model: fallbackModel,
             contents: { parts },
-            config: {
-              ...config,
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            },
+            config: fallbackConfig,
           });
           const text = unaryRes.text || '';
           if (text) {
