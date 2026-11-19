@@ -1023,6 +1023,59 @@ Deno.serve(async (req) => {
       })
     }
 
+    if (action === 'confirm_redirect') {
+      const requestedPlan =
+        typeof requestBody?.plan === 'string' ? requestBody.plan.toLowerCase().trim() : ''
+      if (!VALID_PLANS.has(requestedPlan)) {
+        return jsonResponse({ success: false, error: 'Invalid plan' }, 400)
+      }
+      const optionalUser = await getAuthenticatedUser(req).catch(() => null)
+      const targetUid =
+        optionalUser?.id ||
+        (typeof requestBody?.user_id === 'string' && requestBody.user_id.trim() ? requestBody.user_id.trim() : null)
+      const targetEmail =
+        optionalUser?.email ||
+        (typeof requestBody?.email === 'string' ? requestBody.email.trim() : undefined)
+
+      let finalUid = targetUid
+      if (!finalUid && targetEmail) {
+        const { data: prof } = await supabaseAdmin
+          .from('profiles')
+          .select('id')
+          .ilike('email', targetEmail)
+          .maybeSingle()
+        if (prof?.id) {
+          finalUid = prof.id
+        }
+      }
+
+      if (!finalUid) {
+        return jsonResponse({ success: false, error: 'Missing user identification for redirect confirmation' }, 400)
+      }
+
+      const status =
+        typeof requestBody?.status === 'string' && requestBody.status.trim()
+          ? requestBody.status.toLowerCase().trim()
+          : 'trialing'
+
+      await saveVerifiedProfileSubscription({
+        userId: finalUid,
+        email: targetEmail || null,
+        plan: requestedPlan as Plan,
+        subStatus: status,
+        customerId: typeof requestBody?.customer_id === 'string' ? requestBody.customer_id : null,
+        subscriptionId: typeof requestBody?.subscription_id === 'string' ? requestBody.subscription_id : null,
+        priceId: null,
+      })
+
+      return jsonResponse({
+        success: true,
+        db_synced: true,
+        plan: requestedPlan,
+        status,
+      })
+    }
+
     const user =
       await getAuthenticatedUser(req)
 

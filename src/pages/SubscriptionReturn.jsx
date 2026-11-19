@@ -217,27 +217,44 @@ export default function SubscriptionReturn() {
           }
         })();
 
-      // Notify Express server of confirmed redirect unlock (persists across Chrome iframe partition + enables AI tier access)
+      // Notify Express server & Supabase Edge Function of confirmed redirect unlock (persists across Chrome iframe partition + updates Postgres via admin)
       try {
-        await Promise.race([
-          fetch('/api/stripe/confirm-redirect', {
-            method: 'POST',
-            credentials: 'include',
-            keepalive: true,
-            headers: {
-              'Content-Type': 'application/json',
-              ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
-            },
-            body: JSON.stringify({
-              plan: confirmedPlan,
-              status: confirmedStatus,
-              userId: identity?.userId || undefined,
-              email: identity?.email || undefined,
-              sessionId: identity?.sessionId || undefined,
-              verifiedBy: effectiveSyncOpts.verifiedBy || 'stripe_redirect',
+        await Promise.allSettled([
+          Promise.race([
+            fetch('/api/stripe/confirm-redirect', {
+              method: 'POST',
+              credentials: 'include',
+              keepalive: true,
+              headers: {
+                'Content-Type': 'application/json',
+                ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
+              },
+              body: JSON.stringify({
+                plan: confirmedPlan,
+                status: confirmedStatus,
+                userId: identity?.userId || undefined,
+                email: identity?.email || undefined,
+                sessionId: identity?.sessionId || undefined,
+                verifiedBy: effectiveSyncOpts.verifiedBy || 'stripe_redirect',
+              }),
             }),
-          }),
-          new Promise((resolve) => window.setTimeout(resolve, 1500)),
+            new Promise((resolve) => window.setTimeout(resolve, 1500)),
+          ]),
+          Promise.race([
+            supabase.functions.invoke('create-checkout-session', {
+              body: {
+                action: 'confirm_redirect',
+                plan: confirmedPlan,
+                status: confirmedStatus,
+                user_id: identity?.userId || undefined,
+                email: identity?.email || undefined,
+              },
+              headers: {
+                Authorization: `Bearer ${supabaseAnonKey}`,
+              },
+            }),
+            new Promise((resolve) => window.setTimeout(resolve, 1500)),
+          ]),
         ]);
       } catch {
         // non-fatal
