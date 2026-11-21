@@ -1601,6 +1601,13 @@ export default function FormLab() {
             }
           );
 
+        if (rawResult?.__ai_error) {
+          throw new Error(
+            rawResult.message ||
+              'Form analysis could not be completed right now.'
+          );
+        }
+
 
         /*
          * ------------------------------------------------------

@@ -55,6 +55,7 @@ const VISUAL_TYPES = new Set([
 const STRICT_JSON_TYPES = new Set([
   'structure',
   'microcycle',
+  'live_workout_adjustment',
 ]);
 
 function getResponseFormat(type: string) {
@@ -675,6 +676,7 @@ async function callGoogleGemini(
   const isJson =
     STRICT_JSON_TYPES.has(type) ||
     type === 'microcycle' ||
+    type === 'live_workout_adjustment' ||
     type === 'form_analysis' ||
     type === 'food_scan' ||
     type === 'progress_photo' ||
@@ -686,7 +688,7 @@ async function callGoogleGemini(
   };
 
   const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=${apiKey}`,
+    `https://generativelanguage.googleapis.com/v1beta/models/gemini-4-hydrogen:generateContent?key=${apiKey}`,
     {
       method: 'POST',
       headers: {
@@ -704,7 +706,7 @@ async function callGoogleGemini(
   const outputText = raw?.candidates?.[0]?.content?.parts?.[0]?.text || '';
   return {
     outputText,
-    model: 'gemini-3.8-flash',
+    model: 'gemini-4-hydrogen',
     usage: raw?.usageMetadata || null,
   };
 }

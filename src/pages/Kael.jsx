@@ -3,7 +3,11 @@ import {
   useEffect,
   useRef,
   useMemo,
+  useCallback,
 } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
+import { toast } from 'sonner';
 
 import {
   supabaseApi,
@@ -70,7 +74,11 @@ import {
 import { supabase } from '@/lib/supabase';
 import { useAuth } from '@/lib/AuthContext';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
-import { getUserTimeZone } from '@/lib/dateUtils';
+import { getLocalDateKey, getUserTimeZone } from '@/lib/dateUtils';
+import {
+  fetchKaelAppContext,
+  parseKaelActions,
+} from '@/lib/kaelAppContext';
 
 import {
   useAppSettings,
@@ -275,8 +283,12 @@ function getPunctuationPause(
 
 
 export default function Kael() {
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const {
     settings,
+    toggleManualRestDay,
+    isRestDayMarked,
   } = useAppSettings();
 
   const [
@@ -357,6 +369,12 @@ export default function Kael() {
 
   const lastScrolledChatRef =
     useRef(null);
+
+  const appContextTextRef =
+    useRef('');
+
+  const executedActionKeysRef =
+    useRef(new Set());
 
   /*
    * Current active conversation metadata
@@ -608,13 +626,112 @@ export default function Kael() {
 
 
   /*
+   * Preload live app context snapshot (program, today workout/rest day, nutrition, maxes, heatmap)
+   */
+  useEffect(() => {
+    let active = true;
+    fetchKaelAppContext({
+      user: effectiveUser,
+      settings,
+      timeZone: effectiveTz,
+    })
+      .then((ctx) => {
+        if (active && ctx?.summaryText) {
+          appContextTextRef.current = ctx.summaryText;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [effectiveUser?.id, effectiveUser?.email, effectiveUser?.subscription_plan, settings?.manualRestDays, settings?.unit, effectiveTz]);
+
+  const executeKaelAction = useCallback(
+    async (action, { isAuto = false, messageId = null } = {}) => {
+      if (!action) return;
+      const dedupeKey = messageId ? `${messageId}:${action.id}` : null;
+      if (isAuto && dedupeKey && executedActionKeysRef.current.has(dedupeKey)) {
+        return;
+      }
+      if (dedupeKey) {
+        executedActionKeysRef.current.add(dedupeKey);
+      }
+
+      if (action.type === 'go' || action.type === 'navigate') {
+        if (isAuto && action.type !== 'go') return;
+        if (!action.route) return;
+        if (isAuto) {
+          toast.info(`Taking you to ${action.label}…`);
+          window.setTimeout(() => {
+            navigate(action.route);
+          }, 600);
+        } else {
+          navigate(action.route);
+        }
+        return;
+      }
+
+      if (action.type === 'log_food') {
+        const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
+        const todayKey = getLocalDateKey(new Date(), effectiveTz);
+        try {
+          await supabaseApi.entities.NutritionEntry.create({
+            food_name: action.food_name,
+            calories: action.calories,
+            protein_g: action.protein_g,
+            carbs_g: action.carbs_g,
+            fat_g: action.fat_g,
+            meal_type: action.meal_type || 'snack',
+            serving_size: '1 serving',
+            date: todayKey,
+            created_by: userKey,
+          });
+          queryClient.invalidateQueries({ queryKey: ['nutrition'] });
+          toast.success(`Logged ${action.food_name} (${action.calories} kcal)`);
+          fetchKaelAppContext({ user: effectiveUser, settings, timeZone: effectiveTz })
+            .then((ctx) => {
+              if (ctx?.summaryText) appContextTextRef.current = ctx.summaryText;
+            })
+            .catch(() => {});
+        } catch (err) {
+          toast.error(err?.message || 'Could not log food entry.');
+        }
+        return;
+      }
+
+      if (action.type === 'log_rest_day') {
+        const todayKey = getLocalDateKey(new Date(), effectiveTz);
+        const alreadyRest = isRestDayMarked?.(todayKey);
+        if (isAuto && alreadyRest) {
+          return;
+        }
+        if (!alreadyRest) {
+          toggleManualRestDay?.(todayKey);
+          queryClient.invalidateQueries({ queryKey: ['logs'] });
+          queryClient.invalidateQueries({ queryKey: ['programs'] });
+          toast.success('Today has been marked as a Rest Day.');
+          fetchKaelAppContext({ user: effectiveUser, settings, timeZone: effectiveTz })
+            .then((ctx) => {
+              if (ctx?.summaryText) appContextTextRef.current = ctx.summaryText;
+            })
+            .catch(() => {});
+        } else {
+          toast.info('Today is already marked as a Rest Day.');
+        }
+      }
+    },
+    [effectiveUser, effectiveTz, isRestDayMarked, navigate, queryClient, settings, toggleManualRestDay]
+  );
+
+  /*
    * ==========================================================
    * BUILD KAEL PROMPT
    * ==========================================================
    */
 
   const buildPrompt = (
-    history
+    history,
+    liveAppContextText = ''
   ) => {
     const isElite =
       plan === 'elite';
@@ -668,12 +785,16 @@ export default function Kael() {
         )
         .join('\n\n');
 
+    const contextBlock = liveAppContextText
+      ? `\n\n${liveAppContextText}`
+      : '';
+
 
     return `${getKaelSystemPrompt(
       trainingType,
       firstName,
       plan
-    )}${responseDepthInstruction}${langInstruction}\n\nCONVERSATION HISTORY (remember what the user has told you about their capabilities, limitations, and preferences — update your understanding if they say something new or different):\n${recentHistory}\n\nKael:`;
+    )}${responseDepthInstruction}${langInstruction}${contextBlock}\n\nCONVERSATION HISTORY (remember what the user has told you about their capabilities, limitations, and preferences — update your understanding if they say something new or different):\n${recentHistory}\n\nKael:`;
   };
 
 
@@ -884,12 +1005,28 @@ export default function Kael() {
       setInput('');
 
       try {
+        let freshContextText = appContextTextRef.current;
+        try {
+          const ctx = await fetchKaelAppContext({
+            user: effectiveUser,
+            settings,
+            timeZone: effectiveTz,
+          });
+          if (ctx?.summaryText) {
+            freshContextText = ctx.summaryText;
+            appContextTextRef.current = ctx.summaryText;
+          }
+        } catch {
+          // use cached snapshot if refresh fails
+        }
+
         const prompt =
           buildPrompt(
             [
               ...previousMessages,
               userMessage,
-            ]
+            ],
+            freshContextText
           );
 
         /*
@@ -1055,6 +1192,15 @@ export default function Kael() {
           responseText,
           trimmed
         );
+
+        const parsedActions = parseKaelActions(responseText).actions;
+        if (parsedActions.length > 0) {
+          for (const action of parsedActions) {
+            if (action.type === 'go' || action.type === 'log_food' || action.type === 'log_rest_day') {
+              executeKaelAction(action, { isAuto: true, messageId: temporaryId });
+            }
+          }
+        }
 
         getServerMessageStats(timeZone)
           .then(
@@ -1416,6 +1562,12 @@ export default function Kael() {
                   isUser={
                     message.role ===
                     'user'
+                  }
+                  onAction={(action) =>
+                    executeKaelAction(action, {
+                      isAuto: false,
+                      messageId: message.id,
+                    })
                   }
                 />
 

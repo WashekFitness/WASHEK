@@ -112,6 +112,7 @@ function isValidUUID(val: any): boolean {
 
 // Lazy initialization of the Google Gemini AI client
 let aiClient: GoogleGenAI | null = null;
+let hydrogenDailyExhaustedUntil = 0;
 function getGeminiClient(): GoogleGenAI {
   if (!aiClient) {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -212,7 +213,7 @@ interface ConfirmedRedirectRecord {
 }
 
 const PENDING_CHECKOUT_TTL_MS = 30 * 60 * 1000;
-const CONFIRMED_REDIRECT_TTL_MS = 24 * 60 * 60 * 1000;
+const CONFIRMED_REDIRECT_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days retention
 const pendingCheckouts = new Map<string, PendingCheckoutRecord>();
 const confirmedRedirectSubscriptions = new Map<string, ConfirmedRedirectRecord>();
 const CONFIRMED_SUBSCRIPTIONS_FILE = path.join(process.cwd(), '.confirmed_subscriptions.json');
@@ -321,6 +322,32 @@ function getConfirmedRedirectEntitlement(
 ): string | null {
   const rec = getConfirmedRedirectRecord(userId, email, cancelledAtIso);
   return rec?.plan || null;
+}
+
+function recordConfirmedRedirectSubscription(params: {
+  userId?: string | null;
+  email?: string | null;
+  plan: string;
+  status?: string;
+  verifiedBy?: string;
+}) {
+  const cleanPlan = String(params.plan || '').toLowerCase().trim();
+  if (!['progress', 'performance', 'elite'].includes(cleanPlan)) return;
+  const cleanUid = params.userId ? String(params.userId).trim() : '';
+  const cleanEmail = params.email ? String(params.email).toLowerCase().trim() : '';
+  const cleanStatus = String(params.status || 'active').toLowerCase().trim();
+  const effectiveStatus = ['active', 'trialing', 'past_due'].includes(cleanStatus)
+    ? cleanStatus
+    : 'active';
+  const entry: ConfirmedRedirectRecord = {
+    plan: cleanPlan,
+    status: effectiveStatus,
+    verifiedBy: String(params.verifiedBy || 'stripe_verify'),
+    timestamp: Date.now(),
+  };
+  if (cleanUid) confirmedRedirectSubscriptions.set(cleanUid, entry);
+  if (cleanEmail) confirmedRedirectSubscriptions.set(cleanEmail, entry);
+  persistConfirmedSubscriptionsToDisk();
 }
 
 function clearCheckoutEntitlementsForUser(userId?: string | null, email?: string | null) {
@@ -915,6 +942,17 @@ app.post('/api/stripe/verify-session', async (req, res) => {
           }
         }
 
+        recordConfirmedRedirectSubscription({
+          userId: targetUid || null,
+          email:
+            email ||
+            sessionObj?.customer_details?.email ||
+            (typeof sessionObj?.customer_email === 'string' ? sessionObj.customer_email : null),
+          plan: resolvedPlan,
+          status: subStatus,
+          verifiedBy: 'stripe_session',
+        });
+
         clearPendingCheckoutForUser(targetUid, email ? String(email) : undefined);
 
         return res.json({
@@ -1071,6 +1109,14 @@ app.post('/api/stripe/verify-session', async (req, res) => {
             }
           }
         }
+
+        recordConfirmedRedirectSubscription({
+          userId: verifiedUid || null,
+          email: cleanEmail || null,
+          plan: resolvedPlan,
+          status: subStatus,
+          verifiedBy: 'stripe_customer_lookup',
+        });
 
         return res.json({
           success: true,
@@ -1247,6 +1293,18 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
       });
       const isEntitled = ['active', 'trialing', 'past_due', 'unpaid'].includes(subStatus);
       const isDeleted = eventType === 'customer.subscription.deleted' || subStatus === 'canceled';
+
+      if (isDeleted) {
+        clearCheckoutEntitlementsForUser(resolvedUid, custEmail || null);
+      } else if (isEntitled && mappedPlan) {
+        recordConfirmedRedirectSubscription({
+          userId: resolvedUid,
+          email: custEmail || null,
+          plan: mappedPlan,
+          status: subStatus || 'active',
+          verifiedBy: 'stripe_webhook',
+        });
+      }
 
       await updateProfileSubscriptionSafely(
         adminDb,
@@ -3233,6 +3291,39 @@ function hasRequiredServerPlan(userPlan: string, requiredPlan: string): boolean 
   return userIdx >= 0 && reqIdx >= 0 && userIdx >= reqIdx;
 }
 
+function resolveEffectivePlanFromServerRecords(params: {
+  profileRow: any | null;
+  userId?: string | null;
+  email?: string | null;
+}): string {
+  const { profileRow, userId, email } = params;
+  const dbPlan = normalizeServerPlan(profileRow?.subscription_plan);
+  const dbStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
+  const isDbPaidActive = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(dbStatus) && dbPlan !== 'free';
+
+  const redirectRec = getConfirmedRedirectRecord(
+    userId || profileRow?.id || null,
+    email,
+    profileRow?.subscription_cancelled_at
+  );
+  const isRedirectActive = Boolean(
+    redirectRec &&
+      SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(String(redirectRec.status || '').toLowerCase().trim())
+  );
+
+  if (isRedirectActive && redirectRec) {
+    const redirectPlan = normalizeServerPlan(redirectRec.plan);
+    if (redirectPlan !== 'free') {
+      // Honor verified server entitlement whenever DB has free/inactive, OR when redirect holds an upgrade above a stale DB plan
+      if (!isDbPaidActive || hasRequiredServerPlan(redirectPlan, dbPlan)) {
+        return redirectPlan;
+      }
+    }
+  }
+
+  return isDbPaidActive ? dbPlan : 'free';
+}
+
 function getTimezoneMonthKey(tz?: string): string {
   if (!tz) return new Date().toISOString().slice(0, 7);
   try {
@@ -3264,6 +3355,8 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
     !rawToken.startsWith('vault_tok_') &&
     !rawToken.startsWith('washek_sess_');
 
+  const adminDb = getServiceRoleSupabase() || supabase;
+
   if (isJwt) {
     try {
       const supabaseUser = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
@@ -3281,20 +3374,18 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
       if (!userError && userData?.user?.id) {
         const userId = userData.user.id;
         const email = userData.user.email ? String(userData.user.email).toLowerCase().trim() : null;
-        const { data: profileRow } = await supabaseUser
+        const profileLookupDb = getServiceRoleSupabase() || supabaseUser;
+        const { data: profileRow } = await profileLookupDb
           .from('profiles')
           .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
           .eq('id', userId)
           .maybeSingle();
 
-        const subStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
-        const isActiveSub = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
-        const redirectPlan = !isActiveSub
-          ? getConfirmedRedirectEntitlement(userId, email, profileRow?.subscription_cancelled_at)
-          : null;
-        const effectivePlan = isActiveSub
-          ? normalizeServerPlan(profileRow?.subscription_plan)
-          : redirectPlan || 'free';
+        const effectivePlan = resolveEffectivePlanFromServerRecords({
+          profileRow,
+          userId,
+          email,
+        });
 
         return {
           client: supabaseUser,
@@ -3310,65 +3401,230 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
     }
   }
 
-  // Cryptographically verified server session (for vault sessions without Supabase JWT)
-  const srvSession = verifyServerSessionFromRequest(req);
-  if (srvSession) {
+  // Cryptographic JWKS recovery for recently expired Supabase JWTs
+  const expiredJwtIdentity = isJwt ? await verifyExpiredSupabaseJwt(rawToken) : null;
+
+  // Parse email from vault token if present (format: vault_tok_<timestamp>_<base64(email)>)
+  let vaultEmail: string | null = null;
+  if (rawToken && rawToken.startsWith('vault_tok_')) {
+    const parts = rawToken.split('_');
+    if (parts.length >= 3) {
+      const b64Part =
+        parts.length >= 4 && /^\d+$/.test(parts[2])
+          ? parts.slice(3).join('_')
+          : parts.slice(2).join('_');
+      try {
+        const decoded = Buffer.from(b64Part, 'base64').toString('utf-8').toLowerCase().trim();
+        if (decoded.includes('@')) {
+          vaultEmail = decoded;
+        }
+      } catch {
+        // ignore decode error
+      }
+    }
+  }
+
+  // Cryptographically verified server session or vault session
+  const srvSession = verifyServerSessionFromRequest(req, vaultEmail || expiredJwtIdentity?.email || undefined);
+  const resolvedEmail =
+    srvSession?.email ||
+    expiredJwtIdentity?.email ||
+    vaultEmail ||
+    (typeof req.body?.email === 'string' && req.body.email.includes('@') ? req.body.email.toLowerCase().trim() : null);
+
+  const bodyUid = req.body?.user_id && isValidUUID(req.body.user_id) ? req.body.user_id : null;
+  const srvUid = srvSession?.userId && isValidUUID(srvSession.userId) ? srvSession.userId : null;
+  const jwtUid = expiredJwtIdentity?.userId && isValidUUID(expiredJwtIdentity.userId) ? expiredJwtIdentity.userId : null;
+  const resolvedUid = srvUid || jwtUid || bodyUid || (resolvedEmail ? 'usr_' + Buffer.from(resolvedEmail.slice(0, 8)).toString('hex') : null);
+
+  if (srvSession || expiredJwtIdentity || vaultEmail || (resolvedEmail && athleteCredentials.has(resolvedEmail))) {
     let profileRow: any = null;
-    if (srvSession.userId && isValidUUID(srvSession.userId)) {
+    if (resolvedUid && isValidUUID(resolvedUid)) {
       try {
-        const { data } = await supabase
+        const { data } = await adminDb
           .from('profiles')
           .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
-          .eq('id', srvSession.userId)
+          .eq('id', resolvedUid)
           .maybeSingle();
         profileRow = data;
       } catch {
         // ignore lookup error
       }
     }
-    if (!profileRow && srvSession.email) {
+    if (!profileRow && resolvedEmail) {
       try {
-        const { data } = await supabase
+        const { data } = await adminDb
           .from('profiles')
           .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
-          .ilike('email', srvSession.email)
+          .ilike('email', resolvedEmail)
           .maybeSingle();
         profileRow = data;
       } catch {
         // ignore lookup error
       }
     }
-    const subStatus = String(profileRow?.subscription_status || '').toLowerCase().trim();
-    const isActiveSub = SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus);
-    const resolvedUid = profileRow?.id || srvSession.userId || null;
-    const redirectPlan = !isActiveSub
-      ? getConfirmedRedirectEntitlement(resolvedUid, srvSession.email, profileRow?.subscription_cancelled_at)
-      : null;
-    const effectivePlan = isActiveSub
-      ? normalizeServerPlan(profileRow?.subscription_plan)
-      : redirectPlan || 'free';
+
+    const effectivePlan = resolveEffectivePlanFromServerRecords({
+      profileRow,
+      userId: profileRow?.id || resolvedUid,
+      email: resolvedEmail,
+    });
 
     return {
       client: supabase,
-      userId: resolvedUid,
-      email: srvSession.email || null,
+      userId: profileRow?.id || resolvedUid,
+      email: resolvedEmail,
       effectivePlan,
       profileRow: profileRow || null,
       isVerifiedJwt: false,
     };
   }
 
-  // Unauthenticated / anonymous / forged client requests ALWAYS resolve to 'free'
-  const fallbackUserId = req.body?.user_id && isValidUUID(req.body.user_id) ? req.body.user_id : null;
-  const fallbackEmail = req.body?.email ? String(req.body.email).trim().toLowerCase() : null;
+  // Fallback for requests with email/userId: check confirmed redirect entitlement
+  const effectivePlan = resolveEffectivePlanFromServerRecords({
+    profileRow: null,
+    userId: resolvedUid,
+    email: resolvedEmail,
+  });
   return {
     client: supabase,
-    userId: fallbackUserId,
-    email: fallbackEmail,
-    effectivePlan: 'free',
+    userId: resolvedUid,
+    email: resolvedEmail,
+    effectivePlan,
     profileRow: null,
     isVerifiedJwt: false,
   };
+}
+
+/**
+ * Recursively converts JSON Schema into a valid @google/genai Schema.
+ * Strips unsupported keys (`additionalProperties`, `$schema`, `default`, `title`, etc.),
+ * converts array types (e.g. `['object', 'null']`), uppercases schema types,
+ * and omits OBJECT nodes with no `properties` (since Gemini rejects empty Type.OBJECT schemas with 400).
+ */
+function sanitizeGeminiResponseSchema(rawSchema: any): Record<string, any> | null {
+  if (!rawSchema || typeof rawSchema !== 'object') return null;
+
+  const mapType = (rawType: string): string => {
+    const t = String(rawType || '').toUpperCase().trim();
+    switch (t) {
+      case 'OBJECT':
+      case 'STRING':
+      case 'NUMBER':
+      case 'INTEGER':
+      case 'BOOLEAN':
+      case 'ARRAY':
+      case 'NULL':
+        return t;
+      case 'FLOAT':
+      case 'DOUBLE':
+        return 'NUMBER';
+      case 'INT':
+        return 'INTEGER';
+      default:
+        return 'STRING';
+    }
+  };
+
+  const walk = (node: any): any => {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return undefined;
+
+    const out: Record<string, any> = {};
+
+    if (Array.isArray(node.type)) {
+      const nonNull = node.type.find((t: any) => String(t).toLowerCase() !== 'null');
+      const hasNull = node.type.some((t: any) => String(t).toLowerCase() === 'null');
+      if (nonNull) out.type = mapType(nonNull);
+      if (hasNull) out.nullable = true;
+    } else if (typeof node.type === 'string') {
+      out.type = mapType(node.type);
+    }
+
+    if (typeof node.nullable === 'boolean') {
+      out.nullable = node.nullable;
+    }
+    if (typeof node.description === 'string' && node.description.trim()) {
+      out.description = node.description;
+    }
+    if (Array.isArray(node.enum) && node.enum.length > 0) {
+      out.enum = node.enum.filter((v: any) => v !== null && v !== undefined).map((v: any) => String(v));
+    }
+    if (typeof node.format === 'string' && node.format.trim()) {
+      out.format = node.format;
+    }
+
+    if (out.type === 'OBJECT' || (node.properties && typeof node.properties === 'object')) {
+      out.type = 'OBJECT';
+      const propEntries = node.properties && typeof node.properties === 'object'
+        ? Object.entries(node.properties)
+        : [];
+      if (propEntries.length === 0) {
+        return undefined;
+      }
+      const cleanProps: Record<string, any> = {};
+      for (const [k, v] of propEntries) {
+        const cleanedChild = walk(v);
+        if (cleanedChild) {
+          cleanProps[k] = cleanedChild;
+        }
+      }
+      if (Object.keys(cleanProps).length === 0) {
+        return undefined;
+      }
+      out.properties = cleanProps;
+      if (Array.isArray(node.required)) {
+        const req = node.required.filter((r: any) => typeof r === 'string' && Object.prototype.hasOwnProperty.call(cleanProps, r));
+        if (req.length > 0) out.required = req;
+      }
+    } else if (out.type === 'ARRAY' || node.items) {
+      out.type = 'ARRAY';
+      if (node.items && typeof node.items === 'object') {
+        const cleanedItems = walk(node.items);
+        if (cleanedItems) {
+          out.items = cleanedItems;
+        } else {
+          return undefined;
+        }
+      }
+    }
+
+    return out;
+  };
+
+  const sanitized = walk(rawSchema);
+  return sanitized || null;
+}
+
+function extractJsonFromAiOutput(rawOutput: string): any {
+  const stripped = String(rawOutput || '')
+    .replace(/^\uFEFF/, '')
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim();
+
+  try {
+    return JSON.parse(stripped);
+  } catch {
+    const firstBrace = stripped.indexOf('{');
+    const lastBrace = stripped.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      try {
+        return JSON.parse(stripped.slice(firstBrace, lastBrace + 1));
+      } catch {
+        // try array below
+      }
+    }
+    const firstBracket = stripped.indexOf('[');
+    const lastBracket = stripped.lastIndexOf(']');
+    if (firstBracket >= 0 && lastBracket > firstBracket) {
+      try {
+        return JSON.parse(stripped.slice(firstBracket, lastBracket + 1));
+      } catch {
+        // fall through
+      }
+    }
+    return rawOutput;
+  }
 }
 
 app.post('/api/ai-generate', async (req, res) => {
@@ -3391,14 +3647,29 @@ app.post('/api/ai-generate', async (req, res) => {
     // Authoritatively resolve user subscription tier on the server (never trust req.body.plan)
     const authCtx = await resolveAuthoritativeAiUser(req);
     let effectivePlan = authCtx.effectivePlan;
-    const requiredTier = AI_TYPE_REQUIRED_PLAN[String(type || 'general')];
+
+    // Determine required tier: live in-workout single-exercise adjustment is Elite,
+    // while post-workout multi-week adaptation is Progress+ (adaptive programming).
+    let requiredTier = AI_TYPE_REQUIRED_PLAN[String(type || 'general')];
+    if (type === 'live_workout_adjustment') {
+      const isPostWorkoutAdaptation =
+        Boolean(response_json_schema?.properties?.adjusted_exercises) ||
+        Boolean(schema?.properties?.adjusted_exercises) ||
+        (typeof prompt === 'string' && prompt.includes('POST-WORKOUT FEEDBACK'));
+      requiredTier = isPostWorkoutAdaptation ? 'progress' : 'elite';
+    }
+
     if (requiredTier && !hasRequiredServerPlan(effectivePlan, requiredTier)) {
+      const planLabel = requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1);
       return res.status(403).json({
         success: false,
         error_code: 'SUBSCRIPTION_REQUIRED',
         required_plan: requiredTier,
         current_plan: effectivePlan,
-        error: `This feature requires the ${requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1)} plan or higher.`,
+        error:
+          requiredTier === 'elite'
+            ? 'This feature requires the Elite plan.'
+            : `This feature requires the ${planLabel} plan or higher.`,
       });
     }
 
@@ -3616,10 +3887,20 @@ app.post('/api/ai-generate', async (req, res) => {
     // Using Google Gemini high-speed models
     const config: Record<string, unknown> = {};
 
+    const sanitizedSchema = isJsonExpected
+      ? sanitizeGeminiResponseSchema(response_json_schema || schema)
+      : null;
+
     if (isJsonExpected) {
       config.responseMimeType = 'application/json';
-      if (response_json_schema || schema) {
-        config.responseSchema = response_json_schema || schema;
+      if (sanitizedSchema && type !== 'live_workout_adjustment') {
+        config.responseSchema = sanitizedSchema;
+      } else if (sanitizedSchema && type === 'live_workout_adjustment' && Array.isArray(parts) && parts.length > 0) {
+        const schemaHint = `\n\nSTRICT JSON OUTPUT CONTRACT: Return ONLY valid JSON matching this structure:\n${JSON.stringify(sanitizedSchema)}`;
+        const lastIdx = parts.length - 1;
+        if (typeof parts[lastIdx]?.text === 'string') {
+          parts[lastIdx] = { ...parts[lastIdx], text: parts[lastIdx].text + schemaHint };
+        }
       }
     }
 
@@ -3628,20 +3909,21 @@ app.post('/api/ai-generate', async (req, res) => {
       const kaelBaseMandate =
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
         'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
-        'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ';
+        'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ' +
+        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to a page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ';
 
       if (effectivePlan === 'elite') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
+          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words when detailed explanation helps, or crisp & direct if they just want a quick status check or navigation). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
       } else if (effectivePlan === 'performance') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
+          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words when detailed explanation helps). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
       } else if (effectivePlan === 'progress') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
+          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words when detailed explanation helps). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
       } else {
         config.systemInstruction =
           kaelBaseMandate +
@@ -3654,68 +3936,155 @@ app.post('/api/ai-generate', async (req, res) => {
       }
     }
 
-    // High visual intelligence & fast generative models with rock-solid fallback
-    const modelsToTry = [
-      'gemini-4-hydrogen',
-      'gemini-3.1-flash-lite',
-      'gemini-4-neon',
-    ];
+    // Fast, reliable Google Gemini models (flash-lite primary for sub-second-to-few-second latency, hydrogen fallback when daily quota available)
+    const activeModels =
+      Date.now() < hydrogenDailyExhaustedUntil
+        ? ['gemini-3.1-flash-lite']
+        : ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
     let lastError: any = null;
+    const modelErrors: string[] = [];
     let response: any = null;
-    let successfulModel = modelsToTry[0];
+    let successfulModel = activeModels[0];
 
-    for (const currentModel of modelsToTry) {
-      const callConfig = { ...config };
-      // Omit prohibited sampling parameters for gemini-4 and 3.8 series per gemini-api guidelines
-      if (currentModel.includes('gemini-4') || currentModel.includes('3.8')) {
-        delete (callConfig as any).temperature;
-        delete (callConfig as any).topP;
-        delete (callConfig as any).topK;
+    const isTransientUpstreamError = (msg: string) => {
+      const m = String(msg || '').toLowerCase();
+      return (
+        m.includes('503') ||
+        m.includes('unavailable') ||
+        m.includes('high demand') ||
+        m.includes('abort') ||
+        m.includes('timeout') ||
+        m.includes('econnreset') ||
+        m.includes('etimedout') ||
+        m.includes('fetch failed')
+      );
+    };
+
+    const buildSchemaFallbackHint = (schemaObj: any): string => {
+      if (!schemaObj || typeof schemaObj !== 'object') return '';
+      try {
+        return `\n\nSTRICT JSON SCHEMA REQUIREMENT: Return ONLY valid raw JSON matching this structure/keys:\n${JSON.stringify(schemaObj)}`;
+      } catch {
+        return '';
       }
+    };
 
-      for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-          console.log(`[Gemini API] Trying model "${currentModel}" (attempt ${attempt}) for type="${type}"`);
-          const controller = new AbortController();
-          const timeoutMs = type === 'form_analysis' ? 45000 : 35000;
-          const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-          const fullConfig = {
-            ...callConfig,
-            abortSignal: controller.signal,
-          };
-
-          response = await ai.models.generateContent({
-            model: currentModel,
-            contents: parts,
-            config: fullConfig,
-          });
-          clearTimeout(timer);
-          successfulModel = currentModel;
-          break;
-        } catch (modelErr: any) {
-          lastError = modelErr;
-          const errMsg = modelErr?.message || String(modelErr);
-          console.warn(`[Gemini API] Model "${currentModel}" attempt ${attempt} failed:`, errMsg);
-          const isRetryable =
-            errMsg.includes('503') ||
-            errMsg.includes('UNAVAILABLE') ||
-            errMsg.includes('high demand') ||
-            errMsg.includes('429');
-          if (attempt === 1 && isRetryable) {
-            await new Promise((r) => setTimeout(r, 400));
-            continue;
-          }
-          break;
+    const runModelOnce = async (
+      currentModel: string,
+      timeoutMs: number,
+      opts: { dropResponseSchema?: boolean } = {}
+    ) => {
+      const callConfig: Record<string, any> = { ...config };
+      let callParts = parts;
+      if (opts.dropResponseSchema && callConfig.responseSchema) {
+        const schemaHint = buildSchemaFallbackHint(callConfig.responseSchema);
+        delete callConfig.responseSchema;
+        if (schemaHint && Array.isArray(parts) && parts.length > 0) {
+          callParts = parts.map((p, idx) =>
+            idx === parts.length - 1 && typeof p?.text === 'string'
+              ? { ...p, text: p.text + schemaHint }
+              : p
+          );
         }
       }
-      if (response) {
+      // Omit prohibited sampling parameters for gemini-4 and 3.8 series per gemini-api guidelines
+      if (currentModel.includes('gemini-4') || currentModel.includes('3.8')) {
+        delete callConfig.temperature;
+        delete callConfig.topP;
+        delete callConfig.topK;
+        if (!callConfig.thinkingConfig) {
+          callConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+        }
+      } else if (currentModel.includes('gemini-3')) {
+        if (!callConfig.thinkingConfig) {
+          callConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
+        }
+      }
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        console.log(
+          `[Gemini API] Trying model "${currentModel}" for type="${type}"${opts.dropResponseSchema ? ' (json-mime fallback)' : ''}`
+        );
+        const resGen = await ai.models.generateContent({
+          model: currentModel,
+          contents: callParts,
+          config: {
+            ...callConfig,
+            abortSignal: controller.signal,
+          },
+        });
+        clearTimeout(timer);
+        return resGen;
+      } catch (err) {
+        clearTimeout(timer);
+        throw err;
+      }
+    };
+
+    const primaryTimeoutMs =
+      type === 'form_analysis'
+        ? 35000
+        : type === 'microcycle'
+          ? 18000
+          : ['weekly_update', 'food_scan', 'food_barcode', 'progress_photo'].includes(type)
+            ? 14000
+            : 10000;
+
+    let sawTransient = false;
+    for (const currentModel of activeModels) {
+      const timeoutMs =
+        currentModel === 'gemini-3.1-flash-lite'
+          ? primaryTimeoutMs
+          : 10000;
+      try {
+        response = await runModelOnce(currentModel, timeoutMs);
+        successfulModel = currentModel;
         break;
+      } catch (modelErr: any) {
+        lastError = modelErr;
+        const errMsg = modelErr?.message || String(modelErr);
+        modelErrors.push(`[${currentModel}] ${errMsg}`);
+        console.warn(`[Gemini API] Model "${currentModel}" failed:`, errMsg);
+        if (
+          currentModel === 'gemini-4-hydrogen' &&
+          (errMsg.includes('GenerateRequestsPerDay') || errMsg.includes('RESOURCE_EXHAUSTED'))
+        ) {
+          hydrogenDailyExhaustedUntil = Date.now() + 10 * 60 * 1000;
+        }
+        if (currentModel === 'gemini-3.1-flash-lite' && isTransientUpstreamError(errMsg)) {
+          sawTransient = true;
+        }
+      }
+    }
+
+    // Up to 3 staggered retries on primary model if transient 503/timeout/abort errors occur;
+    // when responseSchema constrained decoding is slow/congested, drop responseSchema while keeping JSON MIME
+    if (!response && sawTransient) {
+      for (const [retryIdx, delayMs] of [600, 1500, 2500].entries()) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        try {
+          response = await runModelOnce('gemini-3.1-flash-lite', Math.max(primaryTimeoutMs, 12000), {
+            dropResponseSchema: Boolean(config.responseSchema),
+          });
+          successfulModel = 'gemini-3.1-flash-lite';
+          break;
+        } catch (retryErr: any) {
+          lastError = retryErr;
+          const errMsg = retryErr?.message || String(retryErr);
+          modelErrors.push(`[gemini-3.1-flash-lite#retry${retryIdx + 1}] ${errMsg}`);
+          if (!isTransientUpstreamError(errMsg)) {
+            break;
+          }
+        }
       }
     }
 
     if (!response) {
-      throw lastError || new Error('All Gemini models failed to respond.');
+      const combinedErr: any = new Error(modelErrors.join(' | ') || lastError?.message || 'All Gemini models failed to respond.');
+      combinedErr.modelErrors = modelErrors;
+      throw combinedErr;
     }
 
     const outputText = (response.text || '').trim();
@@ -3845,16 +4214,15 @@ app.post('/api/ai-generate', async (req, res) => {
 
     let result: any = outputText;
     if (isJsonExpected) {
-      try {
-        const stripped = outputText
-          .replace(/^\uFEFF/, '')
-          .replace(/^```(?:json)?\s*/i, '')
-          .replace(/\s*```$/i, '')
-          .trim();
-        result = JSON.parse(stripped);
-      } catch (parseErr) {
-        console.warn('[Gemini API] JSON parse error, returning raw text:', parseErr);
-        result = outputText;
+      result = extractJsonFromAiOutput(outputText);
+      if (type === 'weekly_update' && result && typeof result === 'object') {
+        if (!hasRequiredServerPlan(effectivePlan, 'performance')) {
+          result.nutrition_insight = '';
+          result.nutrition_suggestions = [];
+        }
+        if (!hasRequiredServerPlan(effectivePlan, 'progress')) {
+          result.adjusted_microcycle = null;
+        }
       }
     }
 
@@ -3897,14 +4265,25 @@ app.post('/api/ai-stream', async (req, res) => {
     // Authoritatively resolve user subscription tier on the server (never trust req.body.plan)
     const authCtx = await resolveAuthoritativeAiUser(req);
     let effectivePlan = authCtx.effectivePlan;
-    const requiredTier = AI_TYPE_REQUIRED_PLAN[String(type || 'general')];
+    let requiredTier = AI_TYPE_REQUIRED_PLAN[String(type || 'general')];
+    if (type === 'live_workout_adjustment') {
+      const isPostWorkoutAdaptation =
+        Boolean(response_json_schema?.properties?.adjusted_exercises) ||
+        Boolean(schema?.properties?.adjusted_exercises) ||
+        (typeof prompt === 'string' && prompt.includes('POST-WORKOUT FEEDBACK'));
+      requiredTier = isPostWorkoutAdaptation ? 'progress' : 'elite';
+    }
     if (requiredTier && !hasRequiredServerPlan(effectivePlan, requiredTier)) {
+      const planLabel = requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1);
       return res.status(403).json({
         success: false,
         error_code: 'SUBSCRIPTION_REQUIRED',
         required_plan: requiredTier,
         current_plan: effectivePlan,
-        error: `This feature requires the ${requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1)} plan or higher.`,
+        error:
+          requiredTier === 'elite'
+            ? 'This feature requires the Elite plan.'
+            : `This feature requires the ${planLabel} plan or higher.`,
       });
     }
 
@@ -4038,8 +4417,9 @@ app.post('/api/ai-stream', async (req, res) => {
 
     if (isJsonExpected) {
       config.responseMimeType = 'application/json';
-      if (response_json_schema || schema) {
-        config.responseSchema = response_json_schema || schema;
+      const sanitizedSchema = sanitizeGeminiResponseSchema(response_json_schema || schema);
+      if (sanitizedSchema) {
+        config.responseSchema = sanitizedSchema;
       }
     }
 
@@ -4051,20 +4431,21 @@ app.post('/api/ai-stream', async (req, res) => {
       const kaelBaseMandate =
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
         'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
-        'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ';
+        'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ' +
+        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to a page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ';
 
       if (effectivePlan === 'elite') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
+          'TIER: ELITE. Deliver lightning-fast, masterclass coaching depth (~180–350+ words when detailed explanation helps, or crisp & direct if they just want a quick status check or navigation). Break down how muscles and joints work together in clear, vivid terms with intuitive cues or analogies. Always include at least one insider coaching nuance labeled "🔐 Elite tip:" or "⚡ Secret:", and provide deep "🛡️ Elite recovery:" or "🔋 Recovery call:" deload diagnostics when fatigue or rest is relevant, explained in plain language.';
       } else if (effectivePlan === 'performance') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
+          'TIER: PERFORMANCE. Deliver high-speed, advanced coaching intelligence (~130–220 words when detailed explanation helps). Break down movement tempo (concentric/eccentric cadence explained simply as lowering, pausing, and pushing), muscle activation cues, exercise synergy, and fueling/recovery timing in straightforward terms.';
       } else if (effectivePlan === 'progress') {
         config.systemInstruction =
           kaelBaseMandate +
-          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
+          'TIER: PROGRESS. Deliver faster and smarter coaching answers (~80–140 words when detailed explanation helps). In addition to 100% accurate guidance, explain the practical "why" behind the movement in simple terms, using relatable analogies when helpful, and outline clear actionable progression steps.';
       } else {
         config.systemInstruction =
           kaelBaseMandate +
@@ -4077,11 +4458,10 @@ app.post('/api/ai-stream', async (req, res) => {
       }
     }
 
-    const modelsToTry = [
-      'gemini-4-hydrogen',
-      'gemini-3.1-flash-lite',
-      'gemini-4-neon',
-    ];
+    const modelsToTry =
+      Date.now() < hydrogenDailyExhaustedUntil
+        ? ['gemini-3.1-flash-lite']
+        : ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
 
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -4091,93 +4471,81 @@ app.post('/api/ai-stream', async (req, res) => {
       (res as any).flushHeaders();
     }
 
+    const buildStreamCallConfig = (modelName: string, timeoutMs: number) => {
+      const callConfig: Record<string, any> = { ...config };
+      if (modelName.includes('gemini-4') || modelName.includes('3.8')) {
+        delete callConfig.temperature;
+        delete callConfig.topP;
+        delete callConfig.topK;
+        callConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+      } else if (modelName.includes('gemini-3')) {
+        callConfig.thinkingConfig = { thinkingLevel: ThinkingLevel.MINIMAL };
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      callConfig.abortSignal = controller.signal;
+      return { callConfig, clear: () => clearTimeout(timer) };
+    };
+
     let fullOutput = '';
     let streamResponse: any = null;
     let lastError: any = null;
 
     for (const currentModel of modelsToTry) {
-      const callConfig = { ...config };
-      if (currentModel.includes('gemini-4') || currentModel.includes('3.8')) {
-        delete (callConfig as any).temperature;
-        delete (callConfig as any).topP;
-        delete (callConfig as any).topK;
-      }
-
-      let attempts = 0;
-      while (attempts < 2) {
-        attempts++;
-        try {
-          const controller = new AbortController();
-          const timeoutMs = 45000;
-          const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-          const fullCallConfig = {
-            ...callConfig,
-            abortSignal: controller.signal,
-          };
-
-          streamResponse = await ai.models.generateContentStream({
-            model: currentModel,
-            contents: { parts },
-            config: fullCallConfig,
-          });
-          clearTimeout(timer);
-          break;
-        } catch (modelErr: any) {
-          lastError = modelErr;
-          const errMsg = modelErr?.message || String(modelErr);
-          const isTransient =
-            errMsg.includes('503') ||
-            errMsg.includes('429') ||
-            errMsg.includes('high demand') ||
-            errMsg.includes('UNAVAILABLE') ||
-            errMsg.includes('ResourceExhausted');
-
-          if (isTransient && attempts < 2) {
-            console.warn(`[Gemini Stream] Model "${currentModel}" transient demand spike, retrying in 350ms...`);
-            await new Promise((r) => setTimeout(r, 350));
-            continue;
-          }
-          console.warn(`[Gemini Stream] Model "${currentModel}" failed:`, errMsg);
-          break;
-        }
-      }
-      if (streamResponse) break;
-    }
-
-    if (streamResponse) {
+      const timeoutMs = currentModel === 'gemini-3.1-flash-lite' ? 14000 : 10000;
+      const { callConfig, clear } = buildStreamCallConfig(currentModel, timeoutMs);
       try {
-        for await (const chunk of streamResponse) {
-          const text = chunk.text;
-          if (text) {
-            fullOutput += text;
-            res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+        streamResponse = await ai.models.generateContentStream({
+          model: currentModel,
+          contents: { parts },
+          config: callConfig,
+        });
+        if (streamResponse) {
+          try {
+            for await (const chunk of streamResponse) {
+              const text = chunk.text;
+              if (text) {
+                fullOutput += text;
+                res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+              }
+            }
+          } finally {
+            clear();
           }
+          if (fullOutput) break;
         }
-      } catch (streamIterErr) {
-        console.warn('[Gemini Stream] Stream iteration interrupted:', streamIterErr);
+        clear();
+      } catch (modelErr: any) {
+        clear();
+        lastError = modelErr;
+        const errMsg = modelErr?.message || String(modelErr);
+        console.warn(`[Gemini Stream] Model "${currentModel}" failed:`, errMsg);
+        if (
+          currentModel === 'gemini-4-hydrogen' &&
+          (errMsg.includes('GenerateRequestsPerDay') || errMsg.includes('RESOURCE_EXHAUSTED'))
+        ) {
+          hydrogenDailyExhaustedUntil = Date.now() + 10 * 60 * 1000;
+        }
       }
     }
 
-    // Unary fallback if streaming yielded empty output
+    // Unary fallback if streaming yielded empty output or stalled
     if (!fullOutput) {
       console.warn('[Gemini Stream] Stream output empty or failed, running reliable unary fallback...');
-      for (const fallbackModel of modelsToTry) {
+      const unaryModels =
+        Date.now() < hydrogenDailyExhaustedUntil
+          ? ['gemini-3.1-flash-lite']
+          : ['gemini-3.1-flash-lite', 'gemini-4-hydrogen'];
+      for (const fallbackModel of unaryModels) {
+        const timeoutMs = fallbackModel === 'gemini-3.1-flash-lite' ? 14000 : 10000;
+        const { callConfig, clear } = buildStreamCallConfig(fallbackModel, timeoutMs);
         try {
-          const fallbackConfig: any = {
-            ...config,
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          };
-          if (fallbackModel.includes('gemini-4') || fallbackModel.includes('3.8')) {
-            delete fallbackConfig.temperature;
-            delete fallbackConfig.topP;
-            delete fallbackConfig.topK;
-          }
           const unaryRes = await ai.models.generateContent({
             model: fallbackModel,
             contents: { parts },
-            config: fallbackConfig,
+            config: callConfig,
           });
+          clear();
           const text = unaryRes.text || '';
           if (text) {
             fullOutput = text;
@@ -4185,7 +4553,16 @@ app.post('/api/ai-stream', async (req, res) => {
             break;
           }
         } catch (unaryErr: any) {
-          console.warn(`[Gemini Stream Unary Fallback] ${fallbackModel} failed:`, unaryErr?.message || unaryErr);
+          clear();
+          lastError = unaryErr;
+          const uMsg = unaryErr?.message || String(unaryErr);
+          console.warn(`[Gemini Stream Unary Fallback] ${fallbackModel} failed:`, uMsg);
+          if (
+            fallbackModel === 'gemini-4-hydrogen' &&
+            (uMsg.includes('GenerateRequestsPerDay') || uMsg.includes('RESOURCE_EXHAUSTED'))
+          ) {
+            hydrogenDailyExhaustedUntil = Date.now() + 10 * 60 * 1000;
+          }
         }
       }
     }

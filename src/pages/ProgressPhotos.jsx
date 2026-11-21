@@ -79,6 +79,8 @@ import {
 import {
   canAccess,
   resolveEffectivePlan,
+  normalizePlan,
+  isActiveSubscriptionStatus,
 } from '@/lib/subscription';
 
 import {
@@ -711,6 +713,32 @@ export default function ProgressPhotos() {
     },
     []
   );
+
+  useEffect(() => {
+    const handleSubUpdated = (e) => {
+      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status) {
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+              }
+            : prev
+        );
+      }
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+  }, []);
 
 
   /* ==========================================================
@@ -1466,6 +1494,10 @@ insights must contain personalized coaching analysis.
             }
           );
 
+        if (rawResult?.__ai_error) {
+          throw new Error(rawResult.message || 'Body composition analysis failed.');
+        }
+
         let parsed = rawResult;
         if (typeof parsed === 'string') {
           try {
@@ -1476,7 +1508,15 @@ insights must contain personalized coaching analysis.
               .trim();
             parsed = JSON.parse(clean);
           } catch {
-            // Keep
+            const firstBrace = parsed.indexOf('{');
+            const lastBrace = parsed.lastIndexOf('}');
+            if (firstBrace >= 0 && lastBrace > firstBrace) {
+              try {
+                parsed = JSON.parse(parsed.slice(firstBrace, lastBrace + 1));
+              } catch {
+                // Keep
+              }
+            }
           }
         }
 

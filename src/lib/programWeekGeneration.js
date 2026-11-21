@@ -889,6 +889,19 @@ async function generateOneWeek(
         schema:
           weekSchema,
       });
+
+    if (parsed?.__ai_error) {
+      throw new Error(parsed.message || `Could not generate Week ${weekNumber}.`);
+    }
+
+    if (typeof parsed === 'string') {
+      const cleaned = parsed
+        .replace(/^\uFEFF/, '')
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      parsed = JSON.parse(cleaned);
+    }
   } catch (error) {
     await failWeek(
       programId,

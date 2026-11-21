@@ -474,8 +474,51 @@ async function currentUser(forceFresh = false) {
       isActiveSubscriptionStatus(dbStatus) &&
       dbPlan !== 'free';
 
-    if (dbActive) {
-      clearRedirectUpgradeReceipt();
+    const PLAN_RANK = { free: 0, progress: 1, performance: 2, elite: 3 };
+    let redirectReceipt = getRedirectUpgradeReceipt(profile);
+    if (!redirectReceipt) {
+      try {
+        const serverEnt = await fetchServerEntitlement({
+          userId: user.id,
+          email: user.email,
+          cancelledAtIso: profile?.subscription_cancelled_at || null,
+        });
+        if (serverEnt?.active) {
+          redirectReceipt = {
+            plan: normalizePlan(serverEnt.plan),
+            status: serverEnt.status,
+            timestamp: serverEnt.timestamp,
+            verifiedBy: serverEnt.verifiedBy,
+          };
+        }
+      } catch {
+        // ignore server entitlement lookup error
+      }
+    }
+
+    const redirectHigherOrMissingDb = Boolean(
+      redirectReceipt &&
+        redirectReceipt.plan !== 'free' &&
+        (!dbActive || (PLAN_RANK[normalizePlan(redirectReceipt.plan)] || 0) >= (PLAN_RANK[dbPlan] || 0))
+    );
+
+    if (redirectHigherOrMissingDb && (!dbActive || normalizePlan(redirectReceipt.plan) !== dbPlan)) {
+      normalized.subscription_plan = redirectReceipt.plan;
+      normalized.subscription_status = redirectReceipt.status;
+      normalized.tier = redirectReceipt.plan;
+      normalized.plan = redirectReceipt.plan;
+      normalized.subscription_tier = redirectReceipt.plan;
+      try {
+        localStorage.setItem('washek_subscription_plan', redirectReceipt.plan);
+        localStorage.setItem('washek_subscription_status', redirectReceipt.status);
+        localStorage.removeItem('washek_subscription_cancelled_at');
+      } catch {
+        // ignore
+      }
+    } else if (dbActive) {
+      if (redirectReceipt && dbPlan === normalizePlan(redirectReceipt.plan)) {
+        clearRedirectUpgradeReceipt();
+      }
       normalized.subscription_plan = dbPlan;
       normalized.subscription_status = dbStatus;
       normalized.tier = dbPlan;
@@ -488,27 +531,6 @@ async function currentUser(forceFresh = false) {
         // ignore
       }
     } else {
-      let redirectReceipt = getRedirectUpgradeReceipt(profile);
-      if (!redirectReceipt && !dbActive) {
-        try {
-          const serverEnt = await fetchServerEntitlement({
-            userId: user.id,
-            email: user.email,
-            cancelledAtIso: profile?.subscription_cancelled_at || null,
-          });
-          if (serverEnt?.active) {
-            redirectReceipt = {
-              plan: serverEnt.plan,
-              status: serverEnt.status,
-              timestamp: serverEnt.timestamp,
-              verifiedBy: serverEnt.verifiedBy,
-            };
-          }
-        } catch {
-          // ignore server entitlement lookup error
-        }
-      }
-
       if (redirectReceipt) {
         normalized.subscription_plan = redirectReceipt.plan;
         normalized.subscription_status = redirectReceipt.status;
@@ -1582,16 +1604,16 @@ async function streamAI({
     }
   }
 
-  let currentUserId = null;
-  let currentUserEmail = null;
-  let currentUsed = 0;
+  let currentUserId = lastMeResult?.id || null;
+  let currentUserEmail = lastMeResult?.email || null;
+  let currentUsed = Number(lastMeResult?.kael_msg_count || 0);
   try {
     const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
     if (rawUser) {
       const parsedUser = JSON.parse(rawUser);
-      currentUserId = parsedUser?.id || null;
-      currentUserEmail = parsedUser?.email || null;
-      currentUsed = Number(parsedUser?.kael_msg_count || 0);
+      currentUserId = parsedUser?.id || currentUserId;
+      currentUserEmail = parsedUser?.email || currentUserEmail;
+      currentUsed = Number(parsedUser?.kael_msg_count ?? currentUsed ?? 0);
     }
   } catch (_userErr) {
     // Ignore
@@ -1612,24 +1634,48 @@ async function streamAI({
     // ignore
   }
 
+  let resolvedPlan = plan && plan !== 'free' ? plan : 'free';
   try {
-    const res = await fetch('/api/ai-stream', {
+    if (typeof localStorage !== 'undefined') {
+      const storedPlan = localStorage.getItem('washek_subscription_plan');
+      const storedStatus = localStorage.getItem('washek_subscription_status');
+      if (storedPlan && storedPlan !== 'free' && (!storedStatus || ['active', 'trialing', 'past_due'].includes(storedStatus.toLowerCase()))) {
+        resolvedPlan = storedPlan.toLowerCase();
+      }
+    }
+  } catch {
+    // ignore
+  }
+
+  const requestBody = JSON.stringify({
+    type,
+    prompt,
+    file_urls: normalizedFileUrls,
+    model: model || 'gemini-3.1-flash-lite',
+    schema: schema || response_json_schema || null,
+    response_json_schema: response_json_schema || schema || null,
+    plan: resolvedPlan,
+    timezone: userTz,
+    user_id: currentUserId,
+    email: currentUserEmail,
+    current_used: currentUsed,
+  });
+
+  try {
+    let res = await fetch('/api/ai-stream', {
       method: 'POST',
       headers,
-      body: JSON.stringify({
-        type,
-        prompt,
-        file_urls: normalizedFileUrls,
-        model: model || 'gemini-3.1-flash-lite',
-        schema: schema || response_json_schema || null,
-        response_json_schema: response_json_schema || schema || null,
-        plan: plan || 'free',
-        timezone: userTz,
-        user_id: currentUserId,
-        email: currentUserEmail,
-        current_used: currentUsed,
-      }),
+      body: requestBody,
     });
+
+    if (res.status === 401 && headers['Authorization']) {
+      delete headers['Authorization'];
+      res = await fetch('/api/ai-stream', {
+        method: 'POST',
+        headers,
+        body: requestBody,
+      });
+    }
 
     if (res.status === 403) {
       const errData = await res.json().catch(() => ({}));
@@ -1712,8 +1758,12 @@ async function streamAI({
     response_json_schema,
     schema,
     type,
-    plan,
+    plan: resolvedPlan,
   });
+
+  if (fallback && fallback.__ai_error) {
+    return fallback;
+  }
 
   const text =
     typeof fallback === 'string'
@@ -1790,16 +1840,16 @@ async function invokeAI({
 
   // Primary: Google Gemini Server Backend
   try {
-    let currentUserId = null;
-    let currentUserEmail = null;
-    let currentUsed = 0;
+    let currentUserId = lastMeResult?.id || null;
+    let currentUserEmail = lastMeResult?.email || null;
+    let currentUsed = Number(lastMeResult?.kael_msg_count || 0);
     try {
       const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
       if (rawUser) {
         const parsedUser = JSON.parse(rawUser);
-        currentUserId = parsedUser?.id || null;
-        currentUserEmail = parsedUser?.email || null;
-        currentUsed = Number(parsedUser?.kael_msg_count || 0);
+        currentUserId = parsedUser?.id || currentUserId;
+        currentUserEmail = parsedUser?.email || currentUserEmail;
+        currentUsed = Number(parsedUser?.kael_msg_count ?? currentUsed ?? 0);
       }
     } catch (_userErr) {
       // LocalStorage read fallback
@@ -1820,6 +1870,19 @@ async function invokeAI({
       // ignore
     }
 
+    let resolvedPlan = plan && plan !== 'free' ? plan : 'free';
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const storedPlan = localStorage.getItem('washek_subscription_plan');
+        const storedStatus = localStorage.getItem('washek_subscription_status');
+        if (storedPlan && storedPlan !== 'free' && (!storedStatus || ['active', 'trialing', 'past_due'].includes(storedStatus.toLowerCase()))) {
+          resolvedPlan = storedPlan.toLowerCase();
+        }
+      }
+    } catch {
+      // ignore
+    }
+
     let res = await fetch('/api/ai-generate', {
       method: 'POST',
       headers,
@@ -1830,7 +1893,7 @@ async function invokeAI({
         model: model || 'gemini-3.1-flash-lite',
         schema: schema || response_json_schema || null,
         response_json_schema: response_json_schema || schema || null,
-        plan: plan || 'free',
+        plan: resolvedPlan,
         timezone: userTz,
         user_id: currentUserId,
         email: currentUserEmail,
@@ -1851,9 +1914,10 @@ async function invokeAI({
           model: model || 'gemini-3.1-flash-lite',
           schema: schema || response_json_schema || null,
           response_json_schema: response_json_schema || schema || null,
-          plan: 'free',
+          plan: resolvedPlan,
           timezone: userTz,
           user_id: currentUserId,
+          email: currentUserEmail,
           current_used: currentUsed,
         }),
       });
@@ -1886,6 +1950,12 @@ async function invokeAI({
           details: errData,
         };
       }
+      return {
+        __ai_error: true,
+        message: errData?.error || 'AI generation failed.',
+        code: errData?.error_code || 'AI_ERROR',
+        details: errData,
+      };
     }
 
     if (res.ok) {
@@ -1900,6 +1970,7 @@ async function invokeAI({
                 : data.result?.content || data.result?.response || data.result?.text || data.result,
             quota: data.quota,
             result: data.result,
+            ...(typeof data.result === 'object' && data.result !== null ? data.result : {}),
           };
         }
         return data.result ?? data;

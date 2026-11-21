@@ -543,6 +543,66 @@ function MovementBaseline({ trainingType }) {
   );
 }
 
+// Recursively unwraps nested result/data/array wrappers & markdown JSON strings
+function unwrapAiPayload(raw) {
+  let curr = raw;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (typeof curr === 'string') {
+      const cleaned = curr
+        .replace(/^\uFEFF/, '')
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      try {
+        curr = JSON.parse(cleaned);
+        continue;
+      } catch {
+        const firstBrace = cleaned.indexOf('{');
+        const lastBrace = cleaned.lastIndexOf('}');
+        if (firstBrace >= 0 && lastBrace > firstBrace) {
+          try {
+            curr = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
+            continue;
+          } catch {
+            // keep looking
+          }
+        }
+        const firstBracket = cleaned.indexOf('[');
+        const lastBracket = cleaned.lastIndexOf(']');
+        if (firstBracket >= 0 && lastBracket > firstBracket) {
+          try {
+            curr = JSON.parse(cleaned.slice(firstBracket, lastBracket + 1));
+            continue;
+          } catch {
+            // keep looking
+          }
+        }
+        return cleaned;
+      }
+    }
+    if (Array.isArray(curr)) {
+      curr = curr[0];
+      continue;
+    }
+    if (curr && typeof curr === 'object') {
+      if (curr.result !== undefined && typeof curr.result === 'object' && curr.result !== null) {
+        curr = curr.result;
+        continue;
+      }
+      if (typeof curr.result === 'string') {
+        curr = curr.result;
+        continue;
+      }
+      if (curr.data && typeof curr.data === 'object') {
+        curr = curr.data;
+        continue;
+      }
+    }
+    break;
+  }
+  return curr;
+}
+
 // ─── Elite Live Adjustment ──────────────────────────────
 function LiveAdjustmentPanel({
   exercise,
@@ -659,6 +719,7 @@ Return ONLY JSON:
       const result = await supabaseApi.ai.invoke({
         type: 'live_workout_adjustment',
         prompt,
+        plan: user?.subscription_plan || 'elite',
         response_json_schema: {
           type: 'object',
           properties: {
@@ -696,7 +757,29 @@ Return ONLY JSON:
         },
       });
 
-      if (!result?.adjusted_exercise) {
+      if (result?.__ai_error) {
+        throw new Error(result.message || 'Kael could not adjust this exercise right now.');
+      }
+
+      const payload = unwrapAiPayload(result);
+      const normalizedPayload =
+        payload && typeof payload === 'object' ? payload : null;
+
+      let adjustedExercise =
+        normalizedPayload?.adjusted_exercise ||
+        normalizedPayload?.adjustedExercise ||
+        normalizedPayload?.exercise ||
+        result?.adjusted_exercise ||
+        (normalizedPayload?.name ? { ...exercise, ...normalizedPayload } : null);
+
+      if (typeof adjustedExercise === 'string') {
+        const parsedInner = unwrapAiPayload(adjustedExercise);
+        if (parsedInner && typeof parsedInner === 'object') {
+          adjustedExercise = parsedInner;
+        }
+      }
+
+      if (!adjustedExercise || typeof adjustedExercise !== 'object') {
         throw new Error(
           'Kael did not return a valid adjustment.'
         );
@@ -704,14 +787,14 @@ Return ONLY JSON:
 
       const rawAdjusted = {
         ...exercise,
-        ...result.adjusted_exercise,
+        ...adjustedExercise,
         sets: Math.max(
           completedCount,
-          Number(result.adjusted_exercise.sets) ||
+          Number(adjustedExercise.sets) ||
             totalSets
         ),
         rest_seconds:
-          Number(result.adjusted_exercise.rest_seconds) ||
+          Number(adjustedExercise.rest_seconds) ||
           exercise.rest_seconds ||
           60,
       };
@@ -737,12 +820,16 @@ Return ONLY JSON:
       onApply(adjusted);
 
       const summary =
-        result.adjustment_summary ||
+        normalizedPayload?.adjustment_summary ||
+        payload?.adjustment_summary ||
+        result?.adjustment_summary ||
         'Kael adjusted the exercise based on your current performance.';
 
+      const safety = normalizedPayload?.safety_note || payload?.safety_note || result?.safety_note || '';
+
       setLastAdjustment(
-        result.safety_note
-          ? `${summary} ${result.safety_note}`
+        safety
+          ? `${summary} ${safety}`
           : summary
       );
 
@@ -840,6 +927,7 @@ function PostWorkoutCheckin({
   canAdapt,
   program,
   user,
+  dayIndex = -1,
   onProgramUpdated,
 }) {
   const [checkin, setCheckin] = useState('');
@@ -883,7 +971,11 @@ function PostWorkoutCheckin({
         const nextMicrocycle =
           program.microcycles?.find(
             m => m.week_number === currentWeek + 1
-          ) || null;
+          ) ||
+          program.microcycles?.find(
+            m => m.week_number === currentWeek
+          ) ||
+          null;
 
         const typeLabel = {
           calisthenics: 'calisthenics',
@@ -974,6 +1066,7 @@ Respond in JSON:
         const result = await supabaseApi.ai.invoke({
           type: 'live_workout_adjustment',
           prompt: elitePrompt,
+          plan: user?.subscription_plan || 'progress',
           response_json_schema: {
             type: 'object',
             properties: {
@@ -1014,51 +1107,101 @@ Respond in JSON:
                       type: 'string',
                     },
                   },
+                  required: [
+                    'name',
+                    'sets',
+                    'reps',
+                    'rest_seconds',
+                    'notes',
+                    'activation_cue',
+                  ],
                 },
               },
             },
+            required: [
+              'coach_response',
+              'adjustments_summary',
+              'progress_trajectory',
+              'projected_outlook',
+              'adjusted_exercises',
+            ],
           },
         });
 
-        const note = `${result.coach_response}\n\n📋 12-Week Program Recalibrated: ${result.adjustments_summary}${
-          result.projected_outlook ? `\n🎯 Projected Outlook: ${result.projected_outlook}` : ''
+        if (result?.__ai_error) {
+          throw new Error(result.message || 'Could not get Kael’s response.');
+        }
+
+        const unwrapped = unwrapAiPayload(result);
+        const payload =
+          unwrapped && typeof unwrapped === 'object'
+            ? unwrapped
+            : { coach_response: typeof unwrapped === 'string' ? unwrapped : '' };
+
+        const coachResponse =
+          payload?.coach_response ||
+          result?.coach_response ||
+          (typeof unwrapped === 'string' ? unwrapped : '') ||
+          'Great session! Recovery and consistency will lock in your progress.';
+        const adjustmentsSummary = payload?.adjustments_summary || result?.adjustments_summary || '';
+        const projectedOutlook = payload?.projected_outlook || result?.projected_outlook || '';
+
+        const note = `${coachResponse}${
+          adjustmentsSummary
+            ? `\n\n📋 12-Week Program Recalibrated: ${adjustmentsSummary}`
+            : ''
+        }${
+          projectedOutlook ? `\n🎯 Projected Outlook: ${projectedOutlook}` : ''
         }`;
 
         setAiNote(note);
 
-        await onSave(checkin, note);
+        try {
+          await onSave(checkin, note);
+        } catch (saveErr) {
+          console.warn('[PostWorkoutCheckin] Log note sync warning:', saveErr?.message || saveErr);
+        }
+
+        const adjustedExercises =
+          payload?.adjusted_exercises || result?.adjusted_exercises;
 
         if (
-          result.adjusted_exercises?.length > 0
+          Array.isArray(adjustedExercises) &&
+          adjustedExercises.length > 0
         ) {
-          const adaptedProgram = applyPostWorkoutAdaptation({
-            currentProgram: program,
-            currentWeek,
-            dayName: log?.day_name,
-            adjustedExercises: result.adjusted_exercises,
-            checkinSummary: result.adjustments_summary,
-            coachResponse: result.coach_response,
-            trajectory: result.progress_trajectory || 'steady',
-            projectedOutlook: result.projected_outlook || '',
-            fitnessGoals: user?.fitness_goals,
-            weightGoals: user?.weight_goals,
-            requirements: user?.training_requirements || '',
-            equipment: user?.available_equipment || '',
-            currentSkills: user?.current_skills || '',
-            workoutDays: resolvedWorkoutDays,
-          });
+          try {
+            const adaptedProgram = applyPostWorkoutAdaptation({
+              currentProgram: program,
+              currentWeek,
+              currentDayIndex: dayIndex,
+              dayName: log?.day_name,
+              adjustedExercises,
+              checkinSummary: adjustmentsSummary,
+              coachResponse,
+              trajectory: payload?.progress_trajectory || 'steady',
+              projectedOutlook,
+              fitnessGoals: user?.fitness_goals,
+              weightGoals: user?.weight_goals,
+              requirements: user?.training_requirements || '',
+              equipment: user?.available_equipment || '',
+              currentSkills: user?.current_skills || '',
+              workoutDays: resolvedWorkoutDays,
+            });
 
-          await supabaseApi.entities.WorkoutProgram.update(
-            program.id,
-            {
-              microcycles: adaptedProgram.microcycles,
-              adaptation_history: adaptedProgram.adaptation_history,
-              last_adapted_by_kael: adaptedProgram.last_adapted_by_kael,
+            if (onProgramUpdated) {
+              await onProgramUpdated(adaptedProgram);
+            } else {
+              await supabaseApi.entities.WorkoutProgram.update(
+                program.id,
+                {
+                  microcycles: adaptedProgram.microcycles,
+                  adaptation_history: adaptedProgram.adaptation_history,
+                  last_adapted_by_kael: adaptedProgram.last_adapted_by_kael,
+                }
+              );
             }
-          );
-
-          if (onProgramUpdated) {
-            await onProgramUpdated(adaptedProgram);
+          } catch (adaptErr) {
+            console.warn('[PostWorkoutCheckin] Program adaptation sync warning:', adaptErr?.message || adaptErr);
           }
         }
       } else {
@@ -1094,11 +1237,28 @@ Respond with:
         const result = await supabaseApi.ai.invoke({
           type: 'live_workout',
           prompt,
+          plan: user?.subscription_plan || 'free',
         });
 
-        setAiNote(result);
+        if (result?.__ai_error) {
+          throw new Error(result.message || 'Could not get Kael’s response.');
+        }
 
-        await onSave(checkin, result);
+        const noteText =
+          typeof result === 'string'
+            ? result
+            : result?.content ||
+              (typeof result?.result === 'string' ? result.result : result?.result?.coach_response) ||
+              result?.coach_response ||
+              'Great work showing up and finishing your session!';
+
+        setAiNote(noteText);
+
+        try {
+          await onSave(checkin, noteText);
+        } catch (saveErr) {
+          console.warn('[PostWorkoutCheckin] Free check-in note sync warning:', saveErr?.message || saveErr);
+        }
       }
 
       setLoading(false);
@@ -1220,6 +1380,7 @@ export default function LiveWorkout() {
 
   const [savedLog, setSavedLog] = useState(null);
   const [autoAdaptationResult, setAutoAdaptationResult] = useState(null);
+  const scrollContainerRef = useRef(null);
 
   // Local live workout copy.
   // This is what Elite real-time adjustments modify.
@@ -1356,7 +1517,7 @@ export default function LiveWorkout() {
         queryKey: ['logs'],
       });
 
-      setSavedLog(log);
+      setSavedLog((prev) => ({ ...(prev || {}), ...(log || {}) }));
     },
   });
 
@@ -1427,6 +1588,15 @@ export default function LiveWorkout() {
     if (defaultDayAppliedRef.current || started || days.length === 0) return;
     defaultDayAppliedRef.current = true;
     try {
+      const searchParams = new URLSearchParams(window.location.search);
+      const dayParam = searchParams.get('day');
+      if (dayParam !== null && dayParam !== '') {
+        const parsedDay = Number.parseInt(dayParam, 10);
+        if (Number.isInteger(parsedDay) && parsedDay >= 0 && parsedDay < days.length) {
+          setDayIndex(parsedDay);
+          return;
+        }
+      }
       const todayName = new Date().toLocaleDateString('en-US', { weekday: 'long' });
       const idx = days.findIndex(
         (d) =>
@@ -1437,7 +1607,7 @@ export default function LiveWorkout() {
         setDayIndex(idx);
       }
     } catch {
-      // ignore locale issues
+      // ignore locale/url issues
     }
   }, [days, started]);
 
@@ -1620,7 +1790,13 @@ export default function LiveWorkout() {
         notes: '',
       }));
 
-    logMutation.mutate({
+    const stableLogId =
+      typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+        ? crypto.randomUUID()
+        : `work_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    const logPayload = {
+      id: stableLogId,
       program_id: program?.id,
       date: getLocalDateKey(),
       week_number: currentWeekNum,
@@ -1630,7 +1806,11 @@ export default function LiveWorkout() {
       duration_minutes: Math.round(
         seconds / 60
       ),
-    });
+    };
+
+    // Show PostWorkoutCheckin immediately without waiting on remote database round-trips
+    setSavedLog(logPayload);
+    logMutation.mutate(logPayload);
 
     if (canAdapt && program) {
       const adaptation = applyLivePerformanceAdaptation({
@@ -1671,21 +1851,29 @@ export default function LiveWorkout() {
 
   const handleScrollToTop = (e) => {
     e?.stopPropagation?.();
+    if (scrollContainerRef.current) {
+      scrollContainerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+    }
     if (typeof window !== 'undefined') {
       window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
   return (
-    <div className="flex flex-col min-h-screen bg-background">
+    <div className="fixed inset-0 flex flex-col bg-background overflow-hidden">
       <Tabs
         defaultValue="workout"
-        className="flex-1 flex flex-col"
+        onValueChange={() => {
+          if (scrollContainerRef.current) {
+            scrollContainerRef.current.scrollTo({ top: 0, behavior: 'auto' });
+          }
+        }}
+        className="flex-1 flex flex-col min-h-0 overflow-hidden"
       >
-        {/* Sticky Pinned Header Section - Stays at top when you scroll on mobile & desktop */}
-        <div
+        {/* Pinned Non-Scrolling Header Section - Stays permanently anchored at top while content scrolls below */}
+        <header
           onClick={handleScrollToTop}
-          className="sticky top-0 z-40 bg-background/90 dark:bg-card/90 backdrop-blur-2xl border-b border-border/80 shadow-[0_2px_12px_rgba(0,0,0,0.05)] dark:shadow-[0_4px_20px_rgba(0,0,0,0.35)] select-none pointer-events-auto cursor-pointer transition-colors"
+          className="shrink-0 z-40 bg-background/95 dark:bg-card/95 backdrop-blur-2xl border-b border-border/80 shadow-[0_2px_12px_rgba(0,0,0,0.05)] dark:shadow-[0_4px_20px_rgba(0,0,0,0.35)] select-none pointer-events-auto cursor-pointer transition-colors"
           title="Tap to scroll to top"
         >
           {/* Main Header Bar */}
@@ -1747,12 +1935,17 @@ export default function LiveWorkout() {
               </TabsTrigger>
             </TabsList>
           </div>
-        </div>
+        </header>
 
+        {/* Independent Scrollable Viewport Below Pinned Header */}
+        <div
+          ref={scrollContainerRef}
+          className="flex-1 overflow-y-auto overflow-x-hidden overscroll-y-contain"
+        >
         {/* ── WORKOUT TAB ── */}
         <TabsContent
           value="workout"
-          className="flex-1 px-4 sm:px-5 py-4 space-y-4 safe-bottom m-0"
+          className="px-4 sm:px-5 py-4 space-y-4 safe-bottom m-0"
         >
           {/* Day selector */}
           <div className="flex gap-2 overflow-x-auto pb-1">
@@ -1856,7 +2049,7 @@ export default function LiveWorkout() {
                     size="sm"
                     variant="outline"
                     className="shrink-0 text-xs"
-                    onClick={() => navigate('/pricing')}
+                    onClick={() => navigate('/profile')}
                   >
                     Upgrade
                   </Button>
@@ -1870,6 +2063,7 @@ export default function LiveWorkout() {
                   canAdapt={canAdapt}
                   program={program}
                   user={effectiveUser}
+                  dayIndex={dayIndex}
                   onProgramUpdated={async (adaptedProgram) => {
                     if (adaptedProgram) {
                       await persistProgramAdaptation(adaptedProgram);
@@ -2265,7 +2459,7 @@ export default function LiveWorkout() {
         {/* ── BASELINE TAB ── */}
         <TabsContent
           value="baseline"
-          className="flex-1 px-4 sm:px-5 py-4 safe-bottom m-0"
+          className="px-4 sm:px-5 py-4 safe-bottom m-0"
         >
           <h2 className="font-heading font-bold text-lg mb-1">
             My Current Maxes
@@ -2277,6 +2471,7 @@ export default function LiveWorkout() {
             }
           />
         </TabsContent>
+        </div>
       </Tabs>
 
       {/* Dynamic Warmup Routine Generator (Optional injury prevention step) */}

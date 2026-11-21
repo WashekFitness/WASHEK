@@ -989,3 +989,18 @@ html.dark .card-luminous {
 .glow-button:hover {
   box-shadow: 0 0 35px 0px rgba(37, 99, 235, 0.65);
 }
+
+html,
+body {
+  touch-action: manipulation;
+}
+
+/* Unlayered rule so utility classes (text-xs, text-sm) on mobile/touch viewports never drop below 16px and trigger browser zoom */
+@media (any-pointer: coarse), (hover: none), screen and (max-width: 1024px) {
+  input,
+  textarea,
+  select,
+  [contenteditable="true"] {
+    font-size: 16px !important;
+  }
+}

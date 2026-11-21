@@ -426,15 +426,39 @@ Return ONLY a valid JSON array of objects with this schema:
         type: 'general',
       });
 
-      let parsed = null;
-      if (typeof response === 'string') {
-        const clean = response.replace(/^```json\s*/, '').replace(/\s*```$/, '').trim();
-        parsed = JSON.parse(clean);
-      } else if (response?.result) {
-        parsed = typeof response.result === 'string' ? JSON.parse(response.result) : response.result;
-      } else if (Array.isArray(response)) {
-        parsed = response;
+      if (response?.__ai_error) {
+        console.warn('[DynamicWarmup] AI generation error:', response.message);
+        return;
       }
+
+      const extractArray = (raw) => {
+        if (Array.isArray(raw)) return raw;
+        if (typeof raw !== 'string') return null;
+        const clean = raw
+          .replace(/^\uFEFF/, '')
+          .replace(/^```(?:json)?\s*/i, '')
+          .replace(/\s*```$/i, '')
+          .trim();
+        try {
+          const parsedVal = JSON.parse(clean);
+          if (Array.isArray(parsedVal)) return parsedVal;
+          if (Array.isArray(parsedVal?.warmup)) return parsedVal.warmup;
+        } catch {
+          const firstBracket = clean.indexOf('[');
+          const lastBracket = clean.lastIndexOf(']');
+          if (firstBracket >= 0 && lastBracket > firstBracket) {
+            try {
+              const sliced = JSON.parse(clean.slice(firstBracket, lastBracket + 1));
+              if (Array.isArray(sliced)) return sliced;
+            } catch {
+              // ignore
+            }
+          }
+        }
+        return null;
+      };
+
+      const parsed = extractArray(response?.result ?? response);
 
       if (Array.isArray(parsed) && parsed.length > 0) {
         setAiCustomRoutine(parsed);

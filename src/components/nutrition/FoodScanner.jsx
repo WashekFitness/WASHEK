@@ -222,6 +222,7 @@ function normalizeFood(
     serving_size:
       String(
         food.serving_size ||
+          food.serving ||
           'Estimated serving'
       ).trim(),
 
@@ -235,7 +236,7 @@ function normalizeFood(
     protein_g:
       Number(
         numberOrZero(
-          food.protein_g
+          food.protein_g ?? food.protein
         ).toFixed(
           1
         )
@@ -244,7 +245,7 @@ function normalizeFood(
     carbs_g:
       Number(
         numberOrZero(
-          food.carbs_g
+          food.carbs_g ?? food.carbs
         ).toFixed(
           1
         )
@@ -253,7 +254,7 @@ function normalizeFood(
     fat_g:
       Number(
         numberOrZero(
-          food.fat_g
+          food.fat_g ?? food.fat
         ).toFixed(
           1
         )
@@ -828,6 +829,13 @@ export default function FoodScanner({
             }
           );
 
+        if (rawResult?.__ai_error) {
+          throw new Error(
+            rawResult.message ||
+              'Food analysis could not be completed right now.'
+          );
+        }
+
 
         /*
          * ------------------------------------------------------
@@ -1002,6 +1010,13 @@ export default function FoodScanner({
               ],
             }
           );
+
+        if (rawResult?.__ai_error) {
+          throw new Error(
+            rawResult.message ||
+              'Package analysis could not be completed right now.'
+          );
+        }
 
 
         const parsedResult =

@@ -430,48 +430,51 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
           : null
       );
 
-      // Resolve the true active plan (Postgres profiles is authoritative whenever active; redirect receipt / server entitlement bridges iframe partition until DB/webhook catches up)
       let resolvedPlan = 'free';
       let resolvedStatus = 'inactive';
 
       const dbActive = hasRemoteProfile && profilePlan !== 'free' && isActiveStatus(profileStatus);
-      if (dbActive) {
-        clearRedirectUpgradeReceipt();
+
+      if (!redirectReceipt) {
+        try {
+          const serverEnt = await fetchServerEntitlement({
+            userId: effectiveUid || user?.id || storedUser?.id || '',
+            email: resolvedAuthEmail || '',
+            cancelledAtIso: profileCancelledAt,
+          });
+          if (serverEnt?.active) {
+            redirectReceipt = {
+              plan: normalizePlan(serverEnt.plan),
+              status: serverEnt.status,
+              timestamp: serverEnt.timestamp,
+              verifiedBy: serverEnt.verifiedBy,
+            };
+          }
+        } catch {
+          // ignore server entitlement note
+        }
+      }
+
+      const redirectRank = redirectReceipt ? (TIER_LEVELS[normalizePlan(redirectReceipt.plan)] || 0) : 0;
+      const dbRank = dbActive ? (TIER_LEVELS[profilePlan] || 0) : 0;
+
+      if (redirectReceipt && redirectRank > 0 && (!dbActive || redirectRank > dbRank)) {
+        resolvedPlan = normalizePlan(redirectReceipt.plan);
+        resolvedStatus = redirectReceipt.status || 'active';
+      } else if (dbActive) {
+        if (redirectReceipt && profilePlan === normalizePlan(redirectReceipt.plan)) {
+          clearRedirectUpgradeReceipt();
+        }
         resolvedPlan = profilePlan;
         resolvedStatus = profileStatus || 'active';
-      } else {
-        if (!redirectReceipt) {
-          try {
-            const serverEnt = await fetchServerEntitlement({
-              userId: effectiveUid || user?.id || storedUser?.id || '',
-              email: resolvedAuthEmail || '',
-              cancelledAtIso: profileCancelledAt,
-            });
-            if (serverEnt?.active) {
-              redirectReceipt = {
-                plan: serverEnt.plan,
-                status: serverEnt.status,
-                timestamp: serverEnt.timestamp,
-                verifiedBy: serverEnt.verifiedBy,
-              };
-            }
-          } catch {
-            // ignore server entitlement note
-          }
-        }
-
-        if (redirectReceipt) {
-          resolvedPlan = redirectReceipt.plan;
-          resolvedStatus = redirectReceipt.status;
-        } else if (hasRemoteProfile) {
-          // Authoritative remote DB confirms user is free / canceled / inactive
-          resolvedPlan = 'free';
-          resolvedStatus = profileStatus || 'inactive';
-        } else if (!isLocallyInactive && (localPlanRaw || userObjPlan)) {
-          // Transient profile miss (e.g., session hydrating): preserve cached paid plan rather than flashing Free
-          resolvedPlan = localPlanRaw || userObjPlan || 'free';
-          resolvedStatus = storedStatusRaw || userObjStatus || 'active';
-        }
+      } else if (hasRemoteProfile) {
+        // Authoritative remote DB confirms user is free / canceled / inactive
+        resolvedPlan = 'free';
+        resolvedStatus = profileStatus || 'inactive';
+      } else if (!isLocallyInactive && (localPlanRaw || userObjPlan)) {
+        // Transient profile miss (e.g., session hydrating): preserve cached paid plan rather than flashing Free
+        resolvedPlan = localPlanRaw || userObjPlan || 'free';
+        resolvedStatus = storedStatusRaw || userObjStatus || 'active';
       }
 
       hasLoadedOnceRef.current = true;

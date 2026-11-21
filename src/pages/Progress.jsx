@@ -1,5 +1,5 @@
-import { useMemo, useEffect } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMemo, useEffect, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import {
   BarChart,
@@ -23,6 +23,7 @@ import {
 import { Card } from '@/components/ui/card';
 import PageHeader from '@/components/layout/PageHeader';
 import { supabaseApi } from '@/lib/supabaseApi';
+import { useAuth } from '@/lib/AuthContext';
 import { canAccess, resolveEffectivePlan } from '@/lib/subscription';
 import { calcStreak } from '@/lib/streakUtils';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
@@ -88,6 +89,19 @@ function uniqueDateCount(logs) {
 }
 
 export default function Progress() {
+  const queryClient = useQueryClient();
+  const { user: authUser } = useAuth();
+  const [, setSubTick] = useState(0);
+
+  useEffect(() => {
+    const handleSubUpdated = () => {
+      queryClient.invalidateQueries({ queryKey: ['current-user'] });
+      setSubTick((t) => t + 1);
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+  }, [queryClient]);
+
   const { data: user } = useQuery({
     queryKey: ['current-user'],
     queryFn: () => supabaseApi.auth.me(),
@@ -102,7 +116,7 @@ export default function Progress() {
     }
   })();
 
-  const effectiveUser = user || storedUser;
+  const effectiveUser = authUser || user || storedUser;
   const email = effectiveUser?.email;
   const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
   const plan = resolveEffectivePlan(effectiveUser);

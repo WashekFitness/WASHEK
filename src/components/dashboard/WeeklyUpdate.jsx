@@ -1537,6 +1537,38 @@ Never diagnose a medical condition.
                   'object',
                   'null',
                 ],
+                properties: {
+                  week_number: { type: 'number' },
+                  mesocycle_index: { type: 'number' },
+                  week_type: { type: 'string' },
+                  days: {
+                    type: 'array',
+                    items: {
+                      type: 'object',
+                      properties: {
+                        day_name: { type: 'string' },
+                        workout_type: { type: 'string' },
+                        exercises: {
+                          type: 'array',
+                          items: {
+                            type: 'object',
+                            properties: {
+                              name: { type: 'string' },
+                              sets: { type: 'number' },
+                              reps: { type: 'string' },
+                              rest_seconds: { type: 'number' },
+                              notes: { type: 'string' },
+                              activation_cue: { type: 'string' },
+                            },
+                            required: ['name', 'sets', 'reps', 'rest_seconds', 'notes', 'activation_cue'],
+                          },
+                        },
+                      },
+                      required: ['day_name', 'workout_type', 'exercises'],
+                    },
+                  },
+                },
+                required: ['week_number', 'week_type', 'days'],
               },
             },
 
@@ -1554,6 +1586,13 @@ Never diagnose a medical condition.
         });
 
 
+      if (rawResult?.__ai_error) {
+        throw new Error(
+          rawResult.message ||
+            'Could not generate weekly report right now.'
+        );
+      }
+
       console.log(
         '[KAEL WEEKLY UPDATE] Raw result:',
         rawResult
@@ -1565,6 +1604,13 @@ Never diagnose a medical condition.
           rawResult
         );
 
+      if (!hasNutritionInsights) {
+        result.nutrition_insight = '';
+        result.nutrition_suggestions = [];
+      }
+      if (!hasAdaptiveProgramming) {
+        result.adjusted_microcycle = null;
+      }
 
       console.log(
         '[KAEL WEEKLY UPDATE] Normalized result:',
