@@ -24,6 +24,7 @@ import {
   enforceUserSubscriptionState,
   isActiveSubscriptionStatus,
   normalizePlan,
+  getPlanRank,
   getRedirectUpgradeReceipt,
   applySubscriptionUpgrade,
 } from '@/lib/subscription';
@@ -43,9 +44,12 @@ export const AuthProvider = ({ children }) => {
         parsed.photo_url = null;
         modified = true;
       }
-      if (parsed && !isActiveSubscriptionStatus(parsed.subscription_status)) {
+      if (parsed) {
         const receipt = getRedirectUpgradeReceipt(parsed);
-        if (receipt) {
+        const parsedActive = isActiveSubscriptionStatus(parsed.subscription_status);
+        const parsedRank = parsedActive ? getPlanRank(parsed.subscription_plan) : 0;
+        const receiptRank = receipt ? getPlanRank(receipt.plan) : 0;
+        if (receipt && (!parsedActive || receiptRank > parsedRank)) {
           parsed = {
             ...parsed,
             subscription_plan: receipt.plan,
@@ -55,7 +59,7 @@ export const AuthProvider = ({ children }) => {
             subscription_tier: receipt.plan,
           };
           modified = true;
-        } else {
+        } else if (!parsedActive) {
           try {
             localStorage.removeItem('washek_subscription_plan');
           } catch (_err) {
@@ -338,11 +342,11 @@ export const AuthProvider = ({ children }) => {
         }
       }
 
-      // Cross-partition entitlement check when user is loaded on Free tier
+      // Cross-partition entitlement check whenever loaded user is not already on an active Elite plan
       if (
         mounted &&
         resolvedUser &&
-        (normalizePlan(resolvedUser.subscription_plan) === 'free' ||
+        (normalizePlan(resolvedUser.subscription_plan) !== 'elite' ||
           !isActiveSubscriptionStatus(resolvedUser.subscription_status))
       ) {
         try {
@@ -351,9 +355,13 @@ export const AuthProvider = ({ children }) => {
             email: resolvedUser.email,
             cancelledAtIso: resolvedUser.subscription_cancelled_at || null,
           });
-          if (mounted && ent?.active && ent.plan && ent.plan !== 'free') {
+          const curActive = isActiveSubscriptionStatus(resolvedUser.subscription_status);
+          const curRank = curActive ? getPlanRank(resolvedUser.subscription_plan) : 0;
+          const entRank = ent?.active ? getPlanRank(ent.plan) : 0;
+          if (mounted && ent?.active && ent.plan && ent.plan !== 'free' && (!curActive || entRank > curRank)) {
             applySubscriptionUpgrade(ent.plan, ent.status, {
               persistReceipt: true,
+              timestamp: ent.timestamp,
               syncServer: false,
             });
             setUser((prev) =>

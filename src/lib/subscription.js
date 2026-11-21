@@ -497,7 +497,12 @@ export function getPlanLabel(
  */
 const RECENT_UPGRADE_KEY = 'washek_recent_upgrade';
 const REDIRECT_RECEIPT_KEY = 'washek_redirect_upgrade_receipt';
-const REDIRECT_RECEIPT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const REDIRECT_RECEIPT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
+export function getPlanRank(plan) {
+  const idx = PLAN_HIERARCHY.indexOf(normalizePlan(plan));
+  return idx >= 0 ? idx : 0;
+}
 
 export function getRecentUpgradeGrace() {
   clearRecentUpgradeGrace();
@@ -520,10 +525,11 @@ export function setRedirectUpgradeReceipt(plan, status = 'active', details = {})
   if (normPlan === 'free' || !isActiveSubscriptionStatus(normStatus)) {
     return null;
   }
+  const parsedTs = Number(details?.timestamp);
   const receipt = {
     plan: normPlan,
     status: normStatus,
-    timestamp: Date.now(),
+    timestamp: Number.isFinite(parsedTs) && parsedTs > 0 ? parsedTs : Date.now(),
     verifiedBy: details?.verifiedBy || 'stripe_redirect',
   };
   try {

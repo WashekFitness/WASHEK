@@ -3627,6 +3627,56 @@ function extractJsonFromAiOutput(rawOutput: string): any {
   }
 }
 
+function buildKaelPlanPermissionsMandate(effectivePlan: string): string {
+  const plan = normalizeServerPlan(effectivePlan);
+  if (plan === 'elite') {
+    return (
+      ' AUTHORIZATION & PLAN ACCESS (VERIFIED: ELITE): This user has full unrestricted Elite access to EVERY feature and route in the app ' +
+      '(including /formlab, AI progress photo body-fat & physique analysis, live workout adjustments, detailed workout analytics, weekly nutrition insights, adaptive macros, adaptive programming, insider Elite coaching tips, deep recovery guidance, and direct navigation anywhere). ' +
+      'When navigating the user to any page (such as [ACTION:go:/formlab|Open Form Lab]), always use the exact format [ACTION:go:/route|Button Label].'
+    );
+  }
+
+  const lockedCapabilities: string[] = [];
+  if (!hasRequiredServerPlan(plan, 'progress')) {
+    lockedCapabilities.push(
+      'side-by-side progress photo comparisons (Progress plan)',
+      'AI food photo or barcode nutrition scanning (Progress plan)',
+      'custom workout plan overrides & adaptive multi-week programming (Progress plan)',
+      'workout-adaptive calorie/macro recalculation (Progress plan)'
+    );
+  }
+  if (!hasRequiredServerPlan(plan, 'performance')) {
+    lockedCapabilities.push(
+      'AI progress photo body-fat estimation, physique critique, or visual body analysis (Performance plan)',
+      'detailed workout performance analytics (Performance plan)',
+      'AI weekly nutrition insights (Performance plan)'
+    );
+  }
+  lockedCapabilities.push(
+    'Form Lab video technique analysis and navigating/linking to /formlab (Elite plan)',
+    'live in-workout real-time exercise adjustments (Elite plan)',
+    'Progress Graph predictions and Elite insider tips/deep recovery protocols (Elite plan)'
+  );
+
+  return (
+    ` STRICT PLAN AUTHORIZATION & HARD LOCKS (SERVER-VERIFIED PLAN: ${plan.toUpperCase()}): ` +
+    `NEVER perform, simulate, or navigate to ANY feature above ${plan.toUpperCase()}. ` +
+    `LOCKED FOR THIS USER: ${lockedCapabilities.join('; ')}. ` +
+    'If the user asks you to perform any locked analysis (for example analyzing progress photos or estimating body fat on Free/Progress) ' +
+    'or asks to go to a locked page (such as /formlab on non-Elite), DO NOT fulfill the locked request and NEVER emit [ACTION:go:/formlab...], [ACTION:navigate:/formlab...], or [ACTION:/formlab]. ' +
+    'Instead, politely decline that specific locked feature, accurately state the minimum required plan name listed above, and optionally offer [ACTION:navigate:/profile|Upgrade Plan].'
+  );
+}
+
+function sanitizeKaelResponseActionsForPlan(rawText: string, effectivePlan: string): string {
+  const text = String(rawText || '');
+  if (hasRequiredServerPlan(effectivePlan, 'elite')) {
+    return text;
+  }
+  return text.replace(/\[ACTION:(?:(?:go|navigate):)?\/formlab(?:[?|][^\]]*)?\]/gi, '');
+}
+
 app.post('/api/ai-generate', async (req, res) => {
   try {
     const {
@@ -3910,7 +3960,9 @@ app.post('/api/ai-generate', async (req, res) => {
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
         'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
         'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ' +
-        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to a page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ';
+        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to an AUTHORIZED page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ' +
+        buildKaelPlanPermissionsMandate(effectivePlan) +
+        ' ';
 
       if (effectivePlan === 'elite') {
         config.systemInstruction =
@@ -4087,9 +4139,12 @@ app.post('/api/ai-generate', async (req, res) => {
       throw combinedErr;
     }
 
-    const outputText = (response.text || '').trim();
+    let outputText = (response.text || '').trim();
     if (!outputText) {
       throw new Error('Coach Kael generated an empty response.');
+    }
+    if (isKael) {
+      outputText = sanitizeKaelResponseActionsForPlan(outputText, effectivePlan).trim();
     }
 
     // Now that Kael has actually answered, atomically claim and decrement the message quota
@@ -4432,7 +4487,9 @@ app.post('/api/ai-stream', async (req, res) => {
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
         'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
         'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ' +
-        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to a page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ';
+        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to an AUTHORIZED page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ' +
+        buildKaelPlanPermissionsMandate(effectivePlan) +
+        ' ';
 
       if (effectivePlan === 'elite') {
         config.systemInstruction =
@@ -4488,6 +4545,27 @@ app.post('/api/ai-stream', async (req, res) => {
     };
 
     let fullOutput = '';
+    let streamRawBuffer = '';
+    const needsKaelActionSanitize = isKael && !hasRequiredServerPlan(effectivePlan, 'elite');
+    const flushSanitizedStream = (flushTail: boolean) => {
+      if (!needsKaelActionSanitize) return;
+      let releaseSource = streamRawBuffer;
+      let pendingTail = '';
+      if (!flushTail) {
+        const openIdx = streamRawBuffer.lastIndexOf('[ACTION:');
+        if (openIdx >= 0 && streamRawBuffer.indexOf(']', openIdx) === -1) {
+          releaseSource = streamRawBuffer.slice(0, openIdx);
+          pendingTail = streamRawBuffer.slice(openIdx);
+        }
+      }
+      const sanitizedPrefix = sanitizeKaelResponseActionsForPlan(releaseSource, effectivePlan);
+      streamRawBuffer = sanitizedPrefix + pendingTail;
+      if (sanitizedPrefix.length > fullOutput.length) {
+        const delta = sanitizedPrefix.slice(fullOutput.length);
+        fullOutput = sanitizedPrefix;
+        res.write(`data: ${JSON.stringify({ chunk: delta, full: fullOutput })}\n\n`);
+      }
+    };
     let streamResponse: any = null;
     let lastError: any = null;
 
@@ -4505,9 +4583,17 @@ app.post('/api/ai-stream', async (req, res) => {
             for await (const chunk of streamResponse) {
               const text = chunk.text;
               if (text) {
-                fullOutput += text;
-                res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+                if (needsKaelActionSanitize) {
+                  streamRawBuffer += text;
+                  flushSanitizedStream(false);
+                } else {
+                  fullOutput += text;
+                  res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);
+                }
               }
+            }
+            if (needsKaelActionSanitize && streamRawBuffer) {
+              flushSanitizedStream(true);
             }
           } finally {
             clear();
@@ -4546,7 +4632,9 @@ app.post('/api/ai-stream', async (req, res) => {
             config: callConfig,
           });
           clear();
-          const text = unaryRes.text || '';
+          const text = isKael
+            ? sanitizeKaelResponseActionsForPlan(unaryRes.text || '', effectivePlan)
+            : (unaryRes.text || '');
           if (text) {
             fullOutput = text;
             res.write(`data: ${JSON.stringify({ chunk: text, full: fullOutput })}\n\n`);

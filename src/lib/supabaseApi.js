@@ -6,6 +6,7 @@ import {
   enforceUserSubscriptionState,
   isActiveSubscriptionStatus,
   normalizePlan,
+  getPlanRank,
   getRedirectUpgradeReceipt,
   clearRedirectUpgradeReceipt,
 } from '@/lib/subscription';
@@ -355,7 +356,10 @@ async function currentUser(forceFresh = false) {
             isActiveSubscriptionStatus(parsedStatus) &&
             parsedPlan !== 'free';
 
-          if (!isParsedActive && redirectReceipt) {
+          const parsedRank = isParsedActive ? getPlanRank(parsedPlan) : 0;
+          const redirectRank = redirectReceipt ? getPlanRank(redirectReceipt.plan) : 0;
+
+          if (redirectReceipt && (!isParsedActive || redirectRank > parsedRank)) {
             parsed.subscription_plan = redirectReceipt.plan;
             parsed.subscription_status = redirectReceipt.status;
             parsed.tier = redirectReceipt.plan;
@@ -379,8 +383,8 @@ async function currentUser(forceFresh = false) {
     }
   }
 
-  // Return recently fetched authoritative user within short TTL window unless cache invalidated
-  if (lastMeResult && Date.now() - lastMeFetchedAt < ME_FRESH_TTL_MS) {
+  // Return recently fetched authoritative user within short TTL window unless forceFresh requested
+  if (!forceFresh && lastMeResult && Date.now() - lastMeFetchedAt < ME_FRESH_TTL_MS) {
     return lastMeResult;
   }
 
@@ -1585,12 +1589,15 @@ async function streamAI({
     : [];
 
   let authToken = null;
+  let sessionUser = null;
   try {
     const { data: sessionData } = await supabase.auth.getSession();
     authToken = sessionData?.session?.access_token || null;
+    sessionUser = sessionData?.session?.user || null;
     if (!authToken) {
       const { data: refreshed } = await supabase.auth.refreshSession();
       authToken = refreshed?.session?.access_token || null;
+      sessionUser = refreshed?.session?.user || sessionUser;
     }
   } catch (_tokenErr) {
     // Ignore
@@ -1604,8 +1611,8 @@ async function streamAI({
     }
   }
 
-  let currentUserId = lastMeResult?.id || null;
-  let currentUserEmail = lastMeResult?.email || null;
+  let currentUserId = lastMeResult?.id || sessionUser?.id || null;
+  let currentUserEmail = lastMeResult?.email || sessionUser?.email || null;
   let currentUsed = Number(lastMeResult?.kael_msg_count || 0);
   try {
     const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
@@ -1664,6 +1671,7 @@ async function streamAI({
   try {
     let res = await fetch('/api/ai-stream', {
       method: 'POST',
+      credentials: 'include',
       headers,
       body: requestBody,
     });
@@ -1672,6 +1680,7 @@ async function streamAI({
       delete headers['Authorization'];
       res = await fetch('/api/ai-stream', {
         method: 'POST',
+        credentials: 'include',
         headers,
         body: requestBody,
       });
@@ -1819,12 +1828,15 @@ async function invokeAI({
 
   // Get active session token for backend authorization & quota claiming
   let authToken = null;
+  let sessionUser = null;
   try {
     const { data: sessionData } = await supabase.auth.getSession();
     authToken = sessionData?.session?.access_token || null;
+    sessionUser = sessionData?.session?.user || null;
     if (!authToken) {
       const { data: refreshed } = await supabase.auth.refreshSession();
       authToken = refreshed?.session?.access_token || null;
+      sessionUser = refreshed?.session?.user || sessionUser;
     }
   } catch (tokenErr) {
     console.warn('[invokeAI] Failed to get session token:', tokenErr);
@@ -1840,8 +1852,8 @@ async function invokeAI({
 
   // Primary: Google Gemini Server Backend
   try {
-    let currentUserId = lastMeResult?.id || null;
-    let currentUserEmail = lastMeResult?.email || null;
+    let currentUserId = lastMeResult?.id || sessionUser?.id || null;
+    let currentUserEmail = lastMeResult?.email || sessionUser?.email || null;
     let currentUsed = Number(lastMeResult?.kael_msg_count || 0);
     try {
       const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
@@ -1885,6 +1897,7 @@ async function invokeAI({
 
     let res = await fetch('/api/ai-generate', {
       method: 'POST',
+      credentials: 'include',
       headers,
       body: JSON.stringify({
         type,
@@ -1906,6 +1919,7 @@ async function invokeAI({
       delete headers['Authorization'];
       res = await fetch('/api/ai-generate', {
         method: 'POST',
+        credentials: 'include',
         headers,
         body: JSON.stringify({
           type,

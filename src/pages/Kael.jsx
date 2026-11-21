@@ -65,7 +65,7 @@ import {
   getCurrentMonthKey,
   getPlanLimit,
 } from '@/lib/messageLimit';
-import { resolveEffectivePlan } from '@/lib/subscription';
+import { getPlanRank, resolveEffectivePlan } from '@/lib/subscription';
 import {
   kaelStore,
   useKaelStore,
@@ -78,6 +78,7 @@ import { getLocalDateKey, getUserTimeZone } from '@/lib/dateUtils';
 import {
   fetchKaelAppContext,
   parseKaelActions,
+  validateKaelRoute,
 } from '@/lib/kaelAppContext';
 
 import {
@@ -346,7 +347,14 @@ export default function Kael() {
   });
 
   const { user: authUser, setUser: setAuthUser } = useAuth() || {};
-  const effectiveUser = user || authUser;
+  const effectiveUser = (() => {
+    if (authUser && user) {
+      return getPlanRank(resolveEffectivePlan(authUser)) >= getPlanRank(resolveEffectivePlan(user))
+        ? { ...user, ...authUser }
+        : { ...authUser, ...user };
+    }
+    return authUser || user;
+  })();
 
   const { timeZone } = useMidnightSync(effectiveUser);
 
@@ -401,7 +409,7 @@ export default function Kael() {
     let active = true;
 
     supabaseApi.auth
-      .me()
+      .me(true)
       .then((u) => {
         if (!active) {
           return;
@@ -644,7 +652,15 @@ export default function Kael() {
     return () => {
       active = false;
     };
-  }, [effectiveUser?.id, effectiveUser?.email, effectiveUser?.subscription_plan, settings?.manualRestDays, settings?.unit, effectiveTz]);
+  }, [
+    effectiveUser?.id,
+    effectiveUser?.email,
+    effectiveUser?.subscription_plan,
+    effectiveUser?.subscription_status,
+    settings?.manualRestDays,
+    settings?.unit,
+    effectiveTz,
+  ]);
 
   const executeKaelAction = useCallback(
     async (action, { isAuto = false, messageId = null } = {}) => {
@@ -660,13 +676,20 @@ export default function Kael() {
       if (action.type === 'go' || action.type === 'navigate') {
         if (isAuto && action.type !== 'go') return;
         if (!action.route) return;
+        const authorizedRoute = validateKaelRoute(action.route, effectiveUser || plan);
+        if (!authorizedRoute) {
+          if (!isAuto) {
+            toast.error('Upgrade your plan to access that feature.');
+          }
+          return;
+        }
         if (isAuto) {
           toast.info(`Taking you to ${action.label}…`);
           window.setTimeout(() => {
-            navigate(action.route);
+            navigate(authorizedRoute);
           }, 600);
         } else {
-          navigate(action.route);
+          navigate(authorizedRoute);
         }
         return;
       }
@@ -1193,7 +1216,7 @@ export default function Kael() {
           trimmed
         );
 
-        const parsedActions = parseKaelActions(responseText).actions;
+        const parsedActions = parseKaelActions(responseText, effectiveUser || plan).actions;
         if (parsedActions.length > 0) {
           for (const action of parsedActions) {
             if (action.type === 'go' || action.type === 'log_food' || action.type === 'log_rest_day') {
@@ -1528,6 +1551,7 @@ export default function Kael() {
               isUser={
                 false
               }
+              userOrPlan={effectiveUser || plan}
             />
           )}
 
@@ -1563,6 +1587,7 @@ export default function Kael() {
                     message.role ===
                     'user'
                   }
+                  userOrPlan={effectiveUser || plan}
                   onAction={(action) =>
                     executeKaelAction(action, {
                       isAuto: false,

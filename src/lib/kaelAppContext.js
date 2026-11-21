@@ -13,7 +13,7 @@ import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 import { calculateWeeklyMuscleDistribution } from '@/lib/muscleDistribution';
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import { calcStreak } from '@/lib/streakUtils';
-import { canAccess, resolveEffectivePlan } from '@/lib/subscription';
+import { canAccess, FEATURE_PLANS, resolveEffectivePlan } from '@/lib/subscription';
 import { extractWeekdayFromDayName, resolveWorkoutDays, WEEKDAYS } from '@/lib/workoutSchedule';
 
 export const KAEL_STATIC_ROUTES = [
@@ -32,6 +32,10 @@ export const KAEL_STATIC_ROUTES = [
   '/kael',
 ];
 
+export const ROUTE_REQUIRED_FEATURE = {
+  '/formlab': 'form_analysis',
+};
+
 const ROUTE_DEFAULT_LABELS = {
   '/': 'Open Dashboard',
   '/program': 'View Program',
@@ -47,7 +51,21 @@ const ROUTE_DEFAULT_LABELS = {
 
 const VALID_MEAL_TYPES = new Set(['breakfast', 'lunch', 'dinner', 'snack', 'post-workout']);
 
-export function validateKaelRoute(rawRoute) {
+export function canAccessKaelRoute(route, userOrPlan) {
+  const cleanBase = String(route || '').split('?')[0].trim();
+  const reqFeature = ROUTE_REQUIRED_FEATURE[cleanBase];
+  if (!reqFeature) {
+    return { allowed: true, requiredPlan: 'free', feature: null };
+  }
+  const allowed = canAccess(userOrPlan || 'free', reqFeature);
+  return {
+    allowed,
+    requiredPlan: FEATURE_PLANS[reqFeature] || 'elite',
+    feature: reqFeature,
+  };
+}
+
+export function validateKaelRoute(rawRoute, userOrPlan = null) {
   if (typeof rawRoute !== 'string') return null;
   const trimmed = rawRoute.trim();
   if (!trimmed.startsWith('/') || trimmed.startsWith('//')) return null;
@@ -60,6 +78,13 @@ export function validateKaelRoute(rawRoute) {
   const isProgramDay = /^\/program\/day\/([0-9]|1[0-9]|20)$/.test(cleanPath);
   if (!isProgramDay && !KAEL_STATIC_ROUTES.includes(cleanPath)) {
     return null;
+  }
+
+  if (userOrPlan !== null && userOrPlan !== undefined) {
+    const access = canAccessKaelRoute(cleanPath, userOrPlan);
+    if (!access.allowed) {
+      return null;
+    }
   }
 
   if (!queryPart) return cleanPath;
@@ -92,7 +117,7 @@ export function getRouteLabel(route) {
  * Parses [ACTION:...] directives out of Kael responses and strips both
  * complete tags and trailing partial tags while streaming.
  */
-export function parseKaelActions(rawContent = '') {
+export function parseKaelActions(rawContent = '', userOrPlan = null) {
   const source = String(rawContent || '');
   const actions = [];
   const seenKeys = new Set();
@@ -104,14 +129,20 @@ export function parseKaelActions(rawContent = '') {
     if (!inner) continue;
 
     const firstColon = inner.indexOf(':');
-    const actionKindRaw = (firstColon >= 0 ? inner.slice(0, firstColon) : inner.split('|')[0])
+    const rawPrefix = (firstColon >= 0 ? inner.slice(0, firstColon) : inner.split('|')[0])
       .trim()
       .toLowerCase();
-    const rest = firstColon >= 0 ? inner.slice(firstColon + 1).trim() : inner.slice(actionKindRaw.length).replace(/^\|/, '').trim();
+    const isShorthandRoute = firstColon === -1 && rawPrefix.startsWith('/');
+    const actionKindRaw = isShorthandRoute ? 'go' : rawPrefix;
+    const rest = isShorthandRoute
+      ? inner
+      : firstColon >= 0
+        ? inner.slice(firstColon + 1).trim()
+        : inner.slice(actionKindRaw.length).replace(/^\|/, '').trim();
 
     if (actionKindRaw === 'go' || actionKindRaw === 'navigate') {
       const [rawRoute, rawLabel] = rest.split('|').map((s) => (s || '').trim());
-      const validRoute = validateKaelRoute(rawRoute);
+      const validRoute = validateKaelRoute(rawRoute, userOrPlan);
       if (validRoute) {
         const dedupeKey = `nav:${validRoute}`;
         if (!seenKeys.has(dedupeKey)) {
@@ -637,6 +668,11 @@ export async function fetchKaelAppContext({ user, settings, timeZone }) {
   lines.push(`Progress Photos Count: ${photos.length}${photos[0] ? ` (latest: ${String(photos[0].date || photos[0].created_at || '').slice(0, 10)})` : ''}`);
   if (canBodyAnalysis && photos[0]?.body_fat_estimate) {
     lines.push(`Latest AI Body Analysis: ${photos[0].body_fat_estimate}${photos[0].ai_insights ? ` — ${String(photos[0].ai_insights).slice(0, 140)}` : ''}`);
+  } else if (!canBodyAnalysis) {
+    lines.push('AI Progress Photo Body Analysis: LOCKED (requires Performance plan or higher) — NEVER analyze or critique progress photos or estimate body fat.');
+  }
+  if (!canPhotoCompare) {
+    lines.push('Side-by-Side Photo Comparison: LOCKED (requires Progress plan or higher).');
   }
   if (canFormAnalysis && formAnalyses.length > 0) {
     lines.push(
@@ -645,24 +681,68 @@ export async function fetchKaelAppContext({ user, settings, timeZone }) {
         .map((fa) => `${fa.exercise_name || 'Exercise'} (score: ${fa.score ?? '?'}, focus: ${fa.priority_focus || 'technique'})`)
         .join(' | ')}`
     );
+  } else if (!canFormAnalysis) {
+    lines.push('Form Lab Video Analysis (/formlab): LOCKED (requires Elite plan).');
+  }
+
+  lines.push('');
+  lines.push(`--- STRICT PLAN PERMISSIONS & AUTHORIZATION BOUNDARIES (${plan.toUpperCase()}) ---`);
+  if (plan === 'elite') {
+    lines.push(
+      'USER HAS FULL ELITE ACCESS: Every feature, analysis, and page in the app is UNLOCKED for this user (including /formlab, AI progress photo body-fat & physique analysis, live workout adjustments, detailed workout analytics, weekly nutrition insights, adaptive macros, adaptive programming, and full navigation).'
+    );
+  } else {
+    const lockedItems = [];
+    if (!canPhotoCompare) lockedItems.push('Side-by-side Progress Photo comparisons (requires Progress)');
+    if (!canSnapFood) lockedItems.push('AI Food Photo / Nutrition Label & Barcode scanning (requires Progress)');
+    if (!canCustomWorkoutAdj) lockedItems.push('Custom workout plan overrides & adaptive multi-week programming (requires Progress)');
+    if (!canAdaptiveMacros) lockedItems.push('Workout-adaptive calorie/macro recalculation (requires Progress)');
+    if (!canBodyAnalysis) lockedItems.push('AI Progress Photo body-fat estimation, physique critique, or visual body analysis (requires Performance)');
+    if (!canWorkoutAnalytics) lockedItems.push('Detailed workout performance analytics & trend breakdowns (requires Performance)');
+    if (!canNutritionInsights) lockedItems.push('AI weekly nutrition insights & optimization reports (requires Performance)');
+    if (!canLiveAdj) lockedItems.push('Live in-workout real-time exercise adjustments (requires Elite)');
+    if (!canFormAnalysis) lockedItems.push('Form Lab video technique analysis & opening/navigating to /formlab (requires Elite)');
+    if (plan !== 'elite') lockedItems.push('Progress Graph predictive trajectory & Elite deep recovery/insider coaching secrets (requires Elite)');
+
+    lines.push(
+      `HARD ENFORCEMENT RULE: Do NOT perform, simulate, or navigate to ANY locked feature for this ${plan.toUpperCase()} user.`
+    );
+    lines.push(`LOCKED FEATURES FOR ${plan.toUpperCase()}: ${lockedItems.join(' | ')}`);
+    lines.push(
+      'If the user asks for any locked analysis or asks to go to a locked page (such as analyzing their progress photos on Free/Progress or opening /formlab when not Elite), you MUST politely decline, state which plan unlocks it, and offer [ACTION:navigate:/profile|View Plans] instead of fulfilling the locked request or emitting a restricted route tag.'
+    );
   }
 
   lines.push('');
   lines.push('--- APP NAVIGATION & ACTION CAPABILITIES ---');
-  lines.push(
-    'Valid App Routes: / (Dashboard), /program (Weekly Program), /program/day/0..N (Specific Workout Day), /live-workout or /live-workout?day=N (Start/Track Live Workout), /nutrition (Food & Macros), /progress (Analytics & Streaks), /photos (Progress Photos & Weight), /formlab (Form Lab Video Check), /muscle-heatmap (Muscle Heatmap), /profile (Profile, Settings & Subscription Plans), /onboarding (Program Setup)'
-  );
+  const allowedRoutesList = [
+    '/ (Dashboard)',
+    '/program (Weekly Program)',
+    '/program/day/0..N (Specific Workout Day)',
+    '/live-workout or /live-workout?day=N (Start/Track Live Workout)',
+    '/nutrition (Food & Macros)',
+    '/progress (Progress Tracker)',
+    '/photos (Progress Photos & Weight)',
+    canFormAnalysis ? '/formlab (Form Lab Video Check)' : null,
+    '/muscle-heatmap (Muscle Heatmap)',
+    '/profile (Profile, Settings & Subscription Plans)',
+    '/onboarding (Program Setup)',
+  ].filter(Boolean);
+  lines.push(`Valid Authorized App Routes for ${plan.toUpperCase()}: ${allowedRoutesList.join(', ')}`);
+  if (!canFormAnalysis) {
+    lines.push('RESTRICTED ROUTE (DO NOT NAVIGATE OR LINK): /formlab is LOCKED for non-Elite plans.');
+  }
   lines.push(
     'Interactive Action Tags (output at the end of your reply ONLY when helpful or requested):\n' +
-      '- To immediately open/navigate to a page because the user asked you to take them there or start something:\n' +
+      '- To immediately open/navigate to an AUTHORIZED page because the user asked you to take them there or start something:\n' +
       '  [ACTION:go:/route|Button Label]  (e.g. [ACTION:go:/live-workout?day=2|Start Today\'s Workout] or [ACTION:go:/nutrition|Open Nutrition Tracker])\n' +
-      '- To offer a clickable shortcut button WITHOUT auto-navigating away from chat:\n' +
+      '- To offer a clickable shortcut button to an AUTHORIZED page WITHOUT auto-navigating away from chat:\n' +
       '  [ACTION:navigate:/route|Button Label]  (e.g. [ACTION:navigate:/program/day/0|View Workout Details])\n' +
       '- When the user explicitly tells you to log a meal or food they ate right now:\n' +
       '  [ACTION:log_food:Food Name|Calories|ProteinG|CarbsG|FatG|meal_type]  (meal_type one of breakfast,lunch,dinner,snack,post-workout)\n' +
       '- When the user explicitly asks to mark today as a Rest Day:\n' +
       '  [ACTION:log_rest_day|Mark Today as Rest Day]\n' +
-      'CRITICAL RULES: Answer exact facts strictly from LIVE APP CONTEXT above (never guess exercises or say today has a workout when it says TODAY IS A REST DAY). Do not emit [ACTION:go:...] unless the user clearly asks to go/open/take them to a page or start a feature.'
+      'CRITICAL RULES: Answer exact facts strictly from LIVE APP CONTEXT above (never guess exercises or say today has a workout when it says TODAY IS A REST DAY). Never emit [ACTION:go:...] or [ACTION:navigate:...] for any locked route. Do not emit [ACTION:go:...] unless the user clearly asks to go/open/take them to an authorized page.'
   );
 
   return {

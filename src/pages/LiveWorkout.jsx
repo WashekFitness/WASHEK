@@ -3,10 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
 import {
+  applySubscriptionUpgrade,
   canAccess,
+  getPlanRank,
   isActiveSubscriptionStatus,
   normalizePlan,
+  resolveEffectivePlan,
 } from '@/lib/subscription';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 import {
   applyPostWorkoutAdaptation,
   applyLivePerformanceAdaptation,
@@ -719,7 +723,7 @@ Return ONLY JSON:
       const result = await supabaseApi.ai.invoke({
         type: 'live_workout_adjustment',
         prompt,
-        plan: user?.subscription_plan || 'elite',
+        plan: resolveEffectivePlan(user) || 'free',
         response_json_schema: {
           type: 'object',
           properties: {
@@ -1066,7 +1070,7 @@ Respond in JSON:
         const result = await supabaseApi.ai.invoke({
           type: 'live_workout_adjustment',
           prompt: elitePrompt,
-          plan: user?.subscription_plan || 'progress',
+          plan: resolveEffectivePlan(user) || 'progress',
           response_json_schema: {
             type: 'object',
             properties: {
@@ -1237,7 +1241,7 @@ Respond with:
         const result = await supabaseApi.ai.invoke({
           type: 'live_workout',
           prompt,
-          plan: user?.subscription_plan || 'free',
+          plan: resolveEffectivePlan(user) || 'free',
         });
 
         if (result?.__ai_error) {
@@ -1356,7 +1360,14 @@ export default function LiveWorkout() {
     }
   });
 
-  const effectiveUser = user || authUser;
+  const effectiveUser = (() => {
+    if (authUser && user) {
+      return getPlanRank(resolveEffectivePlan(authUser)) >= getPlanRank(resolveEffectivePlan(user))
+        ? { ...user, ...authUser }
+        : { ...authUser, ...user };
+    }
+    return authUser || user;
+  })();
   const userKey = effectiveUser?.id || effectiveUser?.email || 'guest';
 
   const [showWarmupModal, setShowWarmupModal] = useState(false);
@@ -1391,8 +1402,54 @@ export default function LiveWorkout() {
     useState({});
 
   useEffect(() => {
-    supabaseApi.auth.me().then((u) => {
-      if (u) setUser(u);
+    if (authUser) {
+      setUser((prev) => {
+        if (!prev) return authUser;
+        const authRank = getPlanRank(resolveEffectivePlan(authUser));
+        const prevRank = getPlanRank(resolveEffectivePlan(prev));
+        return authRank >= prevRank ? { ...prev, ...authUser } : prev;
+      });
+    }
+  }, [authUser]);
+
+  useEffect(() => {
+    let active = true;
+    supabaseApi.auth.me(true).then(async (u) => {
+      if (!active) return;
+      if (u) {
+        setUser(u);
+      }
+      const targetUser = u || effectiveUser;
+      if (targetUser && !canAccess(targetUser, 'live_workout_adjustments') && (targetUser.id || targetUser.email)) {
+        try {
+          const ent = await fetchServerEntitlement({
+            userId: targetUser.id,
+            email: targetUser.email,
+            cancelledAtIso: targetUser.subscription_cancelled_at || null,
+          });
+          if (active && ent?.active && ent.plan && ent.plan !== 'free') {
+            const curRank = getPlanRank(resolveEffectivePlan(targetUser));
+            const entRank = getPlanRank(ent.plan);
+            if (entRank > curRank) {
+              applySubscriptionUpgrade(ent.plan, ent.status, {
+                persistReceipt: true,
+                timestamp: ent.timestamp,
+                syncServer: false,
+              });
+              setUser((prev) => ({
+                ...(prev || targetUser),
+                subscription_plan: ent.plan,
+                subscription_status: ent.status,
+                plan: ent.plan,
+                tier: ent.plan,
+                subscription_tier: ent.plan,
+              }));
+            }
+          }
+        } catch {
+          // ignore server entitlement fallback error
+        }
+      }
     }).catch(() => {});
 
     const handleSubUpdated = (e) => {
@@ -1411,18 +1468,23 @@ export default function LiveWorkout() {
                 subscription_status: rawStatus,
                 plan: nextPlan,
                 tier: nextPlan,
+                subscription_tier: nextPlan,
               }
             : {
                 subscription_plan: nextPlan,
                 subscription_status: rawStatus,
                 plan: nextPlan,
                 tier: nextPlan,
+                subscription_tier: nextPlan,
               }
         );
       }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
-    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    return () => {
+      active = false;
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    };
   }, []);
 
   // iOS back gesture: when workout is done, back navigates

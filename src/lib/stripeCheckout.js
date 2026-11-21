@@ -833,6 +833,7 @@ export async function fetchServerEntitlement({ userId = '', email = '', cancelle
         if (plan !== 'free' && isActiveSubscriptionStatus(status) && checkNotSupersededByCancel(ts)) {
           setRedirectUpgradeReceipt(plan, status, {
             verifiedBy: data.verifiedBy || 'stripe_redirect',
+            timestamp: ts,
           });
           const result = {
             active: true,

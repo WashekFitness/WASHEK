@@ -3,10 +3,10 @@ import { cn } from '@/lib/utils';
 import ReactMarkdown from 'react-markdown';
 import { parseKaelActions } from '@/lib/kaelAppContext';
 
-export default function MessageBubble({ msg, isUser, onAction }) {
+export default function MessageBubble({ msg, isUser, onAction, userOrPlan = null }) {
   const parsed = isUser
     ? { cleanText: msg?.content || '', actions: [] }
-    : parseKaelActions(msg?.content || '');
+    : parseKaelActions(msg?.content || '', userOrPlan);
 
   const isWaitingForFirstChunk = !isUser && msg?.isStreaming && !parsed.cleanText;
   const visibleActions = !isUser && !msg?.isStreaming ? parsed.actions : [];
