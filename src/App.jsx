@@ -12,7 +12,7 @@ import { QueryClientProvider } from '@tanstack/react-query';
 import { Toaster } from '@/components/ui/toaster';
 import { Toaster as SonnerToaster } from '@/components/ui/sonner';
 import { queryClientInstance } from '@/lib/query-client';
-import { AppSettingsProvider } from '@/lib/AppSettingsContext';
+import { AppSettingsProvider, useAppSettings } from '@/lib/AppSettingsContext';
 import { AuthProvider, useAuth } from '@/lib/AuthContext';
 
 import AppLayout from '@/components/layout/AppLayout';
@@ -22,6 +22,8 @@ import { useMidnightSync } from '@/hooks/useMidnightSync';
 import PageNotFound from '@/lib/PageNotFound';
 import ErrorBoundary from '@/components/ErrorBoundary';
 import OfflineIndicator from '@/components/pwa/OfflineIndicator';
+import QuickStartTutorialModal from '@/components/tutorial/QuickStartTutorialModal';
+import LanguageTranslator from '@/components/LanguageTranslator';
 
 const Dashboard = lazy(() => import('@/pages/Dashboard'));
 const Onboarding = lazy(() => import('@/pages/Onboarding'));
@@ -59,6 +61,37 @@ function PageLoader() {
 function GlobalMidnightWatcher() {
   const { user } = useAuth();
   useMidnightSync(user);
+  return null;
+}
+
+function ProfileLanguageSync() {
+  const { user } = useAuth();
+  const { settings, updateSettings } = useAppSettings();
+  const syncedUidRef = React.useRef('');
+
+  React.useEffect(() => {
+    const uid = user?.id || user?.email || '';
+    if (!uid) {
+      syncedUidRef.current = '';
+      return;
+    }
+    if (syncedUidRef.current === uid) return;
+    syncedUidRef.current = uid;
+    if (
+      !settings?.languageExplicitlySet &&
+      user?.language &&
+      typeof user.language === 'string' &&
+      user.language.trim() &&
+      user.language !== settings?.language
+    ) {
+      updateSettings({
+        language: user.language.trim(),
+        ...(user.country ? { country: user.country } : {}),
+        ...(user.unit ? { unit: user.unit } : {}),
+      });
+    }
+  }, [user, settings?.language, settings?.languageExplicitlySet, updateSettings]);
+
   return null;
 }
 
@@ -273,8 +306,10 @@ function AuthenticatedApp() {
     <>
       <OfflineIndicator />
       <SubscriptionWatcher />
+      {isAuthenticated && <ProfileLanguageSync />}
       {isAuthenticated && <GlobalMidnightWatcher />}
       {isAuthenticated && <ProgramWeekBootstrap />}
+      {isAuthenticated && <QuickStartTutorialModal />}
 
       <ErrorBoundary>
         <Suspense fallback={<PageLoader />}>
@@ -359,6 +394,7 @@ function AuthenticatedApp() {
 function App() {
   return (
     <AppSettingsProvider>
+      <LanguageTranslator />
       <AuthProvider>
         <QueryClientProvider client={queryClientInstance}>
           <Router>

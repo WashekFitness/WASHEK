@@ -19,6 +19,7 @@ import {
   ShieldCheck,
   Shield,
   HeartPulse,
+  Compass,
 } from 'lucide-react';
 
 import { useQuery } from '@tanstack/react-query';
@@ -41,6 +42,7 @@ import { cn } from '@/lib/utils';
 import { supabase } from '@/lib/supabase';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
+import { markQuickStartCompleted, openQuickStartTutorial } from '@/lib/quickStartTutorial';
 import { toast } from 'sonner';
 
 
@@ -104,6 +106,7 @@ function SearchableDropdown({
       >
 
         <span
+          data-no-translate="true"
           className={
             value
               ? 'text-foreground'
@@ -174,10 +177,13 @@ function SearchableDropdown({
           </div>
 
 
-          <div className="
-            max-h-52
-            overflow-y-auto
-          ">
+          <div
+            data-no-translate="true"
+            className="
+              max-h-52
+              overflow-y-auto
+            "
+          >
 
             {filtered.map(
               (option) => (
@@ -310,6 +316,7 @@ function CountryDropdown({
       >
 
         <span
+          data-no-translate="true"
           className={
             selected
               ? 'text-foreground'
@@ -380,10 +387,13 @@ function CountryDropdown({
           </div>
 
 
-          <div className="
-            max-h-52
-            overflow-y-auto
-          ">
+          <div
+            data-no-translate="true"
+            className="
+              max-h-52
+              overflow-y-auto
+            "
+          >
 
             {filtered.map(
               (country) => (
@@ -539,9 +549,17 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
       setConfirmRegenerateOpen(false);
       return;
     }
+    if (user) {
+      markQuickStartCompleted(user);
+    }
     setConfirmRegenerateOpen(false);
     closeModal();
     navigate('/onboarding');
+  };
+
+  const handleOpenQuickStart = () => {
+    closeModal();
+    openQuickStartTutorial();
   };
 
 
@@ -710,15 +728,40 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
 
 
   const save = () => {
-    updateSettings(
-      {
-        ...local,
-      }
-    );
+    const nextSettings = {
+      ...local,
+      language: local.language || 'English',
+    };
 
-    setOpen(
-      false
-    );
+    updateSettings(nextSettings);
+
+    try {
+      const rawUser = localStorage.getItem('washek_user');
+      if (rawUser) {
+        const parsed = JSON.parse(rawUser);
+        localStorage.setItem(
+          'washek_user',
+          JSON.stringify({
+            ...parsed,
+            country: nextSettings.country,
+            language: nextSettings.language,
+            unit: nextSettings.unit,
+          })
+        );
+      }
+    } catch {
+      // ignore storage sync fallback error
+    }
+
+    supabaseApi.auth
+      .updateMe({
+        country: nextSettings.country,
+        language: nextSettings.language,
+        unit: nextSettings.unit,
+      })
+      .catch(() => {});
+
+    setOpen(false);
   };
 
 
@@ -1006,23 +1049,40 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
 
                 <div>
 
-                  <p className="
-                    text-xs
-                    font-bold
-                    uppercase
-                    tracking-wider
-                    text-muted-foreground
-                    mb-2
-                    flex
-                    items-center
-                    gap-1.5
-                  ">
+                  <div className="flex items-center justify-between mb-2">
+                    <p className="
+                      text-xs
+                      font-bold
+                      uppercase
+                      tracking-wider
+                      text-muted-foreground
+                      flex
+                      items-center
+                      gap-1.5
+                    ">
 
-                    <Languages className="w-3 h-3" />
+                      <Languages className="w-3 h-3" />
 
-                    Language
+                      Language
 
-                  </p>
+                    </p>
+
+                    {local.language && local.language !== 'English' && (
+                      <button
+                        type="button"
+                        data-no-translate="true"
+                        onClick={() =>
+                          setLocal((previous) => ({
+                            ...previous,
+                            language: 'English',
+                          }))
+                        }
+                        className="text-[11px] font-semibold text-primary hover:underline pointer-events-auto touch-manipulation"
+                      >
+                        English
+                      </button>
+                    )}
+                  </div>
 
 
                   <SearchableDropdown
@@ -1207,6 +1267,26 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
                     {isProgramLocked
                       ? `Locked for 7 days to preserve your periodized training progression. Available in ${programRemainingDays} day${programRemainingDays === 1 ? '' : 's'}.`
                       : 'Return to onboarding to update your goals and create a new plan. All photos, chats, and logs remain safe.'}
+                  </p>
+                </div>
+
+                {/* App Guide / Quick Start Tutorial */}
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">
+                    <Compass className="w-3 h-3 text-primary" />
+                    App Guide
+                  </p>
+
+                  <button
+                    type="button"
+                    onClick={handleOpenQuickStart}
+                    className="w-full h-12 rounded-xl border border-border bg-muted/30 text-sm font-semibold hover:border-primary/40 hover:bg-muted transition-all pointer-events-auto touch-manipulation flex items-center justify-center gap-2"
+                  >
+                    <Compass className="w-4 h-4 text-primary" />
+                    <span>Quick Start Tutorial</span>
+                  </button>
+                  <p className="text-[11px] text-muted-foreground mt-1.5 px-0.5 leading-normal">
+                    Review how to use the app and where workouts, Coach Kael, nutrition, and tools live.
                   </p>
                 </div>
 

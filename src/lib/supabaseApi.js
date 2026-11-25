@@ -1973,6 +1973,30 @@ async function streamAI({
     // ignore
   }
 
+  const getActiveAppLanguage = () => {
+    try {
+      if (typeof localStorage !== 'undefined') {
+        const rawSettings = localStorage.getItem('washek_app_settings');
+        if (rawSettings) {
+          const parsed = JSON.parse(rawSettings);
+          if (parsed?.language && String(parsed.language).trim()) {
+            return String(parsed.language).trim();
+          }
+        }
+        const rawUser = localStorage.getItem('washek_user');
+        if (rawUser) {
+          const pu = JSON.parse(rawUser);
+          if (pu?.language && String(pu.language).trim()) {
+            return String(pu.language).trim();
+          }
+        }
+      }
+    } catch {
+      // ignore storage read error
+    }
+    return 'English';
+  };
+
   const requestBody = JSON.stringify({
     type,
     prompt,
@@ -1982,6 +2006,7 @@ async function streamAI({
     response_json_schema: response_json_schema || schema || null,
     plan: resolvedPlan,
     timezone: userTz,
+    language: getActiveAppLanguage(),
     user_id: currentUserId,
     email: currentUserEmail,
     current_used: currentUsed,
@@ -2273,6 +2298,30 @@ async function invokeAI({
       // ignore
     }
 
+    const activeAppLanguage = (() => {
+      try {
+        if (typeof localStorage !== 'undefined') {
+          const rawSettings = localStorage.getItem('washek_app_settings');
+          if (rawSettings) {
+            const parsed = JSON.parse(rawSettings);
+            if (parsed?.language && String(parsed.language).trim()) {
+              return String(parsed.language).trim();
+            }
+          }
+          const rawUser = localStorage.getItem('washek_user');
+          if (rawUser) {
+            const pu = JSON.parse(rawUser);
+            if (pu?.language && String(pu.language).trim()) {
+              return String(pu.language).trim();
+            }
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return 'English';
+    })();
+
     let res = await fetch('/api/ai-generate', {
       method: 'POST',
       credentials: 'include',
@@ -2286,6 +2335,7 @@ async function invokeAI({
         response_json_schema: response_json_schema || schema || null,
         plan: resolvedPlan,
         timezone: userTz,
+        language: activeAppLanguage,
         user_id: currentUserId,
         email: currentUserEmail,
         current_used: currentUsed,
@@ -2308,6 +2358,7 @@ async function invokeAI({
           response_json_schema: response_json_schema || schema || null,
           plan: resolvedPlan,
           timezone: userTz,
+          language: activeAppLanguage,
           user_id: currentUserId,
           email: currentUserEmail,
           current_used: currentUsed,

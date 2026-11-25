@@ -1,8 +1,8 @@
-// ── Calisthenics exercise list for FormLab ──────────────────
+// ── Calisthenics & Weightlifting exercise list for FormLab ──
 // category: 'hold' = static isometric skill, 'dynamic' = rep-based movement
 
 export const FORM_EXERCISES = [
-  // Push
+  // Calisthenics — Push
   { name: 'Push-up', category: 'dynamic' },
   { name: 'Pseudo Planche Push-up', category: 'dynamic' },
   { name: 'Archer Push-up', category: 'dynamic' },
@@ -10,13 +10,16 @@ export const FORM_EXERCISES = [
   { name: 'Decline Push-up', category: 'dynamic' },
   { name: 'Ring Push-up', category: 'dynamic' },
   { name: 'Dip', category: 'dynamic' },
+  { name: 'Weighted Dip', category: 'dynamic' },
   { name: 'Ring Dip', category: 'dynamic' },
   { name: 'Pike Push-up', category: 'dynamic' },
   { name: 'Handstand Push-up', category: 'dynamic' },
 
-  // Pull
+  // Calisthenics — Pull
   { name: 'Pull-up', category: 'dynamic' },
+  { name: 'Weighted Pull-up', category: 'dynamic' },
   { name: 'Chin-up', category: 'dynamic' },
+  { name: 'Weighted Chin-up', category: 'dynamic' },
   { name: 'Australian Row', category: 'dynamic' },
   { name: 'Scapular Pull-up', category: 'dynamic' },
   { name: 'Archer Pull-up', category: 'dynamic' },
@@ -25,7 +28,64 @@ export const FORM_EXERCISES = [
   { name: 'Bar Muscle-up', category: 'dynamic' },
   { name: 'Ring Muscle-up', category: 'dynamic' },
 
-  // Legs
+  // Weightlifting — Squats & Lower Body
+  { name: 'Barbell Back Squat', category: 'dynamic' },
+  { name: 'Barbell Front Squat', category: 'dynamic' },
+  { name: 'Goblet Squat', category: 'dynamic' },
+  { name: 'Hack Squat', category: 'dynamic' },
+  { name: 'Bulgarian Split Squat', category: 'dynamic' },
+  { name: 'Dumbbell Lunge', category: 'dynamic' },
+  { name: 'Walking Lunge', category: 'dynamic' },
+  { name: 'Leg Press', category: 'dynamic' },
+  { name: 'Calf Raise', category: 'dynamic' },
+
+  // Weightlifting — Hinges & Deadlifts
+  { name: 'Deadlift', category: 'dynamic' },
+  { name: 'Conventional Deadlift', category: 'dynamic' },
+  { name: 'Sumo Deadlift', category: 'dynamic' },
+  { name: 'Romanian Deadlift (RDL)', category: 'dynamic' },
+  { name: 'Trap Bar Deadlift', category: 'dynamic' },
+  { name: 'Barbell Hip Thrust', category: 'dynamic' },
+  { name: 'Good Morning', category: 'dynamic' },
+  { name: 'Kettlebell Swing', category: 'dynamic' },
+
+  // Weightlifting — Horizontal & Vertical Press
+  { name: 'Bench Press', category: 'dynamic' },
+  { name: 'Incline Bench Press', category: 'dynamic' },
+  { name: 'Dumbbell Bench Press', category: 'dynamic' },
+  { name: 'Incline Dumbbell Press', category: 'dynamic' },
+  { name: 'Overhead Press', category: 'dynamic' },
+  { name: 'Dumbbell Shoulder Press', category: 'dynamic' },
+  { name: 'Arnold Press', category: 'dynamic' },
+
+  // Weightlifting — Rows, Pulldowns & Accessories
+  { name: 'Barbell Row', category: 'dynamic' },
+  { name: 'Pendlay Row', category: 'dynamic' },
+  { name: 'Dumbbell Row', category: 'dynamic' },
+  { name: 'Seated Cable Row', category: 'dynamic' },
+  { name: 'T-Bar Row', category: 'dynamic' },
+  { name: 'Lat Pulldown', category: 'dynamic' },
+  { name: 'Face Pull', category: 'dynamic' },
+  { name: 'Barbell Bicep Curl', category: 'dynamic' },
+  { name: 'Dumbbell Curl', category: 'dynamic' },
+  { name: 'Hammer Curl', category: 'dynamic' },
+  { name: 'Preacher Curl', category: 'dynamic' },
+  { name: 'Tricep Pushdown', category: 'dynamic' },
+  { name: 'Overhead Tricep Extension', category: 'dynamic' },
+  { name: 'Skull Crusher', category: 'dynamic' },
+  { name: 'Lateral Raise', category: 'dynamic' },
+  { name: 'Dumbbell Fly', category: 'dynamic' },
+  { name: 'Barbell Shrug', category: 'dynamic' },
+
+  // Olympic & Explosive Lifts
+  { name: 'Power Clean', category: 'dynamic' },
+  { name: 'Hang Clean', category: 'dynamic' },
+  { name: 'Clean & Jerk', category: 'dynamic' },
+  { name: 'Snatch', category: 'dynamic' },
+  { name: 'Hang Snatch', category: 'dynamic' },
+  { name: 'Thruster', category: 'dynamic' },
+
+  // Bodyweight Legs
   { name: 'Bodyweight Squat', category: 'dynamic' },
   { name: 'Pistol Squat', category: 'dynamic' },
   { name: 'Shrimp Squat', category: 'dynamic' },
@@ -39,6 +99,9 @@ export const FORM_EXERCISES = [
   { name: 'Hanging Windshield Wiper', category: 'dynamic' },
   { name: 'Dragon Flag', category: 'dynamic' },
   { name: 'Hollow Body Hold', category: 'hold' },
+  { name: 'Plank', category: 'hold' },
+  { name: 'Weighted Plank', category: 'hold' },
+  { name: 'Wall Sit', category: 'hold' },
   { name: 'L-Sit', category: 'hold' },
   { name: 'V-Sit', category: 'hold' },
   { name: 'Tuck Planche', category: 'hold' },
@@ -59,6 +122,7 @@ export const FORM_EXERCISES = [
   { name: 'Human Flag', category: 'hold' },
   { name: 'Elbow Lever', category: 'hold' },
   { name: 'Dead Hang', category: 'hold' },
+  { name: "Farmer's Hold", category: 'hold' },
 
   // Other
   { name: 'Other / Custom', category: 'dynamic' },
@@ -74,7 +138,7 @@ export function isStaticHoldExercise(exerciseName = '', category = '') {
   const found = FORM_EXERCISES.find((e) => e.name.toLowerCase() === normalized);
   if (found) return found.category === 'hold';
 
-  // Specific dynamic movements that contain static words (e.g. "push-up", "raise")
+  // Specific dynamic movements that contain static words (e.g. "hang clean", "push-up", "raise")
   const dynamicDisqualifiers = [
     'push-up',
     'pushup',
@@ -84,10 +148,33 @@ export function isStaticHoldExercise(exerciseName = '', category = '') {
     'pull-up',
     'pullup',
     'pull up',
+    'chin-up',
+    'chinup',
+    'chin up',
+    'muscle-up',
+    'muscleup',
+    'muscle up',
+    'pulldown',
+    'pushdown',
     'raise',
     'curl',
     'squat',
     'row',
+    'deadlift',
+    'rdl',
+    'clean',
+    'snatch',
+    'jerk',
+    'lunge',
+    'thrust',
+    'extension',
+    'fly',
+    'shrug',
+    'swing',
+    'kickback',
+    'crusher',
+    'thruster',
+    'pull',
   ];
   if (dynamicDisqualifiers.some((d) => normalized.includes(d))) {
     return false;
@@ -97,6 +184,8 @@ export function isStaticHoldExercise(exerciseName = '', category = '') {
   const staticPatterns = [
     'hold',
     'hang',
+    'plank',
+    'wall sit',
     'l-sit',
     'lsit',
     'v-sit',
@@ -514,7 +603,7 @@ export function buildFormAnalysisPrompt(
       : `The AI receives chronological still frames representing the movement sequence.`;
 
   return `
-You are an elite calisthenics form-analysis expert and coach.
+You are an elite calisthenics and weightlifting (barbell, dumbbell, kettlebell, cable, and machine) form-analysis expert and coach.
 
 ATHLETE:
 Name: ${firstName}
@@ -561,10 +650,10 @@ Determine whether the camera angle is adequate for analyzing this exercise.
 
 Consider:
 - whether the athlete is visible
-- whether the full relevant body is visible
-- whether the angle allows the important joints and body line to be evaluated
+- whether the full relevant body (and barbell, dumbbells, or weights when used) is visible
+- whether the angle allows the important joints, bar path, and body line to be evaluated
 - whether the camera is too far away
-- whether the movement is obstructed
+- whether the movement is obstructed by plates, racks, or equipment
 
 If the angle is inadequate, explain exactly why.
 
@@ -584,13 +673,13 @@ Do not count any repetitions or setup movements that occurred before ${trimStart
 DYNAMIC REP COUNTING RULES (NEVER TAKE AWAY OR DROP REPS):
 - THE REP COUNTER MUST BE 100% REAL & EXACT: Do not guess, do not add phantom reps, and NEVER take away valid reps.
 - COUNT EVERY ATTEMPTED REPETITION: Count all repetitions the athlete performs in the analyzed window from the very first rep to the very last rep.
-- DO NOT DISQUALIFY REPS FOR FORM FLAWS: If a repetition has cut depth, partial range of motion, soft lockout, slight momentum, or technique breakdown near fatigue, IT STILL FULLY COUNTS AS A REP! A repetition is counted whenever the user initiates and reverses the movement (e.g. descends and presses back up, or pulls and lowers). Form flaws reduce the form score; they NEVER subtract from the rep count!
+- DO NOT DISQUALIFY REPS FOR FORM FLAWS: If a repetition has cut depth, partial range of motion, soft lockout, slight momentum, or technique breakdown near fatigue, IT STILL FULLY COUNTS AS A REP! A repetition is counted whenever the user initiates and reverses the movement (e.g. descends and presses/squats back up, pulls and lowers, or hinges and locks out). Form flaws reduce the form score; they NEVER subtract from the rep count!
 - COUNT FIRST AND LAST REPS: Count the initial rep (even if fast or setting up) and count the final rep (even if reaching muscular failure).
 - Set "rep_count" to the exact total integer count of all repetitions performed.
 - Set "hold_time_seconds": null.
 
 STATIC ISOMETRIC HOLD RULES (REAL HOLD DURATION):
-- NEVER COUNT REPS FOR STATIC HOLDS: For any static isometric hold (Planche, Front/Back Lever, L-Sit, V-Sit, Handstand, Dead Hang, Human Flag, etc.), do NOT count repetitions under any circumstances. Set "rep_count": null.
+- NEVER COUNT REPS FOR STATIC HOLDS: For any static isometric hold (Planche, Front/Back Lever, L-Sit, V-Sit, Handstand, Dead Hang, Human Flag, Plank, Wall Sit, Isometric Hold, etc.), do NOT count repetitions under any circumstances. Set "rep_count": null.
 - Measure the full continuous hold duration in seconds strictly within the analyzed section from the moment the athlete stabilizes in the hold until they completely drop, dismount, or touch down.
 - Minor wobbles, balance micro-adjustments, or slight form sagging DO NOT terminate the hold timer — the timer continues until the athlete actually drops or exits the hold. Form imperfections affect the form score, NOT the hold time duration.
 - Set "hold_time_seconds": number (e.g. 8.5 or 12.0). Set "rep_count" strictly to null.
@@ -610,14 +699,15 @@ Estimate:
 Give an overall form score from 1 to 100.
 
 SCORING ACCURACY & TRUTH MANDATE (TELL LITERALLY EVERYTHING WRONG — NEVER SUGARCOAT):
+- Apply the EXACT same strict 1%–100% scoring standard equally to both calisthenics and weightlifting exercises.
 - The rating must be REAL, accurate, and completely honest. Stop sugarcoating. If form is bad or dangerous, TELL LITERALLY EVERYTHING WRONG WITH THE FORM. Bad or dangerous form is dangerous and must NEVER be scored high or sugarcoated to spare feelings.
 - Score anywhere from 1% to 100% based on honest reality:
-  * 1–20%: Dangerous or hazardous execution with high injury risk (e.g., collapsing lumbar spine under load, severe shoulder impingement shearing, uncontrolled dropping/falling).
-  * 20–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging, worming push-ups, heavy kipping/swinging, cutting half the range of motion, severe asymmetry, collapsed core tension).
-  * 45–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM, flared elbows >60°, uncontrolled eccentric cadence, soft lockout).
+  * 1–20%: Dangerous or hazardous execution with high injury risk (e.g., collapsing or heavily rounded lumbar spine under deadlift/squat load, severe knee valgus cave under heavy load, severe shoulder impingement shearing, uncontrolled dropping/falling).
+  * 20–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging or spinal rounding under tension, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy kipping/swinging/body-heaving, cutting half the range of motion, severe asymmetry, collapsed core bracing).
+  * 45–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM / squats above parallel, flared elbows >60°–75°, bar path drifting forward, heels lifting, uncontrolled eccentric cadence, soft lockout).
   * 70–84%: Acceptable or moderate execution with clear technical flaws to fix.
   * 85–94%: High-level execution with 1 minor technical refinement.
-  * 95–100%: Rare, flawless, gymnastics-grade textbook execution with full range of motion, locked body tension, and zero complaints.
+  * 95–100%: Rare, flawless, competition/gymnastics-grade textbook execution with full range of motion, locked bracing/body tension, and zero complaints.
 - Deductions:
   * Minor tip: -5 to -8 pts
   * Moderate flaw: -15 to -20 pts
@@ -638,8 +728,9 @@ Analyze what can actually be seen about:
 - wrists
 - hips
 - knees
-- ankles
-- spine
+- ankles / heels
+- spine (cervical, thoracic, lumbar)
+- bar / weight path & grip symmetry (when external load is used)
 
 ============================================================
 6. BODY ALIGNMENT
@@ -647,12 +738,13 @@ Analyze what can actually be seen about:
 
 Look for:
 
-- excessive arching
+- excessive lumbar arching ("banana back") or spinal rounding ("cat-back" / butt wink)
 - excessive piking
 - sagging
-- twisting
-- loss of body tension
+- twisting or uneven weight shift
+- loss of bracing / core body tension
 - poor pelvic position
+- knee valgus (caving inward) or heel lift
 - asymmetry
 
 ============================================================
@@ -665,7 +757,7 @@ Evaluate:
 - retraction
 - elevation
 - depression
-- scapular control
+- scapular control & ribcage stability
 
 Judge these according to the specific movement.
 
@@ -686,7 +778,7 @@ Distinguish:
 9. TEMPO / CONTROL
 ============================================================
 
-Assess control and momentum only where the sampled frames support the conclusion.
+Assess control, bar/body speed, pause/touch-and-go habits, and momentum only where the sampled frames support the conclusion.
 
 Do not claim precise tempo if the frames are insufficient.
 
@@ -694,54 +786,68 @@ Do not claim precise tempo if the frames are insufficient.
 10. EXERCISE-SPECIFIC DETAILS
 ============================================================
 
+Judge strictly against the specific mechanics of whichever calisthenics or weightlifting movement is being analyzed:
+
+--- CALISTHENICS ---
 HANDSTAND:
-- banana / arched shape
-- shoulder elevation
-- shoulder line
-- head position
-- finger balance
-- body line
+- banana / arched shape, shoulder elevation, shoulder line, head position, finger balance, body line
 
 PLANCHE:
-- elbow lockout
-- scapular position
-- forward lean
-- pelvis
-- leg line
-- sagging
+- elbow lockout, scapular protraction, forward lean, pelvis tilt, leg line, sagging
 
 FRONT / BACK LEVER:
-- arm position
-- body line
-- shoulder position
-- hip position
-- piking / arching
+- arm lockout, body line, scapular depression/retraction, hip height, piking / arching
 
 MUSCLE-UP:
-- transition
-- unnecessary kip
-- ring/bar control
-- finishing position
+- transition path, unnecessary kip, ring/bar control, straight-bar/ring dip lockout
 
-PULL-UP:
-- bottom range
-- top range
-- shoulder position
-- swing
-- control
+PULL-UP / CHIN-UP:
+- dead-hang bottom range, chin/chest over bar top range, shoulder depression, kipping/swing, eccentric control
 
 DIP:
-- depth
-- shoulder position
-- elbow tracking
-- control
+- depth (shoulders below elbows), forward torso lean stability, elbow tracking, lockout control
 
 PUSH-UP:
-- body line
-- depth
-- elbow tracking
-- lockout
-- scapular control
+- hollow/plank body line, chest-to-floor depth, elbow tuck (30°–50° vs flared >60°), full lockout, scapular control
+
+--- WEIGHTLIFTING ---
+SQUAT (BACK, FRONT, GOBLET, BULGARIAN SPLIT, HACK):
+- squat depth (hip crease at or below top of knee / parallel)
+- knee tracking in line with toes vs inward knee valgus collapse
+- lumbar spine neutrality vs "butt wink" or chest collapse/good-morning hips shooting up early
+- midfoot balance vs heels lifting or toes rolling up
+- vertical bar path over midfoot & upper-back/rack tightness
+
+DEADLIFT / HINGE (CONVENTIONAL, SUMO, RDL, TRAP BAR):
+- neutral lumbar and thoracic spine under tension (zero lumbar rounding / "cat-back")
+- bar staying tight against shins and thighs over midfoot (no forward bar drift)
+- proper hip-hinge initiation & pulling slack out vs yanking or squatting the barbell
+- synchronized hip and chest rise (hips not shooting up first)
+- clean, vertical hip/knee lockout without exaggerated lumbar hyperextension at the top
+- controlled eccentric vs bouncing plates off the floor
+
+BENCH PRESS & HORIZONTAL PRESS (BARBELL, DUMBBELL, INCLINE):
+- scapular retraction & depression on the bench with stable leg drive and glutes planted
+- 45°–60° elbow tuck (avoid flaring elbows >75° at the shoulders)
+- forearms vertical under wrists/bar at the bottom
+- controlled J-curve bar path from chest/sternum up over shoulders without chest bouncing
+- symmetrical press and clean elbow lockout without shoulder protraction collapse
+
+OVERHEAD PRESS / SHOULDER PRESS (BARBELL, DUMBBELL, ARNOLD):
+- vertical bar path clearing the chin/nose cleanly to stacked wrist-elbow-shoulder-hip lockout
+- stacked wrists (not bent back excessively) and locked ribcage/glute brace (avoid excessive lower-back "banana" hyperextension)
+- strict lower-body control (no unintended knee-dip push-press cheating on strict reps)
+
+ROWS, PULLDOWNS & ISOLATION (BARBELL/DB/CABLE ROW, LAT PULLDOWN, CURLS, RAISES, TRICEPS):
+- stable torso angle and braced spine without excessive hip heave, torso jerking, or momentum swinging
+- scapular glide and elbow-driven pull without shrugging shoulders into ears
+- upper-arm stability on curls/tricep extensions (elbows not swinging far forward/outward to cheat weight)
+- controlled eccentric and full lengthened/shortened range of motion
+
+OLYMPIC & EXPLOSIVE LIFTS (POWER CLEAN, HANG CLEAN, SNATCH, CLEAN & JERK, KETTLEBELL SWING):
+- first and second pull torso angle, bar/bell staying close to body, and crisp triple extension timing
+- aggressive pull-under / fast front-rack elbows or overhead catch stability without excessive starfishing or press-out
+- on kettlebell swings: crisp hip hinge snap (not a squat) with ribcage locked at top (no lumbar lean-back)
 
 ============================================================
 11. ISSUES FOUND

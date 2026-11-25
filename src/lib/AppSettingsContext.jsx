@@ -1,9 +1,16 @@
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
+  useMemo,
   useState,
 } from 'react';
+import {
+  getLanguageIsoCode,
+  isRtlLanguage,
+  normalizeAppLanguage,
+} from '@/lib/i18n';
 
 const SETTINGS_KEY = 'washek_app_settings';
 
@@ -66,6 +73,17 @@ function applyTheme(theme) {
   meta.setAttribute('content', themeColor);
 }
 
+function applyLanguageAttributes(language) {
+  if (typeof document === 'undefined') {
+    return;
+  }
+  const normalizedLang = normalizeAppLanguage(language);
+  const root = document.documentElement;
+  root.lang = getLanguageIsoCode(normalizedLang);
+  root.dir = isRtlLanguage(normalizedLang) ? 'rtl' : 'ltr';
+  root.dataset.language = normalizedLang;
+}
+
 function getInitialSettings() {
   const fallback = {
     ...defaultSettings,
@@ -124,6 +142,7 @@ if (
     );
 
     let theme = defaultSettings.theme;
+    let language = defaultSettings.language;
 
     if (raw) {
       const parsed = JSON.parse(raw);
@@ -133,11 +152,16 @@ if (
       } else if (parsed?.theme === 'dark') {
         theme = 'dark';
       }
+      if (parsed?.language) {
+        language = parsed.language;
+      }
     }
 
     applyTheme(theme);
+    applyLanguageAttributes(language);
   } catch {
     applyTheme(defaultSettings.theme);
+    applyLanguageAttributes(defaultSettings.language);
   }
 }
 
@@ -154,10 +178,7 @@ export function AppSettingsProvider({ children }) {
   }, [settings]);
 
   useEffect(() => {
-    if (typeof document !== 'undefined') {
-      document.documentElement.lang =
-        settings.language || 'en';
-    }
+    applyLanguageAttributes(settings.language);
   }, [settings.language]);
 
   // Keep settings synchronized if another tab/window
@@ -201,12 +222,13 @@ export function AppSettingsProvider({ children }) {
     };
   }, []);
 
-  const updateSettings = (patch = {}) => {
+  const updateSettings = useCallback((patch = {}) => {
     setSettings((previous) => {
       const next = normalizeAppSettings(
         {
           ...previous,
           ...patch,
+          ...('language' in patch ? { languageExplicitlySet: true } : {}),
           theme:
             patch.theme === 'light' || patch.theme === 'dark'
               ? patch.theme
@@ -215,19 +237,12 @@ export function AppSettingsProvider({ children }) {
         previous
       );
 
-      // Apply immediately so the UI does not wait for
-      // another render/effect cycle.
-      if (patch.theme) {
-        applyTheme(next.theme);
-      }
-
       saveSettings(next);
-
       return next;
     });
-  };
+  }, []);
 
-  const toggleManualRestDay = (dateKey) => {
+  const toggleManualRestDay = useCallback((dateKey) => {
     if (!dateKey) return;
     setSettings((previous) => {
       const currentMap = previous?.manualRestDays || {};
@@ -244,22 +259,28 @@ export function AppSettingsProvider({ children }) {
       saveSettings(next);
       return next;
     });
-  };
+  }, []);
 
-  const isRestDayMarked = (dateKey) => {
-    if (!dateKey) return false;
-    return Boolean(settings?.manualRestDays?.[dateKey]);
-  };
+  const isRestDayMarked = useCallback(
+    (dateKey) => {
+      if (!dateKey) return false;
+      return Boolean(settings?.manualRestDays?.[dateKey]);
+    },
+    [settings?.manualRestDays]
+  );
+
+  const contextValue = useMemo(
+    () => ({
+      settings,
+      updateSettings,
+      toggleManualRestDay,
+      isRestDayMarked,
+    }),
+    [settings, updateSettings, toggleManualRestDay, isRestDayMarked]
+  );
 
   return (
-    <AppSettingsContext.Provider
-      value={{
-        settings,
-        updateSettings,
-        toggleManualRestDay,
-        isRestDayMarked,
-      }}
-    >
+    <AppSettingsContext.Provider value={contextValue}>
       {children}
     </AppSettingsContext.Provider>
   );

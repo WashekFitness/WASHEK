@@ -20,6 +20,7 @@ import { WEEKDAYS, WEEKDAY_SHORT, sortWeekdays, parseWorkoutDaysFromText } from 
 import { useProgramCooldown, recordProgramGenerated, checkProgramGenerationLock } from '@/lib/programCooldown';
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import { setCachedActiveProgram } from '@/lib/cacheStore';
+import { queueQuickStartAfterOnboarding } from '@/lib/quickStartTutorial';
 import { toast } from 'sonner';
 
 const levels = [
@@ -49,7 +50,7 @@ function SearchSelect({ value, onChange, options, placeholder }) {
         onClick={() => { setOpen(o => !o); setSearch(''); }}
         className="w-full h-12 px-4 rounded-2xl border-2 border-border bg-card text-sm text-left flex items-center justify-between hover:border-muted-foreground/30 transition-all"
       >
-        <span className={value ? 'text-foreground' : 'text-muted-foreground'}>
+        <span data-no-translate="true" className={value ? 'text-foreground' : 'text-muted-foreground'}>
           {value || placeholder}
         </span>
         <span className="text-muted-foreground text-xs">▾</span>
@@ -67,7 +68,7 @@ function SearchSelect({ value, onChange, options, placeholder }) {
             />
           </div>
 
-          <div className="max-h-52 overflow-y-auto">
+          <div data-no-translate="true" className="max-h-52 overflow-y-auto">
             {filtered.map(opt => (
               <button
                 key={opt}
@@ -109,7 +110,7 @@ function CountrySelect({ value, onChange }) {
         onClick={() => { setOpen(o => !o); setSearch(''); }}
         className="w-full h-12 px-4 rounded-2xl border-2 border-border bg-card text-sm text-left flex items-center justify-between hover:border-muted-foreground/30 transition-all"
       >
-        <span className={selected ? 'text-foreground' : 'text-muted-foreground'}>
+        <span data-no-translate="true" className={selected ? 'text-foreground' : 'text-muted-foreground'}>
           {selected?.name || 'Select your country…'}
         </span>
         <span className="text-muted-foreground text-xs">▾</span>
@@ -127,7 +128,7 @@ function CountrySelect({ value, onChange }) {
             />
           </div>
 
-          <div className="max-h-52 overflow-y-auto">
+          <div data-no-translate="true" className="max-h-52 overflow-y-auto">
             {filtered.map(c => (
               <button
                 key={c.code}
@@ -157,16 +158,16 @@ function CountrySelect({ value, onChange }) {
 
 export default function Onboarding() {
   const navigate = useNavigate();
-  const { updateSettings } = useAppSettings();
-  const { user } = useAuth();
+  const { settings, updateSettings } = useAppSettings();
+  const { user, setUser } = useAuth();
   const { isLocked: isProgramLocked, remainingDays: programRemainingDays } = useProgramCooldown(user);
 
   const [step, setStep] = useState(0);
   const [firstName, setFirstName] = useState('');
   const [lastName, setLastName] = useState('');
-  const [country, setCountry] = useState('');
-  const [language, setLanguage] = useState('English');
-  const [unit, setUnit] = useState('imperial');
+  const [country, setCountry] = useState(() => settings?.country || '');
+  const [language, setLanguage] = useState(() => settings?.language || 'English');
+  const [unit, setUnit] = useState(() => settings?.unit || 'imperial');
   const [trainingType, setTrainingType] = useState('');
   const [level, setLevel] = useState('');
   const [goalDescription, setGoalDescription] = useState('');
@@ -188,11 +189,22 @@ export default function Onboarding() {
   const [workoutDays, setWorkoutDays] = useState(['Monday', 'Tuesday', 'Thursday', 'Friday']);
   const [hasToggledWorkoutDays, setHasToggledWorkoutDays] = useState(false);
 
+  const handleLanguageChange = (nextLang) => {
+    const clean = nextLang || 'English';
+    setLanguage(clean);
+    updateSettings({ language: clean });
+  };
+
   const handleCountryChange = (code) => {
     setCountry(code);
     const defaults = getCountryDefaults(code);
     setLanguage(defaults.language);
     setUnit(defaults.unit);
+    updateSettings({
+      country: code,
+      language: defaults.language,
+      unit: defaults.unit,
+    });
   };
 
   const toggleGoal = (val) => {
@@ -252,7 +264,12 @@ export default function Onboarding() {
       if (p.first_name) setFirstName(p.first_name);
       if (p.last_name) setLastName(p.last_name);
       if (p.country) setCountry(p.country);
-      if (p.language) setLanguage(p.language);
+      if (p.language && (!settings?.language || settings.language === 'English')) {
+        setLanguage(p.language);
+        if (p.language !== 'English') {
+          updateSettings({ language: p.language });
+        }
+      }
       if (p.unit) setUnit(p.unit);
       if (p.training_type) setTrainingType(p.training_type);
       if (p.fitness_level) setLevel(p.fitness_level);
@@ -831,6 +848,10 @@ export default function Onboarding() {
         console.debug('[Onboarding] Profile sync note:', profSyncErr);
       }
       markUserOnboarded(validUserId, user?.email);
+      queueQuickStartAfterOnboarding({
+        id: validUserId,
+        email: user?.email || profileData?.email || '',
+      });
 
       // Sync active program to localStorage for instant hydration on dashboard and profile
       try {
@@ -843,29 +864,28 @@ export default function Onboarding() {
         console.debug('[Onboarding] Active program cache note:', cacheErr);
       }
 
-      // Sync updated profile with macros and active program into localStorage
+      // Sync updated profile with macros and active program into localStorage & AuthContext
       try {
         const rawLocal = localStorage.getItem('washek_user');
         const parsedLocal = rawLocal ? JSON.parse(rawLocal) : {};
-        localStorage.setItem(
-          'washek_user',
-          JSON.stringify({
-            ...parsedLocal,
-            ...profileData,
-            training_days: resolvedWorkoutDays,
-            id: validUserId,
-            active_program_id: savedProgram.id,
-            training_type: programPayload.training_type,
-            fitness_level: programPayload.fitness_level,
-            primary_goal: programPayload.goal,
-            last_program_generated_at: nowIso,
-            calorie_target: personalizedNutrition.calories,
-            protein_target: personalizedNutrition.protein,
-            carbs_target: personalizedNutrition.carbs,
-            fat_target: personalizedNutrition.fat,
-            onboarded: true,
-          })
-        );
+        const nextStoredUser = {
+          ...parsedLocal,
+          ...profileData,
+          training_days: resolvedWorkoutDays,
+          id: validUserId,
+          active_program_id: savedProgram.id,
+          training_type: programPayload.training_type,
+          fitness_level: programPayload.fitness_level,
+          primary_goal: programPayload.goal,
+          last_program_generated_at: nowIso,
+          calorie_target: personalizedNutrition.calories,
+          protein_target: personalizedNutrition.protein,
+          carbs_target: personalizedNutrition.carbs,
+          fat_target: personalizedNutrition.fat,
+          onboarded: true,
+        };
+        localStorage.setItem('washek_user', JSON.stringify(nextStoredUser));
+        setUser?.((prev) => ({ ...(prev || {}), ...nextStoredUser }));
       } catch (uSyncErr) {
         console.debug('[Onboarding] User localStorage sync note:', uSyncErr);
       }
@@ -1041,13 +1061,25 @@ export default function Onboarding() {
               </div>
 
               <div>
-                <p className="text-xs text-muted-foreground mb-1 font-medium">
-                  Language
-                </p>
+                <div className="flex items-center justify-between mb-1">
+                  <p className="text-xs text-muted-foreground font-medium">
+                    Language
+                  </p>
+                  {language && language !== 'English' && (
+                    <button
+                      type="button"
+                      data-no-translate="true"
+                      onClick={() => handleLanguageChange('English')}
+                      className="text-xs font-semibold text-primary hover:underline"
+                    >
+                      English
+                    </button>
+                  )}
+                </div>
 
                 <SearchSelect
                   value={language}
-                  onChange={setLanguage}
+                  onChange={handleLanguageChange}
                   options={LANGUAGES}
                   placeholder="Select language…"
                 />

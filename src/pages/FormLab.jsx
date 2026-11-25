@@ -669,12 +669,12 @@ function normalizeResult(
   for (const prio of priorityList) {
     if (typeof prio === 'string' && prio.trim().length > 4) {
       const pLower = prio.toLowerCase();
-      const correctiveWords = ['avoid', 'stop', 'fix', 'prevent', 'do not', "don't", 'sag', 'flare', 'kip', 'momentum', 'arch', 'collapse', 'cheat', 'cut depth', 'parallel', 'hyperexten', 'sway', 'strain'];
+      const correctiveWords = ['avoid', 'stop', 'fix', 'prevent', 'do not', "don't", 'sag', 'flare', 'kip', 'momentum', 'arch', 'collapse', 'cheat', 'cut depth', 'parallel', 'hyperexten', 'sway', 'strain', 'round', 'butt wink', 'valgus', 'cave', 'caving', 'bounce', 'hitch', 'heel', 'lockout', 'bar path', 'swing', 'jerk'];
       if (correctiveWords.some((w) => pLower.includes(w))) {
         const alreadyCaptured = realComplaints.some((c) => pLower.includes(String(c.problem || '').toLowerCase().slice(0, 10)));
         if (!alreadyCaptured) {
-          const isCritical = pLower.includes('dangerous') || pLower.includes('collapse') || pLower.includes('hyperexten') || pLower.includes('spine') || pLower.includes('injury');
-          const isMajor = pLower.includes('sag') || pLower.includes('worm') || pLower.includes('kip') || pLower.includes('momentum');
+          const isCritical = pLower.includes('dangerous') || pLower.includes('collapse') || pLower.includes('hyperexten') || pLower.includes('spine') || pLower.includes('injury') || pLower.includes('cat-back') || pLower.includes('cat back');
+          const isMajor = pLower.includes('sag') || pLower.includes('worm') || pLower.includes('kip') || pLower.includes('momentum') || pLower.includes('round') || pLower.includes('valgus') || pLower.includes('hitch') || pLower.includes('bounce');
           realComplaints.push({
             area: isCritical || isMajor ? 'Spine / Core Alignment' : 'Movement Technique',
             problem: prio,
@@ -696,7 +696,7 @@ function normalizeResult(
         fix: 'Immediately cease this progression level; master baseline joint alignment and core tension.',
         corrective_exercises: ['Hollow body hold', 'Plank with posterior pelvic tilt'],
       });
-    } else if (textBlob.includes('sag') || textBlob.includes('worm') || textBlob.includes('kip') || textBlob.includes('flare') || textBlob.includes('arch') || textBlob.includes('cheat') || textBlob.includes('poor')) {
+    } else if (textBlob.includes('sag') || textBlob.includes('worm') || textBlob.includes('kip') || textBlob.includes('flare') || textBlob.includes('arch') || textBlob.includes('cheat') || textBlob.includes('poor') || textBlob.includes('round') || textBlob.includes('valgus') || textBlob.includes('hitch') || textBlob.includes('bounce')) {
       realComplaints.push({
         area: 'Kinetic Chain Alignment',
         problem: 'Noticeable technical breakdown detected during movement path.',
@@ -815,7 +815,7 @@ function normalizeResult(
     // Check if the overall assessment or summary explicitly mentions a rep count
     let textMentionedReps = null;
     const textBlob = `${source.overall_assessment || ''} ${source.summary || ''} ${source.critique || ''}`;
-    const repMatch = textBlob.match(/\b(?:completed|performed|across all|total of|did)\s+(\d{1,2})\s+(?:reps?|repetitions?|push-?ups?|pull-?ups?|dips?|squats?|curls?|rows?)\b/i);
+    const repMatch = textBlob.match(/\b(?:completed|performed|across all|total of|did)\s+(\d{1,2})\s+(?:reps?|repetitions?|push-?ups?|pull-?ups?|chin-?ups?|dips?|squats?|curls?|rows?|deadlifts?|rdls?|press(?:es)?|bench(?:es)?|snatches?|cleans?|jerks?|lunges?|thrusters?|raises?|fly(?:es|s)?|extensions?|shrugs?|lifts?|pulls?)\b/i);
     if (repMatch) {
       const parsedTextReps = parseInt(repMatch[1], 10);
       if (Number.isFinite(parsedTextReps) && parsedTextReps > 0 && parsedTextReps <= 40) {
@@ -943,12 +943,12 @@ VERY IMPORTANT ACCURACY & FAIRNESS RULES:
 3. HOLD TIMES (FULL DURATION): For static holds, measure the continuous duration in seconds held strictly within this analyzed section until the athlete completely drops, releases, or touches down. Form adjustments or wobbles do NOT stop the hold timer. Set "hold_time_seconds": number. Set "rep_count": null.
 4. REAL SCORE MANDATE (1% TO 100% — ABSOLUTELY NO SUGARCOATING — TELL LITERALLY EVERYTHING WRONG):
 The score MUST be completely realistic, honest, and anywhere from 1% to 100%. Stop sugarcoating bad form. Bad or dangerous form is dangerous and must NEVER receive a high score or be excused to protect the athlete ego.
-- 1%–20%: Dangerous or hazardous execution with extreme injury risk (e.g. collapsing lumbar spine under load, severe shoulder impingement shearing, uncontrolled dropping/falling).
-- 20%–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging, worming push-ups, heavy swinging/kipping, cutting half the range of motion, severe asymmetry, collapsed core tension).
-- 45%–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM, flared elbows >60°, uncontrolled eccentric cadence, soft lockout).
+- 1%–20%: Dangerous or hazardous execution with extreme injury risk (e.g. collapsing or rounding lumbar spine under heavy load, severe knee valgus cave under load, severe shoulder impingement shearing, uncontrolled dropping/falling).
+- 20%–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging or spinal rounding, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy swinging/kipping, cutting half the range of motion, severe asymmetry, collapsed core bracing).
+- 45%–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM / above-parallel squats, flared elbows >60°–75°, bar path drifting forward, heels lifting, uncontrolled eccentric cadence, soft lockout).
 - 70%–84%: Acceptable or moderate execution with clear technical flaws to fix.
 - 85%–94%: High-level execution with 1 minor technical refinement.
-- 95%–100%: Rare, flawless, gymnastics-grade textbook execution with full range of motion, locked body tension, and zero detectable complaints.
+- 95%–100%: Rare, flawless, competition/gymnastics-grade textbook execution with full range of motion, locked bracing/body tension, and zero detectable complaints.
 MANDATORY: You MUST list literally every single flaw in the "issues" array with exact problem, severity, and fix! Never leave "issues" empty if the athlete makes mistakes!
 5. BOUNDARIES: Only analyze movement within this analyzed section (${start.toFixed(2)}s to ${end.toFixed(2)}s).
 
@@ -1262,8 +1262,8 @@ export default function FormLab() {
   const selectedEx =
     FORM_EXERCISES.find(
       e =>
-        e.name ===
-        exercise
+        e.name.toLowerCase() ===
+        exercise.trim().toLowerCase()
     );
 
   const exCategory =
@@ -1310,7 +1310,7 @@ export default function FormLab() {
 
           <p className="text-muted-foreground text-sm max-w-xs mb-6">
             AI-powered form analysis with frame-level
-            analysis. Record any calisthenics movement
+            analysis. Record any calisthenics or weightlifting movement
             and get a score, rep/hold assessment,
             and corrective drills.
           </p>
@@ -2046,7 +2046,7 @@ export default function FormLab() {
       />
 
       <p className="text-sm text-muted-foreground mb-5">
-        Record or upload any calisthenics movement.
+        Record or upload any calisthenics or weightlifting movement.
         Kael analyzes chronological frames from your
         selected video section to assess your technique,
         score your form, estimate reps or hold quality,
@@ -2120,7 +2120,7 @@ export default function FormLab() {
                   e.target.value
                 )
               }
-              placeholder="e.g. Push-ups, Pull-ups, Handstand hold…"
+              placeholder="e.g. Squat, Bench Press, Deadlift, Push-ups, Pull-ups, Handstand…"
               className="h-12 text-base"
               disabled={
                 uploading ||
@@ -2192,7 +2192,7 @@ export default function FormLab() {
               <li>
                 • Keep your{' '}
                 <span className="font-semibold text-foreground">
-                  full body in frame
+                  full body (and weights) in frame
                 </span>
               </li>
 

@@ -31,6 +31,7 @@ import {
 } from '@/lib/subscription';
 import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 import { getCachedMessageStats } from '@/lib/messageLimit';
+import { markNewAccountForQuickStart } from '@/lib/quickStartTutorial';
 
 function preserveMonthlyKaelCount(nextUser, prevUser = null) {
   if (!nextUser || typeof nextUser !== 'object') return nextUser;
@@ -919,6 +920,7 @@ export const AuthProvider = ({ children }) => {
           cleanEmail.split('@')[0] ||
           'Athlete';
 
+        const isBrandNewAccount = data?.isNewAccount !== false;
         const finalProfile = enforceUserSubscriptionState({
           ...p,
           id: u.id || p.id,
@@ -927,9 +929,14 @@ export const AuthProvider = ({ children }) => {
           last_name: lastName || p.last_name || meta.last_name || '',
           full_name: resolvedName,
           role: p.role || meta.role || 'athlete',
+          onboarded: p.onboarded ?? (isBrandNewAccount ? false : true),
           subscription_plan: p.subscription_plan || 'free',
           subscription_status: p.subscription_status || 'inactive',
         });
+
+        if (isBrandNewAccount && finalProfile.onboarded !== true) {
+          markNewAccountForQuickStart(finalProfile);
+        }
 
         if (data.serverSessionToken) {
           try {

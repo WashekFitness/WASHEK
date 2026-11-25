@@ -179,6 +179,7 @@ export default defineConfig(async ({ command }) => {
         "**/.deleted_accounts.json",
         "**/.washek_session_secret",
         "**/.kael_usage.json",
+        "**/.i18n_cache.json",
         "**/dist/**",
         "**/supabase/**",
       ],

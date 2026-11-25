@@ -3213,6 +3213,7 @@ app.post('/api/auth/signup', async (req, res) => {
           setServerSessionCookie(res, srvToken, req);
           return res.json({
             success: true,
+            isNewAccount: false,
             user: signData.user,
             session: signData.session,
             profile: {
@@ -3256,6 +3257,7 @@ app.post('/api/auth/signup', async (req, res) => {
         setServerSessionCookie(res, srvToken, req);
         return res.json({
           success: true,
+          isNewAccount: false,
           isVaultSession: true,
           user: athleteUser,
           session: {
@@ -3324,6 +3326,7 @@ app.post('/api/auth/signup', async (req, res) => {
       last_name: lastName,
       full_name: fullName,
       role: 'athlete',
+      onboarded: false,
       subscription_plan: 'free',
       subscription_status: 'inactive',
       subscription_tier: 'free',
@@ -3343,6 +3346,7 @@ app.post('/api/auth/signup', async (req, res) => {
     setServerSessionCookie(res, srvToken, req);
     return res.json({
       success: true,
+      isNewAccount: true,
       user: data?.user || athleteUser,
       session: athleteSession,
       profile: athleteProfile,
@@ -3919,7 +3923,7 @@ const SYSTEM_INSTRUCTIONS: Record<string, string> = {
   kael: 'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. You are direct, scientifically grounded, encouraging, and focused on progressive overload, proper form, recovery, and nutrition. Always communicate in simple, everyday language that any beginner can easily understand, without confusing textbook jargon. Use intuitive real-world analogies when helpful to make concepts click, but never talk down to the athlete or sound like you are explaining things to a baby. Maintain a mature, supportive, and practical coaching presence.',
   structure: 'You are an elite strength & conditioning program architect for WASHEK. Design workout structures and weekly splits tailored to the athlete goals with proactive fatigue management and maximum safe progression velocity. Balance push/pull volume, prioritize high-CNS demands when fresh, and eliminate junk volume. STRICT OUTPUT MANDATE: Return raw JSON ONLY that strictly adheres to the requested schema. Never output conversational intros, explanations, greetings, or markdown code fences.',
   microcycle: 'You are an elite strength & conditioning program architect for WASHEK. Build comprehensive, progressive workout programming for the microcycle with days, exercise sequences, sets, reps, rest intervals, notes, and activation cues. GOAL ACCELERATION & SYSTEMIC FATIGUE MANAGEMENT MANDATE: Program workouts to drive the athlete toward their specific goals as fast as safely possible while actively managing systemic, CNS, and joint fatigue. 1) High Stimulus-to-Fatigue Ratio (SFR): Select high-yield exercises, strictly eliminating junk volume. 2) 1-2 RIR on primary compounds to maximize neuromuscular adaptation without exhausting the CNS. 3) Order high-skill or heavy compound movements first when the athlete is fresh. 4) Prescribe adequate rest periods (90-180s on primary lifts, 60-90s on accessories) for full ATP replenishment. 5) Maintain strict push/pull and joint balance. STRICT OUTPUT MANDATE: Return a single valid JSON object with the "microcycle" key adhering to the requested schema. No markdown code fences, greetings, or preambles.',
-  form_analysis: 'You are an elite calisthenics biomechanist and uncompromising judge for WASHEK Form Lab. Analyze the user exercise execution across the provided video frames. ABSOLUTE HONESTY & REAL SCORE MANDATE (NO SUGARCOATING — SCORES RANGE FROM 1% TO 100%): You are an objective, clinical judge. Stop sugarcoating form. If form is bad, sloppy, or dangerous, TELL LITERALLY EVERYTHING WRONG WITH THE FORM. Bad or dangerous form is dangerous and must NEVER be inflated, praised, or excused to protect the athlete ego. Look at every joint and anatomical segment: cervical spine/neck hyperextension, scapular winging/elevation into ears, flared elbows (>60° creating shoulder impingement), lumbar spine sagging/hyperextension ("banana back"), lack of posterior pelvic tilt, knee collapse, hip sagging/piking, cutting range of motion, kipping, swinging, worming up, or asymmetrical drive. SCORE BRACKETS (1%–100%): 1%–20% for dangerous or hazardous execution with extreme injury risk (e.g., collapsing spine under load, severe joint shearing, uncontrolled falling/dropping); 20%–44% for poor, broken, or terrible form (severe lumbar hyperextension/sagging, worming push-ups, heavy swinging/kipping, cutting over half the range of motion, severe asymmetry, collapsed core tension); 45%–69% for sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM, flared elbows, uncontrolled cadence, soft lockout); 70%–84% for acceptable or moderate execution with clear technical flaws to fix; 85%–94% for high-level execution with 1 minor technical refinement; 95%–100% for rare, flawless, gymnastics-grade textbook execution with full range of motion and locked body tension. Deductions: Minor tip (-5 to -8 pts), Moderate flaw (-15 to -20 pts), Major breakdown (-30 to -45 pts), Critical safety hazard (-50 to -80 pts). MANDATORY ISSUES LIST: If there is ANY breakdown or flaw, you MUST populate the "issues" array with every single flaw, exact problem, severity ("minor", "moderate", "major", "critical"), and fix. Never leave "issues" empty if the form has mistakes! CRITICAL REP & HOLD COUNTER MANDATE (NEVER DROP REPS): Count EVERY attempted repetition across the video frames from start to finish. If a repetition has partial depth, soft lockout, slight momentum, or fatigued form, THAT REPETITION STILL COUNTS AS A REP! Imperfect form reduces the form score; it NEVER subtracts from the rep count. Set "rep_count" to the exact integer total of all repetitions performed; set "hold_time_seconds": null. For static holds (planche, levers, L-sit, handstand, dead hang, etc.): set "rep_count": null; measure the full actual hold duration in seconds ("hold_time_seconds": number). STRICT OUTPUT MANDATE: Return raw JSON ONLY matching the requested structure without markdown code blocks.',
+  form_analysis: 'You are an elite calisthenics and weightlifting (barbell, dumbbell, kettlebell, cable, and machine) biomechanist and uncompromising judge for WASHEK Form Lab. Analyze the user exercise execution across the provided video frames. ABSOLUTE HONESTY & REAL SCORE MANDATE (NO SUGARCOATING — SCORES RANGE FROM 1% TO 100%): Apply the exact same strict 1%–100% scoring standard equally to both calisthenics and weightlifting exercises. Stop sugarcoating form. If form is bad, sloppy, or dangerous, TELL LITERALLY EVERYTHING WRONG WITH THE FORM. Bad or dangerous form is dangerous and must NEVER be inflated, praised, or excused to protect the athlete ego. Look at every joint and anatomical segment: cervical spine/neck hyperextension, lumbar rounding ("cat-back" or butt wink) under load, scapular winging/elevation into ears, flared elbows (>60°–75° creating shoulder impingement), lumbar spine sagging/hyperextension ("banana back"), lack of bracing or posterior pelvic tilt, knee valgus collapse or heel lift, hip sagging/piking, bar path drift away from midfoot, bouncing weights off the chest/floor, hitching deadlifts, cutting range of motion, kipping, swinging, worming up, or asymmetrical drive. SCORE BRACKETS (1%–100%): 1%–20% for dangerous or hazardous execution with extreme injury risk (e.g., collapsing or heavily rounded spine under squat/deadlift load, severe knee valgus cave under load, severe joint shearing, uncontrolled falling/dropping); 20%–44% for poor, broken, or terrible form (severe lumbar hyperextension/sagging or spinal rounding under load, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy swinging/kipping/body-heaving, cutting over half the range of motion, severe asymmetry, collapsed core bracing); 45%–69% for sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM / above-parallel squats, flared elbows, bar path drift, heels lifting, uncontrolled cadence, soft lockout); 70%–84% for acceptable or moderate execution with clear technical flaws to fix; 85%–94% for high-level execution with 1 minor technical refinement; 95%–100% for rare, flawless, competition/gymnastics-grade textbook execution with full range of motion and locked bracing/body tension. Deductions: Minor tip (-5 to -8 pts), Moderate flaw (-15 to -20 pts), Major breakdown (-30 to -45 pts), Critical safety hazard (-50 to -80 pts). MANDATORY ISSUES LIST: If there is ANY breakdown or flaw, you MUST populate the "issues" array with every single flaw, exact problem, severity ("minor", "moderate", "major", "critical"), and fix. Never leave "issues" empty if the form has mistakes! CRITICAL REP & HOLD COUNTER MANDATE (NEVER DROP REPS): Count EVERY attempted repetition across the video frames from start to finish. If a repetition has partial depth, soft lockout, slight momentum, or fatigued form, THAT REPETITION STILL COUNTS AS A REP! Imperfect form reduces the form score; it NEVER subtracts from the rep count. Set "rep_count" to the exact integer total of all repetitions performed; set "hold_time_seconds": null. For static holds (planche, levers, L-sit, handstand, dead hang, plank, wall sit, etc.): set "rep_count": null; measure the full actual hold duration in seconds ("hold_time_seconds": number). STRICT OUTPUT MANDATE: Return raw JSON ONLY matching the requested structure without markdown code blocks.',
   food_scan: 'You are a sports nutritionist and dietitian for WASHEK. Analyze the food photo or ingredients. Identify the foods, estimate portion sizes, and calculate accurate macronutrients (calories, protein, carbohydrates, fat). STRICT OUTPUT MANDATE: Return raw JSON ONLY. No markdown, preambles, or conversational greetings.',
   food_barcode: 'You are a sports nutritionist for WASHEK. Identify the product from the barcode information and estimate accurate nutritional values and serving sizes. STRICT OUTPUT MANDATE: Return raw JSON ONLY. No markdown, preambles, or conversational greetings.',
   progress_photo: 'You are a physique assessment specialist for WASHEK. Objectively assess the progress photo for body composition, estimated body fat percentage range, visible muscle definition, posture, and symmetry. STRICT OUTPUT MANDATE: Return raw JSON ONLY. No markdown, preambles, or conversational greetings.',
@@ -3938,6 +3942,23 @@ const JSON_TYPES = new Set([
   'weekly_update',
   'live_workout_adjustment',
 ]);
+
+function buildLanguageMandate(rawLanguage: any, isJsonExpected: boolean): string {
+  const cleanLang = typeof rawLanguage === 'string' ? rawLanguage.trim() : '';
+  if (!cleanLang || cleanLang.toLowerCase() === 'english' || cleanLang.toLowerCase() === 'en') {
+    return '';
+  }
+  if (isJsonExpected) {
+    return (
+      ` LANGUAGE REQUIREMENT: Respond in ${cleanLang}. ` +
+      `Write ALL natural-language text values (exercise names/notes if descriptive, form issues, descriptions, coaching tips, food descriptions, feedback, suggestions) in natural, fluent ${cleanLang}, while keeping ALL JSON property keys, enum IDs (such as "minor", "moderate", "major", "critical"), numbers, and JSON structure strictly unchanged in English.`
+    );
+  }
+  return (
+    ` LANGUAGE REQUIREMENT: Respond completely in natural, fluent ${cleanLang}. ` +
+    `If you emit any internal action tag syntax such as [ACTION:...], keep the bracket command syntax unchanged in English while translating any user-facing label text into ${cleanLang}.`
+  );
+}
 
 const SERVER_PLAN_HIERARCHY = ['free', 'progress', 'performance', 'elite'] as const;
 const SERVER_ACTIVE_SUBSCRIPTION_STATUSES = new Set(['active', 'trialing', 'past_due']);
@@ -4921,6 +4942,11 @@ app.post('/api/ai-generate', async (req, res) => {
       }
     }
 
+    const langMandate = buildLanguageMandate(req.body?.language, isJsonExpected);
+    if (langMandate) {
+      config.systemInstruction = String(config.systemInstruction || '') + langMandate;
+    }
+
     // Fast, reliable Google Gemini models (flash-lite primary for sub-second-to-few-second latency, hydrogen fallback when daily quota available)
     const activeModels =
       Date.now() < hydrogenDailyExhaustedUntil
@@ -5366,6 +5392,11 @@ app.post('/api/ai-stream', async (req, res) => {
       }
     }
 
+    const streamLangMandate = buildLanguageMandate(req.body?.language, isJsonExpected);
+    if (streamLangMandate) {
+      config.systemInstruction = String(config.systemInstruction || '') + streamLangMandate;
+    }
+
     const modelsToTry =
       Date.now() < hydrogenDailyExhaustedUntil
         ? ['gemini-3.1-flash-lite']
@@ -5756,6 +5787,163 @@ app.post('/api/send-contact-email', async (req, res) => {
       success: false,
       delivered: false,
       error: err?.message || 'Failed to process contact email.',
+    });
+  }
+});
+
+// ------------------------------------------------------------
+// FULL-APP UI TRANSLATION ENDPOINT & PERSISTENT CACHE
+// ------------------------------------------------------------
+
+const I18N_CACHE_FILE = path.join(process.cwd(), '.i18n_cache.json');
+let i18nDiskCache: Record<string, Record<string, string>> = {};
+let i18nFlushTimer: NodeJS.Timeout | null = null;
+
+try {
+  if (fs.existsSync(I18N_CACHE_FILE)) {
+    const rawCache = fs.readFileSync(I18N_CACHE_FILE, 'utf8');
+    const parsed = JSON.parse(rawCache);
+    if (parsed && typeof parsed === 'object') {
+      i18nDiskCache = parsed;
+    }
+  }
+} catch {
+  i18nDiskCache = {};
+}
+
+function scheduleI18nCachePersist() {
+  if (i18nFlushTimer) return;
+  i18nFlushTimer = setTimeout(() => {
+    i18nFlushTimer = null;
+    try {
+      fs.writeFileSync(I18N_CACHE_FILE, JSON.stringify(i18nDiskCache), 'utf8');
+    } catch {
+      // non-fatal disk cache write failure
+    }
+  }, 1500);
+  i18nFlushTimer.unref?.();
+}
+
+app.post('/api/i18n/translate', async (req, res) => {
+  try {
+    const rawLang = typeof req.body?.targetLanguage === 'string' ? req.body.targetLanguage.trim() : '';
+    const rawStrings = Array.isArray(req.body?.strings) ? req.body.strings : [];
+
+    const uniqueStrings: string[] = [];
+    const seen = new Set<string>();
+    for (const item of rawStrings) {
+      if (typeof item !== 'string') continue;
+      if (!item || item.length > 2000 || seen.has(item)) continue;
+      seen.add(item);
+      uniqueStrings.push(item);
+      if (uniqueStrings.length >= 80) break;
+    }
+
+    if (!rawLang || rawLang.toLowerCase() === 'english' || rawLang.toLowerCase() === 'en') {
+      const identity: Record<string, string> = {};
+      for (const s of uniqueStrings) identity[s] = s;
+      return res.json({ success: true, targetLanguage: 'English', translations: identity });
+    }
+
+    if (uniqueStrings.length === 0) {
+      return res.json({ success: true, targetLanguage: rawLang, translations: {} });
+    }
+
+    if (!i18nDiskCache[rawLang]) {
+      i18nDiskCache[rawLang] = {};
+    }
+    const langCache = i18nDiskCache[rawLang];
+
+    const translations: Record<string, string> = {};
+    const missing: string[] = [];
+
+    for (const s of uniqueStrings) {
+      if (typeof langCache[s] === 'string' && langCache[s].trim()) {
+        translations[s] = langCache[s];
+      } else {
+        missing.push(s);
+      }
+    }
+
+    if (missing.length > 0 && process.env.GEMINI_API_KEY) {
+      const ai = getGeminiClient();
+      const prompt =
+        `Translate the following array of UI strings from English into natural, concise ${rawLang} suitable for a mobile/web fitness app.\n` +
+        `CRITICAL RULES:\n` +
+        `1. Preserve order and length strictly: return a JSON object {"translations": [...]} with exact length ${missing.length}.\n` +
+        `2. Keep proper names and technical tokens invariant ("WASHEK", "Kael", "Coach Kael", "Stripe", units like "kg", "lbs", "kcal", "cm").\n` +
+        `3. Keep button/label translations concise so UI layouts remain clean.\n` +
+        `4. Preserve emojis, punctuation, numbers, and symbols cleanly.\n\n` +
+        `INPUT JSON ARRAY:\n${JSON.stringify(missing)}`;
+
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 14000);
+      try {
+        const aiRes = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: [{ text: prompt }],
+          config: {
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: 'OBJECT',
+              properties: {
+                translations: {
+                  type: 'ARRAY',
+                  items: { type: 'STRING' },
+                },
+              },
+              required: ['translations'],
+            } as any,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+            abortSignal: controller.signal,
+          },
+        });
+        clearTimeout(timer);
+
+        const parsed = extractJsonFromAiOutput(aiRes?.text || '');
+        const list = Array.isArray(parsed?.translations)
+          ? parsed.translations
+          : Array.isArray(parsed)
+            ? parsed
+            : [];
+
+        let cacheModified = false;
+        for (let idx = 0; idx < missing.length; idx++) {
+          const orig = missing[idx];
+          const translated = typeof list[idx] === 'string' && list[idx].trim() ? list[idx] : orig;
+          translations[orig] = translated;
+          if (translated !== orig || list[idx] === orig) {
+            if (Object.keys(langCache).length < 6000) {
+              langCache[orig] = translated;
+              cacheModified = true;
+            }
+          }
+        }
+        if (cacheModified) {
+          scheduleI18nCachePersist();
+        }
+      } catch (aiErr: any) {
+        clearTimeout(timer);
+        console.warn('[i18n] Gemini batch translation warning:', aiErr?.message || aiErr);
+      }
+    }
+
+    for (const s of missing) {
+      if (!translations[s]) {
+        translations[s] = s;
+      }
+    }
+
+    return res.json({
+      success: true,
+      targetLanguage: rawLang,
+      translations,
+    });
+  } catch (err: any) {
+    console.error('[server.ts /api/i18n/translate error]', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Translation failed.',
     });
   }
 });

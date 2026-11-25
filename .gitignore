@@ -14,4 +14,5 @@ pnpm-debug.log*
 .deleted_accounts.json
 .washek_session_secret
 .kael_usage.json
+.i18n_cache.json
 firebase-debug.log
