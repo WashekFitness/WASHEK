@@ -1,12 +1,14 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "node:path";
-import { VitePWA } from "vite-plugin-pwa";
 
-export default defineConfig({
-  plugins: [
-    react(),
-    VitePWA({
+export default defineConfig(async ({ command }) => {
+  const plugins = [react()];
+
+  if (command === "build") {
+    const { VitePWA } = await import("vite-plugin-pwa");
+    plugins.push(
+      VitePWA({
       registerType: "autoUpdate",
       includeAssets: [
         "favicon.ico",
@@ -119,8 +121,26 @@ export default defineConfig({
       devOptions: {
         enabled: false,
       },
-    }),
-  ],
+    })
+    );
+  } else {
+    plugins.push({
+      name: "pwa-register-dev-stub",
+      resolveId(id) {
+        if (id === "virtual:pwa-register") {
+          return "\0virtual:pwa-register";
+        }
+      },
+      load(id) {
+        if (id === "\0virtual:pwa-register") {
+          return "export function registerSW() { return async () => {}; }\n";
+        }
+      },
+    });
+  }
+
+  return {
+    plugins,
 
   resolve: {
     alias: {
@@ -152,5 +172,17 @@ export default defineConfig({
     allowedHosts: true,
     hmr: false,
     ws: false,
+    watch: {
+      ignored: [
+        "**/.confirmed_subscriptions.json",
+        "**/.athlete_credentials.json",
+        "**/.deleted_accounts.json",
+        "**/.washek_session_secret",
+        "**/.kael_usage.json",
+        "**/dist/**",
+        "**/supabase/**",
+      ],
+    },
   },
+  };
 });

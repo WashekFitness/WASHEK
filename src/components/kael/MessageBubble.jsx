@@ -3,7 +3,12 @@ import { cn } from '@/lib/utils';
 import ReactMarkdown from 'react-markdown';
 import { parseKaelActions } from '@/lib/kaelAppContext';
 
-export default function MessageBubble({ msg, isUser, onAction, userOrPlan = null }) {
+export default function MessageBubble({
+  msg,
+  isUser,
+  onAction,
+  userOrPlan = null,
+}) {
   const parsed = isUser
     ? { cleanText: msg?.content || '', actions: [] }
     : parseKaelActions(msg?.content || '', userOrPlan);
@@ -45,12 +50,12 @@ export default function MessageBubble({ msg, isUser, onAction, userOrPlan = null
         </div>
 
         {visibleActions.length > 0 && onAction && (
-          <div className="flex flex-wrap gap-1.5 pt-0.5">
+          <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
             {visibleActions.map((act) => {
               const Icon =
-                act.type === 'log_food'
+                act.type === 'log_food' || act.type === 'ask_log_food'
                   ? Utensils
-                  : act.type === 'log_rest_day'
+                  : act.type === 'log_rest_day' || act.type === 'ask_log_rest_day'
                     ? CalendarOff
                     : ArrowUpRight;
 
@@ -59,7 +64,7 @@ export default function MessageBubble({ msg, isUser, onAction, userOrPlan = null
                   key={act.id}
                   type="button"
                   onClick={() => onAction(act)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-semibold bg-primary/10 hover:bg-primary/20 text-primary border border-primary/30 hover:border-primary/50 transition-colors active:scale-[0.98]"
+                  className="inline-flex items-center gap-1.5 px-3 min-h-[34px] rounded-xl text-xs font-semibold bg-primary/10 hover:bg-primary/20 text-primary border border-primary/30 hover:border-primary/50 transition-colors active:scale-[0.98]"
                 >
                   <Icon className="w-3.5 h-3.5 shrink-0" />
                   <span>{act.label}</span>

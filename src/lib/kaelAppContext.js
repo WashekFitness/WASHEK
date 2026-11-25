@@ -29,6 +29,8 @@ export const KAEL_STATIC_ROUTES = [
   '/onboarding',
   '/about',
   '/contact',
+  '/terms',
+  '/privacy',
   '/kael',
 ];
 
@@ -47,6 +49,11 @@ const ROUTE_DEFAULT_LABELS = {
   '/muscle-heatmap': 'Open Muscle Heatmap',
   '/profile': 'Open Profile & Plans',
   '/onboarding': 'Open Setup Wizard',
+  '/about': 'About WASHEK',
+  '/contact': 'Contact Support',
+  '/terms': 'Terms of Service',
+  '/privacy': 'Privacy Policy',
+  '/kael': 'Coach Kael Chat',
 };
 
 const VALID_MEAL_TYPES = new Set(['breakfast', 'lunch', 'dinner', 'snack', 'post-workout']);
@@ -155,7 +162,7 @@ export function parseKaelActions(rawContent = '', userOrPlan = null) {
           });
         }
       }
-    } else if (actionKindRaw === 'log_food') {
+    } else if (actionKindRaw === 'log_food' || actionKindRaw === 'ask_log_food') {
       const parts = rest.split('|').map((s) => (s || '').trim());
       const foodName = (parts[0] || '').slice(0, 120);
       const calories = Math.round(Number(parts[1]));
@@ -180,12 +187,12 @@ export function parseKaelActions(rawContent = '', userOrPlan = null) {
         fatG >= 0 &&
         fatG <= 500
       ) {
-        const dedupeKey = `food:${foodName.toLowerCase()}:${calories}:${mealType}`;
+        const dedupeKey = `food:${actionKindRaw}:${foodName.toLowerCase()}:${calories}:${mealType}`;
         if (!seenKeys.has(dedupeKey)) {
           seenKeys.add(dedupeKey);
           actions.push({
             id: dedupeKey,
-            type: 'log_food',
+            type: actionKindRaw,
             food_name: foodName,
             calories,
             protein_g: proteinG,
@@ -196,14 +203,14 @@ export function parseKaelActions(rawContent = '', userOrPlan = null) {
           });
         }
       }
-    } else if (actionKindRaw === 'log_rest_day') {
+    } else if (actionKindRaw === 'log_rest_day' || actionKindRaw === 'ask_log_rest_day') {
       const [, rawLabel] = inner.split('|').map((s) => (s || '').trim());
-      const dedupeKey = 'log_rest_day';
+      const dedupeKey = actionKindRaw;
       if (!seenKeys.has(dedupeKey)) {
         seenKeys.add(dedupeKey);
         actions.push({
           id: dedupeKey,
-          type: 'log_rest_day',
+          type: actionKindRaw,
           label: (rawLabel || 'Mark Today as Rest Day').slice(0, 48),
         });
       }
@@ -714,6 +721,32 @@ export async function fetchKaelAppContext({ user, settings, timeZone }) {
   }
 
   lines.push('');
+  lines.push('--- WASHEK ABOUT, CONTACT, TERMS & PRIVACY KNOWLEDGE (/about, /contact, /terms, /privacy) ---');
+  lines.push(
+    'About WASHEK (/about): Founded by competitive calisthenics athlete Adrian Washek to make scientific personal coaching accessible without high trainer fees. ' +
+      'Built on 5 Core Pillars: (1) Adaptive 12-Week Periodization (Calisthenics, Weighted Calisthenics, Traditional Weights, Hybrid — progressive overload & smart deloads matched to strength/equipment); ' +
+      '(2) Coach Kael (24/7 context-aware athletic mentor); (3) Form Lab (/formlab, Elite — computer-vision rep counting, hold timing, joint angle evaluation & corrective drills); ' +
+      '(4) Nutrition & Macro Fueling (photo food scan, barcode scan, dynamic calorie/macro targets); (5) Strength Baselines & Physique Tracking (benchmarks, weight logs, private progress photos). ' +
+      'Built for beginners, calisthenics athletes, gym lifters/bodybuilders, and hybrid athletes.'
+  );
+  lines.push(
+    'Contact & Support (/contact): Users can message the WASHEK team anytime via the in-app Contact Us form (/contact) or by emailing washekfitness@gmail.com directly for questions, feedback, bug reports, billing help, or partnerships.'
+  );
+  lines.push(
+    'Terms of Service (/terms — Updated Nov 2026): ' +
+      'Health/Medical Disclaimer: Educational & athletic guidance only — WASHEK, Coach Kael, and Form Lab are not licensed doctors/PTs/dietitians; consult a physician before intense training and stop on sharp pain/dizziness/chest tightness. ' +
+      'Plans & Quotas: Free (100 Kael msgs/mo), Progress (300/mo), Performance (800/mo), Elite (2,000/mo); quotas reset on the 1st of each calendar month in the user timezone. ' +
+      'Free Trial & Billing: Eligible first-time paid subscribers get a 7-day free trial ($0 today) via Stripe before monthly billing starts (1 trial per athlete). Users can cancel anytime in Athlete Profile — cancelling stops future charges, ends paid tier access immediately, and returns to Free; cancel an active plan first before subscribing to another tier to prevent double billing. Started billing cycles are non-refundable except where mandated by law. ' +
+      'AI & Estimations: Kael guidance, Form Lab scores, progress photo body-fat estimates, and food/barcode nutrition estimates are probabilistic approximations (check packaging for allergens; verify safe loads/form yourself; Kael asks permission before modifying logs unless explicitly told).'
+  );
+  lines.push(
+    'Privacy Policy (/privacy — Updated Nov 2026): ' +
+      'Data Collected: Account/profile & timezone/unit/language prefs, workout programs/logs/maxes/rest days/check-ins, nutrition/meal presets/weight history, voluntary Form Lab videos & progress photos, Coach Kael chat threads, Contact submissions, and Stripe subscription status metadata (WASHEK never receives or stores raw card numbers or CVVs). ' +
+      'Processors & Privacy: Stored in Supabase with strict Row-Level Security (RLS) so only your authenticated account accesses your data; payments via Stripe; AI inference routed over encrypted server endpoints. Private photos, videos, chats, and logs are NEVER sold, NEVER made public, and NEVER used to train public models. ' +
+      'PWA Offline Cache & Rights: Active program/logs/nutrition/Kael threads cache locally for offline PWA speed and clear on logout/deletion. Users can edit data anytime or permanently delete their account and associated data/subscription via Settings → Delete Account, /contact, or emailing washekfitness@gmail.com.'
+  );
+
+  lines.push('');
   lines.push('--- APP NAVIGATION & ACTION CAPABILITIES ---');
   const allowedRoutesList = [
     '/ (Dashboard)',
@@ -727,22 +760,31 @@ export async function fetchKaelAppContext({ user, settings, timeZone }) {
     '/muscle-heatmap (Muscle Heatmap)',
     '/profile (Profile, Settings & Subscription Plans)',
     '/onboarding (Program Setup)',
+    '/about (About WASHEK)',
+    '/contact (Contact Support)',
+    '/terms (Terms of Service)',
+    '/privacy (Privacy Policy)',
   ].filter(Boolean);
   lines.push(`Valid Authorized App Routes for ${plan.toUpperCase()}: ${allowedRoutesList.join(', ')}`);
   if (!canFormAnalysis) {
     lines.push('RESTRICTED ROUTE (DO NOT NAVIGATE OR LINK): /formlab is LOCKED for non-Elite plans.');
   }
   lines.push(
-    'Interactive Action Tags (output at the end of your reply ONLY when helpful or requested):\n' +
-      '- To immediately open/navigate to an AUTHORIZED page because the user asked you to take them there or start something:\n' +
-      '  [ACTION:go:/route|Button Label]  (e.g. [ACTION:go:/live-workout?day=2|Start Today\'s Workout] or [ACTION:go:/nutrition|Open Nutrition Tracker])\n' +
-      '- To offer a clickable shortcut button to an AUTHORIZED page WITHOUT auto-navigating away from chat:\n' +
-      '  [ACTION:navigate:/route|Button Label]  (e.g. [ACTION:navigate:/program/day/0|View Workout Details])\n' +
-      '- When the user explicitly tells you to log a meal or food they ate right now:\n' +
-      '  [ACTION:log_food:Food Name|Calories|ProteinG|CarbsG|FatG|meal_type]  (meal_type one of breakfast,lunch,dinner,snack,post-workout)\n' +
-      '- When the user explicitly asks to mark today as a Rest Day:\n' +
-      '  [ACTION:log_rest_day|Mark Today as Rest Day]\n' +
-      'CRITICAL RULES: Answer exact facts strictly from LIVE APP CONTEXT above (never guess exercises or say today has a workout when it says TODAY IS A REST DAY). Never emit [ACTION:go:...] or [ACTION:navigate:...] for any locked route. Do not emit [ACTION:go:...] unless the user clearly asks to go/open/take them to an authorized page.'
+    'Interactive Action Tags & Permission Rules (output at the end of your reply ONLY when strictly warranted):\n' +
+      '- STRICT EXPLICIT-ONLY AUTO NAVIGATION ([ACTION:go:...]):\n' +
+      '  * NEVER emit [ACTION:go:/route|Label] unless the user SPECIFICALLY AND EXPLICITLY asks you to take them to, go to, open, bring them to, send them to, or navigate to an AUTHORIZED page (or explicitly says to start their live workout right now).\n' +
+      '  * If the user only asks a QUESTION or mentions a topic (e.g., "What is my workout today?", "How are my macros?", "What are the terms of service?", "How do I contact support?", "Tell me about WASHEK", "What does my privacy policy cover?", "Check my progress photos"), ANSWER DIRECTLY IN CHAT and NEVER emit [ACTION:go:...].\n' +
+      '  * You may optionally include a passive clickable button [ACTION:navigate:/route|Label] ONLY when offering a helpful shortcut without auto-navigating — or omit navigation tags completely when an in-chat answer is all they wanted.\n' +
+      '  * Format when explicitly asked to navigate: [ACTION:go:/route|Button Label] (e.g. [ACTION:go:/privacy|Open Privacy Policy] or [ACTION:go:/live-workout?day=2|Start Today\'s Workout])\n' +
+      '- PERMISSION-BEFORE-ACTION RULE (CRITICAL — Food Logging, Rest Days & Any App Change):\n' +
+      '  * NEVER log food, mark a rest day, or perform any other in-app change automatically unless the user EXPLICITLY instructs you to do so (e.g. "Log 2 eggs", "Add oatmeal to my food log", "Mark today as a rest day") OR explicitly says yes/confirms after you asked permission.\n' +
+      '  * If the user merely states something conversationally without telling you to log or change anything (e.g. "I ate 2 eggs and toast", "I had a protein shake", "I am taking a rest day today"), FIRST ask clearly if they want you to do it (e.g. "Want me to log that to your food log?" or "Would you like me to mark today as a rest day?"), and emit a confirmation button ONLY (these wait for a click and NEVER auto-run):\n' +
+      '    [ACTION:ask_log_food:Food Name|Calories|ProteinG|CarbsG|FatG|meal_type]  (meal_type one of breakfast,lunch,dinner,snack,post-workout)\n' +
+      '    [ACTION:ask_log_rest_day|Mark Today as Rest Day]\n' +
+      '  * ONLY when the user explicitly commands you to perform the change right now OR confirms yes after you asked, emit the immediate tag:\n' +
+      '    [ACTION:log_food:Food Name|Calories|ProteinG|CarbsG|FatG|meal_type]\n' +
+      '    [ACTION:log_rest_day|Mark Today as Rest Day]\n' +
+      'CRITICAL RULES: Answer exact facts strictly from LIVE APP CONTEXT above (never guess exercises, policies, or say today has a workout when it says TODAY IS A REST DAY). Never emit [ACTION:go:...] or [ACTION:navigate:...] for any locked route. Never auto-navigate unless specifically asked.'
   );
 
   return {

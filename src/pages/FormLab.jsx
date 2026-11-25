@@ -32,14 +32,21 @@ import {
   AlertCircle,
 } from 'lucide-react';
 
+import { useAuth } from '@/lib/AuthContext';
+import { fetchServerEntitlement, syncStripeSubscription } from '@/lib/stripeCheckout';
 import VideoInput from '@/components/formlab/VideoInput';
 
 import AnalysisResults from '@/components/formlab/AnalysisResults';
 import PageHeader from '@/components/layout/PageHeader';
 import {
+  applySubscriptionUpgrade,
+  canAccess,
+  getPlanRank,
   hasPlan,
   isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
   normalizePlan,
+  pickHighestEffectiveUser,
   resolveEffectivePlan,
 } from '@/lib/subscription';
 
@@ -961,11 +968,21 @@ export default function FormLab() {
   const navigate =
     useNavigate();
 
+  const { user: authUser } = useAuth() || {};
   const [
     user,
     setUser,
   ] =
-    useState(null);
+    useState(() => {
+      try {
+        const raw = localStorage.getItem('washek_user');
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    });
+
+  const effectiveUser = pickHighestEffectiveUser(authUser, user);
 
   /*
    * Keep the actual File object.
@@ -1096,21 +1113,88 @@ export default function FormLab() {
    * ==========================================================
    */
 
+  useEffect(() => {
+    if (authUser) {
+      setUser((prev) => {
+        if (!prev) return authUser;
+        const authRank = getPlanRank(resolveEffectivePlan(authUser));
+        const prevRank = getPlanRank(resolveEffectivePlan(prev));
+        return authRank >= prevRank ? { ...prev, ...authUser } : prev;
+      });
+    }
+  }, [authUser]);
+
   useEffect(
     () => {
       let mounted =
         true;
 
       supabaseApi.auth
-        .me()
+        .me(true)
         .then(
-          currentUser => {
-            if (
-              mounted
-            ) {
-              setUser(
-                currentUser
-              );
+          async currentUser => {
+            if (!mounted) return;
+            if (currentUser) {
+              setUser((prev) => {
+                if (!prev) return currentUser;
+                const prevEmail = prev?.email ? String(prev.email).toLowerCase().trim() : '';
+                const uEmail = currentUser?.email ? String(currentUser.email).toLowerCase().trim() : '';
+                if (prevEmail && uEmail && prevEmail !== uEmail) {
+                  return currentUser;
+                }
+                const uRank = getPlanRank(resolveEffectivePlan(currentUser));
+                const prevRank = getPlanRank(resolveEffectivePlan(prev));
+                const uExplicitlyCanceled =
+                  isExplicitlyCanceled(currentUser.subscription_status) && uRank === 0;
+                if (uRank >= prevRank) {
+                  return currentUser;
+                }
+                if (uExplicitlyCanceled && !canAccess(prev, 'form_analysis')) {
+                  return currentUser;
+                }
+                return {
+                  ...currentUser,
+                  subscription_plan: prev.subscription_plan,
+                  subscription_status: prev.subscription_status,
+                  plan: prev.subscription_plan,
+                  tier: prev.subscription_plan,
+                  subscription_tier: prev.subscription_plan,
+                  subscription_cancelled_at: null,
+                };
+              });
+            }
+
+            const targetUser = currentUser || effectiveUser;
+            if (targetUser && !canAccess(targetUser, 'form_analysis') && (targetUser.id || targetUser.email)) {
+              try {
+                const ent = await fetchServerEntitlement({
+                  userId: targetUser.id,
+                  email: targetUser.email,
+                  cancelledAtIso: targetUser.subscription_cancelled_at || null,
+                });
+                if (mounted && ent?.active && ent.plan && ent.plan !== 'free') {
+                  const curRank = getPlanRank(resolveEffectivePlan(targetUser));
+                  const entRank = getPlanRank(ent.plan);
+                  if (entRank > curRank) {
+                    applySubscriptionUpgrade(ent.plan, ent.status, {
+                      persistReceipt: true,
+                      timestamp: ent.timestamp,
+                      syncServer: false,
+                    });
+                    setUser((prev) => ({
+                      ...(prev || targetUser),
+                      subscription_plan: ent.plan,
+                      subscription_status: ent.status,
+                      plan: ent.plan,
+                      tier: ent.plan,
+                      subscription_tier: ent.plan,
+                      subscription_cancelled_at: null,
+                    }));
+                  }
+                }
+              } catch {
+                // ignore entitlement probe error
+              }
             }
           }
         )
@@ -1122,7 +1206,7 @@ export default function FormLab() {
             );
 
             if (
-              mounted
+              mounted && !effectiveUser
             ) {
               setErrorMessage(
                 error?.message ||
@@ -1142,13 +1226,13 @@ export default function FormLab() {
 
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawPlan = normalizePlan(e.detail?.plan || e.detail?.subscription_plan || 'free');
       const rawStatus = String(
-        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+        e.detail?.status || e.detail?.subscription_status || (rawPlan === 'free' ? 'canceled' : 'active')
       ).toLowerCase().trim();
       const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
       const nextPlan = activeSub ? rawPlan : 'free';
-      if (e.detail?.plan || e.detail?.status) {
+      if (e.detail?.plan || e.detail?.status || e.detail?.subscription_plan || e.detail?.subscription_status) {
         setUser((prev) =>
           prev
             ? {
@@ -1157,18 +1241,23 @@ export default function FormLab() {
                 subscription_status: rawStatus,
                 plan: nextPlan,
                 tier: nextPlan,
+                subscription_tier: nextPlan,
               }
             : prev
         );
       }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
-    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
+    };
   }, []);
 
-  const plan = resolveEffectivePlan(user);
+  const plan = resolveEffectivePlan(effectiveUser);
 
-  const isElite = hasPlan(user || plan, 'elite');
+  const isElite = hasPlan(effectiveUser || plan, 'elite');
 
   const selectedEx =
     FORM_EXERCISES.find(
@@ -1188,7 +1277,7 @@ export default function FormLab() {
    * ==========================================================
    */
 
-  if (!user) {
+  if (!effectiveUser) {
     return (
       <div className="flex items-center justify-center min-h-screen">
         <div className="w-8 h-8 border-4 border-muted border-t-primary rounded-full animate-spin" />
@@ -1568,7 +1657,7 @@ export default function FormLab() {
           buildFrameAnalysisPrompt(
             exercise,
             exCategory,
-            user,
+            effectiveUser || user,
             start,
             end,
             frameTimeline,
@@ -1585,7 +1674,7 @@ export default function FormLab() {
          * ------------------------------------------------------
          */
 
-        const rawResult =
+        let rawResult =
           await supabaseApi.ai.invoke(
             {
               prompt,
@@ -1598,8 +1687,59 @@ export default function FormLab() {
 
               type:
                 'form_analysis',
+
+              plan: plan || 'free',
+
+              email: effectiveUser?.email || null,
+
+              user_id: effectiveUser?.id || null,
             }
           );
+
+        if (
+          rawResult?.__ai_error &&
+          (rawResult.code === 'SUBSCRIPTION_REQUIRED' ||
+            rawResult.code === 'FEATURE_REQUIRES_PLAN' ||
+            /requires the (performance|elite) plan/i.test(String(rawResult.message || ''))) &&
+          isElite
+        ) {
+          let verifiedPlan = null;
+          let verifiedStatus = 'active';
+          let verifiedTs = Date.now();
+
+          const ent = await fetchServerEntitlement({
+            userId: effectiveUser?.id,
+            email: effectiveUser?.email,
+          }).catch(() => null);
+
+          if (ent?.active && canAccess(ent.plan, 'form_analysis')) {
+            verifiedPlan = ent.plan;
+            verifiedStatus = ent.status || 'active';
+            verifiedTs = ent.timestamp || Date.now();
+          } else {
+            const synced = await syncStripeSubscription({ planKey: 'elite' }).catch(() => null);
+            if (synced?.verified && canAccess(synced.plan, 'form_analysis')) {
+              verifiedPlan = synced.plan;
+              verifiedStatus = synced.status || 'active';
+            }
+          }
+
+          if (verifiedPlan) {
+            applySubscriptionUpgrade(verifiedPlan, verifiedStatus, {
+              persistReceipt: true,
+              timestamp: verifiedTs,
+              syncServer: false,
+            });
+            rawResult = await supabaseApi.ai.invoke({
+              prompt,
+              file_urls: uploadedFrames.map(frame => frame.url),
+              type: 'form_analysis',
+              plan: verifiedPlan,
+              email: effectiveUser?.email || null,
+              user_id: effectiveUser?.id || null,
+            });
+          }
+        }
 
         if (rawResult?.__ai_error) {
           throw new Error(

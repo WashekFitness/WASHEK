@@ -1,14 +1,23 @@
-import { supabase } from '@/lib/supabase';
-import { getUserTimeZone } from '@/lib/dateUtils';
-import { syncQuotaAcrossApp } from '@/lib/messageLimit';
+import {
+  supabase,
+  supabaseUrl,
+  supabaseAnonKey,
+  readNativeSupabaseStorageSession,
+  syncClientSessionSafely,
+  refreshSupabaseSessionLocked,
+} from '@/lib/supabase';
+import { getUserTimeZone, getCurrentMonthKey } from '@/lib/dateUtils';
+import { syncQuotaAcrossApp, getCachedMessageStats } from '@/lib/messageLimit';
 import { isLogo } from '@/lib/avatarUtils';
 import {
   enforceUserSubscriptionState,
   isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
   normalizePlan,
   getPlanRank,
   getRedirectUpgradeReceipt,
   clearRedirectUpgradeReceipt,
+  syncSubscriptionStorageKeys,
 } from '@/lib/subscription';
 import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 import {
@@ -21,6 +30,14 @@ import {
   removeCachedSavedMeal,
   getDeletedSavedMealIds,
 } from '@/lib/cacheStore';
+import {
+  storePhotoData,
+  getPhotoData,
+  storePhotoRecord,
+  getAllPhotoRecords,
+  deletePhotoData,
+  pruneLegacyLocalStoragePhotos,
+} from '@/lib/photoDb';
 
 const MEDIA_BUCKET =
   import.meta.env.VITE_SUPABASE_MEDIA_BUCKET ||
@@ -132,19 +149,11 @@ function buildCachedUserObject(parsed) {
 }
 
 async function requireUser() {
-  // 1. Check active Supabase local session
-  try {
-    const { data: sessionData } = await supabase.auth.getSession();
-    if (sessionData?.session?.user) {
-      return sessionData.session.user;
-    }
-  } catch (err) {
-    console.warn('[supabaseApi] getSession check warning:', err);
-  }
-
-  // 2. Fast-path local vault sessions so every entity/me call doesn't wait ~850ms on a doomed remote getUser()
+  // 1. Inspect stored token and cached user first so Vault sessions or newly signed-in accounts
+  //    are never hijacked by a stale native Supabase session from another account.
   let parsedStored = null;
   let storedTok = '';
+  let storedEmail = '';
   try {
     storedTok = localStorage.getItem('washek_auth_token') || '';
     const stored = localStorage.getItem('washek_user');
@@ -152,6 +161,7 @@ async function requireUser() {
       const parsed = JSON.parse(stored);
       if (parsed?.id || parsed?.uid || parsed?.email) {
         parsedStored = parsed;
+        storedEmail = parsed?.email ? String(parsed.email).toLowerCase().trim() : '';
       }
     }
   } catch (err) {
@@ -160,8 +170,26 @@ async function requireUser() {
 
   if (
     parsedStored &&
-    (isVaultTokenString(storedTok) || !storedTok || String(parsedStored.id || '').startsWith('usr_'))
+    (isVaultTokenString(storedTok) || String(parsedStored.id || '').startsWith('usr_'))
   ) {
+    return buildCachedUserObject(parsedStored);
+  }
+
+  // 2. Check active Supabase local session (only if it matches storedEmail when storedEmail is present)
+  try {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const sUser = sessionData?.session?.user || null;
+    if (sUser) {
+      const sEmail = sUser.email ? String(sUser.email).toLowerCase().trim() : '';
+      if (!storedEmail || !sEmail || sEmail === storedEmail) {
+        return sUser;
+      }
+    }
+  } catch (err) {
+    console.warn('[supabaseApi] getSession check warning:', err);
+  }
+
+  if (parsedStored && !storedTok) {
     return buildCachedUserObject(parsedStored);
   }
 
@@ -174,7 +202,10 @@ async function requireUser() {
       } = await supabase.auth.getUser();
 
       if (!error && data?.user) {
-        return data.user;
+        const uEmail = data.user.email ? String(data.user.email).toLowerCase().trim() : '';
+        if (!storedEmail || !uEmail || uEmail === storedEmail) {
+          return data.user;
+        }
       }
     } catch (err) {
       console.warn('[supabaseApi] getUser network error:', err);
@@ -309,24 +340,13 @@ async function currentUser(forceFresh = false) {
     // ignore
   }
 
-  const storedStatus = (() => {
+  const rawStoredStatus = (() => {
     try {
       return String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
     } catch {
       return '';
     }
   })();
-
-  const isLocallyInactive =
-    Boolean(storedStatus) && !isActiveSubscriptionStatus(storedStatus);
-
-  if (isLocallyInactive) {
-    try {
-      localStorage.removeItem('washek_subscription_plan');
-    } catch {
-      // ignore
-    }
-  }
 
   // If stored in localStorage and not forceFresh, return cached washek_user quickly
   if (!forceFresh) {
@@ -347,12 +367,11 @@ async function currentUser(forceFresh = false) {
             parsed.onboarded = true;
           }
           const redirectReceipt = getRedirectUpgradeReceipt(parsed);
-          const parsedStatus = String(parsed.subscription_status || storedStatus || '').toLowerCase().trim();
+          const parsedStatus = String(parsed.subscription_status || rawStoredStatus || '').toLowerCase().trim();
           const parsedPlan = normalizePlan(
             parsed.subscription_plan || parsed.plan || parsed.tier || parsed.subscription_tier || 'free'
           );
           const isParsedActive =
-            !isLocallyInactive &&
             isActiveSubscriptionStatus(parsedStatus) &&
             parsedPlan !== 'free';
 
@@ -365,17 +384,30 @@ async function currentUser(forceFresh = false) {
             parsed.tier = redirectReceipt.plan;
             parsed.plan = redirectReceipt.plan;
             parsed.subscription_tier = redirectReceipt.plan;
+            syncSubscriptionStorageKeys(parsed);
+            return parsed;
           } else if (!isParsedActive) {
             parsed.subscription_plan = 'free';
             parsed.subscription_status =
-              storedStatus === 'canceled' || storedStatus === 'cancelled'
+              rawStoredStatus === 'canceled' || rawStoredStatus === 'cancelled'
                 ? 'canceled'
-                : (parsedStatus || storedStatus || 'inactive');
+                : (parsedStatus || rawStoredStatus || 'inactive');
             parsed.tier = 'free';
             parsed.plan = 'free';
             parsed.subscription_tier = 'free';
+            // If cached user appears free and NOT explicitly canceled, allow a periodic fresh check (>15s stale)
+            // instead of returning stale 'free' indefinitely across page navigations.
+            const canceledLocally = isExplicitlyCanceled(parsed.subscription_status) || isExplicitlyCanceled(rawStoredStatus);
+            const staleCheckWindow = !lastMeFetchedAt || Date.now() - lastMeFetchedAt > 15000;
+            if (!canceledLocally && staleCheckWindow) {
+              // Fall through to remote/entitlement check below
+            } else {
+              return parsed;
+            }
+          } else {
+            syncSubscriptionStorageKeys(parsed);
+            return parsed;
           }
-          return parsed;
         }
       }
     } catch (err) {
@@ -425,6 +457,7 @@ async function currentUser(forceFresh = false) {
               user.email &&
               String(storedProfile.email).toLowerCase().trim() === String(user.email).toLowerCase().trim()));
 
+        const isStoredCancelled = rawStoredStatus === 'canceled' || rawStoredStatus === 'cancelled';
         const profileInsert = {
           id: user.id,
           first_name: user.user_metadata?.first_name || '',
@@ -441,8 +474,8 @@ async function currentUser(forceFresh = false) {
           subscription_status:
             storedMatchesUser && storedProfile?.subscription_status
               ? storedProfile.subscription_status
-              : isLocallyInactive
-                ? storedStatus || 'inactive'
+              : isStoredCancelled
+                ? rawStoredStatus
                 : 'inactive',
         };
 
@@ -480,7 +513,7 @@ async function currentUser(forceFresh = false) {
 
     const PLAN_RANK = { free: 0, progress: 1, performance: 2, elite: 3 };
     let redirectReceipt = getRedirectUpgradeReceipt(profile);
-    if (!redirectReceipt) {
+    if (!redirectReceipt || (PLAN_RANK[normalizePlan(redirectReceipt.plan)] || 0) < PLAN_RANK.elite) {
       try {
         const serverEnt = await fetchServerEntitlement({
           userId: user.id,
@@ -488,12 +521,16 @@ async function currentUser(forceFresh = false) {
           cancelledAtIso: profile?.subscription_cancelled_at || null,
         });
         if (serverEnt?.active) {
-          redirectReceipt = {
-            plan: normalizePlan(serverEnt.plan),
-            status: serverEnt.status,
-            timestamp: serverEnt.timestamp,
-            verifiedBy: serverEnt.verifiedBy,
-          };
+          const srvPlan = normalizePlan(serverEnt.plan);
+          const curRank = redirectReceipt ? (PLAN_RANK[normalizePlan(redirectReceipt.plan)] || 0) : 0;
+          if ((PLAN_RANK[srvPlan] || 0) >= curRank) {
+            redirectReceipt = {
+              plan: srvPlan,
+              status: serverEnt.status,
+              timestamp: serverEnt.timestamp,
+              verifiedBy: serverEnt.verifiedBy,
+            };
+          }
         }
       } catch {
         // ignore server entitlement lookup error
@@ -512,6 +549,7 @@ async function currentUser(forceFresh = false) {
       normalized.tier = redirectReceipt.plan;
       normalized.plan = redirectReceipt.plan;
       normalized.subscription_tier = redirectReceipt.plan;
+      normalized.subscription_cancelled_at = null;
       try {
         localStorage.setItem('washek_subscription_plan', redirectReceipt.plan);
         localStorage.setItem('washek_subscription_status', redirectReceipt.status);
@@ -528,9 +566,11 @@ async function currentUser(forceFresh = false) {
       normalized.tier = dbPlan;
       normalized.plan = dbPlan;
       normalized.subscription_tier = dbPlan;
+      normalized.subscription_cancelled_at = null;
       try {
         localStorage.setItem('washek_subscription_plan', dbPlan);
         localStorage.setItem('washek_subscription_status', dbStatus);
+        localStorage.removeItem('washek_subscription_cancelled_at');
       } catch {
         // ignore
       }
@@ -541,6 +581,7 @@ async function currentUser(forceFresh = false) {
         normalized.tier = redirectReceipt.plan;
         normalized.plan = redirectReceipt.plan;
         normalized.subscription_tier = redirectReceipt.plan;
+        normalized.subscription_cancelled_at = null;
         try {
           localStorage.setItem('washek_subscription_plan', redirectReceipt.plan);
           localStorage.setItem('washek_subscription_status', redirectReceipt.status);
@@ -554,11 +595,11 @@ async function currentUser(forceFresh = false) {
           storedProfile?.subscription_plan || localStorage.getItem('washek_subscription_plan') || 'free'
         );
         const cachedStatus = String(
-          storedProfile?.subscription_status || localStorage.getItem('washek_subscription_status') || ''
+          storedProfile?.subscription_status || rawStoredStatus || ''
         )
           .toLowerCase()
           .trim();
-        if (!isLocallyInactive && cachedPlan !== 'free' && isActiveSubscriptionStatus(cachedStatus)) {
+        if (cachedPlan !== 'free' && isActiveSubscriptionStatus(cachedStatus)) {
           normalized.subscription_plan = cachedPlan;
           normalized.subscription_status = cachedStatus;
           normalized.tier = cachedPlan;
@@ -626,8 +667,45 @@ async function currentUser(forceFresh = false) {
       }
     }
 
+    // Guarantee same-month Kael message count never regresses to 0 on profile refresh
+    const effectiveQuotaTz = getUserTimeZone(normalized);
+    const currentMonthKey = getCurrentMonthKey(new Date(), effectiveQuotaTz);
+    const normalizedSameMonthCount =
+      normalized.kael_msg_month === currentMonthKey
+        ? Math.max(0, Number(normalized.kael_msg_count || 0))
+        : 0;
+    const cachedQuota = getCachedMessageStats(
+      normalized,
+      normalized.subscription_plan,
+      effectiveQuotaTz
+    );
+    const localSameMonthCount =
+      cachedQuota?.monthKey === currentMonthKey
+        ? Math.max(0, Number(cachedQuota.used || 0))
+        : 0;
+    normalized.kael_msg_count = Math.max(normalizedSameMonthCount, localSameMonthCount);
+    normalized.kael_msg_month = currentMonthKey;
+
     try {
       localStorage.setItem('washek_user', JSON.stringify(normalized));
+      syncSubscriptionStorageKeys(normalized);
+      const prevPlan = storedProfile ? normalizePlan(storedProfile.subscription_plan) : 'free';
+      const nextPlan = normalizePlan(normalized.subscription_plan);
+      if (
+        typeof window !== 'undefined' &&
+        nextPlan !== 'free' &&
+        isActiveSubscriptionStatus(normalized.subscription_status) &&
+        (prevPlan !== nextPlan || !isActiveSubscriptionStatus(storedProfile?.subscription_status))
+      ) {
+        window.dispatchEvent(
+          new CustomEvent('washek_subscription_updated', {
+            detail: {
+              plan: nextPlan,
+              status: normalized.subscription_status || 'active',
+            },
+          })
+        );
+      }
     } catch (_err) {
       // ignore
     }
@@ -724,8 +802,56 @@ function getLocalEntityRecords(table, userId) {
   return results;
 }
 
+function compactRecordForLocalStorage(table, record) {
+  if (!record || typeof record !== 'object') return record;
+  const copy = { ...record };
+
+  if (table === 'progress_photos' || copy.photo_url || copy.resolved_photo_url) {
+    if (
+      typeof copy.resolved_photo_url === 'string' &&
+      (copy.resolved_photo_url.startsWith('data:') || copy.resolved_photo_url.startsWith('blob:')) &&
+      copy.resolved_photo_url.length > 4096
+    ) {
+      delete copy.resolved_photo_url;
+    }
+    if (
+      typeof copy.photo_url === 'string' &&
+      (copy.photo_url.startsWith('data:') || copy.photo_url.startsWith('blob:')) &&
+      copy.photo_url.length > 4096 &&
+      copy.id
+    ) {
+      copy.photo_url = `idb://${copy.id}`;
+    }
+  }
+
+  return copy;
+}
+
+function writeCompactLocalArray(key, list, table) {
+  const compacted = list.slice(0, 1000).map((item) => compactRecordForLocalStorage(table, item));
+  try {
+    localStorage.setItem(key, JSON.stringify(compacted));
+  } catch (err) {
+    if (err?.name === 'QuotaExceededError' || String(err?.message || '').toLowerCase().includes('quota')) {
+      try {
+        for (let i = localStorage.length - 1; i >= 0; i--) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith('washek_photo_')) {
+            localStorage.removeItem(k);
+          }
+        }
+        localStorage.setItem(key, JSON.stringify(compacted));
+      } catch {
+        // Ignore quota errors after cleanup
+      }
+    }
+  }
+}
+
 function saveLocalEntityRecord(table, userId, record) {
   if (typeof localStorage === 'undefined' || !record?.id) return;
+  const compact = compactRecordForLocalStorage(table, record);
+
   const keys = new Set([
     getEntityStorageKey(table, userId),
     getEntityStorageKey(table, 'guest'),
@@ -739,15 +865,15 @@ function saveLocalEntityRecord(table, userId, record) {
       if (raw) {
         const existing = JSON.parse(raw);
         if (Array.isArray(existing)) {
-          const idx = existing.findIndex((item) => item?.id === record.id);
+          const idx = existing.findIndex((item) => item?.id === compact.id);
           if (idx >= 0) {
-            existing[idx] = { ...existing[idx], ...record };
-            localStorage.setItem(key, JSON.stringify(existing.slice(0, 1000)));
+            existing[idx] = compactRecordForLocalStorage(table, { ...existing[idx], ...compact });
+            writeCompactLocalArray(key, existing, table);
           }
         }
       }
     } catch (_err) {
-      // Ignore quota errors
+      // Ignore parse/quota errors
     }
   }
 
@@ -755,13 +881,14 @@ function saveLocalEntityRecord(table, userId, record) {
   const primaryKey = getEntityStorageKey(table, userId);
   try {
     const existing = JSON.parse(localStorage.getItem(primaryKey) || '[]');
-    const idx = existing.findIndex((item) => item?.id === record.id);
+    const safeList = Array.isArray(existing) ? existing : [];
+    const idx = safeList.findIndex((item) => item?.id === compact.id);
     if (idx >= 0) {
-      existing[idx] = { ...existing[idx], ...record };
+      safeList[idx] = compactRecordForLocalStorage(table, { ...safeList[idx], ...compact });
     } else {
-      existing.unshift(record);
+      safeList.unshift(compact);
     }
-    localStorage.setItem(primaryKey, JSON.stringify(existing.slice(0, 1000)));
+    writeCompactLocalArray(primaryKey, safeList, table);
   } catch (_err) {
     // Ignore quota errors
   }
@@ -779,7 +906,7 @@ function removeLocalEntityRecord(table, userId, recordId) {
     try {
       const existing = JSON.parse(localStorage.getItem(key) || '[]');
       const filtered = existing.filter((item) => item?.id !== recordId);
-      localStorage.setItem(key, JSON.stringify(filtered));
+      writeCompactLocalArray(key, filtered, table);
     } catch (_err) {
       // Ignore
     }
@@ -810,13 +937,7 @@ const KNOWN_TABLE_COLUMNS = {
     'user_id',
     'created_by',
     'photo_url',
-    'resolved_photo_url',
     'date',
-    'created_date',
-    'label',
-    'custom_label',
-    'tags',
-    'notes',
     'weight_lbs',
     'body_fat_estimate',
     'body_fat_numeric',
@@ -937,6 +1058,42 @@ function sanitizeForSupabase(table, payload) {
   return clean;
 }
 
+function extractUnknownColumnName(err) {
+  const msg = String(err?.message || err?.details || '');
+  const match =
+    msg.match(/Could not find the ['"]([^'"]+)['"] column/i) ||
+    msg.match(/column ['"]?([a-zA-Z0-9_]+)['"]? of relation/i);
+  return match?.[1] || null;
+}
+
+async function ensureSupabaseSessionReady() {
+  try {
+    const { data: sessionData } = await supabase.auth.getSession();
+    if (sessionData?.session?.user?.id) {
+      return sessionData.session;
+    }
+
+    const storedTok =
+      typeof localStorage !== 'undefined' ? localStorage.getItem('washek_auth_token') || '' : '';
+    if (storedTok && !isVaultTokenString(storedTok) && storedTok.split('.').length === 3) {
+      const nativeSession = readNativeSupabaseStorageSession();
+      const refreshTok =
+        nativeSession?.refresh_token ||
+        (typeof localStorage !== 'undefined' ? localStorage.getItem('washek_refresh_token') || '' : '');
+      const synced = await syncClientSessionSafely({
+        access_token: storedTok,
+        refresh_token: refreshTok,
+      });
+      if (synced?.user?.id) return synced;
+      const refreshed = await refreshSupabaseSessionLocked(refreshTok);
+      if (refreshed?.user?.id) return refreshed;
+    }
+  } catch {
+    // Non-blocking session hydration
+  }
+  return null;
+}
+
 function entity(table) {
   return {
     async list(sort = '-created_at', limit = 100) {
@@ -949,18 +1106,37 @@ function entity(table) {
         // Guest or unauthenticated session
       }
 
+      if (table === 'progress_photos') {
+        await pruneLegacyLocalStoragePhotos();
+      }
+
       const localRecords = getLocalEntityRecords(table, validUserId);
+      if (table === 'progress_photos') {
+        const idbRecords = await getAllPhotoRecords();
+        const existingMap = new Map(localRecords.map((r) => [r.id, r]));
+        idbRecords.forEach((rec) => {
+          if (rec?.id) {
+            const prev = existingMap.get(rec.id) || {};
+            existingMap.set(rec.id, { ...prev, ...rec });
+          }
+        });
+        localRecords.length = 0;
+        localRecords.push(...existingMap.values());
+      }
+
       let remoteRecords = [];
 
       if (!user?._isLocalVault) {
         try {
+          const activeSession = await ensureSupabaseSessionReady();
+          const queryUserId = activeSession?.user?.id || validUserId;
           const rawColumn = sort.replace(/^-/, '');
           const column = ORDER_ALIASES[rawColumn] || rawColumn;
           const ascending = !sort.startsWith('-');
 
           let q = supabase.from(table).select('*');
-          if (validUserId) {
-            q = q.eq('user_id', validUserId);
+          if (queryUserId) {
+            q = q.eq('user_id', queryUserId);
           }
           q = q.order(column, { ascending });
           if (Number.isFinite(limit)) q = q.limit(limit);
@@ -994,6 +1170,10 @@ function entity(table) {
           map.set(item.id, {
             ...prev,
             ...item,
+            photo_url:
+              prev.photo_url && !String(prev.photo_url).startsWith('idb://')
+                ? prev.photo_url
+                : item.photo_url,
             weight_lbs: item.weight_lbs !== undefined && item.weight_lbs !== null ? item.weight_lbs : prev.weight_lbs,
             label: item.label !== undefined ? item.label : prev.label,
             custom_label: item.custom_label !== undefined ? item.custom_label : prev.custom_label,
@@ -1027,7 +1207,24 @@ function entity(table) {
         // Guest or unauthenticated session
       }
 
+      if (table === 'progress_photos') {
+        await pruneLegacyLocalStoragePhotos();
+      }
+
       const allLocal = getLocalEntityRecords(table, validUserId);
+      if (table === 'progress_photos') {
+        const idbRecords = await getAllPhotoRecords();
+        const existingMap = new Map(allLocal.map((r) => [r.id, r]));
+        idbRecords.forEach((rec) => {
+          if (rec?.id) {
+            const prev = existingMap.get(rec.id) || {};
+            existingMap.set(rec.id, { ...prev, ...rec });
+          }
+        });
+        allLocal.length = 0;
+        allLocal.push(...existingMap.values());
+      }
+
       const localFiltered = allLocal.filter((item) => {
         for (const [key, value] of Object.entries(filters || {})) {
           if (value === undefined || value === null) continue;
@@ -1054,11 +1251,13 @@ function entity(table) {
       let remoteRecords = [];
       if (!user?._isLocalVault) {
         try {
+          const activeSession = await ensureSupabaseSessionReady();
+          const queryUserId = activeSession?.user?.id || validUserId;
           const rawColumn = sort.replace(/^-/, '');
           const column = ORDER_ALIASES[rawColumn] || rawColumn;
           const ascending = !sort.startsWith('-');
 
-          let q = applyFilters(supabase.from(table).select('*'), filters, validUserId).order(column, { ascending });
+          let q = applyFilters(supabase.from(table).select('*'), filters, queryUserId).order(column, { ascending });
           if (Number.isFinite(limit)) q = q.limit(limit);
 
           const { data, error } = await q;
@@ -1115,6 +1314,10 @@ function entity(table) {
             map.set(item.id, {
               ...(existing || {}),
               ...item,
+              photo_url:
+                existing?.photo_url && !String(existing.photo_url).startsWith('idb://')
+                  ? existing.photo_url
+                  : item.photo_url,
               weight_lbs: item.weight_lbs !== undefined && item.weight_lbs !== null ? item.weight_lbs : (existing?.weight_lbs ?? item.weight_lbs),
               label: item.label !== undefined ? item.label : (existing?.label ?? item.label),
               custom_label: item.custom_label !== undefined ? item.custom_label : (existing?.custom_label ?? item.custom_label),
@@ -1196,26 +1399,59 @@ function entity(table) {
         row.items = Array.isArray(payload.items) ? payload.items : [];
       }
 
-      // 1. Immediately persist in local storage cache
+      // 1. Persist image bytes and metadata in IndexedDB for progress_photos
+      if (table === 'progress_photos') {
+        if (typeof row.photo_url === 'string' && row.photo_url.startsWith('data:')) {
+          await storePhotoData(row.id, row.photo_url);
+        } else if (typeof row.resolved_photo_url === 'string' && row.resolved_photo_url.startsWith('data:')) {
+          await storePhotoData(row.id, row.resolved_photo_url);
+        }
+        await storePhotoRecord(row);
+      }
+
+      // 2. Immediately persist compact record in local storage cache
       saveLocalEntityRecord(table, validUserId, row);
 
-      // 2. Persist to Firestore (await to ensure consistency)
+      // 3. Persist to Firestore (await to ensure consistency)
       await syncToFirestore(table, row, 'set');
 
-      // 3. Attempt Supabase insert with schema-safe columns
-      try {
-        const cleanPayload = sanitizeForSupabase(table, row);
-        const { data, error } = await supabase.from(table).insert(cleanPayload).select().single();
-        if (!error && data) {
-          const merged = { ...row, ...data };
-          saveLocalEntityRecord(table, validUserId, merged);
-          return merged;
+      // 4. Attempt Supabase insert with schema-safe columns and automatic unknown-column retry
+      if (!user?._isLocalVault) {
+        try {
+          const activeSession = await ensureSupabaseSessionReady();
+          const authUid = activeSession?.user?.id || validUserId;
+          let candidatePayload = sanitizeForSupabase(table, {
+            ...row,
+            ...(authUid ? { user_id: authUid } : {}),
+          });
+
+          for (let attempt = 0; attempt < 6; attempt++) {
+            const { data, error } = await supabase
+              .from(table)
+              .insert(candidatePayload)
+              .select()
+              .single();
+            if (!error && data) {
+              const merged = { ...row, ...data };
+              if (table === 'progress_photos') {
+                await storePhotoRecord(merged);
+              }
+              saveLocalEntityRecord(table, validUserId, merged);
+              return merged;
+            }
+            if (error) {
+              const unknownCol = extractUnknownColumnName(error);
+              if (unknownCol && unknownCol in candidatePayload) {
+                delete candidatePayload[unknownCol];
+                continue;
+              }
+              console.warn(`[supabaseApi] Supabase insert note on ${table}:`, error.message);
+              break;
+            }
+          }
+        } catch (err) {
+          console.warn(`[supabaseApi] Supabase insert network note on ${table}:`, err?.message || err);
         }
-        if (error) {
-          console.warn(`[supabaseApi] Supabase insert note on ${table}:`, error.message);
-        }
-      } catch (err) {
-        console.warn(`[supabaseApi] Supabase insert network note on ${table}:`, err?.message || err);
       }
 
       return row;
@@ -1233,7 +1469,11 @@ function entity(table) {
 
       // Merge with existing record first so we keep all original fields (photo_url, created_at, created_by, etc.)
       const localRecords = getLocalEntityRecords(table, validUserId);
-      const existing = localRecords.find((item) => item?.id === id);
+      let existing = localRecords.find((item) => item?.id === id);
+      if (!existing && table === 'progress_photos') {
+        const idbRecords = await getAllPhotoRecords();
+        existing = idbRecords.find((item) => item?.id === id);
+      }
 
       // Strip undefined values so they don't overwrite existing fields
       const cleanPayload = {};
@@ -1280,6 +1520,10 @@ function entity(table) {
         if (Array.isArray(cleanPayload.items)) row.items = cleanPayload.items;
       }
 
+      if (table === 'progress_photos') {
+        await storePhotoRecord(row);
+      }
+
       // 1. Immediately update in local storage across all keys
       saveLocalEntityRecord(table, validUserId, row);
 
@@ -1287,22 +1531,42 @@ function entity(table) {
       await syncToFirestore(table, row, 'set');
 
       // 3. Attempt Supabase update with schema-safe columns
-      try {
-        const cleanForDb = sanitizeForSupabase(table, row);
-        delete cleanForDb.id;
+      if (!user?._isLocalVault) {
+        try {
+          await ensureSupabaseSessionReady();
+          let cleanForDb = sanitizeForSupabase(table, row);
+          delete cleanForDb.id;
+          delete cleanForDb.user_id;
 
-        let q = supabase.from(table).update(cleanForDb).eq('id', id);
-        const { data, error } = await q.select().maybeSingle();
-        if (!error && data) {
-          const merged = { ...row, ...data };
-          saveLocalEntityRecord(table, validUserId, merged);
-          return merged;
+          for (let attempt = 0; attempt < 6; attempt++) {
+            const { data, error } = await supabase
+              .from(table)
+              .update(cleanForDb)
+              .eq('id', id)
+              .select()
+              .maybeSingle();
+            if (!error && data) {
+              const merged = { ...row, ...data };
+              if (table === 'progress_photos') {
+                await storePhotoRecord(merged);
+              }
+              saveLocalEntityRecord(table, validUserId, merged);
+              return merged;
+            }
+            if (error) {
+              const unknownCol = extractUnknownColumnName(error);
+              if (unknownCol && unknownCol in cleanForDb) {
+                delete cleanForDb[unknownCol];
+                continue;
+              }
+              console.warn(`[supabaseApi] Supabase update note on ${table}:`, error.message);
+              break;
+            }
+            break;
+          }
+        } catch (err) {
+          console.warn(`[supabaseApi] Supabase update note on ${table}:`, err?.message || err);
         }
-        if (error) {
-          console.warn(`[supabaseApi] Supabase update note on ${table}:`, error.message);
-        }
-      } catch (err) {
-        console.warn(`[supabaseApi] Supabase update note on ${table}:`, err?.message || err);
       }
 
       return row;
@@ -1318,21 +1582,28 @@ function entity(table) {
         // Fallback
       }
 
-      // 1. Remove from local storage
+      // 1. Remove from local storage & IndexedDB
       removeLocalEntityRecord(table, validUserId, id);
+      if (table === 'progress_photos') {
+        await deletePhotoData(id);
+      }
 
       // 2. Remove from Firestore
       await syncToFirestore(table, { id }, 'delete');
 
       // 3. Attempt Supabase delete
-      try {
-        let q = supabase.from(table).delete().eq('id', id);
-        if (validUserId) {
-          q = q.eq('user_id', validUserId);
+      if (!user?._isLocalVault) {
+        try {
+          const activeSession = await ensureSupabaseSessionReady();
+          const queryUserId = activeSession?.user?.id || validUserId;
+          let q = supabase.from(table).delete().eq('id', id);
+          if (queryUserId) {
+            q = q.eq('user_id', queryUserId);
+          }
+          await q;
+        } catch (err) {
+          console.warn(`[supabaseApi] Supabase delete note on ${table}:`, err?.message || err);
         }
-        await q;
-      } catch (err) {
-        console.warn(`[supabaseApi] Supabase delete note on ${table}:`, err?.message || err);
       }
 
       return true;
@@ -1351,7 +1622,7 @@ function getStoragePath(value) {
   if (!value) return null;
   const raw = String(value).trim();
   if (!raw) return null;
-  if (raw.startsWith('data:') || raw.startsWith('blob:')) return null;
+  if (raw.startsWith('data:') || raw.startsWith('blob:') || raw.startsWith('idb://')) return null;
 
   if (!raw.startsWith('http://') && !raw.startsWith('https://')) {
     // Already a storage path
@@ -1458,6 +1729,10 @@ async function resolveMediaUrl(value, expiresIn = 3600) {
   const raw = String(value).trim();
   if (!raw) return null;
   if (raw.startsWith('data:') || raw.startsWith('blob:')) return raw;
+  if (raw.startsWith('idb://')) {
+    const idbId = raw.slice('idb://'.length).trim();
+    return idbId ? await getPhotoData(idbId) : null;
+  }
 
   const path = getStoragePath(raw);
   if (!path) {
@@ -1466,6 +1741,7 @@ async function resolveMediaUrl(value, expiresIn = 3600) {
   }
 
   try {
+    await ensureSupabaseSessionReady();
     return await createSignedUrl(path, expiresIn);
   } catch (err) {
     console.debug('[Storage] Signed URL fallback for path:', path, err?.message || err);
@@ -1482,8 +1758,14 @@ async function uploadFile(input, folder = 'uploads') {
   if (!file) throw new Error('No file was provided.');
 
   const user = await requireUser();
+  if (user?._isLocalVault) {
+    throw new Error('Remote storage upload skipped for local session.');
+  }
+
+  const activeSession = await ensureSupabaseSessionReady();
+  const ownerId = activeSession?.user?.id || user.id;
   const safeName = String(file.name || 'upload').replace(/[^a-zA-Z0-9._-]/g, '_');
-  const path = `${user.id}/${actualFolder}/${crypto.randomUUID()}-${safeName}`;
+  const path = `${ownerId}/${actualFolder}/${crypto.randomUUID()}-${safeName}`;
 
   const bucketsToTry = Array.from(
     new Set([MEDIA_BUCKET, 'user-media', 'washek-media', 'media'].filter(Boolean))
@@ -1588,43 +1870,71 @@ async function streamAI({
       })
     : [];
 
-  let authToken = null;
-  let sessionUser = null;
-  try {
-    const { data: sessionData } = await supabase.auth.getSession();
-    authToken = sessionData?.session?.access_token || null;
-    sessionUser = sessionData?.session?.user || null;
-    if (!authToken) {
-      const { data: refreshed } = await supabase.auth.refreshSession();
-      authToken = refreshed?.session?.access_token || null;
-      sessionUser = refreshed?.session?.user || sessionUser;
-    }
-  } catch (_tokenErr) {
-    // Ignore
-  }
-
-  if (!authToken && typeof localStorage !== 'undefined') {
-    try {
-      authToken = localStorage.getItem('washek_auth_token') || null;
-    } catch (_err) {
-      // Ignore
-    }
-  }
-
-  let currentUserId = lastMeResult?.id || sessionUser?.id || null;
-  let currentUserEmail = lastMeResult?.email || sessionUser?.email || null;
-  let currentUsed = Number(lastMeResult?.kael_msg_count || 0);
+  let currentUserId = lastMeResult?.id || null;
+  let currentUserEmail = lastMeResult?.email || null;
+  const streamTz = getUserTimeZone(lastMeResult);
+  let currentUsed = getCachedMessageStats(lastMeResult, lastMeResult?.subscription_plan || plan, streamTz).used;
+  let storedToken = null;
   try {
     const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
     if (rawUser) {
       const parsedUser = JSON.parse(rawUser);
       currentUserId = parsedUser?.id || currentUserId;
       currentUserEmail = parsedUser?.email || currentUserEmail;
-      currentUsed = Number(parsedUser?.kael_msg_count ?? currentUsed ?? 0);
+      currentUsed = Math.max(
+        currentUsed,
+        getCachedMessageStats(parsedUser, parsedUser?.subscription_plan || plan, streamTz).used
+      );
+    }
+    storedToken = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_auth_token') || null : null;
+    if (!currentUserEmail && storedToken && isVaultTokenString(storedToken)) {
+      const parts = storedToken.split('_');
+      const b64Part =
+        parts.length >= 4 && /^\d+$/.test(parts[2])
+          ? parts.slice(3).join('_')
+          : parts.slice(2).join('_');
+      if (b64Part) {
+        const decoded = atob(b64Part).toLowerCase().trim();
+        if (decoded.includes('@')) currentUserEmail = decoded;
+      }
     }
   } catch (_userErr) {
     // Ignore
   }
+
+  let authToken = null;
+  let sessionUser = null;
+  const isStoredVaultToken = Boolean(storedToken && isVaultTokenString(storedToken));
+  if (!isStoredVaultToken) {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const sUser = sessionData?.session?.user || null;
+      const sEmail = sUser?.email ? String(sUser.email).toLowerCase().trim() : '';
+      const targetEmail = currentUserEmail ? String(currentUserEmail).toLowerCase().trim() : '';
+      if (!targetEmail || !sEmail || sEmail === targetEmail) {
+        authToken = sessionData?.session?.access_token || null;
+        sessionUser = sUser;
+        if (!authToken) {
+          const { data: refreshed } = await supabase.auth.refreshSession();
+          const rUser = refreshed?.session?.user || null;
+          const rEmail = rUser?.email ? String(rUser.email).toLowerCase().trim() : '';
+          if (!targetEmail || !rEmail || rEmail === targetEmail) {
+            authToken = refreshed?.session?.access_token || null;
+            sessionUser = rUser || sessionUser;
+          }
+        }
+      }
+    } catch (_tokenErr) {
+      // Ignore
+    }
+  }
+
+  if (!authToken && storedToken) {
+    authToken = storedToken;
+  }
+
+  currentUserId = currentUserId || sessionUser?.id || null;
+  currentUserEmail = currentUserEmail || sessionUser?.email || null;
 
   const userTz = getUserTimeZone();
   const headers = {
@@ -1648,6 +1958,15 @@ async function streamAI({
       const storedStatus = localStorage.getItem('washek_subscription_status');
       if (storedPlan && storedPlan !== 'free' && (!storedStatus || ['active', 'trialing', 'past_due'].includes(storedStatus.toLowerCase()))) {
         resolvedPlan = storedPlan.toLowerCase();
+      } else if (resolvedPlan === 'free') {
+        const rawUser = localStorage.getItem('washek_user');
+        if (rawUser) {
+          const pu = JSON.parse(rawUser);
+          const puPlan = normalizePlan(pu?.subscription_plan || pu?.plan);
+          if (puPlan !== 'free' && isActiveSubscriptionStatus(pu?.subscription_status)) {
+            resolvedPlan = puPlan;
+          }
+        }
       }
     }
   } catch {
@@ -1715,6 +2034,7 @@ async function streamAI({
       let fullText = '';
       let quota = null;
       let buffer = '';
+      let fatalStreamError = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1726,26 +2046,45 @@ async function streamAI({
         for (const line of lines) {
           const trimmed = line.trim();
           if (trimmed.startsWith('data:')) {
+            let parsedChunk = null;
             try {
-              const data = JSON.parse(trimmed.slice(5).trim());
-              if (data.error) {
-                throw new Error(data.error);
-              }
-              if (data.chunk) {
-                fullText = data.full || (fullText + data.chunk);
-                if (typeof onChunk === 'function') {
-                  onChunk(data.chunk, fullText);
-                }
-              }
-              if (data.quota) {
-                quota = data.quota;
-                syncQuotaAcrossApp(quota);
-              }
+              parsedChunk = JSON.parse(trimmed.slice(5).trim());
             } catch (_parseErr) {
-              // Ignore partial JSON chunks
+              continue;
+            }
+            if (parsedChunk?.error) {
+              fatalStreamError = parsedChunk;
+              break;
+            }
+            if (parsedChunk?.chunk) {
+              fullText = parsedChunk.full || (fullText + parsedChunk.chunk);
+              if (typeof onChunk === 'function') {
+                onChunk(parsedChunk.chunk, fullText);
+              }
+            }
+            if (parsedChunk?.quota) {
+              quota = parsedChunk.quota;
+              syncQuotaAcrossApp(quota);
             }
           }
         }
+        if (fatalStreamError) break;
+      }
+
+      if (fatalStreamError) {
+        if (
+          fatalStreamError.error_code === 'SUBSCRIPTION_REQUIRED' ||
+          fatalStreamError.error_code === 'FEATURE_REQUIRES_PLAN' ||
+          fatalStreamError.error_code === 'KAEL_LIMIT_REACHED'
+        ) {
+          return {
+            __ai_error: true,
+            message: fatalStreamError.error,
+            code: fatalStreamError.error_code,
+            details: fatalStreamError,
+          };
+        }
+        throw new Error(fatalStreamError.error);
       }
 
       if (fullText.trim()) {
@@ -1798,6 +2137,8 @@ async function invokeAI({
   schema = null,
   type = 'general',
   plan = 'free',
+  email = null,
+  user_id = null,
   onChunk = null,
 } = {}) {
   if (typeof onChunk === 'function') {
@@ -1826,46 +2167,74 @@ async function invokeAI({
       })
     : [];
 
+  let currentUserId = user_id || lastMeResult?.id || null;
+  let currentUserEmail = email || lastMeResult?.email || null;
+  const invokeTz = getUserTimeZone(lastMeResult);
+  let currentUsed = getCachedMessageStats(lastMeResult, lastMeResult?.subscription_plan || plan, invokeTz).used;
+  let storedToken = null;
+  try {
+    const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
+    if (rawUser) {
+      const parsedUser = JSON.parse(rawUser);
+      currentUserId = currentUserId || parsedUser?.id || null;
+      currentUserEmail = currentUserEmail || parsedUser?.email || null;
+      currentUsed = Math.max(
+        currentUsed,
+        getCachedMessageStats(parsedUser, parsedUser?.subscription_plan || plan, invokeTz).used
+      );
+    }
+    storedToken = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_auth_token') || null : null;
+    if (!currentUserEmail && storedToken && isVaultTokenString(storedToken)) {
+      const parts = storedToken.split('_');
+      const b64Part =
+        parts.length >= 4 && /^\d+$/.test(parts[2])
+          ? parts.slice(3).join('_')
+          : parts.slice(2).join('_');
+      if (b64Part) {
+        const decoded = atob(b64Part).toLowerCase().trim();
+        if (decoded.includes('@')) currentUserEmail = decoded;
+      }
+    }
+  } catch (_userErr) {
+    // LocalStorage read fallback
+  }
+
   // Get active session token for backend authorization & quota claiming
   let authToken = null;
   let sessionUser = null;
-  try {
-    const { data: sessionData } = await supabase.auth.getSession();
-    authToken = sessionData?.session?.access_token || null;
-    sessionUser = sessionData?.session?.user || null;
-    if (!authToken) {
-      const { data: refreshed } = await supabase.auth.refreshSession();
-      authToken = refreshed?.session?.access_token || null;
-      sessionUser = refreshed?.session?.user || sessionUser;
+  const isStoredVaultToken = Boolean(storedToken && isVaultTokenString(storedToken));
+  if (!isStoredVaultToken) {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const sUser = sessionData?.session?.user || null;
+      const sEmail = sUser?.email ? String(sUser.email).toLowerCase().trim() : '';
+      const targetEmail = currentUserEmail ? String(currentUserEmail).toLowerCase().trim() : '';
+      if (!targetEmail || !sEmail || sEmail === targetEmail) {
+        authToken = sessionData?.session?.access_token || null;
+        sessionUser = sUser;
+        if (!authToken) {
+          const { data: refreshed } = await supabase.auth.refreshSession();
+          const rUser = refreshed?.session?.user || null;
+          const rEmail = rUser?.email ? String(rUser.email).toLowerCase().trim() : '';
+          if (!targetEmail || !rEmail || rEmail === targetEmail) {
+            authToken = refreshed?.session?.access_token || null;
+            sessionUser = rUser || sessionUser;
+          }
+        }
+      }
+    } catch (tokenErr) {
+      console.warn('[invokeAI] Failed to get session token:', tokenErr);
     }
-  } catch (tokenErr) {
-    console.warn('[invokeAI] Failed to get session token:', tokenErr);
   }
 
-  if (!authToken && typeof localStorage !== 'undefined') {
-    try {
-      authToken = localStorage.getItem('washek_auth_token') || null;
-    } catch (_err) {
-      // Ignore localStorage read errors
-    }
+  if (!authToken && storedToken) {
+    authToken = storedToken;
   }
 
   // Primary: Google Gemini Server Backend
   try {
-    let currentUserId = lastMeResult?.id || sessionUser?.id || null;
-    let currentUserEmail = lastMeResult?.email || sessionUser?.email || null;
-    let currentUsed = Number(lastMeResult?.kael_msg_count || 0);
-    try {
-      const rawUser = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
-      if (rawUser) {
-        const parsedUser = JSON.parse(rawUser);
-        currentUserId = parsedUser?.id || currentUserId;
-        currentUserEmail = parsedUser?.email || currentUserEmail;
-        currentUsed = Number(parsedUser?.kael_msg_count ?? currentUsed ?? 0);
-      }
-    } catch (_userErr) {
-      // LocalStorage read fallback
-    }
+    currentUserId = currentUserId || sessionUser?.id || null;
+    currentUserEmail = currentUserEmail || sessionUser?.email || null;
 
     const userTz = getUserTimeZone();
     const headers = {
@@ -1889,6 +2258,15 @@ async function invokeAI({
         const storedStatus = localStorage.getItem('washek_subscription_status');
         if (storedPlan && storedPlan !== 'free' && (!storedStatus || ['active', 'trialing', 'past_due'].includes(storedStatus.toLowerCase()))) {
           resolvedPlan = storedPlan.toLowerCase();
+        } else if (resolvedPlan === 'free') {
+          const rawUser = localStorage.getItem('washek_user');
+          if (rawUser) {
+            const pu = JSON.parse(rawUser);
+            const puPlan = normalizePlan(pu?.subscription_plan || pu?.plan);
+            if (puPlan !== 'free' && isActiveSubscriptionStatus(pu?.subscription_status)) {
+              resolvedPlan = puPlan;
+            }
+          }
         }
       }
     } catch {
@@ -2021,11 +2399,23 @@ async function invokeAI({
 
       if (error) {
         lastError = error;
+        let parsedContext = null;
+        try {
+          if (error?.context && typeof error.context.json === 'function') {
+            parsedContext = await error.context.clone().json().catch(() => null);
+          }
+        } catch {
+          parsedContext = null;
+        }
+
+        const errMessage = parsedContext?.error || error?.message || 'AI generation failed.';
+        const errCode = parsedContext?.error_code || error?.code || null;
+
         const isTransient =
-          String(error?.message || '').toLowerCase().includes('edge_function') ||
-          String(error?.message || '').toLowerCase().includes('timeout') ||
-          String(error?.message || '').includes('504') ||
-          String(error?.message || '').includes('502');
+          String(errMessage).toLowerCase().includes('edge_function') ||
+          String(errMessage).toLowerCase().includes('timeout') ||
+          String(errMessage).includes('504') ||
+          String(errMessage).includes('502');
 
         if (isTransient && attempt < maxAttempts) {
           await new Promise((res) => setTimeout(res, baseBackoffMs * Math.pow(2, attempt - 1)));
@@ -2034,9 +2424,9 @@ async function invokeAI({
 
         return {
           __ai_error: true,
-          message: error?.message || 'AI generation failed.',
-          code: error?.code || null,
-          details: error,
+          message: errMessage,
+          code: errCode,
+          details: parsedContext || error,
         };
       }
 
@@ -2138,7 +2528,10 @@ async function sendEmail({ name, email, message } = {}) {
   let responseData = null;
   let lastError = null;
 
-  // 1. Invoke Supabase Edge Function
+  const isConfirmedDelivery = (resObj) =>
+    Boolean(resObj && resObj.success === true && (resObj.id || resObj.delivered === true));
+
+  // 1. Invoke Supabase Edge Function via client SDK
   try {
     const { data, error } = await supabase.functions.invoke(EMAIL_FUNCTION, {
       body: payload,
@@ -2152,12 +2545,16 @@ async function sendEmail({ name, email, message } = {}) {
       throw new Error(data.error || 'Contact email could not be sent.');
     }
 
-    responseData = data;
+    if (isConfirmedDelivery(data)) {
+      responseData = data;
+    } else {
+      throw new Error('Contact email provider did not confirm delivery.');
+    }
   } catch (edgeErr) {
     lastError = edgeErr;
-    console.warn('[supabaseApi.email.send] Edge function error, attempting server fallback:', edgeErr?.message || edgeErr);
+    console.warn('[supabaseApi.email.send] Edge SDK invoke failed, trying server & anon edge relay:', edgeErr?.message || edgeErr);
 
-    // 2. Resilient fallback to backend server /api/send-contact-email
+    // 2. Try backend /api/send-contact-email (handles direct Resend + clean Supabase relay)
     try {
       const serverRes = await fetch('/api/send-contact-email', {
         method: 'POST',
@@ -2165,20 +2562,45 @@ async function sendEmail({ name, email, message } = {}) {
         body: JSON.stringify(payload),
       });
 
-      if (serverRes.ok) {
-        const serverData = await serverRes.json();
-        if (serverData?.success) {
-          responseData = serverData;
-          lastError = null;
-        }
+      const serverData = await serverRes.json().catch(() => ({}));
+      if (serverRes.ok && isConfirmedDelivery(serverData)) {
+        responseData = serverData;
+        lastError = null;
+      } else {
+        lastError = new Error(serverData?.error || lastError?.message || 'Unable to send contact email.');
       }
     } catch (fallbackErr) {
+      lastError = fallbackErr;
       console.warn('[supabaseApi.email.send] Server fallback error:', fallbackErr?.message || fallbackErr);
+    }
+
+    // 3. Direct anon-key call to Supabase Edge Function if server route was unreachable
+    if (!responseData && supabaseUrl && supabaseAnonKey) {
+      try {
+        const directRes = await fetch(`${supabaseUrl.replace(/\/+$/, '')}/functions/v1/${EMAIL_FUNCTION}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: supabaseAnonKey,
+            Authorization: `Bearer ${supabaseAnonKey}`,
+          },
+          body: JSON.stringify(payload),
+        });
+        const directData = await directRes.json().catch(() => ({}));
+        if (directRes.ok && isConfirmedDelivery(directData)) {
+          responseData = directData;
+          lastError = null;
+        } else if (directData?.error) {
+          lastError = new Error(directData.error);
+        }
+      } catch (directErr) {
+        lastError = directErr;
+      }
     }
   }
 
   if (!responseData) {
-    throw errorFrom(lastError, 'Unable to send message at this time. Please try again.');
+    throw errorFrom(lastError, 'Unable to send message right now. Please email washekfitness@gmail.com directly.');
   }
 
   return responseData;

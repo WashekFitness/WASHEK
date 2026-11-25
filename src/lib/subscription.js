@@ -48,7 +48,7 @@ export function isActiveSubscriptionStatus(status) {
  */
 export function isExplicitlyCanceled(status) {
   const norm = String(status || '').toLowerCase().trim();
-  return ['canceled', 'cancelled', 'inactive', 'unpaid', 'expired'].includes(norm);
+  return ['canceled', 'cancelled', 'unpaid', 'expired'].includes(norm);
 }
 
 /**
@@ -90,17 +90,25 @@ export function resolveEffectivePlan(userOrPlan, explicitStatus) {
     try {
       if (typeof localStorage !== 'undefined') {
         const storedStatus = String(localStorage.getItem('washek_subscription_status') || '').toLowerCase().trim();
-        if (!isActiveSubscriptionStatus(storedStatus)) {
+        const storedUser = localStorage.getItem('washek_user');
+        let parsed = null;
+        if (storedUser) {
+          try {
+            parsed = JSON.parse(storedUser);
+          } catch {
+            parsed = null;
+          }
+        }
+        const activeReceipt = getRedirectUpgradeReceipt(parsed);
+        if (isExplicitlyCanceled(storedStatus) && !activeReceipt) {
           return 'free';
         }
-        const storedUser = localStorage.getItem('washek_user');
-        if (storedUser) {
-          const parsed = JSON.parse(storedUser);
-          if (parsed && typeof parsed === 'object') {
-            const parsedStatus = parsed.subscription_status || storedStatus;
-            if (!isActiveSubscriptionStatus(parsedStatus)) {
-              return 'free';
-            }
+        if (parsed && typeof parsed === 'object') {
+          const parsedStatus = String(parsed.subscription_status || storedStatus || '').toLowerCase().trim();
+          if (isExplicitlyCanceled(parsedStatus) && !activeReceipt) {
+            return 'free';
+          }
+          if (isActiveSubscriptionStatus(parsedStatus)) {
             const parsedPlan = normalizePlan(
               parsed.subscription_plan ||
               parsed.plan ||
@@ -108,16 +116,16 @@ export function resolveEffectivePlan(userOrPlan, explicitStatus) {
               parsed.subscription_tier ||
               'free'
             );
-            return parsedPlan;
+            return getPlanRank(parsedPlan) >= getPlanRank(normPlan) ? parsedPlan : normPlan;
           }
         }
-        return isActiveSubscriptionStatus(storedStatus) ? normPlan : 'free';
+        return normPlan;
       }
     } catch {
-      return 'free';
+      return normPlan;
     }
 
-    return 'free';
+    return normPlan;
   }
 
   // Fallback when caller passed null/undefined: strictly require active status in localStorage / stored user
@@ -184,6 +192,48 @@ export function enforceUserSubscriptionState(userObj) {
       ? 'inactive'
       : effectiveStatus,
   };
+}
+
+/**
+ * Synchronize legacy localStorage subscription keys with a resolved user object
+ * so components/API helpers reading those keys stay consistent.
+ */
+export function syncSubscriptionStorageKeys(userObj) {
+  if (!userObj || typeof userObj !== 'object' || typeof localStorage === 'undefined') return;
+  try {
+    const plan = resolveEffectivePlan(userObj);
+    const status = String(userObj.subscription_status || '').toLowerCase().trim();
+    if (plan !== 'free' && isActiveSubscriptionStatus(status)) {
+      localStorage.setItem('washek_subscription_plan', plan);
+      localStorage.setItem('washek_subscription_status', status);
+      localStorage.removeItem('washek_subscription_cancelled_at');
+    } else if (isExplicitlyCanceled(status)) {
+      localStorage.removeItem('washek_subscription_plan');
+      localStorage.setItem('washek_subscription_status', status);
+    }
+  } catch {
+    // ignore storage write error
+  }
+}
+
+/**
+ * Merge two user objects while preserving whichever has the higher verified
+ * active subscription tier (when both belong to the same account).
+ */
+export function pickHighestEffectiveUser(primaryUser, secondaryUser) {
+  if (primaryUser && secondaryUser) {
+    const emailA = primaryUser?.email ? String(primaryUser.email).toLowerCase().trim() : '';
+    const emailB = secondaryUser?.email ? String(secondaryUser.email).toLowerCase().trim() : '';
+    if (emailA && emailB && emailA !== emailB) {
+      return secondaryUser;
+    }
+    const rankA = getPlanRank(resolveEffectivePlan(primaryUser));
+    const rankB = getPlanRank(resolveEffectivePlan(secondaryUser));
+    return rankA >= rankB
+      ? { ...secondaryUser, ...primaryUser }
+      : { ...primaryUser, ...secondaryUser };
+  }
+  return primaryUser || secondaryUser || null;
 }
 
 

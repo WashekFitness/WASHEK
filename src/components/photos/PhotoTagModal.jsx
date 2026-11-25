@@ -118,7 +118,8 @@ export default function PhotoTagModal({
       }
       setCustomTagInput('');
     }
-  }, [isOpen, photo, unit, today]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, photo, unit]);
 
   if (!isOpen) return null;
 
@@ -153,6 +154,7 @@ export default function PhotoTagModal({
   };
 
   const triggerPullDownClose = () => {
+    if (isSaving) return;
     setIsClosing(true);
     setDragY(window.innerHeight || 600);
     setTimeout(() => {
@@ -210,7 +212,9 @@ export default function PhotoTagModal({
   return (
     <div
       className="fixed inset-0 z-[1050] bg-black/80 backdrop-blur-sm flex items-end sm:items-center justify-center p-0 sm:p-4 pb-1 sm:pb-0 animate-in fade-in-50"
-      onClick={onClose}
+      onClick={() => {
+        if (!isSaving) onClose();
+      }}
       style={{
         opacity: dragY > 0 ? Math.max(0.15, 1 - dragY / 350) : 1,
         transition: isDragging ? 'none' : 'opacity 0.2s ease-out',
@@ -294,8 +298,11 @@ export default function PhotoTagModal({
             <button
               type="button"
               aria-label="Close"
-              className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-muted text-muted-foreground hover:text-foreground transition-colors shrink-0 cursor-pointer"
-              onClick={onClose}
+              disabled={isSaving}
+              className="w-9 h-9 rounded-full flex items-center justify-center hover:bg-muted text-muted-foreground hover:text-foreground transition-colors shrink-0 cursor-pointer disabled:opacity-40"
+              onClick={() => {
+                if (!isSaving) onClose();
+              }}
             >
               <X className="w-4.5 h-4.5" />
             </button>

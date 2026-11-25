@@ -7,6 +7,7 @@ import {
   canAccess,
   getPlanRank,
   isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
   normalizePlan,
   resolveEffectivePlan,
 } from '@/lib/subscription';
@@ -720,10 +721,12 @@ Return ONLY JSON:
   "safety_note": "short safety note or empty string"
 }`;
 
-      const result = await supabaseApi.ai.invoke({
+      const adjustmentPayload = {
         type: 'live_workout_adjustment',
         prompt,
         plan: resolveEffectivePlan(user) || 'free',
+        email: user?.email || undefined,
+        user_id: user?.id || undefined,
         response_json_schema: {
           type: 'object',
           properties: {
@@ -759,9 +762,39 @@ Return ONLY JSON:
             'safety_note',
           ],
         },
-      });
+      };
+
+      let result = await supabaseApi.ai.invoke(adjustmentPayload);
+
+      if (result?.__ai_error && result.code === 'SUBSCRIPTION_REQUIRED') {
+        try {
+          const ent = await fetchServerEntitlement({
+            userId: user?.id,
+            email: user?.email,
+            cancelledAtIso: user?.subscription_cancelled_at || null,
+          });
+          if (ent?.active && canAccess(ent.plan, 'live_workout_adjustments')) {
+            applySubscriptionUpgrade(ent.plan, ent.status, {
+              persistReceipt: true,
+              timestamp: ent.timestamp,
+              syncServer: false,
+            });
+            result = await supabaseApi.ai.invoke({
+              ...adjustmentPayload,
+              plan: ent.plan,
+            });
+          }
+        } catch {
+          // ignore entitlement recheck failure and surface error below
+        }
+      }
 
       if (result?.__ai_error) {
+        if (result.code === 'SUBSCRIPTION_REQUIRED' && canAccess(user, 'live_workout_adjustments')) {
+          throw new Error(
+            'Your server subscription record has not synced yet. Open Profile → Subscription and tap Refresh / Sync Purchase, or sign out and back in.'
+          );
+        }
         throw new Error(result.message || 'Kael could not adjust this exercise right now.');
       }
 
@@ -969,6 +1002,7 @@ function PostWorkoutCheckin({
           ? '\n9. SKILLS POLICY: This athlete did NOT select "Learn Skills" as a goal. Do NOT include or suggest any calisthenics skills (handstands, muscle-ups, planches, levers, human flags, L-sits, etc.) in adjusted_exercises or recommendations.'
           : '';
 
+      let handled = false;
       if (program && canAdapt) {
         const currentWeek = program.current_week || 1;
 
@@ -1132,83 +1166,93 @@ Respond in JSON:
           },
         });
 
-        if (result?.__ai_error) {
+        const isPlanRejection = Boolean(
+          result?.__ai_error &&
+            (result.code === 'SUBSCRIPTION_REQUIRED' ||
+              result.code === 'FEATURE_REQUIRES_PLAN' ||
+              /plan/i.test(String(result.message || '')))
+        );
+
+        if (!result?.__ai_error) {
+          const unwrapped = unwrapAiPayload(result);
+          const payload =
+            unwrapped && typeof unwrapped === 'object'
+              ? unwrapped
+              : { coach_response: typeof unwrapped === 'string' ? unwrapped : '' };
+
+          const coachResponse =
+            payload?.coach_response ||
+            result?.coach_response ||
+            (typeof unwrapped === 'string' ? unwrapped : '') ||
+            'Great session! Recovery and consistency will lock in your progress.';
+          const adjustmentsSummary = payload?.adjustments_summary || result?.adjustments_summary || '';
+          const projectedOutlook = payload?.projected_outlook || result?.projected_outlook || '';
+
+          const note = `${coachResponse}${
+            adjustmentsSummary
+              ? `\n\n📋 12-Week Program Recalibrated: ${adjustmentsSummary}`
+              : ''
+          }${
+            projectedOutlook ? `\n🎯 Projected Outlook: ${projectedOutlook}` : ''
+          }`;
+
+          setAiNote(note);
+
+          try {
+            await onSave(checkin, note);
+          } catch (saveErr) {
+            console.warn('[PostWorkoutCheckin] Log note sync warning:', saveErr?.message || saveErr);
+          }
+
+          const adjustedExercises =
+            payload?.adjusted_exercises || result?.adjusted_exercises;
+
+          if (
+            Array.isArray(adjustedExercises) &&
+            adjustedExercises.length > 0
+          ) {
+            try {
+              const adaptedProgram = applyPostWorkoutAdaptation({
+                currentProgram: program,
+                currentWeek,
+                currentDayIndex: dayIndex,
+                dayName: log?.day_name,
+                adjustedExercises,
+                checkinSummary: adjustmentsSummary,
+                coachResponse,
+                trajectory: payload?.progress_trajectory || 'steady',
+                projectedOutlook,
+                fitnessGoals: user?.fitness_goals,
+                weightGoals: user?.weight_goals,
+                requirements: user?.training_requirements || '',
+                equipment: user?.available_equipment || '',
+                currentSkills: user?.current_skills || '',
+                workoutDays: resolvedWorkoutDays,
+              });
+
+              if (onProgramUpdated) {
+                await onProgramUpdated(adaptedProgram);
+              } else {
+                await supabaseApi.entities.WorkoutProgram.update(
+                  program.id,
+                  {
+                    microcycles: adaptedProgram.microcycles,
+                    adaptation_history: adaptedProgram.adaptation_history,
+                    last_adapted_by_kael: adaptedProgram.last_adapted_by_kael,
+                  }
+                );
+              }
+            } catch (adaptErr) {
+              console.warn('[PostWorkoutCheckin] Program adaptation sync warning:', adaptErr?.message || adaptErr);
+            }
+          }
+          handled = true;
+        } else if (!isPlanRejection) {
           throw new Error(result.message || 'Could not get Kael’s response.');
         }
+      }
 
-        const unwrapped = unwrapAiPayload(result);
-        const payload =
-          unwrapped && typeof unwrapped === 'object'
-            ? unwrapped
-            : { coach_response: typeof unwrapped === 'string' ? unwrapped : '' };
-
-        const coachResponse =
-          payload?.coach_response ||
-          result?.coach_response ||
-          (typeof unwrapped === 'string' ? unwrapped : '') ||
-          'Great session! Recovery and consistency will lock in your progress.';
-        const adjustmentsSummary = payload?.adjustments_summary || result?.adjustments_summary || '';
-        const projectedOutlook = payload?.projected_outlook || result?.projected_outlook || '';
-
-        const note = `${coachResponse}${
-          adjustmentsSummary
-            ? `\n\n📋 12-Week Program Recalibrated: ${adjustmentsSummary}`
-            : ''
-        }${
-          projectedOutlook ? `\n🎯 Projected Outlook: ${projectedOutlook}` : ''
-        }`;
-
-        setAiNote(note);
-
-        try {
-          await onSave(checkin, note);
-        } catch (saveErr) {
-          console.warn('[PostWorkoutCheckin] Log note sync warning:', saveErr?.message || saveErr);
-        }
-
-        const adjustedExercises =
-          payload?.adjusted_exercises || result?.adjusted_exercises;
-
-        if (
-          Array.isArray(adjustedExercises) &&
-          adjustedExercises.length > 0
-        ) {
-          try {
-            const adaptedProgram = applyPostWorkoutAdaptation({
-              currentProgram: program,
-              currentWeek,
-              currentDayIndex: dayIndex,
-              dayName: log?.day_name,
-              adjustedExercises,
-              checkinSummary: adjustmentsSummary,
-              coachResponse,
-              trajectory: payload?.progress_trajectory || 'steady',
-              projectedOutlook,
-              fitnessGoals: user?.fitness_goals,
-              weightGoals: user?.weight_goals,
-              requirements: user?.training_requirements || '',
-              equipment: user?.available_equipment || '',
-              currentSkills: user?.current_skills || '',
-              workoutDays: resolvedWorkoutDays,
-            });
-
-            if (onProgramUpdated) {
-              await onProgramUpdated(adaptedProgram);
-            } else {
-              await supabaseApi.entities.WorkoutProgram.update(
-                program.id,
-                {
-                  microcycles: adaptedProgram.microcycles,
-                  adaptation_history: adaptedProgram.adaptation_history,
-                  last_adapted_by_kael: adaptedProgram.last_adapted_by_kael,
-                }
-              );
-            }
-          } catch (adaptErr) {
-            console.warn('[PostWorkoutCheckin] Program adaptation sync warning:', adaptErr?.message || adaptErr);
-          }
-        }
-      } else {
+      if (!handled) {
         const typeLabel = {
           calisthenics: 'calisthenics',
           weighted_calisthenics:
@@ -1417,7 +1461,33 @@ export default function LiveWorkout() {
     supabaseApi.auth.me(true).then(async (u) => {
       if (!active) return;
       if (u) {
-        setUser(u);
+        setUser((prev) => {
+          if (!prev) return u;
+          const prevEmail = prev?.email ? String(prev.email).toLowerCase().trim() : '';
+          const uEmail = u?.email ? String(u.email).toLowerCase().trim() : '';
+          if (prevEmail && uEmail && prevEmail !== uEmail) {
+            return u;
+          }
+          const uRank = getPlanRank(resolveEffectivePlan(u));
+          const prevRank = getPlanRank(resolveEffectivePlan(prev));
+          const uExplicitlyCanceled =
+            isExplicitlyCanceled(u.subscription_status) && uRank === 0;
+          if (uRank >= prevRank) {
+            return u;
+          }
+          if (uExplicitlyCanceled && !canAccess(prev, 'live_workout_adjustments')) {
+            return u;
+          }
+          return {
+            ...u,
+            subscription_plan: prev.subscription_plan,
+            subscription_status: prev.subscription_status,
+            plan: prev.subscription_plan,
+            tier: prev.subscription_plan,
+            subscription_tier: prev.subscription_plan,
+            subscription_cancelled_at: null,
+          };
+        });
       }
       const targetUser = u || effectiveUser;
       if (targetUser && !canAccess(targetUser, 'live_workout_adjustments') && (targetUser.id || targetUser.email)) {
@@ -1443,6 +1513,7 @@ export default function LiveWorkout() {
                 plan: ent.plan,
                 tier: ent.plan,
                 subscription_tier: ent.plan,
+                subscription_cancelled_at: null,
               }));
             }
           }

@@ -524,7 +524,7 @@ export default function Profile() {
       ? Number(immediateCachedStats.used || 0)
       : 0;
     const rawUsed = Number(base.used || 0);
-    const used = base.forceAuthoritative ? rawUsed : Math.max(rawUsed, cachedUsed);
+    const used = Math.max(rawUsed, cachedUsed);
     return {
       ...base,
       plan,

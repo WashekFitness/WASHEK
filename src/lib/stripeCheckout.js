@@ -809,18 +809,39 @@ export async function fetchServerEntitlement({ userId = '', email = '', cancelle
           return '';
         }
       })();
+      let bearerTok = (() => {
+        try {
+          const t = localStorage.getItem('washek_auth_token') || '';
+          return !isNonJwtToken(t) ? t : '';
+        } catch {
+          return '';
+        }
+      })();
+      if (!bearerTok) {
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          const sTok = sessionData?.session?.access_token || '';
+          const sEmail = sessionData?.session?.user?.email ? String(sessionData.session.user.email).trim().toLowerCase() : '';
+          if (!isNonJwtToken(sTok) && (!cleanEmail || !sEmail || sEmail === cleanEmail)) {
+            bearerTok = sTok;
+          }
+        } catch {
+          // ignore
+        }
+      }
       const params = new URLSearchParams();
       if (uid) params.set('userId', uid);
       if (cleanEmail) params.set('email', cleanEmail);
       if (cancelledAtIso) params.set('cancelledAt', String(cancelledAtIso));
 
       const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-      const timerId = controller ? window.setTimeout(() => controller.abort(), 1600) : null;
+      const timerId = controller ? window.setTimeout(() => controller.abort(), 3200) : null;
       const res = await fetch(`/api/stripe/entitlement?${params.toString()}`, {
         method: 'GET',
         credentials: 'include',
         headers: {
           ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
+          ...(bearerTok ? { Authorization: `Bearer ${bearerTok}` } : {}),
         },
         ...(controller ? { signal: controller.signal } : {}),
       });

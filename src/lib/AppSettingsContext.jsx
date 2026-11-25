@@ -19,6 +19,15 @@ function normalizeTheme(value) {
   return value === 'light' ? 'light' : 'dark';
 }
 
+function normalizeAppSettings(raw = {}, fallback = defaultSettings) {
+  const safeObj = raw && typeof raw === 'object' ? raw : {};
+  return {
+    ...fallback,
+    ...safeObj,
+    theme: normalizeTheme(safeObj?.theme ?? fallback.theme),
+  };
+}
+
 function applyTheme(theme) {
   const normalizedTheme = normalizeTheme(theme);
 
@@ -78,13 +87,7 @@ function getInitialSettings() {
 
     const parsed = JSON.parse(raw);
 
-    const settings = {
-      ...fallback,
-      ...(parsed && typeof parsed === 'object'
-        ? parsed
-        : {}),
-      theme: normalizeTheme(parsed?.theme),
-    };
+    const settings = normalizeAppSettings(parsed, fallback);
 
     applyTheme(settings.theme);
 
@@ -179,13 +182,7 @@ export function AppSettingsProvider({ children }) {
 
         const parsed = JSON.parse(event.newValue);
 
-        setSettings({
-          ...defaultSettings,
-          ...(parsed && typeof parsed === 'object'
-            ? parsed
-            : {}),
-          theme: normalizeTheme(parsed?.theme),
-        });
+        setSettings(normalizeAppSettings(parsed, defaultSettings));
       } catch {
         // Ignore malformed storage events.
       }
@@ -206,19 +203,17 @@ export function AppSettingsProvider({ children }) {
 
   const updateSettings = (patch = {}) => {
     setSettings((previous) => {
-      const next = {
-        ...previous,
-        ...patch,
-      };
-
-      if (
-        patch.theme === 'light' ||
-        patch.theme === 'dark'
-      ) {
-        next.theme = patch.theme;
-      } else {
-        next.theme = normalizeTheme(previous.theme);
-      }
+      const next = normalizeAppSettings(
+        {
+          ...previous,
+          ...patch,
+          theme:
+            patch.theme === 'light' || patch.theme === 'dark'
+              ? patch.theme
+              : normalizeTheme(previous.theme),
+        },
+        previous
+      );
 
       // Apply immediately so the UI does not wait for
       // another render/effect cycle.

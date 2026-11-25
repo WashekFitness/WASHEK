@@ -24,7 +24,14 @@ import { Card } from '@/components/ui/card';
 import PageHeader from '@/components/layout/PageHeader';
 import { supabaseApi } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
-import { canAccess, resolveEffectivePlan } from '@/lib/subscription';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
+import {
+  applySubscriptionUpgrade,
+  canAccess,
+  getPlanRank,
+  pickHighestEffectiveUser,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
 import { calcStreak } from '@/lib/streakUtils';
 import { normalizeWorkoutProgram } from '@/lib/expandMicrocycles';
 import { useAppSettings } from '@/lib/AppSettingsContext';
@@ -99,12 +106,16 @@ export default function Progress() {
       setSubTick((t) => t + 1);
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
-    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
+    };
   }, [queryClient]);
 
   const { data: user } = useQuery({
     queryKey: ['current-user'],
-    queryFn: () => supabaseApi.auth.me(),
+    queryFn: () => supabaseApi.auth.me(true),
   });
 
   const storedUser = (() => {
@@ -116,7 +127,40 @@ export default function Progress() {
     }
   })();
 
-  const effectiveUser = authUser || user || storedUser;
+  const effectiveUser = pickHighestEffectiveUser(
+    pickHighestEffectiveUser(authUser, user),
+    storedUser
+  );
+
+  useEffect(() => {
+    let active = true;
+    if (effectiveUser && !canAccess(effectiveUser, 'workout_analytics') && (effectiveUser.id || effectiveUser.email)) {
+      fetchServerEntitlement({
+        userId: effectiveUser.id,
+        email: effectiveUser.email,
+        cancelledAtIso: effectiveUser.subscription_cancelled_at || null,
+      })
+        .then((ent) => {
+          if (!active || !ent?.active || !ent.plan || ent.plan === 'free') return;
+          const curRank = getPlanRank(resolveEffectivePlan(effectiveUser));
+          const entRank = getPlanRank(ent.plan);
+          if (entRank > curRank) {
+            applySubscriptionUpgrade(ent.plan, ent.status, {
+              persistReceipt: true,
+              timestamp: ent.timestamp,
+              syncServer: false,
+            });
+            queryClient.invalidateQueries({ queryKey: ['current-user'] });
+            setSubTick((t) => t + 1);
+          }
+        })
+        .catch(() => {});
+    }
+    return () => {
+      active = false;
+    };
+  }, [effectiveUser?.id, effectiveUser?.email, effectiveUser?.subscription_plan, queryClient]);
+
   const email = effectiveUser?.email;
   const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
   const plan = resolveEffectivePlan(effectiveUser);

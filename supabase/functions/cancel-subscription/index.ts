@@ -410,24 +410,12 @@ Deno.serve(
         // ignore
       }
 
-      let user: any = null;
-      try {
-        user = await authenticateUser(req);
-      } catch (authErr) {
-        console.warn('[CANCEL] Supabase auth check note:', authErr);
-      }
-
-      const explicitUserId = bodyData?.userId || bodyData?.user_id;
-      const explicitEmail = bodyData?.email;
-      const effectiveUserId = user?.id || explicitUserId;
-
-      if (!effectiveUserId && !explicitEmail) {
-        throw new Error('You must be signed in to cancel your subscription.');
-      }
+      const user = await authenticateUser(req);
+      const effectiveUserId = user.id;
 
       console.log(
         '[CANCEL] Processing cancellation for user:',
-        effectiveUserId || explicitEmail
+        effectiveUserId
       );
 
       /*
@@ -436,10 +424,7 @@ Deno.serve(
        * ======================================================
        */
 
-      let profile: any = null;
-      if (effectiveUserId) {
-        profile = await getProfile(effectiveUserId);
-      }
+      const profile = await getProfile(effectiveUserId);
 
       if (!profile) {
         throw new Error(
@@ -461,7 +446,7 @@ Deno.serve(
         subscriptionsToCancel.add(subscriptionId);
       }
 
-      const userEmail = profile.email || user?.email || explicitEmail || null;
+      const userEmail = profile.email || user.email || null;
 
       // 1. Look up any active/trialing subscriptions by customerId
       if (customerId && typeof customerId === 'string' && customerId.startsWith('cus_')) {

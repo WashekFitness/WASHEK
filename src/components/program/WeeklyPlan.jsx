@@ -29,10 +29,17 @@ import {
 } from 'lucide-react';
 
 import { cn } from '@/lib/utils';
+import { useAuth } from '@/lib/AuthContext';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 import {
+  applySubscriptionUpgrade,
+  canAccess,
+  getPlanRank,
   hasPlan,
   isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
   normalizePlan,
+  pickHighestEffectiveUser,
   resolveEffectivePlan,
 } from '@/lib/subscription';
 import { supabaseApi } from '@/lib/supabaseApi';
@@ -396,10 +403,7 @@ export default function WeeklyPlan({
     program?.current_week || 1
   );
 
-  const [
-    userPlan,
-    setUserPlan,
-  ] = useState('free');
+  const { user: authUser } = useAuth() || {};
 
   const [
     userProfile,
@@ -412,6 +416,13 @@ export default function WeeklyPlan({
       return null;
     }
   });
+
+  const effectiveUser = pickHighestEffectiveUser(authUser, userProfile);
+
+  const [
+    userPlan,
+    setUserPlan,
+  ] = useState(() => resolveEffectivePlan(effectiveUser));
 
   const [
     editingDayIndex,
@@ -611,24 +622,99 @@ export default function WeeklyPlan({
    * Progress is the minimum paid plan that includes the
    * custom workout editor. Performance and Elite inherit it.
    */
+  const resolvedPlan = resolveEffectivePlan(effectiveUser) || userPlan;
   const canEditWorkouts =
-    hasPlan(
-      userPlan,
-      'progress'
+    canAccess(
+      effectiveUser || resolvedPlan,
+      'custom_workout_adjustments'
     );
+
+  useEffect(() => {
+    if (authUser) {
+      setUserProfile((prev) => {
+        const merged = pickHighestEffectiveUser(authUser, prev);
+        setUserPlan(resolveEffectivePlan(merged));
+        return merged;
+      });
+    }
+  }, [authUser]);
 
   useEffect(() => {
     let mounted = true;
 
     supabaseApi.auth
-      .me()
-      .then((user) => {
+      .me(true)
+      .then(async (user) => {
         if (!mounted) {
           return;
         }
 
-        setUserProfile(user);
-        setUserPlan(resolveEffectivePlan(user));
+        if (user) {
+          setUserProfile((prev) => {
+            if (!prev) {
+              setUserPlan(resolveEffectivePlan(user));
+              return user;
+            }
+            const prevEmail = prev?.email ? String(prev.email).toLowerCase().trim() : '';
+            const uEmail = user?.email ? String(user.email).toLowerCase().trim() : '';
+            if (prevEmail && uEmail && prevEmail !== uEmail) {
+              setUserPlan(resolveEffectivePlan(user));
+              return user;
+            }
+            const uRank = getPlanRank(resolveEffectivePlan(user));
+            const prevRank = getPlanRank(resolveEffectivePlan(prev));
+            const uExplicitlyCanceled =
+              isExplicitlyCanceled(user.subscription_status) && uRank === 0;
+            const resolved =
+              uRank >= prevRank || (uExplicitlyCanceled && !canAccess(prev, 'custom_workout_adjustments'))
+                ? user
+                : {
+                    ...user,
+                    subscription_plan: prev.subscription_plan,
+                    subscription_status: prev.subscription_status,
+                    plan: prev.subscription_plan,
+                    tier: prev.subscription_plan,
+                    subscription_tier: prev.subscription_plan,
+                    subscription_cancelled_at: null,
+                  };
+            setUserPlan(resolveEffectivePlan(resolved));
+            return resolved;
+          });
+        }
+
+        const targetUser = user || effectiveUser;
+        if (targetUser && !hasPlan(targetUser, 'elite') && (targetUser.id || targetUser.email)) {
+          try {
+            const ent = await fetchServerEntitlement({
+              userId: targetUser.id,
+              email: targetUser.email,
+              cancelledAtIso: targetUser.subscription_cancelled_at || null,
+            });
+            if (mounted && ent?.active && ent.plan && ent.plan !== 'free') {
+              const curRank = getPlanRank(resolveEffectivePlan(targetUser));
+              const entRank = getPlanRank(ent.plan);
+              if (entRank > curRank) {
+                applySubscriptionUpgrade(ent.plan, ent.status, {
+                  persistReceipt: true,
+                  timestamp: ent.timestamp,
+                  syncServer: false,
+                });
+                setUserPlan(ent.plan);
+                setUserProfile((prev) => ({
+                  ...(prev || targetUser),
+                  subscription_plan: ent.plan,
+                  subscription_status: ent.status,
+                  plan: ent.plan,
+                  tier: ent.plan,
+                  subscription_tier: ent.plan,
+                  subscription_cancelled_at: null,
+                }));
+              }
+            }
+          } catch {
+            // ignore entitlement probe error
+          }
+        }
       })
       .catch((error) => {
         console.error(
@@ -644,15 +730,34 @@ export default function WeeklyPlan({
 
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawPlan = normalizePlan(e.detail?.plan || e.detail?.subscription_plan || 'free');
       const rawStatus = String(
-        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+        e.detail?.status || e.detail?.subscription_status || (rawPlan === 'free' ? 'canceled' : 'active')
       ).toLowerCase().trim();
       const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
-      setUserPlan(activeSub ? rawPlan : 'free');
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status || e.detail?.subscription_plan || e.detail?.subscription_status) {
+        setUserPlan(nextPlan);
+        setUserProfile((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+                subscription_tier: nextPlan,
+              }
+            : prev
+        );
+      }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
-    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
+    };
   }, []);
 
   useEffect(() => {

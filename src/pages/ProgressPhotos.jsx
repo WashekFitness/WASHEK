@@ -76,11 +76,18 @@ import {
   supabaseApi,
 } from '@/lib/supabaseApi';
 
+import { useAuth } from '@/lib/AuthContext';
+import { fetchServerEntitlement, syncStripeSubscription } from '@/lib/stripeCheckout';
+
 import {
+  applySubscriptionUpgrade,
   canAccess,
+  getPlanRank,
   resolveEffectivePlan,
   normalizePlan,
   isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
+  pickHighestEffectiveUser,
 } from '@/lib/subscription';
 
 import {
@@ -95,7 +102,12 @@ import {
 
 import PageHeader from '@/components/layout/PageHeader';
 import PhotoTagModal from '@/components/photos/PhotoTagModal';
-import { getPhotoData, storePhotoData, deletePhotoData } from '@/lib/photoDb';
+import {
+  getPhotoData,
+  storePhotoData,
+  deletePhotoData,
+  pruneLegacyLocalStoragePhotos,
+} from '@/lib/photoDb';
 
 
 /* ==========================================================
@@ -307,8 +319,17 @@ function formatPhotoDateHeading(
    ========================================================== */
 
 async function compressImageFile(file, maxDimension = 1600, quality = 0.86) {
-  if (!file || !file.type?.startsWith('image/')) return file;
+  if (!file || (file.type && !file.type.startsWith('image/'))) return file;
   return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+    const timer = setTimeout(() => finish(file), 8000);
+
     try {
       const img = new Image();
       const url = URL.createObjectURL(file);
@@ -316,7 +337,7 @@ async function compressImageFile(file, maxDimension = 1600, quality = 0.86) {
         URL.revokeObjectURL(url);
         let { width, height } = img;
         if (width <= maxDimension && height <= maxDimension && file.size < 500 * 1024) {
-          resolve(file);
+          finish(file);
           return;
         }
         if (width > maxDimension || height > maxDimension) {
@@ -328,35 +349,39 @@ async function compressImageFile(file, maxDimension = 1600, quality = 0.86) {
             height = maxDimension;
           }
         }
-        const canvas = document.createElement('canvas');
-        canvas.width = Math.max(1, width);
-        canvas.height = Math.max(1, height);
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          resolve(file);
-          return;
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, width);
+          canvas.height = Math.max(1, height);
+          const ctx = canvas.getContext('2d');
+          if (!ctx) {
+            finish(file);
+            return;
+          }
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          canvas.toBlob(
+            (blob) => {
+              if (!blob) {
+                finish(file);
+                return;
+              }
+              const cleanName = (file.name || 'photo').replace(/\.[^/.]+$/, '') + '.jpg';
+              finish(new File([blob], cleanName, { type: 'image/jpeg' }));
+            },
+            'image/jpeg',
+            quality
+          );
+        } catch {
+          finish(file);
         }
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        canvas.toBlob(
-          (blob) => {
-            if (!blob) {
-              resolve(file);
-              return;
-            }
-            const cleanName = (file.name || 'photo').replace(/\.[^/.]+$/, '') + '.jpg';
-            resolve(new File([blob], cleanName, { type: 'image/jpeg' }));
-          },
-          'image/jpeg',
-          quality
-        );
       };
       img.onerror = () => {
         URL.revokeObjectURL(url);
-        resolve(file);
+        finish(file);
       };
       img.src = url;
     } catch {
-      resolve(file);
+      finish(file);
     }
   });
 }
@@ -411,12 +436,18 @@ function getCandidatePhotoUrl(photo, localMap = {}) {
 
   if (!raw) return null;
   const str = String(raw).trim();
-  return str || null;
+  if (!str || str.startsWith('idb://')) return null;
+  return str;
 }
 
 function getPhotoDisplayUrl(photo, localMap = {}) {
   const str = getCandidatePhotoUrl(photo, localMap);
   if (!str) return null;
+
+  if (str.startsWith('idb://')) {
+    const idbId = str.slice('idb://'.length).trim();
+    return (idbId && localMap[idbId]) || null;
+  }
 
   if (
     str.startsWith('data:') ||
@@ -429,9 +460,11 @@ function getPhotoDisplayUrl(photo, localMap = {}) {
     return str;
   }
 
-  // Raw storage path (e.g. user-id/uploads/... or media/...)
+  // Raw storage path (e.g. user-id/progress-photos/...)
+  const bucket = import.meta.env.VITE_SUPABASE_MEDIA_BUCKET || 'user-media';
+  const baseUrl = (import.meta.env.VITE_SUPABASE_URL || 'https://edvvwnaxmjuvwnxineph.supabase.co').replace(/\/+$/, '');
   const cleanPath = str.replace(/^\/+/, '');
-  return `https://edvvwnaxmjuvwnxineph.supabase.co/storage/v1/object/public/media/${cleanPath}`;
+  return `${baseUrl}/storage/v1/object/public/${bucket}/${cleanPath}`;
 }
 
 function resolveFallbackPhotoUrl(currentSrc, photo, localMap = {}) {
@@ -453,7 +486,7 @@ function resolveFallbackPhotoUrl(currentSrc, photo, localMap = {}) {
   }
 
   const candidate = getCandidatePhotoUrl(photo, localMap);
-  if (candidate && candidate !== currentSrc) {
+  if (candidate && candidate !== currentSrc && !candidate.startsWith('idb://')) {
     return candidate;
   }
   return null;
@@ -477,6 +510,8 @@ export default function ProgressPhotos() {
       .toISOString()
       .split('T')[0];
 
+  const { user: authUser } = useAuth() || {};
+
   const [
     user,
     setUser,
@@ -490,7 +525,20 @@ export default function ProgressPhotos() {
       }
     });
 
-  const userKey = user?.email || user?.id || 'athlete';
+  const storedUser = (() => {
+    try {
+      const raw = localStorage.getItem('washek_user');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  })();
+
+  const effectiveUser = pickHighestEffectiveUser(
+    pickHighestEffectiveUser(authUser, user),
+    storedUser
+  );
+  const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
 
   const [failedPhotoIds, setFailedPhotoIds] = useState(() => new Set());
 
@@ -500,6 +548,16 @@ export default function ProgressPhotos() {
       if (prev.has(photoId)) return prev;
       const next = new Set(prev);
       next.add(photoId);
+      return next;
+    });
+  }, []);
+
+  const clearPhotoFailed = useCallback((photoId) => {
+    if (!photoId) return;
+    setFailedPhotoIds((prev) => {
+      if (!prev.has(photoId)) return prev;
+      const next = new Set(prev);
+      next.delete(photoId);
       return next;
     });
   }, []);
@@ -672,8 +730,19 @@ export default function ProgressPhotos() {
 
 
   /* ==========================================================
-     LOAD USER
+     LOAD USER & SUBSCRIPTION SYNC
      ========================================================== */
+
+  useEffect(() => {
+    if (authUser) {
+      setUser((prev) => {
+        if (!prev) return authUser;
+        const authRank = getPlanRank(resolveEffectivePlan(authUser));
+        const prevRank = getPlanRank(resolveEffectivePlan(prev));
+        return authRank >= prevRank ? { ...prev, ...authUser } : prev;
+      });
+    }
+  }, [authUser]);
 
   useEffect(
     () => {
@@ -681,17 +750,73 @@ export default function ProgressPhotos() {
         true;
 
       supabaseApi.auth
-        .me()
+        .me(true)
         .then(
-          (
+          async (
             currentUser
           ) => {
-            if (
-              mounted
-            ) {
-              setUser(
-                currentUser
-              );
+            if (!mounted) return;
+            if (currentUser) {
+              setUser((prev) => {
+                if (!prev) return currentUser;
+                const prevEmail = prev?.email ? String(prev.email).toLowerCase().trim() : '';
+                const uEmail = currentUser?.email ? String(currentUser.email).toLowerCase().trim() : '';
+                if (prevEmail && uEmail && prevEmail !== uEmail) {
+                  return currentUser;
+                }
+                const uRank = getPlanRank(resolveEffectivePlan(currentUser));
+                const prevRank = getPlanRank(resolveEffectivePlan(prev));
+                const uExplicitlyCanceled =
+                  isExplicitlyCanceled(currentUser.subscription_status) && uRank === 0;
+                if (uRank >= prevRank) {
+                  return currentUser;
+                }
+                if (uExplicitlyCanceled && !canAccess(prev, 'progress_photos')) {
+                  return currentUser;
+                }
+                return {
+                  ...currentUser,
+                  subscription_plan: prev.subscription_plan,
+                  subscription_status: prev.subscription_status,
+                  plan: prev.subscription_plan,
+                  tier: prev.subscription_plan,
+                  subscription_tier: prev.subscription_plan,
+                  subscription_cancelled_at: null,
+                };
+              });
+            }
+
+            const targetUser = currentUser || effectiveUser;
+            if (targetUser && !canAccess(targetUser, 'progress_graph') && (targetUser.id || targetUser.email)) {
+              try {
+                const ent = await fetchServerEntitlement({
+                  userId: targetUser.id,
+                  email: targetUser.email,
+                  cancelledAtIso: targetUser.subscription_cancelled_at || null,
+                });
+                if (mounted && ent?.active && ent.plan && ent.plan !== 'free') {
+                  const curRank = getPlanRank(resolveEffectivePlan(targetUser));
+                  const entRank = getPlanRank(ent.plan);
+                  if (entRank > curRank) {
+                    applySubscriptionUpgrade(ent.plan, ent.status, {
+                      persistReceipt: true,
+                      timestamp: ent.timestamp,
+                      syncServer: false,
+                    });
+                    setUser((prev) => ({
+                      ...(prev || targetUser),
+                      subscription_plan: ent.plan,
+                      subscription_status: ent.status,
+                      plan: ent.plan,
+                      tier: ent.plan,
+                      subscription_tier: ent.plan,
+                      subscription_cancelled_at: null,
+                    }));
+                  }
+                }
+              } catch {
+                // ignore entitlement probe error
+              }
             }
           }
         )
@@ -716,13 +841,13 @@ export default function ProgressPhotos() {
 
   useEffect(() => {
     const handleSubUpdated = (e) => {
-      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawPlan = normalizePlan(e.detail?.plan || e.detail?.subscription_plan || 'free');
       const rawStatus = String(
-        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+        e.detail?.status || e.detail?.subscription_status || (rawPlan === 'free' ? 'canceled' : 'active')
       ).toLowerCase().trim();
       const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
       const nextPlan = activeSub ? rawPlan : 'free';
-      if (e.detail?.plan || e.detail?.status) {
+      if (e.detail?.plan || e.detail?.status || e.detail?.subscription_plan || e.detail?.subscription_status) {
         setUser((prev) =>
           prev
             ? {
@@ -731,13 +856,18 @@ export default function ProgressPhotos() {
                 subscription_status: rawStatus,
                 plan: nextPlan,
                 tier: nextPlan,
+                subscription_tier: nextPlan,
               }
             : prev
         );
       }
     };
     window.addEventListener('washek_subscription_updated', handleSubUpdated);
-    return () => window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
+    };
   }, []);
 
 
@@ -745,32 +875,32 @@ export default function ProgressPhotos() {
      PLAN
      ========================================================== */
 
-  const plan = resolveEffectivePlan(user);
+  const plan = resolveEffectivePlan(effectiveUser);
 
   const firstName =
-    user?.first_name ||
-    user?.full_name
+    effectiveUser?.first_name ||
+    effectiveUser?.full_name
       ?.split(' ')[0] ||
     'there';
 
 
   const canCompare =
     canAccess(
-      user || plan,
+      effectiveUser || plan,
       'progress_photos'
     );
 
 
   const canAnalyze =
     canAccess(
-      plan,
+      effectiveUser || plan,
       'ai_body_analysis'
     );
 
 
   const canSeeGraph =
     canAccess(
-      plan,
+      effectiveUser || plan,
       'progress_graph'
     );
 
@@ -789,6 +919,8 @@ export default function ProgressPhotos() {
       ],
 
       queryFn: async () => {
+        await pruneLegacyLocalStoragePhotos();
+
         let rows = await supabaseApi.entities.ProgressPhoto.filter(
           userKey ? { created_by: userKey } : {},
           '-date',
@@ -812,35 +944,50 @@ export default function ProgressPhotos() {
         const safeRows = Array.isArray(rows) ? rows : [];
         return Promise.all(
           safeRows.map(async (photo) => {
+            const idbData = photo?.id ? await getPhotoData(photo.id) : null;
             const candidate = getCandidatePhotoUrl(photo, cachedPhotoMap);
             const directUrl = getPhotoDisplayUrl(photo, cachedPhotoMap);
-            let resolved = photo?.resolved_photo_url;
+            let resolved = idbData || photo?.resolved_photo_url;
+
+            if (resolved && String(resolved).startsWith('idb://')) {
+              resolved = idbData || null;
+            }
+
             if (!resolved && candidate && (candidate.startsWith('data:') || candidate.startsWith('blob:'))) {
               resolved = candidate;
-            } else if (candidate && !candidate.startsWith('data:') && !candidate.startsWith('blob:') && !candidate.startsWith('http')) {
+            } else if (
+              !resolved &&
+              candidate &&
+              !candidate.startsWith('data:') &&
+              !candidate.startsWith('blob:') &&
+              !candidate.startsWith('http') &&
+              !candidate.startsWith('idb://')
+            ) {
               try {
                 resolved = await supabaseApi.storage.resolveMediaUrl(candidate, 3600);
               } catch {
                 // ignore storage resolve error
               }
             }
+
             const finalUrl =
+              idbData ||
               (resolved && (resolved.startsWith('data:') || resolved.startsWith('blob:') || resolved.startsWith('http'))
                 ? resolved
                 : null) ||
               directUrl ||
               candidate;
-            if (photo?.id && finalUrl && (finalUrl.startsWith('data:') || finalUrl.startsWith('blob:'))) {
-              try {
-                localStorage.setItem(`washek_photo_${photo.id}`, finalUrl);
-              } catch (_err) {
-                // Ignore cache quota errors
-              }
+
+            if (photo?.id && finalUrl && finalUrl.startsWith('data:')) {
               await storePhotoData(photo.id, finalUrl);
             }
+            if (photo?.id && finalUrl) {
+              clearPhotoFailed(photo.id);
+            }
+
             return {
               ...photo,
-              photo_url: photo?.photo_url || finalUrl,
+              photo_url: photo?.photo_url || (photo?.id ? `idb://${photo.id}` : finalUrl),
               resolved_photo_url: resolved || finalUrl,
             };
           })
@@ -859,16 +1006,18 @@ export default function ProgressPhotos() {
 
     photos.forEach(async (p) => {
       if (!p?.id) return;
+      const stored = await getPhotoData(p.id);
+      if (stored && active) {
+        clearPhotoFailed(p.id);
+        setCachedPhotoMap((prev) => (prev[p.id] === stored ? prev : { ...prev, [p.id]: stored }));
+        return;
+      }
       const candidate = getCandidatePhotoUrl(p, cachedPhotoMap);
-      if (candidate && (candidate.startsWith('data:') || candidate.startsWith('blob:'))) {
+      if (candidate && candidate.startsWith('data:')) {
         await storePhotoData(p.id, candidate);
         if (active) {
+          clearPhotoFailed(p.id);
           setCachedPhotoMap((prev) => (prev[p.id] === candidate ? prev : { ...prev, [p.id]: candidate }));
-        }
-      } else {
-        const stored = await getPhotoData(p.id);
-        if (stored && active) {
-          setCachedPhotoMap((prev) => (prev[p.id] === stored ? prev : { ...prev, [p.id]: stored }));
         }
       }
     });
@@ -876,7 +1025,7 @@ export default function ProgressPhotos() {
     return () => {
       active = false;
     };
-  }, [photos]);
+  }, [photos, clearPhotoFailed]);
 
 
   /*
@@ -1047,19 +1196,30 @@ export default function ProgressPhotos() {
       onMutate:
         async (newRecord) => {
           await queryClient.cancelQueries({
-            queryKey: ['progress-photos', userKey],
+            queryKey: ['progress-photos'],
           });
+          const previous = queryClient.getQueryData(['progress-photos', userKey]);
           queryClient.setQueriesData(
-            { queryKey: ['progress-photos', userKey] },
+            { queryKey: ['progress-photos'] },
             (old) => {
               const list = Array.isArray(old) ? old : [];
               return [newRecord, ...list.filter((x) => x?.id !== newRecord?.id)];
             }
           );
+          return { previous };
         },
 
       onSuccess:
-        () => {
+        (savedRecord) => {
+          if (savedRecord?.id) {
+            queryClient.setQueriesData(
+              { queryKey: ['progress-photos'] },
+              (old) => {
+                const list = Array.isArray(old) ? old : [];
+                return [savedRecord, ...list.filter((x) => x?.id !== savedRecord.id)];
+              }
+            );
+          }
           queryClient.invalidateQueries(
             {
               queryKey: [
@@ -1067,6 +1227,17 @@ export default function ProgressPhotos() {
               ],
             }
           );
+        },
+
+      onError:
+        (err, _variables, context) => {
+          if (context?.previous !== undefined) {
+            queryClient.setQueryData(['progress-photos', userKey], context.previous);
+          }
+          queryClient.invalidateQueries({
+            queryKey: ['progress-photos'],
+          });
+          toast.error(err?.message || 'Could not save progress photo.');
         },
     });
 
@@ -1164,6 +1335,11 @@ export default function ProgressPhotos() {
             }
           );
         },
+
+      onError:
+        (err) => {
+          toast.error(err?.message || 'Could not update photo details.');
+        },
     });
 
 
@@ -1175,7 +1351,8 @@ export default function ProgressPhotos() {
     const file = event.target?.files?.[0];
     if (!file) return;
 
-    if (!file.type.startsWith('image/')) {
+    const hasImageExt = /\.(jpe?g|png|webp|gif|heic|heif|bmp|avif)$/i.test(file.name || '');
+    if ((file.type && !file.type.startsWith('image/')) || (!file.type && !hasImageExt)) {
       toast.error('Please select an image file.');
       event.target.value = '';
       return;
@@ -1209,27 +1386,31 @@ export default function ProgressPhotos() {
       const fileToUpload = await compressImageFile(pendingFile, 1200, 0.82);
 
       // Convert compressed image to durable data URL so it displays permanently and never 404s
-      const durableDataUrl = await new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.onerror = () => resolve(null);
-        reader.readAsDataURL(fileToUpload);
+      let durableDataUrl = await new Promise((resolve) => {
+        try {
+          const reader = new FileReader();
+          reader.onloadend = () => resolve(typeof reader.result === 'string' ? reader.result : null);
+          reader.onerror = () => resolve(null);
+          reader.readAsDataURL(fileToUpload);
+        } catch {
+          resolve(null);
+        }
       });
+
+      if (!durableDataUrl && typeof pendingFilePreview === 'string' && pendingFilePreview.startsWith('data:')) {
+        durableDataUrl = pendingFilePreview;
+      }
 
       const newPhotoId =
         typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
           ? crypto.randomUUID()
           : `00000000-0000-4000-a000-${Date.now().toString(16).padStart(12, '0').slice(-12)}`;
-      const finalPhotoUrl = durableDataUrl || pendingFilePreview;
+      const finalPhotoUrl = durableDataUrl || (typeof pendingFilePreview === 'string' && pendingFilePreview.startsWith('data:') ? pendingFilePreview : null);
 
-      if (durableDataUrl) {
+      if (durableDataUrl && durableDataUrl.startsWith('data:')) {
         await storePhotoData(newPhotoId, durableDataUrl);
+        clearPhotoFailed(newPhotoId);
         setCachedPhotoMap((prev) => ({ ...prev, [newPhotoId]: durableDataUrl }));
-        try {
-          localStorage.setItem(`washek_photo_${newPhotoId}`, durableDataUrl);
-        } catch (_storageErr) {
-          console.debug('[ProgressPhotos] localStorage photo cache note:', _storageErr);
-        }
       }
 
       // Upload to Supabase Storage under progress-photos so it persists until deleted by the user
@@ -1246,10 +1427,13 @@ export default function ProgressPhotos() {
         console.warn('[ProgressPhotos] Remote storage upload note:', uploadErr?.message || uploadErr);
       }
 
+      const recordPhotoUrl = uploadedPath || finalPhotoUrl || `idb://${newPhotoId}`;
+      const recordResolvedUrl = uploadedUrl || finalPhotoUrl || pendingFilePreview || null;
+
       await createMutation.mutateAsync({
         id: newPhotoId,
-        photo_url: uploadedPath || finalPhotoUrl,
-        resolved_photo_url: uploadedUrl || finalPhotoUrl,
+        photo_url: recordPhotoUrl,
+        resolved_photo_url: recordResolvedUrl,
         created_by: userKey,
         date: date || today,
         created_date: date || today,
@@ -1275,9 +1459,10 @@ export default function ProgressPhotos() {
       setUploadModalOpen(false);
       setPendingFile(null);
       setPendingFilePreview(null);
+      toast.success('Progress photo saved!');
     } catch (error) {
       console.error('[ProgressPhotos] Upload failed:', error);
-      toast.error(error?.message || 'The photo could not be uploaded.');
+      toast.error(error?.message || 'The photo could not be saved.');
     } finally {
       setUploading(false);
     }
@@ -1288,7 +1473,6 @@ export default function ProgressPhotos() {
 
     try {
       const updatedFields = {
-        ...editingPhoto,
         date: date || editingPhoto.date || today,
         created_date: date || editingPhoto.date || today,
         label: label !== undefined ? label : (editingPhoto.label || ''),
@@ -1317,6 +1501,7 @@ export default function ProgressPhotos() {
       }
 
       setEditingPhoto(null);
+      toast.success('Photo details saved!');
     } catch (error) {
       toast.error(error?.message || 'Could not update photo details.');
     }
@@ -1337,8 +1522,15 @@ export default function ProgressPhotos() {
       window.URL.revokeObjectURL(blobUrl);
     } catch (err) {
       console.warn('[ProgressPhotos] Download note:', err);
-      // Direct fallback
-      window.open(url, '_blank');
+      // Direct fallback without window.open
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.download = `washek-progress-${photo?.date || new Date().toISOString().slice(0, 10)}.jpg`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     }
   };
 
@@ -1423,12 +1615,12 @@ export default function ProgressPhotos() {
 
 
         const trainingType =
-          user?.training_type ||
+          effectiveUser?.training_type ||
           'calisthenics';
 
 
         const equipment =
-          user?.available_equipment ||
+          effectiveUser?.available_equipment ||
           '';
 
 
@@ -1457,9 +1649,13 @@ insights must contain personalized coaching analysis.
 
 
         let photoUrl =
-          getPhotoDisplayUrl(photo);
+          getPhotoDisplayUrl(photo, cachedPhotoMap);
 
-        if (!photoUrl && photo?.photo_url) {
+        if (!photoUrl && photo?.id) {
+          photoUrl = await getPhotoData(photo.id);
+        }
+
+        if (!photoUrl && photo?.photo_url && !String(photo.photo_url).startsWith('idb://')) {
           try {
             photoUrl = await supabaseApi.storage.resolveMediaUrl(photo.photo_url, 3600);
           } catch (resErr) {
@@ -1467,7 +1663,7 @@ insights must contain personalized coaching analysis.
           }
         }
 
-        if (!photoUrl && photo?.photo_url) {
+        if (!photoUrl && photo?.photo_url && !String(photo.photo_url).startsWith('idb://')) {
           photoUrl = photo.photo_url;
         }
 
@@ -1477,7 +1673,18 @@ insights must contain personalized coaching analysis.
           );
         }
 
-        const rawResult =
+        if (photoUrl.startsWith('blob:')) {
+          const blobRes = await fetch(photoUrl);
+          const imgBlob = await blobRes.blob();
+          photoUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(String(reader.result || ''));
+            reader.onerror = () => reject(new Error('Could not read photo data for analysis.'));
+            reader.readAsDataURL(imgBlob);
+          });
+        }
+
+        let rawResult =
           await supabaseApi.ai.invoke(
             {
               type:
@@ -1491,8 +1698,71 @@ insights must contain personalized coaching analysis.
 
               response_json_schema:
                 PROGRESS_PHOTO_SCHEMA,
+
+              plan: plan || 'free',
+
+              email: effectiveUser?.email || null,
+
+              user_id: effectiveUser?.id || null,
             }
           );
+
+        const isPlanDeniedError = (resObj) =>
+          Boolean(resObj?.__ai_error) &&
+          (resObj.code === 'SUBSCRIPTION_REQUIRED' ||
+            resObj.code === 'FEATURE_REQUIRES_PLAN' ||
+            /requires the (performance|elite) plan/i.test(String(resObj.message || '')));
+
+        if (isPlanDeniedError(rawResult)) {
+          let verifiedPlan = null;
+          let verifiedStatus = 'active';
+          let verifiedTs = Date.now();
+
+          const ent = await fetchServerEntitlement({
+            userId: effectiveUser?.id,
+            email: effectiveUser?.email,
+          }).catch(() => null);
+
+          if (ent?.active && canAccess(ent.plan, 'ai_body_analysis')) {
+            verifiedPlan = ent.plan;
+            verifiedStatus = ent.status || 'active';
+            verifiedTs = ent.timestamp || Date.now();
+          } else {
+            const synced = await syncStripeSubscription({
+              planKey: plan && plan !== 'free' ? plan : 'elite',
+            }).catch(() => null);
+            if (synced?.verified && canAccess(synced.plan, 'ai_body_analysis')) {
+              verifiedPlan = synced.plan;
+              verifiedStatus = synced.status || 'active';
+            }
+          }
+
+          if (verifiedPlan) {
+            applySubscriptionUpgrade(verifiedPlan, verifiedStatus, {
+              persistReceipt: true,
+              timestamp: verifiedTs,
+              syncServer: false,
+            });
+            setUser((prev) => ({
+              ...(prev || effectiveUser || {}),
+              subscription_plan: verifiedPlan,
+              subscription_status: verifiedStatus,
+              plan: verifiedPlan,
+              tier: verifiedPlan,
+              subscription_tier: verifiedPlan,
+              subscription_cancelled_at: null,
+            }));
+            rawResult = await supabaseApi.ai.invoke({
+              type: 'progress_photo',
+              prompt,
+              file_urls: [photoUrl],
+              response_json_schema: PROGRESS_PHOTO_SCHEMA,
+              plan: verifiedPlan,
+              email: effectiveUser?.email || null,
+              user_id: effectiveUser?.id || null,
+            });
+          }
+        }
 
         if (rawResult?.__ai_error) {
           throw new Error(rawResult.message || 'Body composition analysis failed.');
@@ -1675,7 +1945,6 @@ insights must contain personalized coaching analysis.
       await updateMutation.mutateAsync({
         id: photo.id,
         data: {
-          ...photo,
           weight_lbs: weightLbs,
           created_by: photo.created_by || userKey,
         },
@@ -2308,7 +2577,7 @@ insights must contain personalized coaching analysis.
                 onClick={(event) => event.stopPropagation()}
                 onError={(e) => {
                   console.warn('[ProgressPhotos] Lightbox image fallback for:', lightboxUrl);
-                  const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, lightboxPhoto);
+                  const nextUrl = resolveFallbackPhotoUrl(e.currentTarget.src, lightboxPhoto, cachedPhotoMap);
                   if (nextUrl && nextUrl !== e.currentTarget.src) {
                     e.currentTarget.src = nextUrl;
                   } else {
@@ -2372,6 +2641,7 @@ insights must contain personalized coaching analysis.
       <PhotoTagModal
         isOpen={uploadModalOpen}
         onClose={() => {
+          if (uploading) return;
           setUploadModalOpen(false);
           setPendingFile(null);
           setPendingFilePreview(null);
@@ -2386,6 +2656,7 @@ insights must contain personalized coaching analysis.
         isOpen={!!editingPhoto}
         onClose={() => setEditingPhoto(null)}
         photo={editingPhoto}
+        previewUrl={editingPhoto ? getPhotoDisplayUrl(editingPhoto, cachedPhotoMap) : null}
         onSave={handleSaveEditPhoto}
         onDelete={handleDelete}
         isSaving={updateMutation.isPending}
@@ -3878,7 +4149,10 @@ insights must contain personalized coaching analysis.
                             relative
                           "
                           onClick={async () => {
-                            let url = getPhotoDisplayUrl(photo);
+                            let url = getPhotoDisplayUrl(photo, cachedPhotoMap);
+                            if (!url && photo?.id) {
+                              url = await getPhotoData(photo.id);
+                            }
                             if (
                               !url ||
                               (
@@ -3888,15 +4162,17 @@ insights must contain personalized coaching analysis.
                                 !url.startsWith('blob:')
                               )
                             ) {
-                              try {
-                                const resolved =
-                                  await supabaseApi.storage.resolveMediaUrl(
-                                    photo.photo_url,
-                                    3600
-                                  );
-                                if (resolved) url = resolved;
-                              } catch {
-                                // keep url
+                              if (photo?.photo_url && !String(photo.photo_url).startsWith('idb://')) {
+                                try {
+                                  const resolved =
+                                    await supabaseApi.storage.resolveMediaUrl(
+                                      photo.photo_url,
+                                      3600
+                                    );
+                                  if (resolved) url = resolved;
+                                } catch {
+                                  // keep url
+                                }
                               }
                             }
                             if (url) {

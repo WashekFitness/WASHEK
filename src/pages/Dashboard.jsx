@@ -4,6 +4,17 @@ import { useQuery } from '@tanstack/react-query';
 
 import { supabaseApi, isUserMarkedOnboarded, markUserOnboarded } from '@/lib/supabaseApi';
 import { useAuth } from '@/lib/AuthContext';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
+import {
+  applySubscriptionUpgrade,
+  getPlanRank,
+  hasPlan,
+  isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
+  normalizePlan,
+  pickHighestEffectiveUser,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
 import { BRAND_LOGO_SRC, handleBrandLogoError } from '@/lib/brandLogo';
 
 import DailyWorkoutCard from '@/components/dashboard/DailyWorkoutCard';
@@ -29,23 +40,90 @@ export default function Dashboard() {
   const navigate = useNavigate();
   const { user: authUser } = useAuth();
 
-  const [user, setUser] = useState(() => authUser);
+  const [user, setUser] = useState(() => {
+    if (authUser) return authUser;
+    try {
+      const raw = localStorage.getItem('washek_user');
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  });
 
-  // Sync with AuthContext user
+  // Sync with AuthContext user without downgrading higher verified tier
   useEffect(() => {
     if (authUser) {
-      setUser(authUser);
+      setUser((prev) => pickHighestEffectiveUser(authUser, prev));
     }
   }, [authUser]);
+
+  const effectiveUser = pickHighestEffectiveUser(authUser, user);
 
   /*
    * Synchronized to the user's specific calendar day and timezone.
    * Automatically resets at exactly 12:00:00 AM midnight.
    */
-  const { todayKey: today, timeZone } = useMidnightSync(user || authUser);
+  const { todayKey: today, timeZone } = useMidnightSync(effectiveUser);
+
+  useEffect(() => {
+    const handleSubUpdated = (e) => {
+      const rawPlan = normalizePlan(e.detail?.plan || e.detail?.subscription_plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || e.detail?.subscription_status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status || e.detail?.subscription_plan || e.detail?.subscription_status) {
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+                subscription_tier: nextPlan,
+              }
+            : prev
+        );
+      }
+    };
+    window.addEventListener('washek_subscription_updated', handleSubUpdated);
+    window.addEventListener('washek_user_changed', handleSubUpdated);
+    return () => {
+      window.removeEventListener('washek_subscription_updated', handleSubUpdated);
+      window.removeEventListener('washek_user_changed', handleSubUpdated);
+    };
+  }, []);
 
   useEffect(() => {
     let mounted = true;
+
+    const mergeLoadedUser = (u) => {
+      setUser((prev) => {
+        if (!prev) return u;
+        const prevEmail = prev?.email ? String(prev.email).toLowerCase().trim() : '';
+        const uEmail = u?.email ? String(u.email).toLowerCase().trim() : '';
+        if (prevEmail && uEmail && prevEmail !== uEmail) {
+          return u;
+        }
+        const uRank = getPlanRank(resolveEffectivePlan(u));
+        const prevRank = getPlanRank(resolveEffectivePlan(prev));
+        const uExplicitlyCanceled = isExplicitlyCanceled(u.subscription_status) && uRank === 0;
+        if (uRank >= prevRank || (uExplicitlyCanceled && !hasPlan(prev, 'progress'))) {
+          return u;
+        }
+        return {
+          ...u,
+          subscription_plan: prev.subscription_plan,
+          subscription_status: prev.subscription_status,
+          plan: prev.subscription_plan,
+          tier: prev.subscription_plan,
+          subscription_tier: prev.subscription_plan,
+          subscription_cancelled_at: null,
+        };
+      });
+    };
 
     supabaseApi.auth
       .me(true)
@@ -81,21 +159,53 @@ export default function Dashboard() {
             const healedUser = { ...u, onboarded: true };
             markUserOnboarded(u.id, u.email);
             if (mounted) {
-              setUser(healedUser);
+              mergeLoadedUser(healedUser);
             }
             supabaseApi.auth.updateMe({ onboarded: true }).catch(() => {});
             return;
           }
 
           if (mounted) {
-            setUser(u);
+            mergeLoadedUser(u);
             navigate('/onboarding');
           }
           return;
         }
 
         if (mounted) {
-          setUser(u);
+          mergeLoadedUser(u);
+        }
+
+        if (!hasPlan(u, 'elite') && (u.id || u.email)) {
+          try {
+            const ent = await fetchServerEntitlement({
+              userId: u.id,
+              email: u.email,
+              cancelledAtIso: u.subscription_cancelled_at || null,
+            });
+            if (mounted && ent?.active && ent.plan && ent.plan !== 'free') {
+              const curRank = getPlanRank(resolveEffectivePlan(u));
+              const entRank = getPlanRank(ent.plan);
+              if (entRank > curRank) {
+                applySubscriptionUpgrade(ent.plan, ent.status, {
+                  persistReceipt: true,
+                  timestamp: ent.timestamp,
+                  syncServer: false,
+                });
+                setUser((prev) => ({
+                  ...(prev || u),
+                  subscription_plan: ent.plan,
+                  subscription_status: ent.status,
+                  plan: ent.plan,
+                  tier: ent.plan,
+                  subscription_tier: ent.plan,
+                  subscription_cancelled_at: null,
+                }));
+              }
+            }
+          } catch {
+            // ignore entitlement probe error
+          }
         }
       })
       .catch((error) => {
@@ -109,7 +219,6 @@ export default function Dashboard() {
     };
   }, [authUser?.id, navigate]);
 
-  const effectiveUser = user || authUser;
   const userKey =
     effectiveUser?.email ||
     effectiveUser?.id ||
@@ -285,8 +394,8 @@ export default function Dashboard() {
           ">
             Hey,{' '}
             <span className="text-foreground">
-              {user?.first_name ||
-                user?.full_name?.split(' ')[0] ||
+              {effectiveUser?.first_name ||
+                effectiveUser?.full_name?.split(' ')[0] ||
                 'Athlete'}
             </span>
           </h1>
@@ -307,7 +416,7 @@ export default function Dashboard() {
 
           <StreakCard
             logs={logs}
-            user={user}
+            user={effectiveUser}
             timeZone={timeZone}
             program={activeProgram}
           />
@@ -315,7 +424,7 @@ export default function Dashboard() {
 
           <DailyWorkoutCard
             program={activeProgram}
-            user={user}
+            user={effectiveUser}
             timeZone={timeZone}
             isLoading={isLoadingPrograms && !activeProgram}
           />
@@ -323,7 +432,7 @@ export default function Dashboard() {
 
           <NutritionSummary
             entries={nutrition}
-            user={user}
+            user={effectiveUser}
             logs={logs}
             program={activeProgram}
           />
@@ -331,7 +440,7 @@ export default function Dashboard() {
 
           <WeekProgress
             logs={logs}
-            user={user}
+            user={effectiveUser}
             timeZone={timeZone}
           />
 
@@ -340,7 +449,7 @@ export default function Dashboard() {
             logs={logs}
             nutrition={nutrition}
             photos={photos}
-            user={user}
+            user={effectiveUser}
             program={activeProgram}
             timeZone={timeZone}
           />

@@ -219,6 +219,22 @@ export default function SubscriptionReturn() {
 
       // Notify Express server & Supabase Edge Function of confirmed redirect unlock (persists across Chrome iframe partition + updates Postgres via admin)
       try {
+        let authJwt = '';
+        try {
+          const { data: sessionData } = await supabase.auth.getSession();
+          const jwt = sessionData?.session?.access_token;
+          if (jwt && jwt.split('.').length === 3) {
+            authJwt = jwt;
+          } else {
+            const storedTok = localStorage.getItem('washek_auth_token') || '';
+            if (storedTok && storedTok.split('.').length === 3) {
+              authJwt = storedTok;
+            }
+          }
+        } catch {
+          // ignore session read
+        }
+
         await Promise.allSettled([
           Promise.race([
             fetch('/api/stripe/confirm-redirect', {
@@ -227,6 +243,7 @@ export default function SubscriptionReturn() {
               keepalive: true,
               headers: {
                 'Content-Type': 'application/json',
+                ...(authJwt ? { Authorization: `Bearer ${authJwt}` } : {}),
                 ...(srvTok ? { 'x-washek-server-session': srvTok } : {}),
               },
               body: JSON.stringify({
@@ -248,9 +265,10 @@ export default function SubscriptionReturn() {
                 status: confirmedStatus,
                 user_id: identity?.userId || undefined,
                 email: identity?.email || undefined,
+                ...(identity?.sessionId ? { session_id: identity.sessionId } : {}),
               },
               headers: {
-                Authorization: `Bearer ${supabaseAnonKey}`,
+                Authorization: `Bearer ${authJwt || supabaseAnonKey}`,
               },
             }),
             new Promise((resolve) => window.setTimeout(resolve, 1500)),
@@ -611,11 +629,32 @@ export default function SubscriptionReturn() {
         console.debug('[SubscriptionReturn] Stripe customer sync note:', syncErr);
       }
 
-      // 3. Quick check against Postgres profiles table (in case webhook updated it right on redirect)
-      if (authUser?.id) {
-        for (let attempt = 0; attempt < 2; attempt++) {
-          if (cancelledRef.current) return;
-          try {
+      // 3. Poll Stripe sync & Postgres profiles table to allow webhook settlement
+      for (let attempt = 0; attempt < 5; attempt++) {
+        if (cancelledRef.current) return;
+        try {
+          if (attempt > 0) {
+            const retrySync = await syncStripeSubscription({
+              planKey: hintedPlan !== 'free' ? hintedPlan : '',
+            }).catch(() => null);
+            if (retrySync?.verified) {
+              const confirmedPlan = normalizePlan(retrySync.plan || hintedPlan);
+              const confirmedStatus = String(retrySync.status || 'active').toLowerCase().trim();
+              if (confirmedPlan !== 'free' && ACTIVE_SUB_STATUSES.includes(confirmedStatus)) {
+                await completeSuccessFlow(
+                  confirmedPlan,
+                  confirmedStatus,
+                  retrySync?.dbSynced
+                    ? { dbConfirmed: true }
+                    : { persistReceipt: true, verifiedBy: 'stripe_sync' },
+                  identity
+                );
+                return;
+              }
+            }
+          }
+
+          if (authUser?.id) {
             let dbProf = null;
             const { data: clientProf, error: profErr } = await supabase
               .from('profiles')
@@ -660,62 +699,24 @@ export default function SubscriptionReturn() {
                 return;
               }
             }
-          } catch {
-            // continue brief check
           }
+        } catch {
+          // continue settlement polling
+        }
 
-          if (attempt < 1) {
-            await new Promise((r) => window.setTimeout(r, 600));
-          }
+        if (attempt < 4) {
+          await new Promise((r) => window.setTimeout(r, 900));
         }
       }
 
       if (cancelledRef.current) return;
 
-      // 4. Redirect confirmation: Stripe only redirects to the after-payment URL once checkout/trial completes.
-      // Unlock the plan they were subscribing to across the entire app while syncing continues in background.
-      if (hintedPlan !== 'free' || Boolean(sessionId) || hasSubscribedParam || Boolean(pendingServer?.plan)) {
-        const unlockedPlan =
-          hintedPlan !== 'free'
-            ? hintedPlan
-            : pendingServer?.plan
-              ? normalizePlan(pendingServer.plan)
-              : 'progress';
-        const hasUsedTrial = Boolean(
-          storedUser?.has_used_trial ||
-            storedUser?.trial_used ||
-            localStorage.getItem('washek_has_used_trial') === 'true'
-        );
-        const trialParam = searchParams.get('trial');
-        const unlockedStatus =
-          trialParam === 'true'
-            ? 'trialing'
-            : trialParam === 'false'
-              ? 'active'
-              : pendingServer?.trial === true
-                ? 'trialing'
-                : pendingServer?.trial === false
-                  ? 'active'
-                  : hasUsedTrial
-                    ? 'active'
-                    : 'trialing';
-
-        await completeSuccessFlow(
-          unlockedPlan,
-          unlockedStatus,
-          {
-            persistReceipt: true,
-            verifiedBy: 'stripe_redirect',
-          },
-          identity
-        );
-        return;
-      }
-
       clearPendingCheckoutArtifacts();
       setStatus('error');
       setErrorMessage(
-        'No pending or active Stripe checkout was found for this redirect. Please select a plan from your Profile to subscribe.'
+        hintedPlan !== 'free' || Boolean(sessionId) || hasSubscribedParam || Boolean(pendingServer?.plan)
+          ? 'Stripe has not confirmed this payment yet. If you just completed checkout, tap Retry Verification below or return to your Profile to sync.'
+          : 'No pending or active Stripe checkout was found for this redirect. Please select a plan from your Profile to subscribe.'
       );
     };
 

@@ -502,7 +502,9 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
   const [userProfile, setUserProfile] = useState(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      return;
+    }
     let mounted = true;
     supabaseApi.auth
       .me()
@@ -1150,7 +1152,6 @@ export default function AppSettingsModal({ triggerClassName, iconClassName } = {
 
                 </div>
 
-                {/* Training Program */}
                 {/* Training Program */}
                 <div>
                   <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2 flex items-center gap-1.5">

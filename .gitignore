@@ -9,3 +9,9 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.athlete_credentials.json
+.confirmed_subscriptions.json
+.deleted_accounts.json
+.washek_session_secret
+.kael_usage.json
+firebase-debug.log

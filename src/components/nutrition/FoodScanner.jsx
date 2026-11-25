@@ -16,8 +16,11 @@ import {
   supabaseApi,
 } from '@/lib/supabaseApi';
 
+import { fetchServerEntitlement, syncStripeSubscription } from '@/lib/stripeCheckout';
 import {
+  applySubscriptionUpgrade,
   canAccess,
+  resolveEffectivePlan,
 } from '@/lib/subscription';
 
 import FoodEditModal from './FoodEditModal';
@@ -814,7 +817,7 @@ export default function FoodScanner({
           '[FoodScanner] Starting high-speed food image analysis.'
         );
 
-        const rawResult =
+        let rawResult =
           await supabaseApi.ai.invoke(
             {
               type:
@@ -826,8 +829,58 @@ export default function FoodScanner({
               file_urls: [
                 imageUrl,
               ],
+
+              plan: resolveEffectivePlan(user || userPlan) || 'free',
+
+              email: user?.email || null,
+
+              user_id: user?.id || null,
             }
           );
+
+        if (
+          rawResult?.__ai_error &&
+          (rawResult.code === 'SUBSCRIPTION_REQUIRED' ||
+            rawResult.code === 'FEATURE_REQUIRES_PLAN' ||
+            /requires the (progress|performance|elite) plan/i.test(String(rawResult.message || ''))) &&
+          !snapLocked
+        ) {
+          let verifiedPlan = null;
+          let verifiedStatus = 'active';
+          let verifiedTs = Date.now();
+          const ent = await fetchServerEntitlement({
+            userId: user?.id,
+            email: user?.email,
+          }).catch(() => null);
+          if (ent?.active && canAccess(ent.plan, 'snap_food')) {
+            verifiedPlan = ent.plan;
+            verifiedStatus = ent.status || 'active';
+            verifiedTs = ent.timestamp || Date.now();
+          } else {
+            const synced = await syncStripeSubscription({
+              planKey: resolveEffectivePlan(user || userPlan) || 'progress',
+            }).catch(() => null);
+            if (synced?.verified && canAccess(synced.plan, 'snap_food')) {
+              verifiedPlan = synced.plan;
+              verifiedStatus = synced.status || 'active';
+            }
+          }
+          if (verifiedPlan) {
+            applySubscriptionUpgrade(verifiedPlan, verifiedStatus, {
+              persistReceipt: true,
+              timestamp: verifiedTs,
+              syncServer: false,
+            });
+            rawResult = await supabaseApi.ai.invoke({
+              type: 'food_scan',
+              prompt: buildFoodPrompt(),
+              file_urls: [imageUrl],
+              plan: verifiedPlan,
+              email: user?.email || null,
+              user_id: user?.id || null,
+            });
+          }
+        }
 
         if (rawResult?.__ai_error) {
           throw new Error(
@@ -996,7 +1049,7 @@ export default function FoodScanner({
          * no structured-output schema.
          */
 
-        const rawResult =
+        let rawResult =
           await supabaseApi.ai.invoke(
             {
               type:
@@ -1008,8 +1061,58 @@ export default function FoodScanner({
               file_urls: [
                 imageUrl,
               ],
+
+              plan: resolveEffectivePlan(user || userPlan) || 'free',
+
+              email: user?.email || null,
+
+              user_id: user?.id || null,
             }
           );
+
+        if (
+          rawResult?.__ai_error &&
+          (rawResult.code === 'SUBSCRIPTION_REQUIRED' ||
+            rawResult.code === 'FEATURE_REQUIRES_PLAN' ||
+            /requires the (progress|performance|elite) plan/i.test(String(rawResult.message || ''))) &&
+          !barcodeLocked
+        ) {
+          let verifiedPlan = null;
+          let verifiedStatus = 'active';
+          let verifiedTs = Date.now();
+          const ent = await fetchServerEntitlement({
+            userId: user?.id,
+            email: user?.email,
+          }).catch(() => null);
+          if (ent?.active && canAccess(ent.plan, 'scan_barcode')) {
+            verifiedPlan = ent.plan;
+            verifiedStatus = ent.status || 'active';
+            verifiedTs = ent.timestamp || Date.now();
+          } else {
+            const synced = await syncStripeSubscription({
+              planKey: resolveEffectivePlan(user || userPlan) || 'progress',
+            }).catch(() => null);
+            if (synced?.verified && canAccess(synced.plan, 'scan_barcode')) {
+              verifiedPlan = synced.plan;
+              verifiedStatus = synced.status || 'active';
+            }
+          }
+          if (verifiedPlan) {
+            applySubscriptionUpgrade(verifiedPlan, verifiedStatus, {
+              persistReceipt: true,
+              timestamp: verifiedTs,
+              syncServer: false,
+            });
+            rawResult = await supabaseApi.ai.invoke({
+              type: 'food_barcode',
+              prompt: buildBarcodePrompt(),
+              file_urls: [imageUrl],
+              plan: verifiedPlan,
+              email: user?.email || null,
+              user_id: user?.id || null,
+            });
+          }
+        }
 
         if (rawResult?.__ai_error) {
           throw new Error(

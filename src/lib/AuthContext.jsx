@@ -27,8 +27,37 @@ import {
   getPlanRank,
   getRedirectUpgradeReceipt,
   applySubscriptionUpgrade,
+  syncSubscriptionStorageKeys,
 } from '@/lib/subscription';
 import { fetchServerEntitlement } from '@/lib/stripeCheckout';
+import { getCachedMessageStats } from '@/lib/messageLimit';
+
+function preserveMonthlyKaelCount(nextUser, prevUser = null) {
+  if (!nextUser || typeof nextUser !== 'object') return nextUser;
+  try {
+    const stats = getCachedMessageStats(nextUser);
+    const sameUserPrev =
+      prevUser &&
+      ((prevUser.email && nextUser.email && String(prevUser.email).toLowerCase().trim() === String(nextUser.email).toLowerCase().trim()) ||
+        (prevUser.id && nextUser.id && prevUser.id === nextUser.id));
+    const prevSameMonth =
+      sameUserPrev && prevUser?.kael_msg_month === stats.monthKey
+        ? Math.max(0, Number(prevUser?.kael_msg_count || 0))
+        : 0;
+    const nextSameMonth =
+      nextUser?.kael_msg_month === stats.monthKey
+        ? Math.max(0, Number(nextUser?.kael_msg_count || 0))
+        : 0;
+    const mergedCount = Math.max(stats.used, prevSameMonth, nextSameMonth);
+    return {
+      ...nextUser,
+      kael_msg_count: mergedCount,
+      kael_msg_month: stats.monthKey,
+    };
+  } catch {
+    return nextUser;
+  }
+}
 
 const AuthContext = createContext(null);
 
@@ -163,10 +192,67 @@ export const AuthProvider = ({ children }) => {
     }
     const promise = (async () => {
     try {
+      const storedToken = (() => {
+        try {
+          return localStorage.getItem('washek_auth_token') || '';
+        } catch {
+          return '';
+        }
+      })();
+      const storedUserObj = (() => {
+        try {
+          const raw = localStorage.getItem('washek_user');
+          return raw ? JSON.parse(raw) : null;
+        } catch {
+          return null;
+        }
+      })();
+      const storedEmail = storedUserObj?.email ? String(storedUserObj.email).toLowerCase().trim() : '';
+      const isVaultTok =
+        storedToken.startsWith('vault_tok_') || storedToken.startsWith('washek_sess_');
+
+      // If user is authenticated via a Vault session, never overwrite with a leftover native Supabase session
+      if (isVaultTok && storedUserObj?.email) {
+        const refreshedVaultUser = await supabaseApi.auth.me(true).catch(() => null);
+        const resolvedVaultUser = preserveMonthlyKaelCount(
+          enforceUserSubscriptionState(refreshedVaultUser || storedUserObj),
+          storedUserObj
+        );
+        setUser(resolvedVaultUser);
+        setIsAuthenticated(true);
+        try {
+          localStorage.setItem('washek_user', JSON.stringify(resolvedVaultUser));
+          syncSubscriptionStorageKeys(resolvedVaultUser);
+          const nextPlan = normalizePlan(resolvedVaultUser?.subscription_plan);
+          if (
+            typeof window !== 'undefined' &&
+            nextPlan !== 'free' &&
+            isActiveSubscriptionStatus(resolvedVaultUser?.subscription_status)
+          ) {
+            window.dispatchEvent(
+              new CustomEvent('washek_subscription_updated', {
+                detail: {
+                  plan: nextPlan,
+                  status: resolvedVaultUser.subscription_status || 'active',
+                },
+              })
+            );
+          }
+        } catch {
+          // ignore
+        }
+        return resolvedVaultUser;
+      }
+
       let session = null;
       try {
         const { data } = await supabase.auth.getSession();
-        session = data?.session;
+        const sEmail = data?.session?.user?.email
+          ? String(data.session.user.email).toLowerCase().trim()
+          : '';
+        if (!storedEmail || !sEmail || sEmail === storedEmail) {
+          session = data?.session || null;
+        }
       } catch (_sErr) {
         // session query note
       }
@@ -174,16 +260,20 @@ export const AuthProvider = ({ children }) => {
       // If no active session but genuine JWT/refresh tokens are in localStorage, attempt recovery or refresh
       if (!session) {
         const nativeSession = readNativeSupabaseStorageSession();
-        const storedToken = localStorage.getItem('washek_auth_token') || '';
-        const isVaultTok =
-          storedToken.startsWith('vault_tok_') || storedToken.startsWith('washek_sess_');
+        const nativeEmail = nativeSession?.user?.email
+          ? String(nativeSession.user.email).toLowerCase().trim()
+          : '';
         const token =
           storedToken && !isVaultTok
             ? storedToken
-            : nativeSession?.access_token || '';
+            : (!storedEmail || !nativeEmail || nativeEmail === storedEmail)
+              ? nativeSession?.access_token || ''
+              : '';
         const refreshToken =
           localStorage.getItem('washek_refresh_token') ||
-          (!isVaultTok ? nativeSession?.refresh_token : '') ||
+          (!isVaultTok && (!storedEmail || !nativeEmail || nativeEmail === storedEmail)
+            ? nativeSession?.refresh_token
+            : '') ||
           '';
 
         if (!isVaultTok && refreshToken) {
@@ -233,13 +323,29 @@ export const AuthProvider = ({ children }) => {
             setIsAuthenticated(true);
             try {
               localStorage.setItem('washek_user', JSON.stringify(profileUser));
+              syncSubscriptionStorageKeys(profileUser);
+              const nextPlan = normalizePlan(profileUser?.subscription_plan);
+              if (
+                typeof window !== 'undefined' &&
+                nextPlan !== 'free' &&
+                isActiveSubscriptionStatus(profileUser?.subscription_status)
+              ) {
+                window.dispatchEvent(
+                  new CustomEvent('washek_subscription_updated', {
+                    detail: {
+                      plan: nextPlan,
+                      status: profileUser.subscription_status || 'active',
+                    },
+                  })
+                );
+              }
             } catch (err) {
               console.debug('[AUTH] Storage note:', err);
             }
             return profileUser;
           }
         } catch {
-          const fallbackUser = formatAthleteUser(session.user);
+          const fallbackUser = preserveMonthlyKaelCount(formatAthleteUser(session.user), storedUserObj);
           setUser(fallbackUser);
           setIsAuthenticated(true);
           try {
@@ -373,6 +479,7 @@ export const AuthProvider = ({ children }) => {
                     tier: ent.plan,
                     plan: ent.plan,
                     subscription_tier: ent.plan,
+                    subscription_cancelled_at: null,
                   }
                 : prev
             );
@@ -392,6 +499,32 @@ export const AuthProvider = ({ children }) => {
       (event, session) => {
         if (!mounted) return;
         if (event === 'SIGNED_IN' || event === 'USER_UPDATED' || event === 'TOKEN_REFRESHED') {
+          const activeToken = (() => {
+            try {
+              return localStorage.getItem('washek_auth_token') || '';
+            } catch {
+              return '';
+            }
+          })();
+          const activeEmail = (() => {
+            try {
+              const raw = localStorage.getItem('washek_user');
+              const parsed = raw ? JSON.parse(raw) : null;
+              return parsed?.email ? String(parsed.email).toLowerCase().trim() : '';
+            } catch {
+              return '';
+            }
+          })();
+          const sessionEmail = session?.user?.email
+            ? String(session.user.email).toLowerCase().trim()
+            : '';
+          if (
+            (activeToken.startsWith('vault_tok_') || activeToken.startsWith('washek_sess_')) ||
+            (activeEmail && sessionEmail && activeEmail !== sessionEmail)
+          ) {
+            return;
+          }
+
           const incomingToken = session?.access_token || '';
           const tokenUnchanged =
             Boolean(incomingToken) && incomingToken === lastLoadedTokenRef.current;
@@ -521,13 +654,16 @@ export const AuthProvider = ({ children }) => {
       const profileData = e.detail?.profile;
       if (recoveredUser?.id || profileData?.id) {
         setUser((prev) => {
-          const updated = enforceUserSubscriptionState({
-            ...(prev || {}),
-            ...(profileData || {}),
-            id: recoveredUser?.id || profileData?.id || prev?.id,
-            email: recoveredUser?.email || profileData?.email || prev?.email || '',
-            onboarded: prev?.onboarded ?? profileData?.onboarded ?? true,
-          });
+          const updated = preserveMonthlyKaelCount(
+            enforceUserSubscriptionState({
+              ...(prev || {}),
+              ...(profileData || {}),
+              id: recoveredUser?.id || profileData?.id || prev?.id,
+              email: recoveredUser?.email || profileData?.email || prev?.email || '',
+              onboarded: prev?.onboarded ?? profileData?.onboarded ?? true,
+            }),
+            prev
+          );
           try {
             localStorage.setItem('washek_user', JSON.stringify(updated));
           } catch {
@@ -630,8 +766,19 @@ export const AuthProvider = ({ children }) => {
               });
             } else if (data.isVaultSession) {
               // Server /api/auth/signin already verified against Supabase and fell back to vault;
-              // clear stale refresh tokens instead of repeating a failing signInWithPassword RTT.
+              // clear stale refresh tokens and any mismatched native session instead of leaking a prior account JWT.
               localStorage.removeItem('washek_refresh_token');
+              try {
+                const { data: nativeData } = await supabase.auth.getSession();
+                const nativeEmail = nativeData?.session?.user?.email
+                  ? String(nativeData.session.user.email).toLowerCase().trim()
+                  : '';
+                if (nativeEmail && nativeEmail !== cleanEmail.toLowerCase()) {
+                  await supabase.auth.signOut({ scope: 'local' });
+                }
+              } catch {
+                // ignore local signOut cleanup errors
+              }
             } else {
               // Non-vault token missing refresh token: try browser signInWithPassword once
               try {
@@ -682,13 +829,30 @@ export const AuthProvider = ({ children }) => {
     }
 
     if (authSucceeded && finalProfile) {
-      setUser(finalProfile);
-      setIsAuthenticated(true);
       try {
+        localStorage.removeItem('washek_subscription_cancelled_at');
+        localStorage.removeItem('washek_redirect_upgrade_receipt');
+        localStorage.removeItem('washek_recent_upgrade');
+        if (
+          finalProfile.subscription_plan &&
+          finalProfile.subscription_plan !== 'free' &&
+          isActiveSubscriptionStatus(finalProfile.subscription_status)
+        ) {
+          localStorage.setItem('washek_subscription_plan', finalProfile.subscription_plan);
+          localStorage.setItem('washek_subscription_status', finalProfile.subscription_status);
+        } else {
+          localStorage.removeItem('washek_subscription_plan');
+          localStorage.setItem(
+            'washek_subscription_status',
+            finalProfile.subscription_status || 'inactive'
+          );
+        }
         localStorage.setItem('washek_user', JSON.stringify(finalProfile));
       } catch (err) {
         console.debug('[AUTH] Storage note:', err);
       }
+      setUser(finalProfile);
+      setIsAuthenticated(true);
       setIsLoadingAuth(false);
       return finalProfile;
     }
@@ -792,13 +956,30 @@ export const AuthProvider = ({ children }) => {
           }
         }
 
-        setUser(finalProfile);
-        setIsAuthenticated(true);
         try {
+          localStorage.removeItem('washek_subscription_cancelled_at');
+          localStorage.removeItem('washek_redirect_upgrade_receipt');
+          localStorage.removeItem('washek_recent_upgrade');
+          if (
+            finalProfile.subscription_plan &&
+            finalProfile.subscription_plan !== 'free' &&
+            isActiveSubscriptionStatus(finalProfile.subscription_status)
+          ) {
+            localStorage.setItem('washek_subscription_plan', finalProfile.subscription_plan);
+            localStorage.setItem('washek_subscription_status', finalProfile.subscription_status);
+          } else {
+            localStorage.removeItem('washek_subscription_plan');
+            localStorage.setItem(
+              'washek_subscription_status',
+              finalProfile.subscription_status || 'inactive'
+            );
+          }
           localStorage.setItem('washek_user', JSON.stringify(finalProfile));
         } catch {
           // ignore
         }
+        setUser(finalProfile);
+        setIsAuthenticated(true);
         setIsLoadingAuth(false);
         return finalProfile;
       }
@@ -952,6 +1133,7 @@ export const AuthProvider = ({ children }) => {
         localStorage.removeItem('washek_user');
         localStorage.removeItem('washek_subscription_plan');
         localStorage.removeItem('washek_subscription_status');
+        localStorage.removeItem('washek_subscription_cancelled_at');
         localStorage.removeItem('washek_recent_upgrade');
         localStorage.removeItem('washek_redirect_upgrade_receipt');
         localStorage.removeItem('washek_pending_checkout_plan');

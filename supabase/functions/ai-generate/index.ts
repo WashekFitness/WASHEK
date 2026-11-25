@@ -163,6 +163,129 @@ function hasRequiredPlan(userPlan: string, requiredPlan: string) {
   );
 }
 
+async function syncPlanFromStripeForAi(params: {
+  userId: string;
+  email?: string | null;
+  profile: any;
+  supabaseUrl: string;
+}) {
+  const stripeKey = Deno.env.get('STRIPE_SECRET_KEY') || '';
+  const serviceRoleKey = getServiceRoleKey();
+  if (!stripeKey) return null;
+
+  const stripeFetch = async (path: string) => {
+    const res = await fetch(`https://api.stripe.com/v1/${path}`, {
+      headers: { Authorization: `Bearer ${stripeKey}` },
+    });
+    if (!res.ok) return null;
+    return res.json().catch(() => null);
+  };
+
+  const priceIdMap: Record<string, string> = {};
+  const mapEnv = (envName: string, tier: string) => {
+    const val = (Deno.env.get(envName) || '').trim();
+    if (val) priceIdMap[val] = tier;
+  };
+  mapEnv('STRIPE_PRICE_PROGRESS', 'progress');
+  mapEnv('STRIPE_PRICE_PERFORMANCE', 'performance');
+  mapEnv('STRIPE_PRICE_ELITE', 'elite');
+
+  const mapStripeSubPlan = (sub: any): string | null => {
+    const metaPlan = String(sub?.metadata?.plan || '').toLowerCase().trim();
+    if (PLAN_HIERARCHY.includes(metaPlan) && metaPlan !== 'free') return metaPlan;
+    const priceItem = sub?.items?.data?.[0]?.price;
+    const pid = priceItem?.id ? String(priceItem.id).trim() : '';
+    if (pid && priceIdMap[pid]) return priceIdMap[pid];
+    const amt = Number(priceItem?.unit_amount ?? 0);
+    if (amt === 999) return 'progress';
+    if (amt === 1799) return 'performance';
+    if (amt === 3499) return 'elite';
+    return null;
+  };
+
+  const cancelMs =
+    params.profile?.subscription_cancelled_at &&
+    (params.profile?.subscription_plan === 'free' || params.profile?.subscription_status === 'canceled')
+      ? Date.parse(String(params.profile.subscription_cancelled_at)) || 0
+      : 0;
+
+  const isCreatedAfterCancel = (createdSec: unknown) => {
+    const ms = Number(createdSec || 0) * 1000;
+    return !(cancelMs > 0 && ms > 0 && ms <= cancelMs);
+  };
+
+  const candidateCustomerIds = new Set<string>();
+  if (params.profile?.stripe_customer_id && String(params.profile.stripe_customer_id).startsWith('cus_')) {
+    candidateCustomerIds.add(String(params.profile.stripe_customer_id));
+  }
+
+  const entitledSubs: any[] = [];
+  if (params.profile?.stripe_subscription_id && String(params.profile.stripe_subscription_id).startsWith('sub_')) {
+    const directSub = await stripeFetch(`subscriptions/${encodeURIComponent(String(params.profile.stripe_subscription_id))}`);
+    const st = String(directSub?.status || '').toLowerCase().trim();
+    if ((FULLY_ACTIVE_STATUSES.has(st) || GRACE_ELIGIBLE_STATUSES.has(st)) && isCreatedAfterCancel(directSub?.created)) {
+      entitledSubs.push(directSub);
+    }
+  }
+
+  const cleanEmail = params.email ? String(params.email).toLowerCase().trim() : '';
+  if (entitledSubs.length === 0 && cleanEmail) {
+    const listRes = await stripeFetch(`customers?email=${encodeURIComponent(cleanEmail)}&limit=10`);
+    for (const c of listRes?.data || []) {
+      if (c?.id && !c.deleted) candidateCustomerIds.add(c.id);
+    }
+    for (const custId of candidateCustomerIds) {
+      const subsRes = await stripeFetch(`subscriptions?customer=${encodeURIComponent(custId)}&status=all&limit=10`);
+      for (const s of subsRes?.data || []) {
+        const st = String(s?.status || '').toLowerCase().trim();
+        if ((FULLY_ACTIVE_STATUSES.has(st) || GRACE_ELIGIBLE_STATUSES.has(st)) && isCreatedAfterCancel(s?.created)) {
+          entitledSubs.push(s);
+        }
+      }
+    }
+  }
+
+  if (entitledSubs.length === 0) return null;
+
+  let bestPlan = 'free';
+  let bestStatus = 'inactive';
+  let bestSub: any = null;
+  for (const s of entitledSubs) {
+    const mapped = mapStripeSubPlan(s);
+    if (mapped && (bestPlan === 'free' || hasRequiredPlan(mapped, bestPlan))) {
+      bestPlan = mapped;
+      bestStatus = String(s?.status || 'active').toLowerCase().trim();
+      bestSub = s;
+    }
+  }
+
+  if (bestPlan === 'free' || !bestSub) return null;
+
+  if (serviceRoleKey) {
+    try {
+      const admin = createClient(params.supabaseUrl, serviceRoleKey);
+      const custId = typeof bestSub.customer === 'string' ? bestSub.customer : bestSub.customer?.id || null;
+      const priceId = bestSub?.items?.data?.[0]?.price?.id || null;
+      await admin
+        .from('profiles')
+        .update({
+          subscription_plan: bestPlan,
+          subscription_status: bestStatus,
+          subscription_cancelled_at: null,
+          stripe_subscription_id: bestSub.id,
+          ...(custId ? { stripe_customer_id: custId } : {}),
+          ...(priceId ? { stripe_price_id: priceId } : {}),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', params.userId);
+    } catch {
+      // ignore non-fatal DB sync error
+    }
+  }
+
+  return { plan: bestPlan, status: bestStatus };
+}
+
 async function getUserPlan(req: Request, user: any) {
   const authHeader = req.headers.get('Authorization');
   const supabaseUrl = Deno.env.get('SUPABASE_URL');
@@ -175,10 +298,12 @@ async function getUserPlan(req: Request, user: any) {
   const client = createClient(supabaseUrl, supabaseKey, {
     global: { headers: { Authorization: authHeader } },
   });
-  const { data, error } = await client
+  const serviceRoleKey = getServiceRoleKey();
+  const lookupClient = serviceRoleKey ? createClient(supabaseUrl, serviceRoleKey) : client;
+  const { data, error } = await lookupClient
     .from('profiles')
     .select(
-      'subscription_plan, subscription_status, subscription_grace_until'
+      'id, email, subscription_plan, subscription_status, subscription_grace_until, subscription_cancelled_at, stripe_subscription_id, stripe_customer_id'
     )
     .eq('id', user.id)
     .maybeSingle();
@@ -207,24 +332,41 @@ async function getUserPlan(req: Request, user: any) {
   const plan = normalizePlan(
     isEntitled ? data?.subscription_plan : 'free'
   );
-  return { plan, status };
+  return { plan, status, profile: data, supabaseUrl };
 }
 
 async function enforcePlanAccess(
   req: Request,
   user: any,
-  type: string
+  type: string,
+  body: any = {}
 ) {
-  const requiredPlan =
-    type === 'live_workout_adjustment'
-      ? 'elite'
-      : SERVER_FEATURE_PLANS[type] || null;
+  let requiredPlan = SERVER_FEATURE_PLANS[type] || null;
+  if (type === 'live_workout_adjustment') {
+    const isPostWorkoutAdaptation =
+      Boolean(body?.schema?.properties?.adjusted_exercises) ||
+      Boolean(body?.response_json_schema?.properties?.adjusted_exercises) ||
+      (typeof body?.prompt === 'string' && body.prompt.includes('POST-WORKOUT FEEDBACK'));
+    requiredPlan = isPostWorkoutAdaptation ? 'progress' : 'elite';
+  }
 
   if (!requiredPlan) {
     return { allowed: true, plan: null, requiredPlan: null };
   }
 
-  const { plan } = await getUserPlan(req, user);
+  let { plan, profile, supabaseUrl } = await getUserPlan(req, user);
+  if (!hasRequiredPlan(plan, requiredPlan)) {
+    const synced = await syncPlanFromStripeForAi({
+      userId: user.id,
+      email: user.email || profile?.email || null,
+      profile,
+      supabaseUrl,
+    }).catch(() => null);
+    if (synced?.plan && hasRequiredPlan(synced.plan, requiredPlan)) {
+      plan = synced.plan;
+    }
+  }
+
   if (!hasRequiredPlan(plan, requiredPlan)) {
     return { allowed: false, plan, requiredPlan };
   }
@@ -234,7 +376,7 @@ async function enforcePlanAccess(
 /* ============================================================
  * KAEL MESSAGE QUOTA (SERVER-ENFORCED)
  * ============================================================ */
-async function claimKaelMessageServerSide(req: Request) {
+async function claimKaelMessageServerSide(req: Request, timezone?: string) {
   const authHeader = req.headers.get('Authorization');
   const supabaseUrl = Deno.env.get('SUPABASE_URL');
   const supabaseKey = getSupabaseAnonKey();
@@ -246,7 +388,14 @@ async function claimKaelMessageServerSide(req: Request) {
   const client = createClient(supabaseUrl, supabaseKey, {
     global: { headers: { Authorization: authHeader } },
   });
-  const { data, error } = await client.rpc('claim_kael_message');
+  let { data, error } = timezone
+    ? await client.rpc('claim_kael_message', { p_timezone: timezone })
+    : await client.rpc('claim_kael_message');
+  if (error && error.code === 'PGRST202') {
+    const fallbackRes = await client.rpc('claim_kael_message');
+    data = fallbackRes.data;
+    error = fallbackRes.error;
+  }
   if (error) {
     console.error('[AI] KAEL QUOTA RPC ERROR', {
       message: error.message,
@@ -275,21 +424,24 @@ async function resolveStoragePath(rawValue: string, userId: string) {
   const value = String(rawValue || '').trim();
   if (!value) throw new Error('Empty media path.');
 
-  if (isHttpUrl(value) || isDataUrl(value)) return value;
+  if (isDataUrl(value)) return value;
 
+  let bucketHint = '';
   let path = value;
   const objectMarker = '/storage/v1/object/';
   const markerIndex = path.indexOf(objectMarker);
-  if (markerIndex >= 0) {
+  if (markerIndex >= 0 && !path.includes('/storage/v1/object/sign/')) {
     const afterMarker = path.slice(markerIndex + objectMarker.length);
     const parts = afterMarker.split('/');
-    if (parts.length >= 2) {
+    if (parts.length >= 3) {
       parts.shift();
-      const bucket = parts.shift();
-      if (bucket === MEDIA_BUCKET && parts.length > 0) {
-        path = decodeURIComponent(parts.join('/'));
+      bucketHint = parts.shift() || '';
+      if (parts.length > 0) {
+        path = decodeURIComponent(parts.join('/').split('?')[0]);
       }
     }
+  } else if (isHttpUrl(value)) {
+    return value;
   }
 
   const expectedPrefix = `${userId}/`;
@@ -308,23 +460,31 @@ async function resolveStoragePath(rawValue: string, userId: string) {
   }
 
   const admin = createClient(supabaseUrl, serviceRoleKey);
-  const { data, error } = await admin.storage
-    .from(MEDIA_BUCKET)
-    .createSignedUrl(path, 3600);
+  const candidateBuckets = Array.from(
+    new Set([bucketHint, MEDIA_BUCKET, 'user-media', 'washek-media', 'media'].filter(Boolean))
+  );
 
-  if (error || !data?.signedUrl) {
-    console.error('[AI] STORAGE SIGNED URL ERROR', {
-      path,
-      bucket: MEDIA_BUCKET,
-      message: error?.message || 'No signed URL returned.',
-    });
-    throw new Error(
-      `Unable to access uploaded media: ${
-        error?.message || 'signed URL could not be created.'
-      }`
-    );
+  let lastErrorMsg = '';
+  for (const bucket of candidateBuckets) {
+    const { data, error } = await admin.storage
+      .from(bucket)
+      .createSignedUrl(path, 3600);
+    if (!error && data?.signedUrl) {
+      return data.signedUrl;
+    }
+    if (error?.message) lastErrorMsg = error.message;
   }
-  return data.signedUrl;
+
+  console.error('[AI] STORAGE SIGNED URL ERROR', {
+    path,
+    candidateBuckets,
+    message: lastErrorMsg || 'No signed URL returned.',
+  });
+  throw new Error(
+    `Unable to access uploaded media: ${
+      lastErrorMsg || 'signed URL could not be created.'
+    }`
+  );
 }
 
 async function resolveAllMedia(fileUrls: unknown[], userId: string) {
@@ -654,9 +814,13 @@ async function callGoogleGemini(
         const res = await fetch(url);
         if (res.ok) {
           const buffer = await res.arrayBuffer();
-          const base64 = btoa(
-            String.fromCharCode(...new Uint8Array(buffer))
-          );
+          const bytes = new Uint8Array(buffer);
+          let binary = '';
+          const chunkSize = 0x8000;
+          for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode(...bytes.subarray(i, i + chunkSize));
+          }
+          const base64 = btoa(binary);
           const mimeType = res.headers.get('content-type') || 'image/jpeg';
           parts.push({
             inlineData: {
@@ -879,7 +1043,7 @@ Deno.serve(async (req) => {
     /* --------------------------------------------------------
      * PLAN ACCESS
      * ------------------------------------------------------ */
-    const access = await enforcePlanAccess(req, user, type);
+    const access = await enforcePlanAccess(req, user, type, body);
     if (!access.allowed) {
       console.warn('[AI] PLAN DENIED', {
         userId: user.id,
@@ -905,8 +1069,11 @@ Deno.serve(async (req) => {
      * ------------------------------------------------------ */
     let kaelQuota: any = null;
     if (type === 'kael') {
+      const reqTz = String(
+        req.headers.get('x-timezone') || (body as any)?.timezone || ''
+      ).trim() || undefined;
       try {
-        kaelQuota = await claimKaelMessageServerSide(req);
+        kaelQuota = await claimKaelMessageServerSide(req, reqTz);
       } catch (quotaError) {
         console.error('[AI] KAEL QUOTA ERROR', {
           userId: user.id,

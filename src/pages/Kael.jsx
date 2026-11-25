@@ -65,7 +65,15 @@ import {
   getCurrentMonthKey,
   getPlanLimit,
 } from '@/lib/messageLimit';
-import { getPlanRank, resolveEffectivePlan } from '@/lib/subscription';
+import {
+  applySubscriptionUpgrade,
+  getPlanRank,
+  hasPlan,
+  isActiveSubscriptionStatus,
+  normalizePlan,
+  resolveEffectivePlan,
+} from '@/lib/subscription';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 import {
   kaelStore,
   useKaelStore,
@@ -331,7 +339,7 @@ export default function Kael() {
 
   const [
     stats,
-    setStats,
+    setStatsRaw,
   ] = useState(() => {
     try {
       const stored = typeof localStorage !== 'undefined' ? localStorage.getItem('washek_user') : null;
@@ -345,6 +353,41 @@ export default function Kael() {
     }
     return null;
   });
+
+  const setStats = useCallback((nextOrUpdater) => {
+    setStatsRaw((prev) => {
+      const next = typeof nextOrUpdater === 'function' ? nextOrUpdater(prev) : nextOrUpdater;
+      if (!next) return prev;
+      const validPrevMonth = /^\d{4}-\d{2}$/.test(String(prev?.monthKey || ''));
+      const validNextMonth = /^\d{4}-\d{2}$/.test(String(next?.monthKey || ''));
+      const sameAccount =
+        !prev?.userId ||
+        !next?.userId ||
+        String(prev.userId) === String(next.userId) ||
+        (prev?.userEmail && next?.userEmail && prev.userEmail === next.userEmail);
+
+      // Never allow message count to decrease mid-month; only reset when monthKey rolls to a new month
+      if (
+        prev &&
+        sameAccount &&
+        validPrevMonth &&
+        (!validNextMonth || prev.monthKey === next.monthKey) &&
+        typeof prev.used === 'number' &&
+        typeof next.used === 'number' &&
+        next.used < prev.used
+      ) {
+        const limit = Number(next.limit || prev.limit || 100);
+        return {
+          ...next,
+          used: prev.used,
+          limit,
+          remaining: Math.max(0, limit - prev.used),
+          monthKey: prev.monthKey,
+        };
+      }
+      return next;
+    });
+  }, []);
 
   const { user: authUser, setUser: setAuthUser } = useAuth() || {};
   const effectiveUser = (() => {
@@ -410,14 +453,48 @@ export default function Kael() {
 
     supabaseApi.auth
       .me(true)
-      .then((u) => {
+      .then(async (u) => {
         if (!active) {
           return;
         }
 
-        const loadedUser = u || authUser;
+        let loadedUser = u || authUser;
         if (loadedUser) {
           setUser(loadedUser);
+        }
+
+        if (loadedUser && !hasPlan(loadedUser, 'elite') && (loadedUser.id || loadedUser.email)) {
+          try {
+            const ent = await fetchServerEntitlement({
+              userId: loadedUser.id,
+              email: loadedUser.email,
+              cancelledAtIso: loadedUser.subscription_cancelled_at || null,
+            });
+            if (active && ent?.active && ent.plan && ent.plan !== 'free') {
+              const curRank = getPlanRank(resolveEffectivePlan(loadedUser));
+              const entRank = getPlanRank(ent.plan);
+              if (entRank > curRank) {
+                applySubscriptionUpgrade(ent.plan, ent.status, {
+                  persistReceipt: true,
+                  timestamp: ent.timestamp,
+                  syncServer: false,
+                });
+                loadedUser = {
+                  ...loadedUser,
+                  subscription_plan: ent.plan,
+                  subscription_status: ent.status,
+                  plan: ent.plan,
+                  tier: ent.plan,
+                  subscription_tier: ent.plan,
+                  subscription_cancelled_at: null,
+                };
+                setUser(loadedUser);
+                setAuthUser?.(loadedUser);
+              }
+            }
+          } catch {
+            // ignore entitlement probe error
+          }
         }
 
         const effectiveTz = timeZone || getUserTimeZone(loadedUser);
@@ -454,7 +531,7 @@ export default function Kael() {
     };
   }, [timeZone, authUser?.id]);
 
-  // Real-time listener for quota updates dispatched anywhere in the app
+  // Real-time listener for quota and subscription updates dispatched anywhere in the app
   useEffect(() => {
     const handleQuotaUpdate = (e) => {
       if (e?.detail) {
@@ -462,9 +539,36 @@ export default function Kael() {
       }
     };
 
+    const handleSubUpdate = (e) => {
+      const rawPlan = normalizePlan(e.detail?.plan || e.detail?.subscription_plan || 'free');
+      const rawStatus = String(
+        e.detail?.status || e.detail?.subscription_status || (rawPlan === 'free' ? 'canceled' : 'active')
+      ).toLowerCase().trim();
+      const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
+      const nextPlan = activeSub ? rawPlan : 'free';
+      if (e.detail?.plan || e.detail?.status || e.detail?.subscription_plan || e.detail?.subscription_status) {
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                subscription_plan: nextPlan,
+                subscription_status: rawStatus,
+                plan: nextPlan,
+                tier: nextPlan,
+                subscription_tier: nextPlan,
+              }
+            : prev
+        );
+      }
+    };
+
     window.addEventListener('kael-quota-updated', handleQuotaUpdate);
+    window.addEventListener('washek_subscription_updated', handleSubUpdate);
+    window.addEventListener('washek_user_changed', handleSubUpdate);
     return () => {
       window.removeEventListener('kael-quota-updated', handleQuotaUpdate);
+      window.removeEventListener('washek_subscription_updated', handleSubUpdate);
+      window.removeEventListener('washek_user_changed', handleSubUpdate);
     };
   }, []);
 
@@ -626,8 +730,8 @@ export default function Kael() {
 
 
   const firstName =
-    user?.first_name ||
-    user?.full_name?.split(
+    effectiveUser?.first_name ||
+    effectiveUser?.full_name?.split(
       ' '
     )[0] ||
     '';
@@ -694,7 +798,8 @@ export default function Kael() {
         return;
       }
 
-      if (action.type === 'log_food') {
+      if (action.type === 'log_food' || action.type === 'ask_log_food') {
+        if (isAuto && action.type !== 'log_food') return;
         const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
         const todayKey = getLocalDateKey(new Date(), effectiveTz);
         try {
@@ -722,7 +827,8 @@ export default function Kael() {
         return;
       }
 
-      if (action.type === 'log_rest_day') {
+      if (action.type === 'log_rest_day' || action.type === 'ask_log_rest_day') {
+        if (isAuto && action.type !== 'log_rest_day') return;
         const todayKey = getLocalDateKey(new Date(), effectiveTz);
         const alreadyRest = isRestDayMarked?.(todayKey);
         if (isAuto && alreadyRest) {
@@ -997,10 +1103,12 @@ export default function Kael() {
    */
 
   const sendMessage =
-    async () => {
+    async (overrideText = null) => {
 
+      const candidateText =
+        typeof overrideText === 'string' ? overrideText : input;
       const trimmed =
-        input.trim();
+        candidateText.trim();
 
 
       if (
@@ -1010,7 +1118,6 @@ export default function Kael() {
       ) {
         return;
       }
-
 
       typingCancelledRef.current =
         true;
@@ -1025,7 +1132,9 @@ export default function Kael() {
         assistantId: temporaryId,
       } = kaelStore.startMessageExchange(trimmed);
 
-      setInput('');
+      if (typeof overrideText !== 'string') {
+        setInput('');
+      }
 
       try {
         let freshContextText = appContextTextRef.current;
@@ -1128,33 +1237,46 @@ export default function Kael() {
          */
         const currentLimit = displayStats?.limit || 100;
         const currentUsed = typeof displayStats?.used === 'number' ? displayStats.used : 0;
-        const serverUsed = result?.quota && typeof result.quota.used === 'number' ? result.quota.used : null;
-        const newUsed = serverUsed !== null ? serverUsed : currentUsed + 1;
-        const newRemaining = Math.max(0, currentLimit - newUsed);
         const currentMonthKey = displayStats?.monthKey || getCurrentMonthKey(new Date(), effectiveTz);
+        const serverMonthKey = result?.quota?.monthKey;
+        const isMonthRollover = Boolean(
+          serverMonthKey && /^\d{4}-\d{2}$/.test(serverMonthKey) && serverMonthKey !== currentMonthKey
+        );
+        const serverUsed = result?.quota && typeof result.quota.used === 'number' ? result.quota.used : null;
+        const effectiveMonthKey = isMonthRollover ? serverMonthKey : currentMonthKey;
+        const newUsed = isMonthRollover
+          ? Math.max(1, Number(serverUsed ?? 1))
+          : (serverUsed !== null ? Math.max(serverUsed, currentUsed + 1) : currentUsed + 1);
+        const newRemaining = Math.max(0, currentLimit - newUsed);
 
         const updatedQuota = {
           allowed: newRemaining > 0,
           used: newUsed,
           limit: currentLimit,
           remaining: newRemaining,
-          monthKey: currentMonthKey,
+          monthKey: effectiveMonthKey,
           plan: plan || 'free',
           timezone: effectiveTz,
           userId: user?.id || authUser?.id || null,
+          userEmail: (user?.email || authUser?.email) ? String(user?.email || authUser?.email).toLowerCase().trim() : null,
         };
 
         // 1. Immediately update UI state, React Query cache, localStorage & broadcast across Profile/app
         setStats(updatedQuota);
         syncQuotaAcrossApp(updatedQuota);
 
-        // 3. Keep local and global user profiles in sync
+        // 3. Keep local and global user profiles in sync monotonically within the same calendar month
         const syncProfile = (prev) => {
           if (!prev) return prev;
+          const prevSameMonth =
+            prev.kael_msg_month === effectiveMonthKey && typeof prev.kael_msg_count === 'number'
+              ? prev.kael_msg_count
+              : 0;
+          const finalCount = Math.max(prevSameMonth, newUsed);
           const next = {
             ...prev,
-            kael_msg_count: newUsed,
-            kael_msg_month: currentMonthKey,
+            kael_msg_count: finalCount,
+            kael_msg_month: effectiveMonthKey,
           };
           try {
             localStorage.setItem('washek_user', JSON.stringify(next));
@@ -1174,7 +1296,7 @@ export default function Kael() {
         const isUUID = typeof userIdToSync === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(userIdToSync.trim());
         const countPayload = {
           kael_msg_count: newUsed,
-          kael_msg_month: currentMonthKey,
+          kael_msg_month: effectiveMonthKey,
           timezone: effectiveTz,
         };
 
@@ -1218,8 +1340,119 @@ export default function Kael() {
 
         const parsedActions = parseKaelActions(responseText, effectiveUser || plan).actions;
         if (parsedActions.length > 0) {
+          const lastAssistant = [...previousMessages].reverse().find((m) => m?.role === 'assistant');
+          const prevAssistantContent = String(lastAssistant?.content || '').toLowerCase();
+
+          const isExplicitNavigationAuthorized = (route) => {
+            const rawTxt = String(trimmed || '').trim().toLowerCase();
+            if (!rawTxt) return false;
+
+            // Block explicit negations or instructions to stay in chat
+            if (
+              /\b(don't|do not|dont|never|no need to|without|stop)\s+(take|bring|send|go|navigate|open|switch|pull)\b/i.test(rawTxt) ||
+              /\b(stay here|keep me here|just tell me|just answer|just explain|in chat only)\b/i.test(rawTxt)
+            ) {
+              return false;
+            }
+
+            const baseRoute = String(route || '').split('?')[0].trim();
+
+            // Allow short affirmative confirmation ONLY if Kael just offered to navigate to a page
+            const isShortAffirmative =
+              /^(yes|yeah|yep|yup|sure|ok|okay|please|please do|do it|go ahead|sounds good|take me there|open it|yes please|sure thing)[.!?\s]*$/i.test(rawTxt);
+            const prevOfferedNav =
+              prevAssistantContent.includes('?') &&
+              (/\b(want me to|would you like me to|should i|shall i)\s+(take you|bring you|open|go to|navigate|send you)\b/i.test(prevAssistantContent) ||
+                /\[ACTION:(?:go|navigate):/i.test(String(lastAssistant?.content || '')));
+            if (isShortAffirmative && prevOfferedNav) {
+              return true;
+            }
+
+            // Strip conversational idioms that are NOT page navigation commands
+            const navTxt = rawTxt
+              .replace(/\b(go over|go ahead|going to|let's go|lets go|keep going|on the go|go to sleep|go to bed|go to the gym|go for a run|take me through|walk me through|open up about|open up)\b/gi, ' ')
+              .replace(/\s+/g, ' ')
+              .trim();
+
+            const hasExplicitNavVerb =
+              /\b(take|bring|send)\s+me\s+(?:back\s+)?(?:to|over\s+to)\b/i.test(navTxt) ||
+              /\b(take|bring|send)\s+me\s+(?:back\s+)?home\b/i.test(navTxt) ||
+              /\b(go|head|jump|switch|redirect|navigate)\s+(?:back\s+)?(?:to|over\s+to)\b/i.test(navTxt) ||
+              /\bgo\s+(?:back\s+)?home\b/i.test(navTxt) ||
+              /\bnavigate\b/i.test(navTxt) ||
+              /\b(open|pull up|bring up|launch|visit)\s+(?:the\s+|my\s+)?(?:page|tab|screen|view|dashboard|home|program|schedule|workout|live\s*workout|nutrition|food\s*log|macros|progress|photos|form\s*lab|formlab|heatmap|muscle\s*heatmap|profile|settings|plans?|pricing|billing|onboarding|setup|about|contact|support|terms|tos|privacy)\b/i.test(navTxt) ||
+              /(?:^|[.!?;]\s*)(?:please\s+)?start\s+(?:my\s+|today'?s\s+)?(?:live\s+)?workout\b/i.test(navTxt);
+
+            if (!hasExplicitNavVerb) {
+              return false;
+            }
+
+            const ROUTE_KEYWORDS = {
+              '/': /\b(dashboard|home|main\s*page|home\s*page|overview)\b/i,
+              '/program': /\b(program|schedule|routine|weekly|plan)\b/i,
+              '/live-workout': /\b(live\s*workout|workout|session|training|tracker|start)\b/i,
+              '/nutrition': /\b(nutrition|food|macro|macros|calorie|calories|meal|diet)\b/i,
+              '/progress': /\b(progress|analytics|stats|chart|graph|milestones?)\b/i,
+              '/photos': /\b(photo|photos|weight|weigh|body\s*fat|physique)\b/i,
+              '/formlab': /\b(form\s*lab|formlab|form\s*check|video|form|technique)\b/i,
+              '/muscle-heatmap': /\b(heatmap|heat\s*map|muscle\s*map|muscles?|muscle\s*balance)\b/i,
+              '/profile': /\b(profile|settings|account|plans?|pricing|subscription|upgrade|billing)\b/i,
+              '/onboarding': /\b(onboarding|setup|wizard|new\s*program|create\s*program)\b/i,
+              '/about': /\b(about|story|mission|what\s+is\s+washek)\b/i,
+              '/contact': /\b(contact|support|help|email|reach\s+out)\b/i,
+              '/terms': /\b(terms|tos|terms\s+of\s+service|legal|conditions)\b/i,
+              '/privacy': /\b(privacy|privacy\s+policy|data\s+policy)\b/i,
+              '/kael': /\b(kael|chat)\b/i,
+            };
+
+            if (/^\/program\/day\/\d+$/.test(baseRoute)) {
+              return /\b(day|program|workout|schedule|session)\b/i.test(navTxt);
+            }
+
+            const matcher = ROUTE_KEYWORDS[baseRoute];
+            return matcher ? matcher.test(navTxt) : true;
+          };
+
+          const isExplicitMutationAuthorized = (actionType) => {
+            const txt = String(trimmed || '').trim().toLowerCase();
+            if (!txt) return false;
+            const negated = /\b(don't|do not|didn't|did not|not yet|never|stop)\s+(log|add|record|track|save|enter|mark|set)\b/i.test(txt);
+            if (negated) return false;
+
+            const isShortAffirmative =
+              /^(yes|yeah|yep|yup|sure|ok|okay|please|please do|do it|go ahead|sounds good|confirm|log it|add it|mark it|yes please|sure thing|that works)[.!?\s]*$/i.test(txt) ||
+              /\b(yes|yeah|yep|go ahead|please do|do it|log it|add it|mark it)\b/i.test(txt);
+
+            if (actionType === 'log_food') {
+              const explicitFoodCmd = /\b(log|add|record|track|save|put|enter)\b/i.test(txt);
+              const prevAskedFood =
+                prevAssistantContent.includes('?') &&
+                (/\bfood log\b|\blog (that|it|this|them|the)\b|\badd (that|it|this)\b|\bwant me to log\b|\bwould you like me to log\b|\bshould i log\b/i.test(prevAssistantContent) ||
+                  /\[ACTION:ask_log_food:/i.test(String(lastAssistant?.content || '')));
+              return explicitFoodCmd || (isShortAffirmative && prevAskedFood);
+            }
+
+            if (actionType === 'log_rest_day') {
+              const explicitRestCmd =
+                /\b(mark|set|log|make|switch|change|turn)\b[\w\s]{0,24}\brest\s*day\b/i.test(txt) ||
+                /\brest\s*day\b[\w\s]{0,24}\b(mark|set|log)\b/i.test(txt);
+              const prevAskedRest =
+                prevAssistantContent.includes('?') &&
+                (/\brest day\b/i.test(prevAssistantContent) ||
+                  /\[ACTION:ask_log_rest_day/i.test(String(lastAssistant?.content || '')));
+              return explicitRestCmd || (isShortAffirmative && prevAskedRest);
+            }
+
+            return false;
+          };
+
           for (const action of parsedActions) {
-            if (action.type === 'go' || action.type === 'log_food' || action.type === 'log_rest_day') {
+            if (action.type === 'go' && isExplicitNavigationAuthorized(action.route)) {
+              executeKaelAction(action, { isAuto: true, messageId: temporaryId });
+            } else if (
+              (action.type === 'log_food' || action.type === 'log_rest_day') &&
+              isExplicitMutationAuthorized(action.type)
+            ) {
               executeKaelAction(action, { isAuto: true, messageId: temporaryId });
             }
           }
@@ -1460,7 +1693,7 @@ export default function Kael() {
             ml-auto
             flex
             items-center
-            gap-2
+            gap-1.5
             flex-shrink-0
           ">
 
@@ -1471,7 +1704,7 @@ export default function Kael() {
               size="sm"
               onClick={handleNewChat}
               className="
-                h-8
+                h-9
                 px-2.5
                 text-xs
                 font-semibold
@@ -1566,7 +1799,6 @@ export default function Kael() {
               ).startsWith(
                 '_typing_'
               );
-
 
             return (
               <div
@@ -1739,7 +1971,7 @@ export default function Kael() {
             placeholder={
               atLimit
                 ? 'Upgrade to keep chatting…'
-                : 'Ask Kael anything about training or nutrition…'
+                : 'Ask Kael anything…'
             }
             disabled={
               atLimit ||
@@ -1769,7 +2001,6 @@ export default function Kael() {
             rows={1}
           />
 
-
           <Button
             type="button"
             size="icon"
@@ -1796,7 +2027,7 @@ export default function Kael() {
               atLimit
             }
             onClick={
-              sendMessage
+              () => sendMessage()
             }
           >
 

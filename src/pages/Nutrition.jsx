@@ -21,6 +21,8 @@ import {
 import { toast } from 'sonner';
 
 import { supabaseApi } from '@/lib/supabaseApi';
+import { useAuth } from '@/lib/AuthContext';
+import { fetchServerEntitlement } from '@/lib/stripeCheckout';
 
 import FoodScanner from '@/components/nutrition/FoodScanner';
 import ManualFoodEntry from '@/components/nutrition/ManualFoodEntry';
@@ -31,9 +33,14 @@ import PageHeader from '@/components/layout/PageHeader';
 
 import { calcNutritionGoals } from '@/lib/nutritionGoals';
 import {
+  applySubscriptionUpgrade,
   canAccess,
+  getPlanRank,
+  hasPlan,
   isActiveSubscriptionStatus,
+  isExplicitlyCanceled,
   normalizePlan,
+  pickHighestEffectiveUser,
   resolveEffectivePlan,
 } from '@/lib/subscription';
 import { useMidnightSync } from '@/hooks/useMidnightSync';
@@ -57,6 +64,8 @@ export default function Nutrition() {
    * USER & TIMEZONE SYNCHRONIZATION
    * ============================================================
    */
+  const { user: authUser } = useAuth() || {};
+
   const [
     user,
     setUser,
@@ -69,7 +78,8 @@ export default function Nutrition() {
     }
   });
 
-  const userKey = user?.email || user?.id || 'athlete';
+  const effectiveUser = pickHighestEffectiveUser(authUser, user);
+  const userKey = effectiveUser?.email || effectiveUser?.id || 'athlete';
 
   /*
    * Synchronized to the user's specific calendar day and timezone.
@@ -77,20 +87,90 @@ export default function Nutrition() {
    * automatically advances, instantly resetting macro tracking for
    * the fresh day and invalidating relevant queries.
    */
-  const { todayKey: today, timeZone } = useMidnightSync(user);
+  const { todayKey: today, timeZone } = useMidnightSync(effectiveUser);
+
+  useEffect(() => {
+    if (authUser) {
+      setUser((prev) => {
+        if (!prev) return authUser;
+        const authRank = getPlanRank(resolveEffectivePlan(authUser));
+        const prevRank = getPlanRank(resolveEffectivePlan(prev));
+        return authRank >= prevRank ? { ...prev, ...authUser } : prev;
+      });
+    }
+  }, [authUser]);
 
   useEffect(() => {
     let active = true;
 
     supabaseApi.auth
-      .me()
-      .then((currentUser) => {
+      .me(true)
+      .then(async (currentUser) => {
         if (!active) {
           return;
         }
 
         if (currentUser) {
-          setUser(currentUser);
+          setUser((prev) => {
+            if (!prev) return currentUser;
+            const prevEmail = prev?.email ? String(prev.email).toLowerCase().trim() : '';
+            const uEmail = currentUser?.email ? String(currentUser.email).toLowerCase().trim() : '';
+            if (prevEmail && uEmail && prevEmail !== uEmail) {
+              return currentUser;
+            }
+            const uRank = getPlanRank(resolveEffectivePlan(currentUser));
+            const prevRank = getPlanRank(resolveEffectivePlan(prev));
+            const uExplicitlyCanceled =
+              isExplicitlyCanceled(currentUser.subscription_status) && uRank === 0;
+            if (uRank >= prevRank) {
+              return currentUser;
+            }
+            if (uExplicitlyCanceled && !canAccess(prev, 'advanced_macro_tracking')) {
+              return currentUser;
+            }
+            return {
+              ...currentUser,
+              subscription_plan: prev.subscription_plan,
+              subscription_status: prev.subscription_status,
+              plan: prev.subscription_plan,
+              tier: prev.subscription_plan,
+              subscription_tier: prev.subscription_plan,
+              subscription_cancelled_at: null,
+            };
+          });
+        }
+
+        const targetUser = currentUser || effectiveUser;
+        if (targetUser && !hasPlan(targetUser, 'elite') && (targetUser.id || targetUser.email)) {
+          try {
+            const ent = await fetchServerEntitlement({
+              userId: targetUser.id,
+              email: targetUser.email,
+              cancelledAtIso: targetUser.subscription_cancelled_at || null,
+            });
+            if (active && ent?.active && ent.plan && ent.plan !== 'free') {
+              const curRank = getPlanRank(resolveEffectivePlan(targetUser));
+              const entRank = getPlanRank(ent.plan);
+              if (entRank > curRank) {
+                applySubscriptionUpgrade(ent.plan, ent.status, {
+                  persistReceipt: true,
+                  timestamp: ent.timestamp,
+                  syncServer: false,
+                });
+                setUser((prev) => ({
+                  ...(prev || targetUser),
+                  subscription_plan: ent.plan,
+                  subscription_status: ent.status,
+                  plan: ent.plan,
+                  tier: ent.plan,
+                  subscription_tier: ent.plan,
+                  subscription_cancelled_at: null,
+                }));
+              }
+            }
+          } catch {
+            // ignore server entitlement fallback error
+          }
         }
       })
       .catch((error) => {
@@ -101,13 +181,13 @@ export default function Nutrition() {
       });
 
     const handleSubUpdated = (e) => {
-      const rawPlan = normalizePlan(e.detail?.plan || 'free');
+      const rawPlan = normalizePlan(e.detail?.plan || e.detail?.subscription_plan || 'free');
       const rawStatus = String(
-        e.detail?.status || (rawPlan === 'free' ? 'canceled' : 'active')
+        e.detail?.status || e.detail?.subscription_status || (rawPlan === 'free' ? 'canceled' : 'active')
       ).toLowerCase().trim();
       const activeSub = rawPlan !== 'free' && isActiveSubscriptionStatus(rawStatus);
       const nextPlan = activeSub ? rawPlan : 'free';
-      if ((e.detail?.plan || e.detail?.status) && active) {
+      if (e.detail?.plan || e.detail?.status || e.detail?.subscription_plan || e.detail?.subscription_status) {
         setUser((prev) =>
           prev
             ? {
@@ -116,6 +196,7 @@ export default function Nutrition() {
                 subscription_status: rawStatus,
                 plan: nextPlan,
                 tier: nextPlan,
+                subscription_tier: nextPlan,
               }
             : prev
         );
@@ -248,7 +329,7 @@ function getSmartDefaultMeal() {
    * ============================================================
    */
   const { data: savedMeals = [] } = useQuery({
-    queryKey: ['saved_meals'],
+    queryKey: ['saved_meals', userKey],
     queryFn: async () => {
       try {
         const list = await supabaseApi.entities.SavedMeal.list('-created_at', 200);
@@ -768,7 +849,7 @@ function getSmartDefaultMeal() {
 
   const goals =
     calcNutritionGoals(
-      user,
+      effectiveUser,
       {
         program: activeProgram,
         workoutLogs,
@@ -778,7 +859,7 @@ function getSmartDefaultMeal() {
 
 
   const hasAdaptiveMacros = canAccess(
-    user,
+    effectiveUser,
     'advanced_macro_tracking'
   );
 
@@ -1295,8 +1376,8 @@ function getSmartDefaultMeal() {
                 )
             }
             onSaveToMeals={handleSaveToMeals}
-            user={user}
-            userPlan={resolveEffectivePlan(user)}
+            user={effectiveUser}
+            userPlan={resolveEffectivePlan(effectiveUser)}
           />
 
 

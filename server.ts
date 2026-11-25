@@ -2,7 +2,6 @@ import express from 'express';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
 
@@ -247,6 +246,101 @@ function persistConfirmedSubscriptionsToDisk() {
   } catch {
     // ignore disk persistence note
   }
+}
+
+interface KaelUsageDiskRecord {
+  used: number;
+  monthKey: string;
+  updatedAt: number;
+}
+
+const kaelUsageDiskStore = new Map<string, KaelUsageDiskRecord>();
+const KAEL_USAGE_FILE = path.join(process.cwd(), '.kael_usage.json');
+
+try {
+  if (fs.existsSync(KAEL_USAGE_FILE)) {
+    const raw = fs.readFileSync(KAEL_USAGE_FILE, 'utf-8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed)) {
+        const rec = v as KaelUsageDiskRecord;
+        if (rec && /^\d{4}-\d{2}$/.test(String(rec.monthKey || '')) && typeof rec.used === 'number') {
+          kaelUsageDiskStore.set(k, {
+            used: Math.max(0, Number(rec.used)),
+            monthKey: String(rec.monthKey),
+            updatedAt: Number(rec.updatedAt || Date.now()),
+          });
+        }
+      }
+    }
+  }
+} catch (e) {
+  console.debug('[Kael] Disk usage init note:', e);
+}
+
+function persistKaelUsageToDisk() {
+  try {
+    const obj: Record<string, KaelUsageDiskRecord> = {};
+    for (const [k, v] of kaelUsageDiskStore.entries()) {
+      if (v && /^\d{4}-\d{2}$/.test(v.monthKey)) {
+        obj[k] = v;
+      }
+    }
+    fs.writeFileSync(KAEL_USAGE_FILE, JSON.stringify(obj, null, 2), 'utf-8');
+  } catch {
+    // ignore disk persistence note
+  }
+}
+
+function getStoredKaelMonthlyCount(
+  userId?: string | null,
+  email?: string | null,
+  currentMonthKey?: string | null
+): number {
+  if (!currentMonthKey || !/^\d{4}-\d{2}$/.test(currentMonthKey)) return 0;
+  const cleanUid = userId && userId !== 'guest' ? `uid:${String(userId).trim()}` : '';
+  const cleanEmail = email ? `email:${String(email).toLowerCase().trim()}` : '';
+  let maxUsed = 0;
+  for (const key of [cleanUid, cleanEmail]) {
+    if (!key) continue;
+    const rec = kaelUsageDiskStore.get(key);
+    if (rec && rec.monthKey === currentMonthKey && typeof rec.used === 'number') {
+      maxUsed = Math.max(maxUsed, rec.used);
+    }
+  }
+  return maxUsed;
+}
+
+function recordStoredKaelMonthlyCount(
+  userId?: string | null,
+  email?: string | null,
+  monthKey?: string | null,
+  used?: number
+): number {
+  const cleanMonth = String(monthKey || '').trim();
+  if (!/^\d{4}-\d{2}$/.test(cleanMonth)) return Math.max(0, Number(used || 0));
+  const cleanUid = userId && userId !== 'guest' ? `uid:${String(userId).trim()}` : '';
+  const cleanEmail = email ? `email:${String(email).toLowerCase().trim()}` : '';
+  const existingForMonth = getStoredKaelMonthlyCount(userId, email, cleanMonth);
+  const finalUsed = Math.max(existingForMonth, Math.max(0, Number(used || 0)));
+  const entry: KaelUsageDiskRecord = {
+    used: finalUsed,
+    monthKey: cleanMonth,
+    updatedAt: Date.now(),
+  };
+  let changed = false;
+  for (const key of [cleanUid, cleanEmail]) {
+    if (!key) continue;
+    const prev = kaelUsageDiskStore.get(key);
+    if (!prev || prev.monthKey !== cleanMonth || prev.used !== finalUsed) {
+      kaelUsageDiskStore.set(key, entry);
+      changed = true;
+    }
+  }
+  if (changed) {
+    persistKaelUsageToDisk();
+  }
+  return finalUsed;
 }
 
 function recordPendingCheckoutEntry(entry: PendingCheckoutRecord) {
@@ -1211,6 +1305,10 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
       return isValidUUID(uid) ? String(uid).trim() : '';
     })();
 
+    const eventEmail =
+      obj?.customer_details?.email ||
+      (typeof obj?.customer_email === 'string' ? obj.customer_email : '');
+
     const resolveUid = async (): Promise<string> => {
       if (targetUserId) return targetUserId;
       const subId =
@@ -1237,12 +1335,11 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
           .limit(1);
         if (rows?.[0]?.id) return rows[0].id;
       }
-      const custEmail = obj?.customer_details?.email || (typeof obj?.customer_email === 'string' ? obj.customer_email : '');
-      if (custEmail && adminDb) {
+      if (eventEmail && adminDb) {
         const { data: rows } = await adminDb
           .from('profiles')
           .select('id')
-          .ilike('email', custEmail.trim())
+          .ilike('email', eventEmail.trim())
           .limit(1);
         if (rows?.[0]?.id) return rows[0].id;
       }
@@ -1294,12 +1391,13 @@ app.post('/api/stripe/webhook', async (req: any, res) => {
       const isEntitled = ['active', 'trialing', 'past_due', 'unpaid'].includes(subStatus);
       const isDeleted = eventType === 'customer.subscription.deleted' || subStatus === 'canceled';
 
+      clearStripeSyncCachesForUser(resolvedUid, eventEmail || null);
       if (isDeleted) {
-        clearCheckoutEntitlementsForUser(resolvedUid, custEmail || null);
+        clearCheckoutEntitlementsForUser(resolvedUid, eventEmail || null);
       } else if (isEntitled && mappedPlan) {
         recordConfirmedRedirectSubscription({
           userId: resolvedUid,
-          email: custEmail || null,
+          email: eventEmail || null,
           plan: mappedPlan,
           status: subStatus || 'active',
           verifiedBy: 'stripe_webhook',
@@ -1606,6 +1704,10 @@ async function handleCancelStripeSubscription(req: express.Request, res: express
       userId ? String(userId) : uid ? String(uid) : undefined,
       cleanEmail
     );
+    clearStripeSyncCachesForUser(
+      userId ? String(userId) : uid ? String(uid) : undefined,
+      cleanEmail
+    );
 
     return res.json({
       success: true,
@@ -1694,31 +1796,421 @@ app.get('/api/checkout/pending', (req, res) => {
   }
 });
 
-app.get('/api/stripe/entitlement', (req, res) => {
+const edgeStripeSyncCache = new Map<string, { plan: string; status: string; timestamp: number; checkedAt: number }>();
+
+async function syncStripeEntitlementViaSupabaseEdge(params: {
+  rawToken?: string | null;
+  userId?: string | null;
+  email?: string | null;
+  cancelledAtIso?: string | null;
+}): Promise<{ active: boolean; plan: string; status: string; timestamp: number } | null> {
+  const rawToken = params.rawToken ? String(params.rawToken).trim() : '';
+  const userId = params.userId ? String(params.userId).trim() : '';
+  const cleanEmail = params.email ? String(params.email).toLowerCase().trim() : '';
+  if (!rawToken || rawToken.split('.').length !== 3) {
+    return null;
+  }
+
+  const cacheKey = userId || cleanEmail || rawToken.slice(-24);
+  const cached = edgeStripeSyncCache.get(cacheKey);
+  if (cached && Date.now() - cached.checkedAt < 30_000) {
+    if (cached.plan !== 'free' && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(cached.status)) {
+      const cancelMs = params.cancelledAtIso ? Date.parse(String(params.cancelledAtIso)) : 0;
+      if (!cancelMs || cached.timestamp > cancelMs) {
+        return { active: true, plan: cached.plan, status: cached.status, timestamp: cached.timestamp };
+      }
+    }
+    return null;
+  }
+
   try {
-    const queryUid = req.query.userId ? String(req.query.userId).trim() : '';
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 3000);
+    const fnRes = await fetch(`${SUPABASE_URL}/functions/v1/create-checkout-session`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${rawToken}`,
+      },
+      body: JSON.stringify({ action: 'sync_subscription' }),
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    const data = await fnRes.json().catch(() => null);
+    const plan = normalizeServerPlan(data?.plan);
+    const status = String(data?.status || 'active').toLowerCase().trim();
+    if (fnRes.ok && data?.verified && plan !== 'free' && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(status)) {
+      const ts = Date.now();
+      edgeStripeSyncCache.set(cacheKey, { plan, status, timestamp: ts, checkedAt: ts });
+      recordConfirmedRedirectSubscription({
+        userId: userId || null,
+        email: cleanEmail || null,
+        plan,
+        status,
+        verifiedBy: 'stripe_edge_sync',
+      });
+      return { active: true, plan, status, timestamp: ts };
+    }
+
+    edgeStripeSyncCache.set(cacheKey, { plan: 'free', status: 'inactive', timestamp: Date.now(), checkedAt: Date.now() });
+  } catch (err) {
+    console.debug('[Stripe] Edge sync_subscription check note:', err);
+  }
+  return null;
+}
+
+const emailStripeSyncCache = new Map<string, { plan: string; status: string; timestamp: number; checkedAt: number }>();
+
+async function syncStripeEntitlementByEmail(
+  email?: string | null,
+  cancelledAtIso?: string | null
+): Promise<{ active: boolean; plan: string; status: string; timestamp: number } | null> {
+  const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+  if (!cleanEmail || !cleanEmail.includes('@')) return null;
+
+  const cfg = getServerStripeConfig();
+  if (!cfg.configured) return null;
+
+  const cancelMs = cancelledAtIso ? Date.parse(String(cancelledAtIso)) : 0;
+  const cached = emailStripeSyncCache.get(cleanEmail);
+  if (cached && Date.now() - cached.checkedAt < 30_000) {
+    if (cached.plan !== 'free' && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(cached.status)) {
+      if (!cancelMs || cached.timestamp > cancelMs) {
+        return { active: true, plan: cached.plan, status: cached.status, timestamp: cached.timestamp };
+      }
+    }
+    return null;
+  }
+
+  try {
+    const customersRes = await stripeApiRequest(
+      `customers?email=${encodeURIComponent(cleanEmail)}&limit=3`,
+      cfg.secretKey
+    );
+    const customers = Array.isArray(customersRes?.data) ? customersRes.data : [];
+    let bestPlan = 'free';
+    let bestStatus = 'inactive';
+    let bestCreatedMs = 0;
+
+    for (const cust of customers) {
+      if (!cust?.id) continue;
+      const subsRes = await stripeApiRequest(
+        `subscriptions?customer=${encodeURIComponent(cust.id)}&status=all&limit=5`,
+        cfg.secretKey
+      );
+      const subs = Array.isArray(subsRes?.data) ? subsRes.data : [];
+      for (const sub of subs) {
+        const subStatus = String(sub?.status || '').toLowerCase().trim();
+        if (!SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus)) continue;
+        const createdMs = Number(sub?.created || 0) * 1000;
+        if (cancelMs && createdMs && createdMs < cancelMs) continue;
+        const priceItem = sub?.items?.data?.[0]?.price;
+        const mappedPlan = mapStripePlan({
+          metadataPlan: sub?.metadata?.plan,
+          priceId: priceItem?.id || null,
+          unitAmountCents: priceItem?.unit_amount ?? null,
+        });
+        if (mappedPlan && (bestPlan === 'free' || hasRequiredServerPlan(mappedPlan, bestPlan))) {
+          bestPlan = mappedPlan;
+          bestStatus = subStatus;
+          bestCreatedMs = Math.max(bestCreatedMs, createdMs || Date.now());
+        }
+      }
+    }
+
+    if (bestPlan !== 'free' && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(bestStatus)) {
+      const ts = bestCreatedMs || Date.now();
+      emailStripeSyncCache.set(cleanEmail, {
+        plan: bestPlan,
+        status: bestStatus,
+        timestamp: ts,
+        checkedAt: Date.now(),
+      });
+      recordConfirmedRedirectSubscription({
+        email: cleanEmail,
+        plan: bestPlan,
+        status: bestStatus,
+        verifiedBy: 'stripe_email_sync',
+      });
+      return { active: true, plan: bestPlan, status: bestStatus, timestamp: ts };
+    }
+
+    emailStripeSyncCache.set(cleanEmail, {
+      plan: 'free',
+      status: 'inactive',
+      timestamp: Date.now(),
+      checkedAt: Date.now(),
+    });
+  } catch (err) {
+    console.debug('[Stripe] syncStripeEntitlementByEmail note:', err);
+  }
+  return null;
+}
+
+function clearStripeSyncCachesForUser(userId?: string | null, email?: string | null) {
+  const cleanUid = userId ? String(userId).trim() : '';
+  const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+  if (cleanUid) edgeStripeSyncCache.delete(cleanUid);
+  if (cleanEmail) {
+    edgeStripeSyncCache.delete(cleanEmail);
+    emailStripeSyncCache.delete(cleanEmail);
+  }
+}
+
+async function resolveAuthProfileEntitlement(params: {
+  email?: string | null;
+  userId?: string | null;
+  profileRow?: any | null;
+  accessToken?: string | null;
+}) {
+  const cleanEmail = params.email ? String(params.email).toLowerCase().trim() : '';
+  const cleanUid = params.userId ? String(params.userId).trim() : '';
+  let profileRow = params.profileRow || null;
+
+  const adminDb = getServiceRoleSupabase();
+  if (!profileRow && adminDb) {
+    try {
+      if (cleanUid && isValidUUID(cleanUid)) {
+        const { data } = await adminDb
+          .from('profiles')
+          .select('*')
+          .eq('id', cleanUid)
+          .maybeSingle();
+        if (data) profileRow = data;
+      }
+      if (!profileRow && cleanEmail) {
+        const { data } = await adminDb
+          .from('profiles')
+          .select('*')
+          .ilike('email', cleanEmail)
+          .maybeSingle();
+        if (data) profileRow = data;
+      }
+    } catch {
+      // ignore service role profile lookup error
+    }
+  }
+
+  let effectivePlan = resolveEffectivePlanFromServerRecords({
+    profileRow,
+    userId: profileRow?.id || cleanUid || null,
+    email: cleanEmail || null,
+  });
+
+  const redirectRec = getConfirmedRedirectRecord(
+    profileRow?.id || cleanUid || null,
+    cleanEmail || null,
+    profileRow?.subscription_cancelled_at || null
+  );
+
+  let effectiveStatus =
+    effectivePlan !== 'free'
+      ? (SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(String(profileRow?.subscription_status || '').toLowerCase().trim()) &&
+          normalizeServerPlan(profileRow?.subscription_plan) === effectivePlan
+          ? String(profileRow.subscription_status).toLowerCase().trim()
+          : redirectRec?.status || 'active')
+      : String(profileRow?.subscription_status || 'inactive').toLowerCase().trim() || 'inactive';
+
+  if (effectivePlan !== 'elite' && params.accessToken) {
+    const syncedEdge = await syncStripeEntitlementViaSupabaseEdge({
+      rawToken: params.accessToken,
+      userId: profileRow?.id || cleanUid || null,
+      email: cleanEmail || null,
+      cancelledAtIso: profileRow?.subscription_cancelled_at || null,
+    });
+    if (
+      syncedEdge?.active &&
+      syncedEdge.plan !== 'free' &&
+      hasRequiredServerPlan(syncedEdge.plan, effectivePlan) &&
+      syncedEdge.plan !== effectivePlan
+    ) {
+      effectivePlan = syncedEdge.plan;
+      effectiveStatus = syncedEdge.status || 'active';
+    }
+  }
+
+  if (effectivePlan !== 'elite' && cleanEmail) {
+    const syncedStripe = await syncStripeEntitlementByEmail(
+      cleanEmail,
+      profileRow?.subscription_cancelled_at || null
+    );
+    if (
+      syncedStripe?.active &&
+      syncedStripe.plan !== 'free' &&
+      hasRequiredServerPlan(syncedStripe.plan, effectivePlan) &&
+      syncedStripe.plan !== effectivePlan
+    ) {
+      effectivePlan = syncedStripe.plan;
+      effectiveStatus = syncedStripe.status || 'active';
+    }
+  }
+
+  return {
+    subscription_plan: effectivePlan,
+    subscription_status: effectiveStatus,
+    subscription_tier: effectivePlan,
+    profileRow,
+  };
+}
+
+app.get('/api/stripe/entitlement', async (req, res) => {
+  try {
     const queryEmail = req.query.email ? String(req.query.email).toLowerCase().trim() : '';
     const queryCancelledAt = req.query.cancelledAt ? String(req.query.cancelledAt).trim() : null;
     const srvProof = verifyServerSessionFromRequest(req, queryEmail || undefined);
-    const effectiveUid = srvProof?.userId || queryUid || '';
-    const effectiveEmail = srvProof?.email || queryEmail || '';
+
+    const authHeader = req.headers.authorization;
+    const rawToken =
+      authHeader && authHeader.startsWith('Bearer ')
+        ? authHeader.replace(/^Bearer\s+/i, '').trim()
+        : '';
+    const hasJwt =
+      Boolean(rawToken) &&
+      !rawToken.startsWith('vault_tok_') &&
+      !rawToken.startsWith('washek_sess_') &&
+      rawToken.split('.').length === 3;
+
+    let verifiedJwtUid = '';
+    let verifiedJwtEmail = '';
+    let userClient: any = null;
+    let isValidLiveJwt = false;
+
+    if (hasJwt) {
+      try {
+        userClient = createStatelessSupabase(rawToken);
+        const { data: authData } = await userClient.auth.getUser(rawToken);
+        if (authData?.user?.id) {
+          verifiedJwtUid = authData.user.id;
+          verifiedJwtEmail = authData.user.email ? String(authData.user.email).toLowerCase().trim() : '';
+          isValidLiveJwt = true;
+        }
+      } catch {
+        // ignore and try expired JWT JWKS signature
+      }
+      if (!verifiedJwtUid) {
+        const expId = await verifyExpiredSupabaseJwt(rawToken);
+        if (expId?.userId) {
+          verifiedJwtUid = expId.userId;
+          verifiedJwtEmail = expId.email || '';
+        }
+      }
+    }
+
+    const effectiveUid = verifiedJwtUid || srvProof?.userId || '';
+    const effectiveEmail = verifiedJwtEmail || srvProof?.email || '';
 
     if (!effectiveUid && !effectiveEmail) {
       return res.json({ active: false, plan: 'free', status: 'inactive' });
     }
 
-    const rec = getConfirmedRedirectRecord(effectiveUid, effectiveEmail, queryCancelledAt);
-    if (!rec) {
-      return res.json({ active: false, plan: 'free', status: 'inactive' });
+    const adminDb = getServiceRoleSupabase();
+    const lookupDb = adminDb || userClient;
+    let profRow: any = null;
+    if (lookupDb) {
+      try {
+        if (effectiveUid && isValidUUID(effectiveUid)) {
+          const { data } = await lookupDb
+            .from('profiles')
+            .select('id, email, subscription_plan, subscription_status, subscription_cancelled_at')
+            .eq('id', effectiveUid)
+            .maybeSingle();
+          profRow = data;
+        }
+        if (!profRow && effectiveEmail && adminDb) {
+          const { data } = await adminDb
+            .from('profiles')
+            .select('id, email, subscription_plan, subscription_status, subscription_cancelled_at')
+            .ilike('email', effectiveEmail)
+            .maybeSingle();
+          profRow = data;
+        }
+      } catch {
+        // ignore profile lookup error
+      }
     }
 
-    return res.json({
-      active: true,
-      plan: rec.plan,
-      status: rec.status,
-      timestamp: rec.timestamp,
-      verifiedBy: rec.verifiedBy || 'stripe_redirect',
+    const cancelledAt = profRow?.subscription_cancelled_at || queryCancelledAt || null;
+    let bestPlan = resolveEffectivePlanFromServerRecords({
+      profileRow: profRow,
+      userId: profRow?.id || effectiveUid || null,
+      email: effectiveEmail || null,
     });
+    const rec = getConfirmedRedirectRecord(profRow?.id || effectiveUid, effectiveEmail, cancelledAt);
+    const dbStatus = String(profRow?.subscription_status || '').toLowerCase().trim();
+    let bestStatus =
+      bestPlan !== 'free'
+        ? (SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(dbStatus) &&
+            normalizeServerPlan(profRow?.subscription_plan) === bestPlan
+            ? dbStatus
+            : rec?.status || 'active')
+        : 'inactive';
+    let bestTimestamp = rec?.timestamp || Date.now();
+    let bestVerifiedBy = rec?.verifiedBy || (bestPlan !== 'free' ? 'postgres_profile' : 'none');
+
+    if (bestPlan !== 'elite' && isValidLiveJwt) {
+      const synced = await syncStripeEntitlementViaSupabaseEdge({
+        rawToken,
+        userId: profRow?.id || effectiveUid,
+        email: effectiveEmail,
+        cancelledAtIso: cancelledAt,
+      });
+      if (
+        synced?.active &&
+        synced.plan !== 'free' &&
+        hasRequiredServerPlan(synced.plan, bestPlan) &&
+        synced.plan !== bestPlan
+      ) {
+        bestPlan = synced.plan;
+        bestStatus = synced.status || 'active';
+        bestTimestamp = synced.timestamp;
+        bestVerifiedBy = 'stripe_edge_sync';
+      }
+    }
+
+    if (bestPlan !== 'elite' && effectiveEmail) {
+      const emailSynced = await syncStripeEntitlementByEmail(effectiveEmail, cancelledAt);
+      if (
+        emailSynced?.active &&
+        emailSynced.plan !== 'free' &&
+        hasRequiredServerPlan(emailSynced.plan, bestPlan) &&
+        emailSynced.plan !== bestPlan
+      ) {
+        bestPlan = emailSynced.plan;
+        bestStatus = emailSynced.status || 'active';
+        bestTimestamp = emailSynced.timestamp;
+        bestVerifiedBy = 'stripe_email_sync';
+        const targetUid = profRow?.id || (isValidUUID(effectiveUid) ? effectiveUid : '');
+        if (adminDb && targetUid) {
+          updateProfileSubscriptionSafely(adminDb, targetUid, {
+            subscription_plan: bestPlan,
+            subscription_status: bestStatus,
+            subscription_cancelled_at: null,
+            subscription_updated_at: new Date().toISOString(),
+          }).catch(() => {});
+        }
+      }
+    }
+
+    if (bestPlan !== 'free' && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(bestStatus)) {
+      recordConfirmedRedirectSubscription({
+        userId: profRow?.id || effectiveUid || null,
+        email: effectiveEmail || null,
+        plan: bestPlan,
+        status: bestStatus,
+        verifiedBy: bestVerifiedBy,
+      });
+      return res.json({
+        active: true,
+        plan: bestPlan,
+        status: bestStatus,
+        timestamp: bestTimestamp,
+        verifiedBy: bestVerifiedBy,
+      });
+    }
+
+    return res.json({ active: false, plan: 'free', status: 'inactive' });
   } catch (err: any) {
     return res.status(500).json({ active: false, plan: 'free', error: err?.message });
   }
@@ -1726,57 +2218,198 @@ app.get('/api/stripe/entitlement', (req, res) => {
 
 app.post('/api/stripe/confirm-redirect', async (req, res) => {
   try {
-    const { plan, status = 'trialing', userId, email, sessionId, verifiedBy = 'stripe_redirect' } = req.body || {};
-    const cleanPlan = String(plan || '').toLowerCase().trim();
-    const cleanStatus = String(status || 'trialing').toLowerCase().trim();
+    const { userId, email, sessionId } = req.body || {};
     const cleanUid = userId ? String(userId).trim() : '';
     const cleanEmail = email ? String(email).toLowerCase().trim() : '';
+    const cleanSessionId = sessionId ? String(sessionId).trim() : '';
 
-    if (!['progress', 'performance', 'elite'].includes(cleanPlan)) {
-      return res.status(400).json({ success: false, error: 'Valid paid plan is required.' });
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const isJwt =
+      Boolean(rawToken) &&
+      !rawToken.startsWith('vault_tok_') &&
+      !rawToken.startsWith('washek_sess_') &&
+      rawToken.split('.').length === 3;
+
+    let callerUid = '';
+    let callerEmail = '';
+    let liveJwt = false;
+    if (isJwt) {
+      try {
+        const { data: uData } = await createStatelessSupabase(rawToken).auth.getUser(rawToken);
+        if (uData?.user?.id) {
+          callerUid = uData.user.id;
+          callerEmail = uData.user.email ? String(uData.user.email).toLowerCase().trim() : '';
+          liveJwt = true;
+        }
+      } catch {
+        // ignore
+      }
+      if (!callerUid) {
+        const exp = await verifyExpiredSupabaseJwt(rawToken);
+        if (exp?.userId) {
+          callerUid = exp.userId;
+          callerEmail = exp.email || '';
+        }
+      }
     }
 
-    const effectiveStatus = ['active', 'trialing', 'past_due'].includes(cleanStatus)
-      ? cleanStatus
-      : 'trialing';
+    const srvProof = verifyServerSessionFromRequest(req, cleanEmail || callerEmail || undefined);
+    const verifiedUid = callerUid || (srvProof?.userId && isValidUUID(srvProof.userId) ? srvProof.userId : '') || cleanUid;
+    const verifiedEmail = callerEmail || srvProof?.email || cleanEmail;
 
-    const entry: ConfirmedRedirectRecord = {
-      plan: cleanPlan,
-      status: effectiveStatus,
-      verifiedBy: String(verifiedBy || 'stripe_redirect'),
-      timestamp: Date.now(),
-    };
+    if (!callerUid && !srvProof && !cleanSessionId) {
+      return res.status(401).json({ success: false, verified: false, error: 'Authentication required.' });
+    }
 
-    if (cleanUid) confirmedRedirectSubscriptions.set(cleanUid, entry);
-    if (cleanEmail) confirmedRedirectSubscriptions.set(cleanEmail, entry);
-    persistConfirmedSubscriptionsToDisk();
-
-    clearPendingCheckoutForUser(cleanUid || null, cleanEmail || null);
-
-    // If Node has service role + Stripe session wasn't already persisted, write to profiles cleanly
-    let dbSynced = false;
+    const cfg = getServerStripeConfig();
     const adminDb = getServiceRoleSupabase();
-    if (adminDb && cleanUid && isValidUUID(cleanUid)) {
+    let confirmedPlan: PaidPlanKey | null = null;
+    let confirmedStatus = 'active';
+    let resolvedSubId: string | null = null;
+    let resolvedCustomerId: string | null = null;
+    let resolvedPriceId: string | null = null;
+    let targetUid = verifiedUid;
+    let targetEmail = verifiedEmail;
+
+    // 1. Verify Stripe Checkout Session directly if sessionId is supplied and Stripe key exists
+    if (cleanSessionId && cfg.configured) {
+      const sessionObj = await stripeApiRequest(
+        `checkout/sessions/${encodeURIComponent(cleanSessionId)}?expand[]=subscription`,
+        cfg.secretKey
+      );
+      const sessionUid =
+        (typeof sessionObj?.client_reference_id === 'string' && isValidUUID(sessionObj.client_reference_id)
+          ? sessionObj.client_reference_id.trim()
+          : '') ||
+        (isValidUUID(sessionObj?.metadata?.user_id) ? String(sessionObj.metadata.user_id).trim() : '');
+      const sessionEmail = String(
+        sessionObj?.customer_details?.email || sessionObj?.customer_email || ''
+      ).toLowerCase().trim();
+
+      if (verifiedUid && sessionUid && verifiedUid !== sessionUid) {
+        return res.status(403).json({ success: false, verified: false, error: 'Session does not belong to user.' });
+      }
+      if (!sessionUid && verifiedEmail && sessionEmail && verifiedEmail !== sessionEmail) {
+        return res.status(403).json({ success: false, verified: false, error: 'Session email mismatch.' });
+      }
+
+      const paymentStatus = String(sessionObj?.payment_status || '').toLowerCase().trim();
+      const paymentConfirmed = paymentStatus === 'paid' || paymentStatus === 'no_payment_required';
+      const subObj = typeof sessionObj?.subscription === 'object' ? sessionObj.subscription : null;
+      resolvedSubId = typeof sessionObj?.subscription === 'string' ? sessionObj.subscription : subObj?.id || null;
+      resolvedCustomerId =
+        typeof sessionObj?.customer === 'string' ? sessionObj.customer : sessionObj?.customer?.id || null;
+      resolvedPriceId = subObj?.items?.data?.[0]?.price?.id || null;
+      const subStatus = String(subObj?.status || (paymentConfirmed ? 'active' : 'incomplete')).toLowerCase().trim();
+      const mapped = mapStripePlan({
+        metadataPlan: subObj?.metadata?.plan || sessionObj?.metadata?.plan,
+        priceId: resolvedPriceId,
+        unitAmountCents: subObj?.items?.data?.[0]?.price?.unit_amount ?? null,
+      });
+
+      if (paymentConfirmed && mapped && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(subStatus)) {
+        confirmedPlan = mapped;
+        confirmedStatus = subStatus;
+        targetUid = verifiedUid || sessionUid;
+        targetEmail = verifiedEmail || sessionEmail;
+      }
+    }
+
+    // 2. Otherwise verify via Edge Function / Stripe email lookup / Postgres profile
+    if (!confirmedPlan && liveJwt) {
+      const synced = await syncStripeEntitlementViaSupabaseEdge({
+        rawToken,
+        userId: targetUid,
+        email: targetEmail,
+      });
+      if (synced?.active && synced.plan !== 'free') {
+        confirmedPlan = synced.plan as PaidPlanKey;
+        confirmedStatus = synced.status || 'active';
+      }
+    }
+
+    if (!confirmedPlan && targetEmail) {
+      const emailSynced = await syncStripeEntitlementByEmail(targetEmail);
+      if (emailSynced?.active && emailSynced.plan !== 'free') {
+        confirmedPlan = emailSynced.plan as PaidPlanKey;
+        confirmedStatus = emailSynced.status || 'active';
+      }
+    }
+
+    if (!confirmedPlan && adminDb) {
+      let profRow: any = null;
+      if (targetUid && isValidUUID(targetUid)) {
+        const { data } = await adminDb
+          .from('profiles')
+          .select('id, subscription_plan, subscription_status')
+          .eq('id', targetUid)
+          .maybeSingle();
+        profRow = data;
+      } else if (targetEmail) {
+        const { data } = await adminDb
+          .from('profiles')
+          .select('id, subscription_plan, subscription_status')
+          .ilike('email', targetEmail)
+          .maybeSingle();
+        profRow = data;
+      }
+      const dbPlan = normalizeServerPlan(profRow?.subscription_plan);
+      const dbStatus = String(profRow?.subscription_status || '').toLowerCase().trim();
+      if (dbPlan !== 'free' && SERVER_ACTIVE_SUBSCRIPTION_STATUSES.has(dbStatus)) {
+        confirmedPlan = dbPlan as PaidPlanKey;
+        confirmedStatus = dbStatus;
+        if (!targetUid && profRow?.id) targetUid = profRow.id;
+      }
+    }
+
+    if (!confirmedPlan) {
+      return res.status(202).json({
+        success: false,
+        verified: false,
+        error: 'Awaiting Stripe payment verification.',
+      });
+    }
+
+    clearStripeSyncCachesForUser(targetUid || null, targetEmail || null);
+    recordConfirmedRedirectSubscription({
+      userId: targetUid || null,
+      email: targetEmail || null,
+      plan: confirmedPlan,
+      status: confirmedStatus,
+      verifiedBy: cleanSessionId ? 'stripe_session' : 'stripe_sync',
+    });
+
+    clearPendingCheckoutForUser(targetUid || null, targetEmail || null);
+
+    let dbSynced = false;
+    if (adminDb && targetUid && isValidUUID(targetUid)) {
       await updateProfileSubscriptionSafely(
         adminDb,
-        cleanUid,
+        targetUid,
         {
-          subscription_plan: cleanPlan,
-          subscription_status: effectiveStatus,
+          subscription_plan: confirmedPlan,
+          subscription_status: confirmedStatus,
           has_used_trial: true,
           trial_used: true,
           subscription_cancelled_at: null,
           subscription_updated_at: new Date().toISOString(),
         },
-        sessionId ? { stripe_checkout_session_id: String(sessionId) } : {}
+        {
+          ...(cleanSessionId ? { stripe_checkout_session_id: cleanSessionId } : {}),
+          ...(resolvedSubId ? { stripe_subscription_id: resolvedSubId } : {}),
+          ...(resolvedCustomerId ? { stripe_customer_id: resolvedCustomerId } : {}),
+          ...(resolvedPriceId ? { stripe_price_id: resolvedPriceId } : {}),
+        }
       );
       dbSynced = true;
     }
 
     return res.json({
       success: true,
-      plan: cleanPlan,
-      status: effectiveStatus,
+      verified: true,
+      plan: confirmedPlan,
+      status: confirmedStatus,
       dbSynced,
     });
   } catch (err: any) {
@@ -1788,12 +2421,57 @@ app.post('/api/stripe/confirm-redirect', async (req, res) => {
 app.post('/api/user/delete-account', async (req, res) => {
   try {
     const { userId, email } = req.body || {};
-    console.log('[API] Processing delete-account for:', { userId, email });
-
     const cleanEmail = email ? String(email).trim().toLowerCase() : '';
     const cleanId = userId ? String(userId).trim() : '';
 
-    if (!cleanId && !cleanEmail) {
+    const authHeader = req.headers.authorization ? String(req.headers.authorization) : '';
+    const rawToken = authHeader.startsWith('Bearer ') ? authHeader.replace(/^Bearer\s+/i, '').trim() : '';
+    const isJwt =
+      Boolean(rawToken) &&
+      !rawToken.startsWith('vault_tok_') &&
+      !rawToken.startsWith('washek_sess_') &&
+      rawToken.split('.').length === 3;
+
+    let callerUid = '';
+    let callerEmail = '';
+    if (isJwt) {
+      try {
+        const { data: uData } = await createStatelessSupabase(rawToken).auth.getUser(rawToken);
+        if (uData?.user?.id) {
+          callerUid = uData.user.id;
+          callerEmail = uData.user.email ? String(uData.user.email).toLowerCase().trim() : '';
+        }
+      } catch {
+        // ignore
+      }
+      if (!callerUid) {
+        const exp = await verifyExpiredSupabaseJwt(rawToken);
+        if (exp?.userId) {
+          callerUid = exp.userId;
+          callerEmail = exp.email || '';
+        }
+      }
+    }
+
+    const srvProof = verifyServerSessionFromRequest(req, cleanEmail || callerEmail || undefined);
+    const verifiedCallerUid = callerUid || srvProof?.userId || '';
+    const verifiedCallerEmail = callerEmail || srvProof?.email || '';
+
+    if (!verifiedCallerUid && !verifiedCallerEmail) {
+      return res.status(401).json({ success: false, error: 'Authentication required to delete account.' });
+    }
+
+    if (cleanId && verifiedCallerUid && cleanId !== verifiedCallerUid && (!cleanEmail || cleanEmail !== verifiedCallerEmail)) {
+      return res.status(403).json({ success: false, error: 'You are not authorized to delete another user account.' });
+    }
+    if (cleanEmail && verifiedCallerEmail && cleanEmail !== verifiedCallerEmail) {
+      return res.status(403).json({ success: false, error: 'Account email does not match signed-in session.' });
+    }
+
+    const targetId = verifiedCallerUid || cleanId;
+    const targetEmail = verifiedCallerEmail || cleanEmail;
+
+    if (!targetId && !targetEmail) {
       return res.status(400).json({ success: false, error: 'User identifier required' });
     }
 
@@ -1802,11 +2480,11 @@ app.post('/api/user/delete-account', async (req, res) => {
     // 1. Check for active Stripe subscription on user profile
     let stripeSubscriptionId: string | null = null;
     try {
-      if (cleanId && isValidUUID(cleanId)) {
+      if (targetId && isValidUUID(targetId)) {
         const { data: profile } = await adminDb
           .from('profiles')
           .select('id, stripe_subscription_id, subscription_plan, subscription_status')
-          .eq('id', cleanId)
+          .eq('id', targetId)
           .maybeSingle();
         if (profile?.stripe_subscription_id) {
           stripeSubscriptionId = String(profile.stripe_subscription_id);
@@ -1840,10 +2518,10 @@ app.post('/api/user/delete-account', async (req, res) => {
     }
 
     // 3. Mark subscription canceled in profile before table deletion
-    if (cleanId && isValidUUID(cleanId)) {
+    if (targetId && isValidUUID(targetId)) {
       await updateProfileSubscriptionSafely(
         adminDb,
-        cleanId,
+        targetId,
         {
           subscription_plan: 'free',
           subscription_status: 'canceled',
@@ -1872,12 +2550,12 @@ app.post('/api/user/delete-account', async (req, res) => {
 
     for (const table of userTables) {
       try {
-        if (cleanId) {
-          await adminDb.from(table).delete().eq('user_id', cleanId);
-          await adminDb.from(table).delete().eq('id', cleanId);
+        if (targetId) {
+          await adminDb.from(table).delete().eq('user_id', targetId);
+          await adminDb.from(table).delete().eq('id', targetId);
         }
-        if (cleanEmail && table !== 'profiles') {
-          await adminDb.from(table).delete().eq('email', cleanEmail);
+        if (targetEmail && table !== 'profiles') {
+          await adminDb.from(table).delete().eq('email', targetEmail);
         }
       } catch (tableErr) {
         console.debug(`[API] Table ${table} delete note:`, tableErr);
@@ -1885,9 +2563,10 @@ app.post('/api/user/delete-account', async (req, res) => {
     }
 
     // Clear any pending checkout and purge credentials from vault
-    clearCheckoutEntitlementsForUser(cleanId, cleanEmail);
-    if (cleanEmail) {
-      deleteAthleteCredential(cleanEmail);
+    clearCheckoutEntitlementsForUser(targetId, targetEmail);
+    clearStripeSyncCachesForUser(targetId, targetEmail);
+    if (targetEmail) {
+      deleteAthleteCredential(targetEmail);
     }
 
     res.json({
@@ -2339,13 +3018,27 @@ app.post('/api/auth/signin', async (req, res) => {
         }
       }
 
+      const authEnt = await resolveAuthProfileEntitlement({
+        email: cleanEmail,
+        userId: data.user.id,
+        profileRow: profile,
+        accessToken: data.session?.access_token || null,
+      });
+      const resolvedProfile = {
+        ...(profile || { id: data.user.id, email: cleanEmail }),
+        subscription_plan: authEnt.subscription_plan,
+        subscription_status: authEnt.subscription_status,
+        subscription_tier: authEnt.subscription_tier,
+        ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
+      };
+
       const srvToken = createServerSessionToken(cleanEmail, data.user.id);
       setServerSessionCookie(res, srvToken, req);
       return res.json({
         success: true,
         user: data.user,
         session: data.session,
-        profile,
+        profile: resolvedProfile,
         serverSessionToken: srvToken,
       });
     }
@@ -2368,6 +3061,10 @@ app.post('/api/auth/signin', async (req, res) => {
             role: 'athlete',
           },
         };
+        const authEnt = await resolveAuthProfileEntitlement({
+          email: cleanEmail,
+          userId: athleteUser.id,
+        });
         const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
         const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
         setServerSessionCookie(res, srvToken, req);
@@ -2382,14 +3079,16 @@ app.post('/api/auth/signin', async (req, res) => {
             user: athleteUser,
           },
           profile: {
+            ...(authEnt.profileRow || {}),
             id: athleteUser.id,
             email: cleanEmail,
-            full_name: athleteUser.user_metadata.full_name,
-            role: 'athlete',
-            subscription_plan: 'free',
-            subscription_status: 'inactive',
-            subscription_tier: 'free',
-            onboarded: true,
+            full_name: authEnt.profileRow?.full_name || athleteUser.user_metadata.full_name,
+            role: authEnt.profileRow?.role || 'athlete',
+            subscription_plan: authEnt.subscription_plan,
+            subscription_status: authEnt.subscription_status,
+            subscription_tier: authEnt.subscription_tier,
+            ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
+            onboarded: authEnt.profileRow?.onboarded ?? true,
           },
           serverSessionToken: srvToken,
         });
@@ -2468,7 +3167,7 @@ app.post('/api/auth/signup', async (req, res) => {
 
     // Always unmark deleted status on fresh signup
     if (deletedAccounts.has(cleanEmail)) {
-      unmarkDeletedAccount(cleanEmail);
+      deletedAccounts.delete(cleanEmail);
     }
 
     // Always securely save credentials into vault so athlete can log in
@@ -2505,6 +3204,11 @@ app.post('/api/auth/signup', async (req, res) => {
 
         if (!signErr && signData?.user) {
           console.log('[API Auth] User exists in Supabase, successfully signed in via signup credentials:', cleanEmail);
+          const authEnt = await resolveAuthProfileEntitlement({
+            email: cleanEmail,
+            userId: signData.user.id,
+            accessToken: signData.session?.access_token || null,
+          });
           const srvToken = createServerSessionToken(cleanEmail, signData.user.id);
           setServerSessionCookie(res, srvToken, req);
           return res.json({
@@ -2512,14 +3216,17 @@ app.post('/api/auth/signup', async (req, res) => {
             user: signData.user,
             session: signData.session,
             profile: {
+              ...(authEnt.profileRow || {}),
               id: signData.user.id,
               email: cleanEmail,
-              first_name: firstName,
-              last_name: lastName,
-              full_name: fullName,
-              role: 'athlete',
-              subscription_plan: 'free',
-              subscription_status: 'inactive',
+              first_name: authEnt.profileRow?.first_name || firstName,
+              last_name: authEnt.profileRow?.last_name || lastName,
+              full_name: authEnt.profileRow?.full_name || fullName,
+              role: authEnt.profileRow?.role || 'athlete',
+              subscription_plan: authEnt.subscription_plan,
+              subscription_status: authEnt.subscription_status,
+              subscription_tier: authEnt.subscription_tier,
+              ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
             },
             serverSessionToken: srvToken,
           });
@@ -2540,6 +3247,10 @@ app.post('/api/auth/signup', async (req, res) => {
             role: 'athlete',
           },
         };
+        const authEnt = await resolveAuthProfileEntitlement({
+          email: cleanEmail,
+          userId: athleteUser.id,
+        });
         const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
         const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
         setServerSessionCookie(res, srvToken, req);
@@ -2554,15 +3265,17 @@ app.post('/api/auth/signup', async (req, res) => {
             user: athleteUser,
           },
           profile: {
+            ...(authEnt.profileRow || {}),
             id: athleteUser.id,
             email: cleanEmail,
-            first_name: firstName,
-            last_name: lastName,
-            full_name: fullName,
-            role: 'athlete',
-            subscription_plan: 'free',
-            subscription_status: 'inactive',
-            subscription_tier: 'free',
+            first_name: authEnt.profileRow?.first_name || firstName,
+            last_name: authEnt.profileRow?.last_name || lastName,
+            full_name: authEnt.profileRow?.full_name || fullName,
+            role: authEnt.profileRow?.role || 'athlete',
+            subscription_plan: authEnt.subscription_plan,
+            subscription_status: authEnt.subscription_status,
+            subscription_tier: authEnt.subscription_tier,
+            ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
           },
           serverSessionToken: srvToken,
         });
@@ -2687,90 +3400,6 @@ app.post('/api/auth/reset-password', async (req, res) => {
       success: false,
       code: 'auth/server-error',
       error: err?.message || 'Password reset service error.',
-    });
-  }
-});
-
-// Direct Instant Password Reset (Allows athlete to set/update their password directly)
-app.post('/api/auth/instant-reset', async (req, res) => {
-  try {
-    const { email, newPassword } = req.body || {};
-    const cleanEmail = email ? String(email).trim().toLowerCase() : '';
-    const cleanNewPass = newPassword ? String(newPassword) : '';
-
-    if (!cleanEmail) {
-      return res.status(400).json({
-        success: false,
-        code: 'auth/missing-email',
-        error: 'Athlete email is required.',
-      });
-    }
-
-    if (!cleanNewPass || cleanNewPass.length < 6) {
-      return res.status(400).json({
-        success: false,
-        code: 'auth/weak-password',
-        error: 'New password must be at least 6 characters long.',
-      });
-    }
-
-    // Verify that athlete account actually exists
-    let userExists = athleteCredentials.has(cleanEmail) || cleanEmail === 'washekfitness@gmail.com';
-
-    if (!userExists) {
-      return res.status(404).json({
-        success: false,
-        code: 'auth/user-not-found',
-        error: `No athlete account found for ${cleanEmail}. Please create an account first before resetting your password.`,
-      });
-    }
-
-    // Save into server-side credential vault
-    saveAthleteCredential(cleanEmail, cleanNewPass);
-    console.log('[API Auth] Instant password reset successfully stored for', cleanEmail);
-
-    const athleteUser = {
-      id: `usr_${Buffer.from(cleanEmail).toString('hex').substring(0, 16)}`,
-      email: cleanEmail,
-      aud: 'authenticated',
-      role: 'authenticated',
-      user_metadata: {
-        full_name: cleanEmail === 'washekfitness@gmail.com' ? 'Washek Coach' : cleanEmail.split('@')[0],
-        role: 'athlete',
-      },
-    };
-
-    const token = `vault_tok_${Date.now()}_${Buffer.from(cleanEmail).toString('base64')}`;
-    const session = {
-      access_token: token,
-      token_type: 'bearer',
-      expires_in: 604800,
-      user: athleteUser,
-    };
-
-    const srvToken = createServerSessionToken(cleanEmail, athleteUser.id);
-    setServerSessionCookie(res, srvToken, req);
-    return res.json({
-      success: true,
-      isVaultSession: true,
-      message: 'Password successfully updated! You are now signed in.',
-      user: athleteUser,
-      session,
-      profile: {
-        id: athleteUser.id,
-        email: cleanEmail,
-        full_name: athleteUser.user_metadata.full_name,
-        role: 'athlete',
-        subscription_plan: 'free',
-      },
-      serverSessionToken: srvToken,
-    });
-  } catch (err: any) {
-    console.error('[API Auth] instant-reset error:', err);
-    return res.status(500).json({
-      success: false,
-      code: 'auth/server-error',
-      error: err?.message || 'Password update failed.',
     });
   }
 });
@@ -2954,10 +3583,14 @@ app.post('/api/auth/change-password', async (req, res) => {
       }
 
       saveAthleteCredential(cleanEmail, cleanNewPass);
+      const srvUid = verifiedSupabaseSession?.user?.id || `usr_${Buffer.from(cleanEmail).toString('hex').substring(0, 16)}`;
+      const srvToken = createServerSessionToken(cleanEmail, srvUid);
+      setServerSessionCookie(res, srvToken, req);
       return res.json({
         success: true,
         message: 'Password changed successfully.',
         ...(verifiedSupabaseSession ? { session: verifiedSupabaseSession } : {}),
+        serverSessionToken: srvToken,
       });
     }
 
@@ -3101,11 +3734,25 @@ app.post('/api/auth/refresh-supabase-session', async (req, res) => {
         }
       }
 
+      const authEnt = await resolveAuthProfileEntitlement({
+        email: resolvedEmail,
+        userId: recovery.session.user?.id || null,
+        profileRow: profile,
+        accessToken: recovery.session.access_token,
+      });
+      const resolvedProfile = {
+        ...(profile || { id: recovery.session.user?.id, email: resolvedEmail }),
+        subscription_plan: authEnt.subscription_plan,
+        subscription_status: authEnt.subscription_status,
+        subscription_tier: authEnt.subscription_tier,
+        ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
+      };
+
       return res.json({
         success: true,
         session: recovery.session,
         user: recovery.session.user,
-        profile,
+        profile: resolvedProfile,
         serverSessionToken: newSrvToken,
       });
     }
@@ -3175,11 +3822,25 @@ app.post('/api/auth/sync-supabase-session', async (req, res) => {
       // ignore
     }
 
+    const authEnt = await resolveAuthProfileEntitlement({
+      email: cleanEmail,
+      userId: data.user.id,
+      profileRow: profile,
+      accessToken: data.session.access_token,
+    });
+    const resolvedProfile = {
+      ...(profile || { id: data.user.id, email: cleanEmail }),
+      subscription_plan: authEnt.subscription_plan,
+      subscription_status: authEnt.subscription_status,
+      subscription_tier: authEnt.subscription_tier,
+      ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
+    };
+
     return res.json({
       success: true,
       session: data.session,
       user: data.user,
-      profile,
+      profile: resolvedProfile,
       serverSessionToken: srvToken,
     });
   } catch (err: any) {
@@ -3227,11 +3888,25 @@ app.post('/api/auth/sync-vault-after-otp', async (req, res) => {
       // ignore
     }
 
+    const authEnt = await resolveAuthProfileEntitlement({
+      email: cleanEmail,
+      userId: data.user.id,
+      profileRow: profile,
+      accessToken: token,
+    });
+    const resolvedProfile = {
+      ...(profile || { id: data.user.id, email: cleanEmail }),
+      subscription_plan: authEnt.subscription_plan,
+      subscription_status: authEnt.subscription_status,
+      subscription_tier: authEnt.subscription_tier,
+      ...(authEnt.subscription_plan !== 'free' ? { subscription_cancelled_at: null } : {}),
+    };
+
     return res.json({
       success: true,
       email: cleanEmail,
       userId: data.user.id,
-      profile,
+      profile: resolvedProfile,
       serverSessionToken: srvToken,
     });
   } catch (err: any) {
@@ -3373,23 +4048,80 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
       const { data: userData, error: userError } = await supabaseUser.auth.getUser(rawToken);
       if (!userError && userData?.user?.id) {
         const userId = userData.user.id;
-        const email = userData.user.email ? String(userData.user.email).toLowerCase().trim() : null;
+        const jwtEmail = userData.user.email ? String(userData.user.email).toLowerCase().trim() : null;
         const profileLookupDb = getServiceRoleSupabase() || supabaseUser;
-        const { data: profileRow } = await profileLookupDb
+        let { data: profileRow } = await profileLookupDb
           .from('profiles')
-          .select('id, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+          .select('id, email, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
           .eq('id', userId)
           .maybeSingle();
 
-        const effectivePlan = resolveEffectivePlanFromServerRecords({
+        if (!profileRow && jwtEmail && getServiceRoleSupabase()) {
+          const { data: emailProfileRow } = await adminDb
+            .from('profiles')
+            .select('id, email, subscription_plan, subscription_status, subscription_cancelled_at, subscription_grace_until, kael_msg_count, kael_msg_month, timezone')
+            .ilike('email', jwtEmail)
+            .maybeSingle();
+          if (emailProfileRow) profileRow = emailProfileRow;
+        }
+
+        const email = jwtEmail || (profileRow?.email ? String(profileRow.email).toLowerCase().trim() : null);
+
+        let effectivePlan = resolveEffectivePlanFromServerRecords({
           profileRow,
-          userId,
+          userId: profileRow?.id || userId,
           email,
         });
 
+        if (effectivePlan !== 'elite') {
+          const synced = await syncStripeEntitlementViaSupabaseEdge({
+            rawToken,
+            userId: profileRow?.id || userId,
+            email,
+            cancelledAtIso: profileRow?.subscription_cancelled_at || null,
+          });
+          if (
+            synced?.active &&
+            synced.plan !== 'free' &&
+            hasRequiredServerPlan(synced.plan, effectivePlan) &&
+            synced.plan !== effectivePlan
+          ) {
+            effectivePlan = synced.plan;
+            if (getServiceRoleSupabase()) {
+              updateProfileSubscriptionSafely(adminDb, profileRow?.id || userId, {
+                subscription_plan: synced.plan,
+                subscription_status: synced.status || 'active',
+                subscription_cancelled_at: null,
+                subscription_updated_at: new Date().toISOString(),
+              }).catch(() => {});
+            }
+          } else if (email) {
+            const syncedByEmail = await syncStripeEntitlementByEmail(
+              email,
+              profileRow?.subscription_cancelled_at || null
+            );
+            if (
+              syncedByEmail?.active &&
+              syncedByEmail.plan !== 'free' &&
+              hasRequiredServerPlan(syncedByEmail.plan, effectivePlan) &&
+              syncedByEmail.plan !== effectivePlan
+            ) {
+              effectivePlan = syncedByEmail.plan;
+              if (getServiceRoleSupabase()) {
+                updateProfileSubscriptionSafely(adminDb, profileRow?.id || userId, {
+                  subscription_plan: syncedByEmail.plan,
+                  subscription_status: syncedByEmail.status || 'active',
+                  subscription_cancelled_at: null,
+                  subscription_updated_at: new Date().toISOString(),
+                }).catch(() => {});
+              }
+            }
+          }
+        }
+
         return {
           client: supabaseUser,
-          userId,
+          userId: profileRow?.id || userId,
           email,
           effectivePlan,
           profileRow: profileRow || null,
@@ -3404,40 +4136,14 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
   // Cryptographic JWKS recovery for recently expired Supabase JWTs
   const expiredJwtIdentity = isJwt ? await verifyExpiredSupabaseJwt(rawToken) : null;
 
-  // Parse email from vault token if present (format: vault_tok_<timestamp>_<base64(email)>)
-  let vaultEmail: string | null = null;
-  if (rawToken && rawToken.startsWith('vault_tok_')) {
-    const parts = rawToken.split('_');
-    if (parts.length >= 3) {
-      const b64Part =
-        parts.length >= 4 && /^\d+$/.test(parts[2])
-          ? parts.slice(3).join('_')
-          : parts.slice(2).join('_');
-      try {
-        const decoded = Buffer.from(b64Part, 'base64').toString('utf-8').toLowerCase().trim();
-        if (decoded.includes('@')) {
-          vaultEmail = decoded;
-        }
-      } catch {
-        // ignore decode error
-      }
-    }
-  }
-
-  // Cryptographically verified server session or vault session
-  const srvSession = verifyServerSessionFromRequest(req, vaultEmail || expiredJwtIdentity?.email || undefined);
-  const resolvedEmail =
-    srvSession?.email ||
-    expiredJwtIdentity?.email ||
-    vaultEmail ||
-    (typeof req.body?.email === 'string' && req.body.email.includes('@') ? req.body.email.toLowerCase().trim() : null);
-
-  const bodyUid = req.body?.user_id && isValidUUID(req.body.user_id) ? req.body.user_id : null;
+  // Cryptographically verified server session
+  const srvSession = verifyServerSessionFromRequest(req, expiredJwtIdentity?.email || undefined);
+  const resolvedEmail = srvSession?.email || expiredJwtIdentity?.email || null;
   const srvUid = srvSession?.userId && isValidUUID(srvSession.userId) ? srvSession.userId : null;
   const jwtUid = expiredJwtIdentity?.userId && isValidUUID(expiredJwtIdentity.userId) ? expiredJwtIdentity.userId : null;
-  const resolvedUid = srvUid || jwtUid || bodyUid || (resolvedEmail ? 'usr_' + Buffer.from(resolvedEmail.slice(0, 8)).toString('hex') : null);
+  const resolvedUid = srvUid || jwtUid || (resolvedEmail ? 'usr_' + Buffer.from(resolvedEmail.slice(0, 8)).toString('hex') : null);
 
-  if (srvSession || expiredJwtIdentity || vaultEmail || (resolvedEmail && athleteCredentials.has(resolvedEmail))) {
+  if (srvSession || expiredJwtIdentity) {
     let profileRow: any = null;
     if (resolvedUid && isValidUUID(resolvedUid)) {
       try {
@@ -3464,11 +4170,35 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
       }
     }
 
-    const effectivePlan = resolveEffectivePlanFromServerRecords({
+    let effectivePlan = resolveEffectivePlanFromServerRecords({
       profileRow,
       userId: profileRow?.id || resolvedUid,
       email: resolvedEmail,
     });
+
+    if (effectivePlan !== 'elite' && resolvedEmail) {
+      const syncedByEmail = await syncStripeEntitlementByEmail(
+        resolvedEmail,
+        profileRow?.subscription_cancelled_at || null
+      );
+      if (
+        syncedByEmail?.active &&
+        syncedByEmail.plan !== 'free' &&
+        hasRequiredServerPlan(syncedByEmail.plan, effectivePlan) &&
+        syncedByEmail.plan !== effectivePlan
+      ) {
+        effectivePlan = syncedByEmail.plan;
+        const targetUid = profileRow?.id || (isValidUUID(resolvedUid) ? resolvedUid : null);
+        if (getServiceRoleSupabase() && targetUid) {
+          updateProfileSubscriptionSafely(adminDb, targetUid, {
+            subscription_plan: syncedByEmail.plan,
+            subscription_status: syncedByEmail.status || 'active',
+            subscription_cancelled_at: null,
+            subscription_updated_at: new Date().toISOString(),
+          }).catch(() => {});
+        }
+      }
+    }
 
     return {
       client: supabase,
@@ -3480,19 +4210,212 @@ async function resolveAuthoritativeAiUser(req: express.Request): Promise<{
     };
   }
 
-  // Fallback for requests with email/userId: check confirmed redirect entitlement
-  const effectivePlan = resolveEffectivePlanFromServerRecords({
-    profileRow: null,
-    userId: resolvedUid,
-    email: resolvedEmail,
-  });
   return {
     client: supabase,
-    userId: resolvedUid,
-    email: resolvedEmail,
-    effectivePlan,
+    userId: null,
+    email: null,
+    effectivePlan: 'free',
     profileRow: null,
     isVerifiedJwt: false,
+  };
+}
+
+async function resolveAuthoritativeKaelUsageSnapshot(params: {
+  authCtx: Awaited<ReturnType<typeof resolveAuthoritativeAiUser>>;
+  effectiveTz: string;
+  effectivePlan: string;
+  clientUsed?: number;
+}) {
+  const { authCtx, effectiveTz, effectivePlan, clientUsed = 0 } = params;
+  const currentMonthKey = getTimezoneMonthKey(effectiveTz);
+  const resolvedPlan = normalizeServerPlan(effectivePlan);
+  const usageLimit = SERVER_PLAN_LIMITS[resolvedPlan] || 100;
+  const adminDb = getServiceRoleSupabase();
+
+  let rpcUsed = 0;
+  let rpcMonthKey = currentMonthKey;
+
+  if (authCtx.isVerifiedJwt && authCtx.userId) {
+    try {
+      let { data: rpcUsage, error: rpcErr } = await authCtx.client.rpc('get_kael_usage', {
+        p_timezone: effectiveTz,
+      });
+      if (rpcErr && rpcErr.code === 'PGRST202') {
+        const fallbackRes = await authCtx.client.rpc('get_kael_usage');
+        if (!fallbackRes.error) {
+          rpcUsage = fallbackRes.data;
+          rpcErr = null;
+        }
+      }
+      if (!rpcErr && rpcUsage && typeof rpcUsage.used === 'number') {
+        const candidateMonth = String(rpcUsage.monthKey || '').trim();
+        if (/^\d{4}-\d{2}$/.test(candidateMonth)) {
+          rpcMonthKey = candidateMonth;
+        }
+        if (rpcMonthKey === currentMonthKey) {
+          rpcUsed = Math.max(0, Number(rpcUsage.used || 0));
+        }
+      }
+    } catch (err) {
+      console.warn('[server.ts] get_kael_usage note:', err);
+    }
+  }
+
+  let tableUsed = 0;
+  if (adminDb && authCtx.userId && isValidUUID(authCtx.userId)) {
+    try {
+      const { data: uRow } = await adminDb
+        .from('kael_usage')
+        .select('message_count, month_key')
+        .eq('user_id', authCtx.userId)
+        .maybeSingle();
+      if (uRow && uRow.month_key === currentMonthKey && typeof uRow.message_count === 'number') {
+        tableUsed = Math.max(0, Number(uRow.message_count));
+      }
+    } catch {
+      // ignore kael_usage read error
+    }
+  }
+
+  const profileUsed =
+    authCtx.profileRow?.kael_msg_month === currentMonthKey
+      ? Math.max(0, Number(authCtx.profileRow?.kael_msg_count || 0))
+      : 0;
+
+  const diskUsed = getStoredKaelMonthlyCount(authCtx.userId, authCtx.email, currentMonthKey);
+  const safeClientUsed =
+    !authCtx.isVerifiedJwt && !adminDb
+      ? Math.max(0, Math.min(Number(clientUsed || 0), usageLimit))
+      : 0;
+
+  const finalUsed = Math.max(rpcUsed, tableUsed, profileUsed, diskUsed, safeClientUsed);
+
+  if (finalUsed > 0 && (authCtx.userId || authCtx.email)) {
+    recordStoredKaelMonthlyCount(authCtx.userId, authCtx.email, currentMonthKey, finalUsed);
+  }
+
+  return {
+    used: finalUsed,
+    limit: usageLimit,
+    remaining: Math.max(0, usageLimit - finalUsed),
+    monthKey: currentMonthKey,
+    plan: resolvedPlan,
+    timezone: effectiveTz,
+  };
+}
+
+async function persistAuthoritativeKaelIncrement(params: {
+  client: any;
+  isVerifiedJwt: boolean;
+  userId?: string | null;
+  email?: string | null;
+  effectiveTz: string;
+  usageLimit: number;
+  resolvedPlan: string;
+  currentMonthKey: string;
+  baselineUsed: number;
+}) {
+  const {
+    client,
+    isVerifiedJwt,
+    userId,
+    email,
+    effectiveTz,
+    usageLimit,
+    resolvedPlan,
+    currentMonthKey,
+    baselineUsed,
+  } = params;
+
+  let claimData: any = null;
+  if (isVerifiedJwt && userId && isValidUUID(userId)) {
+    try {
+      let res = await client.rpc('claim_kael_message', { p_timezone: effectiveTz });
+      if (res.error && res.error.code === 'PGRST202') {
+        res = await client.rpc('claim_kael_message');
+      }
+      if (!res.error && res.data && typeof res.data.used === 'number') {
+        claimData = res.data;
+      }
+    } catch (err) {
+      console.warn('[server.ts] claim_kael_message RPC note:', err);
+    }
+  }
+
+  const claimMonth = claimData?.monthKey && /^\d{4}-\d{2}$/.test(String(claimData.monthKey))
+    ? String(claimData.monthKey)
+    : currentMonthKey;
+  const rolledToNewMonth = claimMonth !== currentMonthKey;
+
+  const nextUsed = rolledToNewMonth
+    ? Math.max(1, Number(claimData?.used || 1))
+    : Math.max(Number(claimData?.used || 0), Number(baselineUsed || 0) + 1);
+
+  const persistedUsed = recordStoredKaelMonthlyCount(userId, email, claimMonth, nextUsed);
+  const finalUsed = Math.max(nextUsed, persistedUsed);
+
+  const adminDb = getServiceRoleSupabase();
+  const dbClient = adminDb || (isVerifiedJwt ? client : null);
+
+  if (dbClient) {
+    const profilePayload: Record<string, any> = {
+      kael_msg_count: finalUsed,
+      kael_msg_month: claimMonth,
+    };
+    if (effectiveTz) {
+      profilePayload.timezone = effectiveTz;
+    }
+
+    let profileUpdated = false;
+    if (userId && userId !== 'guest' && isValidUUID(userId)) {
+      try {
+        const { error: dbErr } = await dbClient
+          .from('profiles')
+          .update(profilePayload)
+          .eq('id', userId);
+        if (!dbErr) profileUpdated = true;
+      } catch (dbErr) {
+        console.warn('[server.ts] Profile Kael count sync note:', dbErr);
+      }
+
+      if (adminDb) {
+        try {
+          await adminDb
+            .from('kael_usage')
+            .upsert(
+              {
+                user_id: userId,
+                month_key: claimMonth,
+                message_count: finalUsed,
+                updated_at: new Date().toISOString(),
+              },
+              { onConflict: 'user_id' }
+            );
+        } catch (kuErr) {
+          console.warn('[server.ts] kael_usage table sync note:', kuErr);
+        }
+      }
+    }
+    if (!profileUpdated && email) {
+      try {
+        await dbClient
+          .from('profiles')
+          .update(profilePayload)
+          .ilike('email', email);
+      } catch (emailErr) {
+        console.warn('[server.ts] Profile Kael count sync by email note:', emailErr);
+      }
+    }
+  }
+
+  return {
+    allowed: finalUsed < usageLimit,
+    used: finalUsed,
+    limit: usageLimit,
+    remaining: Math.max(0, usageLimit - finalUsed),
+    monthKey: claimMonth,
+    plan: resolvedPlan,
+    timezone: effectiveTz,
   };
 }
 
@@ -3632,8 +4555,8 @@ function buildKaelPlanPermissionsMandate(effectivePlan: string): string {
   if (plan === 'elite') {
     return (
       ' AUTHORIZATION & PLAN ACCESS (VERIFIED: ELITE): This user has full unrestricted Elite access to EVERY feature and route in the app ' +
-      '(including /formlab, AI progress photo body-fat & physique analysis, live workout adjustments, detailed workout analytics, weekly nutrition insights, adaptive macros, adaptive programming, insider Elite coaching tips, deep recovery guidance, and direct navigation anywhere). ' +
-      'When navigating the user to any page (such as [ACTION:go:/formlab|Open Form Lab]), always use the exact format [ACTION:go:/route|Button Label].'
+      '(including /formlab, AI progress photo body-fat & physique analysis, live workout adjustments, detailed workout analytics, weekly nutrition insights, adaptive macros, adaptive programming, insider Elite coaching tips, deep recovery guidance, and full navigation including /about, /contact, /terms, /privacy). ' +
+      'ONLY emit [ACTION:go:/route|Button Label] when the user EXPLICITLY asks you to take them to, open, or go to a page; otherwise answer in chat without auto-navigating.'
     );
   }
 
@@ -3677,6 +4600,90 @@ function sanitizeKaelResponseActionsForPlan(rawText: string, effectivePlan: stri
   return text.replace(/\[ACTION:(?:(?:go|navigate):)?\/formlab(?:[?|][^\]]*)?\]/gi, '');
 }
 
+async function resolveServerStorageMediaUrl(rawItem: string, userClient: any): Promise<string> {
+  const raw = String(rawItem || '').trim();
+  if (!raw || raw.startsWith('data:')) return raw;
+
+  let storageBucketHint = '';
+  let storagePath = raw;
+
+  const objectMarker = '/storage/v1/object/';
+  const markerIndex = raw.indexOf(objectMarker);
+  if (markerIndex >= 0 && !raw.includes('/storage/v1/object/sign/')) {
+    const afterMarker = raw.slice(markerIndex + objectMarker.length);
+    const parts = afterMarker.split('/');
+    if (parts.length >= 3) {
+      parts.shift(); // public | authenticated
+      storageBucketHint = parts.shift() || '';
+      storagePath = decodeURIComponent(parts.join('/').split('?')[0]);
+    }
+  } else if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    return raw;
+  }
+
+  const storageClient = getServiceRoleSupabase() || userClient || supabase;
+  const candidateBuckets = Array.from(
+    new Set(
+      [
+        storageBucketHint,
+        process.env.SUPABASE_MEDIA_BUCKET,
+        process.env.VITE_SUPABASE_MEDIA_BUCKET,
+        'user-media',
+        'washek-media',
+        'media',
+      ].filter((b): b is string => Boolean(b && b.trim()))
+    )
+  );
+
+  for (const bucket of candidateBuckets) {
+    try {
+      const { data: signedData, error } = await storageClient.storage
+        .from(bucket)
+        .createSignedUrl(storagePath, 3600);
+      if (!error && signedData?.signedUrl) {
+        return signedData.signedUrl;
+      }
+    } catch {
+      // try next bucket
+    }
+  }
+
+  return raw;
+}
+
+app.get('/api/kael/usage', async (req, res) => {
+  try {
+    const authCtx = await resolveAuthoritativeAiUser(req);
+    if (!authCtx.userId && !authCtx.email) {
+      return res.status(401).json({
+        success: false,
+        error: 'Authentication required.',
+      });
+    }
+
+    const queryTz = typeof req.query?.timezone === 'string' ? req.query.timezone : '';
+    const headerTz = typeof req.headers['x-timezone'] === 'string' ? req.headers['x-timezone'] : '';
+    const effectiveTz = authCtx.profileRow?.timezone || queryTz || headerTz || 'UTC';
+
+    const usage = await resolveAuthoritativeKaelUsageSnapshot({
+      authCtx,
+      effectiveTz,
+      effectivePlan: authCtx.effectivePlan,
+    });
+
+    return res.json({
+      success: true,
+      usage,
+    });
+  } catch (err: any) {
+    console.error('[server.ts] GET /api/kael/usage error:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.message || 'Failed to load Kael usage.',
+    });
+  }
+});
+
 app.post('/api/ai-generate', async (req, res) => {
   try {
     const {
@@ -3710,6 +4717,16 @@ app.post('/api/ai-generate', async (req, res) => {
     }
 
     if (requiredTier && !hasRequiredServerPlan(effectivePlan, requiredTier)) {
+      console.warn('[AI Gate 403 /api/ai-generate]', {
+        type,
+        requiredTier,
+        effectivePlan,
+        isVerifiedJwt: authCtx.isVerifiedJwt,
+        hasUserId: Boolean(authCtx.userId),
+        hasEmail: Boolean(authCtx.email),
+        dbPlan: authCtx.profileRow?.subscription_plan || null,
+        dbStatus: authCtx.profileRow?.subscription_status || null,
+      });
       const planLabel = requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1);
       return res.status(403).json({
         success: false,
@@ -3734,18 +4751,7 @@ app.post('/api/ai-generate', async (req, res) => {
           const raw = String(item || '').trim();
           if (!raw) return null;
 
-          let urlToFetch = raw;
-          if (!urlToFetch.startsWith('data:') && !urlToFetch.startsWith('http://') && !urlToFetch.startsWith('https://')) {
-            try {
-              const bucket = process.env.SUPABASE_MEDIA_BUCKET || process.env.VITE_SUPABASE_MEDIA_BUCKET || 'washek-media';
-              const { data: signedData } = await supabase.storage.from(bucket).createSignedUrl(urlToFetch, 3600);
-              if (signedData?.signedUrl) {
-                urlToFetch = signedData.signedUrl;
-              }
-            } catch (storageErr) {
-              console.warn('[Gemini] Could not create signed URL for path:', urlToFetch, storageErr);
-            }
-          }
+          const urlToFetch = await resolveServerStorageMediaUrl(raw, authCtx.client);
 
           if (urlToFetch.startsWith('data:')) {
             const match = urlToFetch.match(/^data:([^;]+);base64,(.+)$/);
@@ -3796,6 +4802,7 @@ app.post('/api/ai-generate', async (req, res) => {
     let kaelQuota: any = null;
     let kaelUserSession: {
       client: any;
+      isVerifiedJwt?: boolean;
       id: string;
       email?: string | null;
       effectiveTz: string;
@@ -3815,118 +4822,44 @@ app.post('/api/ai-generate', async (req, res) => {
     if (isKael) {
       const clientTimezone = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || '';
       const effectiveTz = authCtx.profileRow?.timezone || clientTimezone || 'UTC';
-      const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-      const resolvedPlan = normalizeServerPlan(effectivePlan);
-      const usageLimit = SERVER_PLAN_LIMITS[resolvedPlan] || 100;
+      const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
 
-      if (authCtx.isVerifiedJwt && authCtx.userId) {
-        let currentUsage: { used: number; limit: number; remaining: number; monthKey: string; plan: string } | null = null;
-        try {
-          let { data: rpcUsage, error: rpcErr } = await authCtx.client.rpc('get_kael_usage');
-          if (rpcErr && rpcErr.code === 'PGRST202') {
-            const fallbackRes = await authCtx.client.rpc('get_kael_usage', {
-              p_timezone: effectiveTz,
-            });
-            if (!fallbackRes.error) {
-              rpcUsage = fallbackRes.data;
-              rpcErr = null;
-            }
-          }
-          if (!rpcErr && rpcUsage && typeof rpcUsage.used === 'number') {
-            currentUsage = {
-              used: rpcUsage.used,
-              limit: usageLimit,
-              remaining: Math.max(0, usageLimit - rpcUsage.used),
-              monthKey: rpcUsage.monthKey || currentMonthKey,
-              plan: resolvedPlan,
-            };
-          }
-        } catch (err) {
-          console.warn('[server.ts] get_kael_usage error:', err);
-        }
+      const currentUsage = await resolveAuthoritativeKaelUsageSnapshot({
+        authCtx,
+        effectiveTz,
+        effectivePlan,
+        clientUsed,
+      });
 
-        if (!currentUsage) {
-          const isCurrentMonth = authCtx.profileRow?.kael_msg_month === currentMonthKey;
-          const count = isCurrentMonth ? Number(authCtx.profileRow?.kael_msg_count || 0) : 0;
-          currentUsage = {
-            used: count,
-            limit: usageLimit,
-            remaining: Math.max(0, usageLimit - count),
-            monthKey: currentMonthKey,
-            plan: resolvedPlan,
-          };
-        }
-
-        if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
-          return res.status(429).json({
-            success: false,
-            error: 'You have reached your monthly message limit for Coach Kael.',
-            error_code: 'KAEL_LIMIT_REACHED',
-            quota: {
-              allowed: false,
-              used: currentUsage.used,
-              limit: currentUsage.limit,
-              remaining: 0,
-              monthKey: currentUsage.monthKey,
-              plan: currentUsage.plan,
-              timezone: effectiveTz,
-            },
-            type: 'kael',
-          });
-        }
-
-        kaelUserSession = {
-          client: authCtx.client,
-          id: authCtx.userId,
-          email: authCtx.email,
-          effectiveTz,
-          usageLimit,
-          resolvedPlan,
-          currentMonthKey,
-          currentUsage,
-        };
-      } else {
-        const isCurrentMonth = authCtx.profileRow?.kael_msg_month === currentMonthKey;
-        const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
-        const count = isCurrentMonth ? Number(authCtx.profileRow?.kael_msg_count ?? clientUsed) : clientUsed;
-
-        const currentUsage = {
-          used: count,
-          limit: usageLimit,
-          remaining: Math.max(0, usageLimit - count),
-          monthKey: currentMonthKey,
-          plan: resolvedPlan,
-        };
-
-        if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
-          return res.status(429).json({
-            success: false,
-            error: 'You have reached your monthly message limit for Coach Kael.',
-            error_code: 'KAEL_LIMIT_REACHED',
-            quota: {
-              allowed: false,
-              used: currentUsage.used,
-              limit: currentUsage.limit,
-              remaining: 0,
-              monthKey: currentUsage.monthKey,
-              plan: currentUsage.plan,
-              timezone: effectiveTz,
-            },
-            type: 'kael',
-          });
-        }
-
-        kaelUserSession = {
-          client: authCtx.client,
-          id: authCtx.userId || 'guest',
-          email: authCtx.email || null,
-          effectiveTz,
-          usageLimit,
-          resolvedPlan,
-          currentMonthKey,
-          currentUsage,
-        };
+      if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
+        return res.status(429).json({
+          success: false,
+          error: 'You have reached your monthly message limit for Coach Kael.',
+          error_code: 'KAEL_LIMIT_REACHED',
+          quota: {
+            allowed: false,
+            used: currentUsage.used,
+            limit: currentUsage.limit,
+            remaining: 0,
+            monthKey: currentUsage.monthKey,
+            plan: currentUsage.plan,
+            timezone: effectiveTz,
+          },
+          type: 'kael',
+        });
       }
+
+      kaelUserSession = {
+        client: authCtx.client,
+        isVerifiedJwt: authCtx.isVerifiedJwt,
+        id: authCtx.userId || 'guest',
+        email: authCtx.email || null,
+        effectiveTz,
+        usageLimit: currentUsage.limit,
+        resolvedPlan: currentUsage.plan,
+        currentMonthKey: currentUsage.monthKey,
+        currentUsage,
+      };
     }
 
     const isJsonExpected =
@@ -3960,7 +4893,7 @@ app.post('/api/ai-generate', async (req, res) => {
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
         'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
         'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ' +
-        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to an AUTHORIZED page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ' +
+        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, plan access, plus WASHEK About, Contact, Terms of Service, and Privacy Policy details). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, stats, or policies. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. STRICT NAVIGATION RULE: NEVER emit `[ACTION:go:/route|Label]` unless the user SPECIFICALLY asks you to take them to, go to, open, or navigate to an AUTHORIZED page (e.g. if they only ask a question about their photos, nutrition, terms, privacy, about, or contact, just answer directly and do NOT emit `[ACTION:go:...]`). PERMISSION-BEFORE-ACTION: Unless the user EXPLICITLY instructs you to perform an app change (like logging food or marking a rest day) OR confirms yes after you asked, NEVER auto-execute changes — first ask for permission clearly and emit the confirmation-only tag `[ACTION:ask_log_food:...]` or `[ACTION:ask_log_rest_day|...]` instead of `[ACTION:log_food:...]` / `[ACTION:log_rest_day|...]`. ' +
         buildKaelPlanPermissionsMandate(effectivePlan) +
         ' ';
 
@@ -4147,92 +5080,19 @@ app.post('/api/ai-generate', async (req, res) => {
       outputText = sanitizeKaelResponseActionsForPlan(outputText, effectivePlan).trim();
     }
 
-    // Now that Kael has actually answered, atomically claim and decrement the message quota
+    // Now that Kael has actually answered, atomically claim and persist monotonic monthly quota
     if (isKael && kaelUserSession) {
-      const {
-        client,
-        id: userId,
-        effectiveTz,
-        usageLimit,
-        resolvedPlan,
-        currentMonthKey,
-        currentUsage,
-      } = kaelUserSession;
-
-      let claimResult: any = null;
-      try {
-        let { data: claimData, error: claimError } = await client.rpc('claim_kael_message');
-        if (claimError && claimError.code === 'PGRST202') {
-          const fallbackClaim = await client.rpc('claim_kael_message', {
-            p_timezone: effectiveTz,
-          });
-          if (!fallbackClaim.error) {
-            claimData = fallbackClaim.data;
-            claimError = null;
-          }
-        }
-        if (!claimError && claimData && typeof claimData.used === 'number') {
-          claimResult = claimData;
-        }
-      } catch (err) {
-        console.warn('[server.ts] claim_kael_message RPC error:', err);
-      }
-
-      if (!claimResult) {
-        // Direct database update fallback to profiles table
-        const newCount = currentUsage.used + 1;
-        const updatePayload: Record<string, any> = {
-          kael_msg_count: newCount,
-          kael_msg_month: currentMonthKey,
-        };
-        if (effectiveTz) {
-          updatePayload.timezone = effectiveTz;
-        }
-        const userEmail = kaelUserSession.email;
-        let profileUpdated = false;
-        if (userId && userId !== 'guest' && isValidUUID(userId)) {
-          try {
-            const { error: dbErr } = await client
-              .from('profiles')
-              .update(updatePayload)
-              .eq('id', userId);
-            if (!dbErr) profileUpdated = true;
-          } catch (dbErr) {
-            console.warn('[server.ts] Profile update fallback note:', dbErr);
-          }
-        }
-        if (!profileUpdated && userEmail) {
-          try {
-            await client
-              .from('profiles')
-              .update(updatePayload)
-              .ilike('email', userEmail);
-          } catch (emailErr) {
-            console.warn('[server.ts] Profile update by email fallback note:', emailErr);
-          }
-        }
-
-        claimResult = {
-          allowed: true,
-          used: newCount,
-          limit: usageLimit,
-          remaining: Math.max(0, usageLimit - newCount),
-          monthKey: currentMonthKey,
-          plan: resolvedPlan,
-          timezone: effectiveTz,
-        };
-      } else {
-        claimResult = {
-          ...claimResult,
-          remaining:
-            typeof claimResult.remaining === 'number'
-              ? claimResult.remaining
-              : Math.max(0, (claimResult.limit || usageLimit) - (claimResult.used || 0)),
-          timezone: effectiveTz,
-        };
-      }
-
-      kaelQuota = claimResult;
+      kaelQuota = await persistAuthoritativeKaelIncrement({
+        client: kaelUserSession.client,
+        isVerifiedJwt: Boolean(kaelUserSession.isVerifiedJwt),
+        userId: kaelUserSession.id,
+        email: kaelUserSession.email,
+        effectiveTz: kaelUserSession.effectiveTz,
+        usageLimit: kaelUserSession.usageLimit,
+        resolvedPlan: kaelUserSession.resolvedPlan,
+        currentMonthKey: kaelUserSession.currentMonthKey,
+        baselineUsed: kaelUserSession.currentUsage.used,
+      });
     }
 
     if (!kaelQuota && isKael) {
@@ -4329,6 +5189,16 @@ app.post('/api/ai-stream', async (req, res) => {
       requiredTier = isPostWorkoutAdaptation ? 'progress' : 'elite';
     }
     if (requiredTier && !hasRequiredServerPlan(effectivePlan, requiredTier)) {
+      console.warn('[AI Gate 403 /api/ai-stream]', {
+        type,
+        requiredTier,
+        effectivePlan,
+        isVerifiedJwt: authCtx.isVerifiedJwt,
+        hasUserId: Boolean(authCtx.userId),
+        hasEmail: Boolean(authCtx.email),
+        dbPlan: authCtx.profileRow?.subscription_plan || null,
+        dbStatus: authCtx.profileRow?.subscription_status || null,
+      });
       const planLabel = requiredTier.charAt(0).toUpperCase() + requiredTier.slice(1);
       return res.status(403).json({
         success: false,
@@ -4353,18 +5223,7 @@ app.post('/api/ai-stream', async (req, res) => {
           const raw = String(item || '').trim();
           if (!raw) return null;
 
-          let urlToFetch = raw;
-          if (!urlToFetch.startsWith('data:') && !urlToFetch.startsWith('http://') && !urlToFetch.startsWith('https://')) {
-            try {
-              const bucket = process.env.SUPABASE_MEDIA_BUCKET || process.env.VITE_SUPABASE_MEDIA_BUCKET || 'washek-media';
-              const { data: signedData } = await supabase.storage.from(bucket).createSignedUrl(urlToFetch, 3600);
-              if (signedData?.signedUrl) {
-                urlToFetch = signedData.signedUrl;
-              }
-            } catch (storageErr) {
-              console.warn('[Gemini Stream] Could not create signed URL for path:', urlToFetch, storageErr);
-            }
-          }
+          const urlToFetch = await resolveServerStorageMediaUrl(raw, authCtx.client);
 
           if (urlToFetch.startsWith('data:')) {
             const match = urlToFetch.match(/^data:([^;]+);base64,(.+)$/);
@@ -4415,21 +5274,14 @@ app.post('/api/ai-stream', async (req, res) => {
     if (isKael) {
       const clientTimezone = (req.headers['x-timezone'] as string) || (req.body?.timezone as string) || '';
       const effectiveTz = authCtx.profileRow?.timezone || clientTimezone || 'UTC';
-      const currentMonthKey = getTimezoneMonthKey(effectiveTz);
-      const resolvedPlan = normalizeServerPlan(effectivePlan);
-      const usageLimit = SERVER_PLAN_LIMITS[resolvedPlan] || 100;
-
-      const isCurrentMonth = authCtx.profileRow?.kael_msg_month === currentMonthKey;
       const clientUsed = typeof req.body?.current_used === 'number' ? req.body.current_used : 0;
-      const count = isCurrentMonth ? Number(authCtx.profileRow?.kael_msg_count ?? 0) : (authCtx.userId && authCtx.isVerifiedJwt ? 0 : clientUsed);
 
-      const currentUsage = {
-        used: count,
-        limit: usageLimit,
-        remaining: Math.max(0, usageLimit - count),
-        monthKey: currentMonthKey,
-        plan: resolvedPlan,
-      };
+      const currentUsage = await resolveAuthoritativeKaelUsageSnapshot({
+        authCtx,
+        effectiveTz,
+        effectivePlan,
+        clientUsed,
+      });
 
       if (currentUsage.remaining <= 0 || currentUsage.used >= currentUsage.limit) {
         return res.status(429).json({
@@ -4449,18 +5301,17 @@ app.post('/api/ai-stream', async (req, res) => {
         });
       }
 
-      if (authCtx.userId || authCtx.email) {
-        kaelUserSession = {
-          client: authCtx.client,
-          id: authCtx.userId || 'guest',
-          email: authCtx.email || null,
-          effectiveTz,
-          usageLimit,
-          resolvedPlan,
-          currentMonthKey,
-          currentUsage,
-        };
-      }
+      kaelUserSession = {
+        client: authCtx.client,
+        isVerifiedJwt: authCtx.isVerifiedJwt,
+        id: authCtx.userId || 'guest',
+        email: authCtx.email || null,
+        effectiveTz,
+        usageLimit: currentUsage.limit,
+        resolvedPlan: currentUsage.plan,
+        currentMonthKey: currentUsage.monthKey,
+        currentUsage,
+      };
     }
 
     const isJsonExpected =
@@ -4487,7 +5338,7 @@ app.post('/api/ai-stream', async (req, res) => {
         'You are Coach Kael, an elite strength & conditioning coach and fitness mentor for WASHEK. ' +
         'CORE SCIENTIFIC ACCURACY MANDATE (ALL PLANS): You are ALWAYS 100% scientifically accurate, biomechanically sound, and physiologically grounded across every plan tier. Safety, anatomical precision, and evidence-based truth NEVER change on any plan. ' +
         'COMMUNICATION CLARITY & ACCESSIBLE LANGUAGE (CRITICAL): Respond in simple, clear, everyday language that any beginner can easily understand, without dense medical or kinesiology jargon. When explaining how the body moves, translate complex biomechanics into intuitive practical terms (e.g., explain scapular depression as pulling shoulder blades down and away from the ears; explain eccentric control as lowering yourself slowly; explain CNS fatigue as deep whole-body burnout). Use an intuitive real-world analogy whenever it helps make the concept or physical sensation click. Never talk down to the user or sound like you are explaining things to a toddler or baby — find that golden balance of mature, respectful, seasoned coaching with zero confusing jargon. Never make responses shorter than the tier guideline or alter the programming. ' +
-        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, and plan access). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, or stats. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. If the user asks you to open/go/take them to an AUTHORIZED page or perform a supported quick action (like logging food or toggling today\'s rest day), emit the exact `[ACTION:...]` tags described in the IN-APP NAVIGATION & ACTIONS section of the prompt while keeping your spoken reply natural. ' +
+        'LIVE APP VISIBILITY & IN-APP ACTIONS: The prompt contains the athlete\'s LIVE APP CONTEXT (today\'s date/weekday, scheduled workout OR Rest Day status, full current week & program, workout logs, maxes, muscle heatmap balance, nutrition goals & logged intake, saved meals, plan access, plus WASHEK About, Contact, Terms of Service, and Privacy Policy details). ALWAYS ground your answers in that exact live data—never guess or invent workouts, rest days, macros, stats, or policies. If today is a Rest Day, clearly say it is a Rest Day and mention when their next scheduled workout is. STRICT NAVIGATION RULE: NEVER emit `[ACTION:go:/route|Label]` unless the user SPECIFICALLY asks you to take them to, go to, open, or navigate to an AUTHORIZED page (e.g. if they only ask a question about their photos, nutrition, terms, privacy, about, or contact, just answer directly and do NOT emit `[ACTION:go:...]`). PERMISSION-BEFORE-ACTION: Unless the user EXPLICITLY instructs you to perform an app change (like logging food or marking a rest day) OR confirms yes after you asked, NEVER auto-execute changes — first ask for permission clearly and emit the confirmation-only tag `[ACTION:ask_log_food:...]` or `[ACTION:ask_log_rest_day|...]` instead of `[ACTION:log_food:...]` / `[ACTION:log_rest_day|...]`. ' +
         buildKaelPlanPermissionsMandate(effectivePlan) +
         ' ';
 
@@ -4661,83 +5512,17 @@ app.post('/api/ai-stream', async (req, res) => {
     }
 
     if (isKael && kaelUserSession) {
-      const {
-        client,
-        id: userId,
-        effectiveTz,
-        usageLimit,
-        resolvedPlan,
-        currentMonthKey,
-        currentUsage,
-      } = kaelUserSession;
-
-      let claimResult: any = null;
-      try {
-        let { data: claimData, error: claimError } = await client.rpc('claim_kael_message');
-        if (claimError && claimError.code === 'PGRST202') {
-          const fallbackClaim = await client.rpc('claim_kael_message', {
-            p_timezone: effectiveTz,
-          });
-          if (!fallbackClaim.error) {
-            claimData = fallbackClaim.data;
-            claimError = null;
-          }
-        }
-        if (!claimError && claimData && typeof claimData.used === 'number') {
-          claimResult = claimData;
-        }
-      } catch (err) {
-        console.warn('[server.ts stream] claim_kael_message RPC error:', err);
-      }
-
-      if (!claimResult) {
-        const newCount = currentUsage.used + 1;
-        const updatePayload: Record<string, any> = {
-          kael_msg_count: newCount,
-          kael_msg_month: currentMonthKey,
-        };
-        if (effectiveTz) {
-          updatePayload.timezone = effectiveTz;
-        }
-        const userEmail = kaelUserSession.email;
-        let profileUpdated = false;
-        if (userId && userId !== 'guest' && isValidUUID(userId)) {
-          try {
-            const { error: dbErr } = await client.from('profiles').update(updatePayload).eq('id', userId);
-            if (!dbErr) profileUpdated = true;
-          } catch (dbErr) {
-            console.warn('[server.ts stream] Profile update fallback note:', dbErr);
-          }
-        }
-        if (!profileUpdated && userEmail) {
-          try {
-            await client.from('profiles').update(updatePayload).ilike('email', userEmail);
-          } catch (emailErr) {
-            console.warn('[server.ts stream] Profile update fallback by email note:', emailErr);
-          }
-        }
-
-        claimResult = {
-          allowed: true,
-          used: newCount,
-          limit: usageLimit,
-          remaining: Math.max(0, usageLimit - newCount),
-          monthKey: currentMonthKey,
-          plan: resolvedPlan,
-          timezone: effectiveTz,
-        };
-      } else {
-        claimResult = {
-          ...claimResult,
-          remaining:
-            typeof claimResult.remaining === 'number'
-              ? claimResult.remaining
-              : Math.max(0, (claimResult.limit || usageLimit) - (claimResult.used || 0)),
-          timezone: effectiveTz,
-        };
-      }
-
-      kaelQuota = claimResult;
+      kaelQuota = await persistAuthoritativeKaelIncrement({
+        client: kaelUserSession.client,
+        isVerifiedJwt: Boolean(kaelUserSession.isVerifiedJwt),
+        userId: kaelUserSession.id,
+        email: kaelUserSession.email,
+        effectiveTz: kaelUserSession.effectiveTz,
+        usageLimit: kaelUserSession.usageLimit,
+        resolvedPlan: kaelUserSession.resolvedPlan,
+        currentMonthKey: kaelUserSession.currentMonthKey,
+        baselineUsed: kaelUserSession.currentUsage.used,
+      });
     }
 
     if (!kaelQuota && isKael) {
@@ -4781,9 +5566,18 @@ app.post('/api/ai-stream', async (req, res) => {
   }
 });
 
+function escapeEmailHtml(value: string): string {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
 app.post('/api/send-contact-email', async (req, res) => {
   try {
-    const { name, email, message, subject, body } = req.body || {};
+    const { name, email, message, subject, body, to, reply_to } = req.body || {};
     const cleanName = typeof name === 'string' ? name.trim() : '';
     const cleanEmail = typeof email === 'string' ? email.trim() : '';
     const cleanMessage =
@@ -4792,6 +5586,12 @@ app.post('/api/send-contact-email', async (req, res) => {
         : typeof body === 'string' && body.trim()
           ? body.trim()
           : '';
+    const cleanBodyText =
+      typeof body === 'string' && body.trim()
+        ? body.trim()
+        : cleanName || cleanEmail
+          ? `${cleanName ? `Name: ${cleanName}\n` : ''}${cleanEmail ? `Email: ${cleanEmail}\n` : ''}\nMessage:\n${cleanMessage}`
+          : cleanMessage;
     const cleanSubject =
       typeof subject === 'string' && subject.trim()
         ? subject.trim()
@@ -4806,65 +5606,155 @@ app.post('/api/send-contact-email', async (req, res) => {
       });
     }
 
+    if (cleanEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanEmail)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Please enter a valid email address.',
+      });
+    }
+
+    const destination =
+      process.env.CONTACT_TO_EMAIL ||
+      (typeof to === 'string' && to.trim()) ||
+      'washekfitness@gmail.com';
+    const replyToAddress =
+      cleanEmail || (typeof reply_to === 'string' ? reply_to.trim() : '');
+
+    let deliveredId: string | null = null;
+    let deliveryError: string | null = null;
+
+    // 1. Direct Resend API delivery when RESEND_API_KEY is configured in server environment
     const resendApiKey = process.env.RESEND_API_KEY;
     if (resendApiKey && !resendApiKey.includes('YOUR_')) {
-      const emailPayload: Record<string, unknown> = {
-        from: process.env.CONTACT_FROM_EMAIL || 'WASHEK <onboarding@resend.dev>',
-        to: [process.env.CONTACT_TO_EMAIL || 'washekfitness@gmail.com'],
-        subject: cleanSubject,
-        text: cleanMessage,
-        html: `
-          <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111;">
-            <h2 style="color: #0f172a; margin-bottom: 12px;">WASHEK Contact Message</h2>
-            ${cleanName ? `<p><strong>Name:</strong> ${cleanName}</p>` : ''}
-            ${cleanEmail ? `<p><strong>Email:</strong> ${cleanEmail}</p>` : ''}
-            <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;" />
-            <p style="white-space: pre-wrap;">${cleanMessage}</p>
-          </div>
-        `,
-      };
+      try {
+        const safeName = escapeEmailHtml(cleanName);
+        const safeEmail = escapeEmailHtml(cleanEmail);
+        const safeMessageHtml = escapeEmailHtml(cleanMessage).replace(/\n/g, '<br />');
 
-      if (cleanEmail) {
-        emailPayload.reply_to = cleanEmail;
-      }
+        const emailPayload: Record<string, unknown> = {
+          from: process.env.CONTACT_FROM_EMAIL || 'WASHEK <onboarding@resend.dev>',
+          to: [destination],
+          subject: cleanSubject,
+          text: cleanBodyText,
+          html: `
+            <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111;">
+              <h2 style="color: #0f172a; margin-bottom: 12px;">WASHEK Contact Message</h2>
+              ${safeName ? `<p><strong>Name:</strong> ${safeName}</p>` : ''}
+              ${safeEmail ? `<p><strong>Email:</strong> <a href="mailto:${safeEmail}">${safeEmail}</a></p>` : ''}
+              <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 16px 0;" />
+              <div style="white-space: pre-wrap;">${safeMessageHtml}</div>
+            </div>
+          `,
+        };
 
-      const emailRes = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${resendApiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(emailPayload),
-      });
+        if (replyToAddress) {
+          emailPayload.reply_to = replyToAddress;
+        }
 
-      const result = await emailRes.json().catch(() => ({}));
-      if (emailRes.ok) {
-        return res.json({
-          success: true,
-          id: result?.id || null,
+        const emailRes = await fetch('https://api.resend.com/emails', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${resendApiKey}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify(emailPayload),
         });
+
+        const result = await emailRes.json().catch(() => ({}));
+        if (emailRes.ok && result?.id) {
+          deliveredId = String(result.id);
+        } else {
+          deliveryError =
+            result?.message ||
+            result?.error ||
+            `Resend rejected email request (${emailRes.status}).`;
+          console.error('[server.ts /api/send-contact-email Resend error]', emailRes.status, result);
+        }
+      } catch (resendErr: any) {
+        deliveryError = resendErr?.message || 'Resend request failed.';
+        console.error('[server.ts /api/send-contact-email Resend network error]', resendErr);
       }
     }
 
-    // Persist to Supabase contact_messages table via server client
+    // 2. Relay via deployed Supabase Edge Function (uses Supabase's configured RESEND_API_KEY)
+    if (!deliveredId && SUPABASE_URL && SUPABASE_ANON_KEY) {
+      try {
+        const edgeUrl = `${SUPABASE_URL.replace(/\/+$/, '')}/functions/v1/send-contact-email`;
+        const edgeRes = await fetch(edgeUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          },
+          body: JSON.stringify({
+            name: cleanName,
+            email: cleanEmail,
+            message: cleanMessage,
+            subject: cleanSubject,
+            body: cleanBodyText,
+            to: destination,
+            reply_to: replyToAddress || undefined,
+          }),
+        });
+
+        const edgeData = await edgeRes.json().catch(() => ({}));
+        if (edgeRes.ok && edgeData?.success && edgeData?.id) {
+          deliveredId = String(edgeData.id);
+          deliveryError = null;
+        } else {
+          deliveryError =
+            edgeData?.error ||
+            edgeData?.message ||
+            deliveryError ||
+            `Email relay returned status ${edgeRes.status}.`;
+          console.error('[server.ts /api/send-contact-email Edge relay error]', edgeRes.status, edgeData);
+        }
+      } catch (edgeErr: any) {
+        deliveryError = edgeErr?.message || deliveryError || 'Email relay connection failed.';
+        console.error('[server.ts /api/send-contact-email Edge relay network error]', edgeErr);
+      }
+    }
+
+    // Optionally archive in Supabase contact_messages if authenticated token passed
     try {
-      await supabase.from('contact_messages').insert({
+      const authHeader = String(req.headers.authorization || '').trim();
+      const bearerToken = authHeader.toLowerCase().startsWith('bearer ')
+        ? authHeader.slice(7).trim()
+        : '';
+      const clientForDb =
+        bearerToken && bearerToken.split('.').length === 3
+          ? createStatelessSupabase(bearerToken)
+          : supabase;
+      await clientForDb.from('contact_messages').insert({
         name: cleanName || 'Guest User',
         email: cleanEmail || 'no-email@washek.fitness',
         message: cleanMessage,
       });
-    } catch (dbErr) {
-      console.warn('[server.ts] Failed to persist to contact_messages:', dbErr);
+    } catch {
+      // Non-fatal archive failure
+    }
+
+    if (!deliveredId) {
+      return res.status(502).json({
+        success: false,
+        delivered: false,
+        error:
+          deliveryError ||
+          'Email delivery is not configured or rejected by the mail provider. Please email washekfitness@gmail.com directly.',
+      });
     }
 
     return res.json({
       success: true,
-      message: 'Message received and stored.',
+      delivered: true,
+      id: deliveredId,
     });
   } catch (err: any) {
     console.error('[server.ts /api/send-contact-email error]', err);
     return res.status(500).json({
       success: false,
+      delivered: false,
       error: err?.message || 'Failed to process contact email.',
     });
   }
@@ -4876,16 +5766,42 @@ app.post('/api/send-contact-email', async (req, res) => {
 
 async function startServer() {
   try {
+    let viteInstance: any = null;
+    let viteReadyPromise: Promise<any> | null = null;
+    let viteInitError: any = null;
+
     if (process.env.NODE_ENV !== 'production') {
-      const vite = await createViteServer({
-        server: {
-          middlewareMode: true,
-          hmr: false,
-          ws: false,
-        },
-        appType: 'spa',
+      viteReadyPromise = import('vite')
+        .then(({ createServer: createViteServer }) =>
+          createViteServer({
+            server: {
+              middlewareMode: true,
+              hmr: false,
+              ws: false,
+            },
+            appType: 'spa',
+          })
+        )
+        .then((vite) => {
+          viteInstance = vite;
+          return vite;
+        })
+        .catch((err) => {
+          viteInitError = err;
+          console.error('[server.ts] Vite dev middleware initialization failed:', err);
+          return null;
+        });
+
+      app.use(async (req, res, next) => {
+        if (viteInstance) {
+          return viteInstance.middlewares(req, res, next);
+        }
+        const vite = await viteReadyPromise;
+        if (vite) {
+          return vite.middlewares(req, res, next);
+        }
+        return next(viteInitError || new Error('Vite dev server failed to initialize'));
       });
-      app.use(vite.middlewares);
     } else {
       const distPath = path.join(process.cwd(), 'dist');
       app.use(express.static(distPath));
@@ -4909,7 +5825,19 @@ async function startServer() {
     });
 
     const shutdown = () => {
+      const forceExitTimer = setTimeout(() => {
+        process.exit(0);
+      }, 500);
+      forceExitTimer.unref();
+
+      if (viteInstance?.close) {
+        Promise.resolve(viteInstance.close()).catch(() => {});
+      }
+      if (typeof (server as any).closeAllConnections === 'function') {
+        (server as any).closeAllConnections();
+      }
       server.close(() => {
+        clearTimeout(forceExitTimer);
         process.exit(0);
       });
     };

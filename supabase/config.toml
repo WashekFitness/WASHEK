@@ -8,7 +8,7 @@ verify_jwt = false
 verify_jwt = true
 
 [functions.send-contact-email]
-verify_jwt = true
+verify_jwt = false
 
 [functions.delete-account]
 verify_jwt = true

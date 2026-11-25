@@ -435,7 +435,7 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
 
       const dbActive = hasRemoteProfile && profilePlan !== 'free' && isActiveStatus(profileStatus);
 
-      if (!redirectReceipt) {
+      if (!redirectReceipt || (TIER_LEVELS[normalizePlan(redirectReceipt.plan)] || 0) < TIER_LEVELS.elite) {
         try {
           const serverEnt = await fetchServerEntitlement({
             userId: effectiveUid || user?.id || storedUser?.id || '',
@@ -443,12 +443,16 @@ export default function PricingSection({ onPlanChange, currentPlanProp }) {
             cancelledAtIso: profileCancelledAt,
           });
           if (serverEnt?.active) {
-            redirectReceipt = {
-              plan: normalizePlan(serverEnt.plan),
-              status: serverEnt.status,
-              timestamp: serverEnt.timestamp,
-              verifiedBy: serverEnt.verifiedBy,
-            };
+            const srvPlan = normalizePlan(serverEnt.plan);
+            const curRank = redirectReceipt ? (TIER_LEVELS[normalizePlan(redirectReceipt.plan)] || 0) : 0;
+            if ((TIER_LEVELS[srvPlan] || 0) >= curRank) {
+              redirectReceipt = {
+                plan: srvPlan,
+                status: serverEnt.status,
+                timestamp: serverEnt.timestamp,
+                verifiedBy: serverEnt.verifiedBy,
+              };
+            }
           }
         } catch {
           // ignore server entitlement note
