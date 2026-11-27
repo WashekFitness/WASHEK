@@ -696,23 +696,23 @@ Estimate:
 4. FORM SCORE (FAIR, ACCURATE 1%-100% RATING)
 ============================================================
 
-Give a fair, realistic overall form score from 1 to 100.
+Give a fair, balanced overall form score from 1 to 100.
 
 SCORING FAIRNESS & ACCURACY STANDARD:
 - Apply the EXACT same fair 1%–100% scoring standard equally to both calisthenics and weightlifting exercises.
-- Be balanced and reasonable — not too harsh and not too easy. Do NOT nitpick clean form just to lower the score, and NEVER mark non-dangerous technique tweaks as "critical" or "dangerous".
-- Score from 1% to 100% based on honest reality:
-  * 95–100%: Textbook or near-perfect execution with full range of motion, controlled tempo, and strong alignment. Award 100% ("issues": []) when reps or hold are genuinely clean and controlled with no meaningful technical flaws — 100% is attainable!
-  * 80–94%: Good, solid execution that is safe and effective with 1–2 minor refinements to polish. Good but imperfect form belongs in the 80s–90s.
-  * 65–79%: Noticeably off in one or more areas (e.g., slightly above-parallel squat depth, mild elbow flare, slight bar drift, mild hip sag or early fatigue) WITHOUT real injury hazard. Keep non-dangerous off-form reasonable and not too low.
-  * 40–64%: Poor or sloppy execution (cutting half the range of motion, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy kipping/swinging, major asymmetry, weak core bracing).
-  * 1–39%: Dangerous execution carrying real injury risk ONLY (e.g., collapsing or heavily rounded lumbar spine under heavy squat/deadlift load, severe knee valgus cave under load, uncontrolled dropping, severe joint shearing).
-- Fair deductions:
-  * Minor tip/refinement: -3 to -5 pts
-  * Moderate flaw (off, not dangerous): -8 to -12 pts
-  * Major breakdown (clearly poor mechanics): -18 to -25 pts
-  * Critical safety hazard (real injury risk only): -40 to -60 pts
-- Reserve 1%–39% strictly for genuine injury-risk execution. Deduct only for clear, visible issues supported by the frames.
+- Start by recognizing what the athlete executed well. Safe, controlled sets with solid range of motion and stable posture naturally belong in the 82%–100% range.
+- Do NOT nitpick tiny stylistic preferences or camera-perspective quirks just to deduct points, and NEVER mark non-dangerous technique flaws as "critical" or "major". When still frames are slightly ambiguous due to angle, give the athlete the benefit of the doubt.
+- Score from 1% to 100% based on honest, reasonable gym/coaching standards:
+  * 95–100%: Textbook or near-perfect execution with full effective range of motion, controlled tempo, and strong alignment. Award 100% ("issues": []) whenever execution is genuinely clean and safe — 100% is attainable!
+  * 80–94%: Good, solid execution that is safe and effective with 1–2 small polish cues (e.g., slightly faster eccentric, tiny bar drift, small symmetry tweak). Good but imperfect form belongs in the 80s–90s.
+  * 65–79%: Noticeably off in one or more areas (e.g., slightly above-parallel squat depth, mild-to-moderate elbow flare, noticeable torso lean/bar drift, mild hip sag or momentum) WITHOUT real injury hazard. Keep non-dangerous off-form reasonable — never drag safe off-form into the 40s or below.
+  * 40–64%: Clearly poor or sloppy execution (cutting half the range of motion, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy kipping/swinging, major asymmetry, collapsing core bracing).
+  * 1–39%: Dangerous execution carrying real, immediate injury risk ONLY (e.g., severe collapsing/buckling lumbar spine under heavy load, severe knee valgus collapse under heavy load, uncontrolled dropping).
+- Severity deduction guide (only for clear, unmistakable flaws):
+  * "minor": small polish cue (-3 pts)
+  * "moderate": noticeable non-dangerous flaw (-8 pts)
+  * "major": clear large mechanical breakdown such as half-reps or heavy swinging/bouncing (-15 pts)
+  * "critical": ONLY extreme acute injury risk (-40 pts)
 
 ============================================================
 5. JOINT POSITION
@@ -864,12 +864,12 @@ For each issue (if any real breakdown exists):
 - fix
 - corrective_exercises
 
-Severity must be:
+Severity must be chosen conservatively:
 
-minor
-moderate
-major
-critical
+minor — small technical polish cue (safe form, good rep overall)
+moderate — noticeable off-form habit without acute safety risk
+major — clearly broken mechanics (e.g. half ROM, heavy kipping/swinging, bouncing bar off chest)
+critical — ONLY unmistakable, extreme acute injury hazard under load
 
 Corrective exercises should be specific to the identified problem.
 

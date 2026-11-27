@@ -306,7 +306,7 @@ async function extractVideoFrames(
       video.videoHeight ||
       720;
 
-    const maxDimension = 420;
+    const maxDimension = 560;
     let targetWidth = sourceWidth;
     let targetHeight = sourceHeight;
 
@@ -464,7 +464,7 @@ async function extractVideoFrames(
       ctx.restore();
 
       // Encode JPEG ONLY for prioritized keyframes
-      const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.75);
       const blob = await canvasToBlob(canvas);
 
       frames.push({
@@ -662,10 +662,34 @@ function normalizeResult(
     return !benignKeywords.some((bk) => problem === bk || problem.startsWith(bk) || area === bk);
   });
 
-  // Normalize issue severities cleanly without fabricating false flaws from assessment/priority text
+  // Semantic severity sanity verification: prevent mild cues or perspective guesses
+  // from triggering brutal "major" or "critical" caps
+  const mildQualifierRegex = /\b(slight|slightly|mild|mildly|minor|subtle|tiny|minimal|a bit|little|small|polish|could be|try to|more tight|tighter|slightly off)\b/i;
+  const criticalHazardRegex = /\b(severe|extreme|dangerous|hazard|collaps|buckl|hyperexten|snap|uncontrolled drop|dropping|caving heavily|acute injury|injury risk)\b/i;
+  const majorBreakdownRegex = /\b(half[- ]?rep|half range|worming|bouncing|hitching|heavy kip|excessive swing|major|collapsed|failing to reach|significantly)\b/i;
+
   for (const comp of realComplaints) {
-    const rawSev = String(comp.severity || 'minor').toLowerCase().trim();
-    comp.severity = ['minor', 'moderate', 'major', 'critical'].includes(rawSev) ? rawSev : 'minor';
+    let sev = String(comp.severity || 'minor').toLowerCase().trim();
+    if (!['minor', 'moderate', 'major', 'critical'].includes(sev)) {
+      sev = 'minor';
+    }
+    const textForSev = `${comp.area || ''} ${comp.problem || ''}`.trim();
+    const looksMild = mildQualifierRegex.test(textForSev);
+    const looksCritical = criticalHazardRegex.test(textForSev);
+    const looksMajor = majorBreakdownRegex.test(textForSev);
+
+    if (sev === 'critical') {
+      if (looksMild || !looksCritical || source.camera_angle_ok === false) {
+        sev = looksMajor && !looksMild ? 'major' : 'moderate';
+      }
+    } else if (sev === 'major') {
+      if (looksMild) {
+        sev = 'minor';
+      } else if (!looksMajor && source.camera_angle_ok === false) {
+        sev = 'moderate';
+      }
+    }
+    comp.severity = sev;
   }
 
   // 2. Fair Score Calibration (1% to 100% — accurate, balanced, possible to hit 100%):
@@ -675,51 +699,74 @@ function normalizeResult(
   if (realComplaints.length === 0) {
     // Clean form with no meaningful complaints
     if (modelScore !== null) {
-      finalScore = modelScore >= 96 ? 100 : Math.max(90, modelScore);
+      finalScore = modelScore >= 94 ? 100 : Math.max(92, modelScore);
     } else {
-      finalScore = source.camera_angle_ok === false ? 80 : 100;
+      finalScore = source.camera_angle_ok === false ? 85 : 100;
     }
   } else {
     // Fair deduction scale matching true mechanical impact:
-    // Minor cue: -4 pts
-    // Moderate flaw (off, not dangerous): -10 pts
-    // Major breakdown (bad mechanics): -20 pts
-    // Critical safety hazard (genuine injury risk only): -45 pts
+    // Minor cue: -3 pts
+    // Moderate flaw (off, not dangerous): -8 pts
+    // Major breakdown (clearly poor mechanics): -15 pts
+    // Critical safety hazard (verified acute injury risk only): -40 pts
     let totalDeduction = 0;
     let hasCritical = false;
     let majorCount = 0;
+    let moderateCount = 0;
 
     for (const comp of realComplaints) {
       const sev = comp.severity;
       if (sev === 'critical') {
-        totalDeduction += 45;
+        totalDeduction += 40;
         hasCritical = true;
       } else if (sev === 'major') {
-        totalDeduction += 20;
+        totalDeduction += 15;
         majorCount++;
       } else if (sev === 'moderate') {
-        totalDeduction += 10;
+        totalDeduction += 8;
+        moderateCount++;
       } else {
-        totalDeduction += 4;
+        totalDeduction += 3;
       }
     }
 
     let calculatedScore = Math.max(1, 100 - totalDeduction);
 
-    // Reasonable ceiling guards aligned with issue severity:
-    if (hasCritical) {
-      calculatedScore = Math.min(calculatedScore, 39); // 1% - 39%: Dangerous / high risk
-    } else if (majorCount >= 2) {
-      calculatedScore = Math.min(calculatedScore, 59); // 40% - 59%: Multiple major breakdowns
-    } else if (majorCount === 1) {
-      calculatedScore = Math.min(calculatedScore, 74); // max 74%: Noticeable major flaw, not dangerous
-    }
+    // Reasonable ceiling and floor guards aligned with actual issue severity:
+    // - Critical hazard: 1% - 39% (Dangerous / High Risk)
+    // - 2+ major breakdowns: 42% - 64% (Poor Form)
+    // - 1 major breakdown: 58% - 79% (Needs Refinement / Borderline Poor)
+    // - Moderate flaws only (off, not dangerous): 68% - 92% (Needs Refinement / Good)
+    // - Minor cues only (good, not perfect): 82% - 97% (Good Form / Near-Perfect)
+    const cap = hasCritical
+      ? 39
+      : majorCount >= 2
+      ? 64
+      : majorCount === 1
+      ? 79
+      : 98;
+
+    const floor = hasCritical
+      ? 10
+      : majorCount >= 2
+      ? 42
+      : majorCount === 1
+      ? 58
+      : moderateCount > 0
+      ? Math.max(68, calculatedScore - 4)
+      : Math.max(82, calculatedScore - 4);
+
+    calculatedScore = Math.min(cap, Math.max(floor, calculatedScore));
 
     if (modelScore !== null) {
-      // Blend model judgment and structured deduction fairly, respecting severity caps
-      const blended = Math.round(modelScore * 0.6 + calculatedScore * 0.4);
-      const cap = hasCritical ? 39 : majorCount >= 2 ? 59 : majorCount === 1 ? 74 : 99;
-      finalScore = Math.min(cap, Math.max(1, blended));
+      // Anchor fairly to structured issue severity so an overly harsh raw number
+      // cannot drag good/safe form below its verified severity bracket
+      const anchoredModel =
+        !hasCritical && majorCount === 0 && modelScore < floor
+          ? floor
+          : modelScore;
+      const blended = Math.round(calculatedScore * 0.65 + anchoredModel * 0.35);
+      finalScore = Math.min(cap, Math.max(floor, blended));
     } else {
       finalScore = calculatedScore;
     }
@@ -904,14 +951,14 @@ VERY IMPORTANT ACCURACY & FAIRNESS RULES:
 1. KEY MOVEMENT PHASES PRIORITIZED: The provided frames have been intelligently filtered using frame-skipping to prioritize crucial inflection points (bottom turnaround depth, peak contraction, top lockout) and hold stability while skipping redundant idle/static pause frames.
 2. REAL REP COUNTER (NEVER DROP OR TAKE AWAY REPS): For dynamic movements, count EVERY single repetition the athlete attempts or performs across the video frames from start to finish. If a repetition had cut depth, partial range of motion, soft lockout, slight momentum, or fatigue breakdown near the end, THAT REPETITION STILL FULLY COUNTS AS A REP! Imperfect execution affects the form score, NEVER the rep count! Always count the initial rep and the final rep. Set "rep_count" to the exact total integer count of all repetitions performed. Set "hold_time_seconds": null.
 3. HOLD TIMES (FULL DURATION): For static holds, measure the continuous duration in seconds held strictly within this analyzed section until the athlete completely drops, releases, or touches down. Form adjustments or wobbles do NOT stop the hold timer. Set "hold_time_seconds": number. Set "rep_count": null.
-4. FAIR & ACCURATE SCORE MANDATE (1% TO 100% — REALISTIC CALIBRATION):
-Score the athlete fairly and objectively based on actual biomechanics, range of motion, control, and safety. Do NOT artificially inflate dangerous form, and do NOT brutally tank good or near-perfect form over tiny stylistic details.
-- 95%–100% (Perfect / Near-Perfect): Textbook execution, strong alignment/bracing, full effective ROM, and controlled tempo. Give 100% with "issues": [] when execution is genuinely clean and dialed in.
-- 80%–94% (Good Form): Solid, safe mechanics with 1–2 small polish cues (minor bar path drift, slight tempo rushing, small symmetry detail) — do NOT drop good form below 80%.
-- 65%–79% (Needs Refinement): Form is noticeably off (moderate depth shortfall, flared elbows, soft lockout, mild momentum) but NOT dangerous. Keep non-dangerous off-form in this fair range.
-- 40%–64% (Poor Form): Bad, sloppy mechanics with major breakdowns (half-reps, heavy bouncing/kipping, collapsing torso/bracing) requiring clear correction.
-- 1%–39% (Dangerous / High Risk): Reserve strictly for genuinely hazardous mechanics with immediate injury risk (severe lumbar rounding/collapse under heavy load, severe knee valgus cave under load, uncontrolled dropping).
-Only list genuine mechanical or safety flaws in "issues"; leave "issues": [] when execution is clean.
+4. FAIR & ACCURATE SCORE MANDATE (1% TO 100% — BALANCED COACHING CALIBRATION):
+Start by evaluating what the athlete did right. Safe, controlled movement with good range of motion belongs in the 82%–100% range. Do NOT inflate genuinely broken or dangerous form, and do NOT brutally punish clean or mostly solid form over minor stylistic cues or ambiguous camera angles.
+- 95%–100% (Perfect / Near-Perfect): Clean, controlled execution with solid alignment and effective ROM. Award 100% with "issues": [] when reps or hold look genuinely clean and dialed in.
+- 80%–94% (Good Form): Safe, solid mechanics with 1–2 small polish cues ("minor" severity). Good form ALWAYS belongs in the 80s–90s.
+- 65%–79% (Needs Refinement): Form is noticeably off (e.g., moderate depth shortfall, mild-to-moderate elbow flare, soft lockout, mild momentum) WITHOUT injury hazard — keep safe off-form reasonable here.
+- 40%–64% (Poor Form): Clearly sloppy mechanics with major breakdowns (half-reps, heavy bouncing/kipping, collapsing torso/bracing).
+- 1%–39% (Dangerous / High Risk): Reserve strictly for unmistakable, extreme injury risk (severe lower-back collapse under heavy load, severe knee valgus collapse under heavy load, uncontrolled dropping).
+Do NOT label mild/minor cues as "major" or "critical". Leave "issues": [] if no real mechanical flaws are visible.
 5. BOUNDARIES: Only analyze movement within this analyzed section (${start.toFixed(2)}s to ${end.toFixed(2)}s).
 
 OUTPUT RULE:
