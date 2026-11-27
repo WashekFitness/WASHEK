@@ -25,25 +25,72 @@ import OfflineIndicator from '@/components/pwa/OfflineIndicator';
 import QuickStartTutorialModal from '@/components/tutorial/QuickStartTutorialModal';
 import LanguageTranslator from '@/components/LanguageTranslator';
 
-const Dashboard = lazy(() => import('@/pages/Dashboard'));
-const Onboarding = lazy(() => import('@/pages/Onboarding'));
-const About = lazy(() => import('@/pages/About'));
-const Contact = lazy(() => import('@/pages/Contact'));
-const Login = lazy(() => import('@/pages/Login'));
-const ResetPassword = lazy(() => import('@/pages/ResetPassword'));
-const Terms = lazy(() => import('@/pages/Terms'));
-const Privacy = lazy(() => import('@/pages/Privacy'));
-const Profile = lazy(() => import('@/pages/Profile'));
-const Program = lazy(() => import('@/pages/Program'));
-const Nutrition = lazy(() => import('@/pages/Nutrition'));
-const Progress = lazy(() => import('@/pages/Progress'));
-const Kael = lazy(() => import('@/pages/Kael'));
-const ProgressPhotos = lazy(() => import('@/pages/ProgressPhotos'));
-const FormLab = lazy(() => import('@/pages/FormLab'));
-const MuscleHeatmapPage = lazy(() => import('@/pages/MuscleHeatmapPage'));
-const ProgramDay = lazy(() => import('@/pages/ProgramDay'));
-const LiveWorkout = lazy(() => import('@/pages/LiveWorkout'));
-const SubscriptionReturn = lazy(() => import('@/pages/SubscriptionReturn'));
+function isChunkLoadError(err) {
+  const msg = String(err?.message || err || '');
+  return (
+    msg.includes('Failed to fetch dynamically imported module') ||
+    msg.includes('Importing a module script failed') ||
+    msg.includes('error loading dynamically imported module') ||
+    msg.includes('Loading chunk')
+  );
+}
+
+function lazyWithRetry(importer, key) {
+  return lazy(async () => {
+    const storageKey = `washek_chunk_reload_${key}`;
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const mod = await importer();
+        try {
+          window.sessionStorage.removeItem(storageKey);
+        } catch {
+          // ignore storage access issues
+        }
+        return mod;
+      } catch (err) {
+        lastError = err;
+        if (!isChunkLoadError(err) || attempt === 2) break;
+        await new Promise((r) => window.setTimeout(r, 350 * (attempt + 1)));
+      }
+    }
+
+    if (isChunkLoadError(lastError)) {
+      try {
+        const lastReload = Number(window.sessionStorage.getItem(storageKey) || 0);
+        if (!lastReload || Date.now() - lastReload > 15000) {
+          window.sessionStorage.setItem(storageKey, String(Date.now()));
+          window.location.reload();
+          return new Promise(() => {});
+        }
+      } catch {
+        // fall through and let ErrorBoundary show reload button
+      }
+    }
+
+    throw lastError;
+  });
+}
+
+const Dashboard = lazyWithRetry(() => import('@/pages/Dashboard'), 'dashboard');
+const Onboarding = lazyWithRetry(() => import('@/pages/Onboarding'), 'onboarding');
+const About = lazyWithRetry(() => import('@/pages/About'), 'about');
+const Contact = lazyWithRetry(() => import('@/pages/Contact'), 'contact');
+const Login = lazyWithRetry(() => import('@/pages/Login'), 'login');
+const ResetPassword = lazyWithRetry(() => import('@/pages/ResetPassword'), 'reset-password');
+const Terms = lazyWithRetry(() => import('@/pages/Terms'), 'terms');
+const Privacy = lazyWithRetry(() => import('@/pages/Privacy'), 'privacy');
+const Profile = lazyWithRetry(() => import('@/pages/Profile'), 'profile');
+const Program = lazyWithRetry(() => import('@/pages/Program'), 'program');
+const Nutrition = lazyWithRetry(() => import('@/pages/Nutrition'), 'nutrition');
+const Progress = lazyWithRetry(() => import('@/pages/Progress'), 'progress');
+const Kael = lazyWithRetry(() => import('@/pages/Kael'), 'kael');
+const ProgressPhotos = lazyWithRetry(() => import('@/pages/ProgressPhotos'), 'photos');
+const FormLab = lazyWithRetry(() => import('@/pages/FormLab'), 'formlab');
+const MuscleHeatmapPage = lazyWithRetry(() => import('@/pages/MuscleHeatmapPage'), 'muscle-heatmap');
+const ProgramDay = lazyWithRetry(() => import('@/pages/ProgramDay'), 'program-day');
+const LiveWorkout = lazyWithRetry(() => import('@/pages/LiveWorkout'), 'live-workout');
+const SubscriptionReturn = lazyWithRetry(() => import('@/pages/SubscriptionReturn'), 'subscription-return');
 
 import { supabase } from '@/lib/supabase';
 import { resolveValidSupabaseSession } from '@/lib/stripeCheckout';

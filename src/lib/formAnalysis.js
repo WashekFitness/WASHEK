@@ -693,29 +693,26 @@ Estimate:
 - active_range_end (the second within the analyzed window where the final rep finishes or hold drops)
 
 ============================================================
-4. FORM SCORE (REAL SCORE FROM 1%-100% — ABSOLUTELY NO SUGARCOATING)
+4. FORM SCORE (FAIR, ACCURATE 1%-100% RATING)
 ============================================================
 
-Give an overall form score from 1 to 100.
+Give a fair, realistic overall form score from 1 to 100.
 
-SCORING ACCURACY & TRUTH MANDATE (TELL LITERALLY EVERYTHING WRONG — NEVER SUGARCOAT):
-- Apply the EXACT same strict 1%–100% scoring standard equally to both calisthenics and weightlifting exercises.
-- The rating must be REAL, accurate, and completely honest. Stop sugarcoating. If form is bad or dangerous, TELL LITERALLY EVERYTHING WRONG WITH THE FORM. Bad or dangerous form is dangerous and must NEVER be scored high or sugarcoated to spare feelings.
-- Score anywhere from 1% to 100% based on honest reality:
-  * 1–20%: Dangerous or hazardous execution with high injury risk (e.g., collapsing or heavily rounded lumbar spine under deadlift/squat load, severe knee valgus cave under heavy load, severe shoulder impingement shearing, uncontrolled dropping/falling).
-  * 20–44%: Poor, broken, or terrible form (severe lumbar hyperextension/sagging or spinal rounding under tension, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy kipping/swinging/body-heaving, cutting half the range of motion, severe asymmetry, collapsed core bracing).
-  * 45–69%: Sub-par or flawed execution with noticeable breakdown (cutting 20–30% ROM / squats above parallel, flared elbows >60°–75°, bar path drifting forward, heels lifting, uncontrolled eccentric cadence, soft lockout).
-  * 70–84%: Acceptable or moderate execution with clear technical flaws to fix.
-  * 85–94%: High-level execution with 1 minor technical refinement.
-  * 95–100%: Rare, flawless, competition/gymnastics-grade textbook execution with full range of motion, locked bracing/body tension, and zero complaints.
-- Deductions:
-  * Minor tip: -5 to -8 pts
-  * Moderate flaw: -15 to -20 pts
-  * Major breakdown: -30 to -45 pts
-  * Critical safety hazard: -50 to -80 pts
-- If there are critical or dangerous flaws, the score MUST drop into the 1% to 25% range!
-- Multiple major flaws MUST drop the score into the 20s–40s range.
-- Deduct points for all actual visible flaws supported by the frames. Be direct, clear, and unvarnished.
+SCORING FAIRNESS & ACCURACY STANDARD:
+- Apply the EXACT same fair 1%–100% scoring standard equally to both calisthenics and weightlifting exercises.
+- Be balanced and reasonable — not too harsh and not too easy. Do NOT nitpick clean form just to lower the score, and NEVER mark non-dangerous technique tweaks as "critical" or "dangerous".
+- Score from 1% to 100% based on honest reality:
+  * 95–100%: Textbook or near-perfect execution with full range of motion, controlled tempo, and strong alignment. Award 100% ("issues": []) when reps or hold are genuinely clean and controlled with no meaningful technical flaws — 100% is attainable!
+  * 80–94%: Good, solid execution that is safe and effective with 1–2 minor refinements to polish. Good but imperfect form belongs in the 80s–90s.
+  * 65–79%: Noticeably off in one or more areas (e.g., slightly above-parallel squat depth, mild elbow flare, slight bar drift, mild hip sag or early fatigue) WITHOUT real injury hazard. Keep non-dangerous off-form reasonable and not too low.
+  * 40–64%: Poor or sloppy execution (cutting half the range of motion, worming push-ups, bouncing barbell off chest, hitching deadlifts, heavy kipping/swinging, major asymmetry, weak core bracing).
+  * 1–39%: Dangerous execution carrying real injury risk ONLY (e.g., collapsing or heavily rounded lumbar spine under heavy squat/deadlift load, severe knee valgus cave under load, uncontrolled dropping, severe joint shearing).
+- Fair deductions:
+  * Minor tip/refinement: -3 to -5 pts
+  * Moderate flaw (off, not dangerous): -8 to -12 pts
+  * Major breakdown (clearly poor mechanics): -18 to -25 pts
+  * Critical safety hazard (real injury risk only): -40 to -60 pts
+- Reserve 1%–39% strictly for genuine injury-risk execution. Deduct only for clear, visible issues supported by the frames.
 
 ============================================================
 5. JOINT POSITION

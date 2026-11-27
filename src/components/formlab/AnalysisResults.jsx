@@ -16,7 +16,7 @@ function ScoreRing({ score }) {
     ? 'text-emerald-500 dark:text-emerald-400'
     : score >= 80
     ? 'text-accent'
-    : score >= 60
+    : score >= 65
     ? 'text-chart-4'
     : score >= 40
     ? 'text-orange-500'
@@ -25,7 +25,7 @@ function ScoreRing({ score }) {
     ? '#10b981'
     : score >= 80
     ? '#22c55e'
-    : score >= 60
+    : score >= 65
     ? '#f59e0b'
     : score >= 40
     ? '#f97316'
@@ -111,17 +111,17 @@ export default function AnalysisResults({ result, exercise }) {
               <h3 className="font-heading font-bold text-base">{exercise}</h3>
               {result.score >= 95 ? (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 border border-emerald-500/30">
-                  {result.score === 100 ? '100% · Flawless' : `${result.score}% · Textbook`}
+                  {result.score === 100 ? '100% · Perfect Form' : `${result.score}% · Near-Perfect`}
                 </span>
               ) : result.score >= 80 ? (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-green-500/15 text-green-600 dark:text-green-400 border border-green-500/30">
-                  {result.score}% · Solid Execution
+                  {result.score}% · Good Form
                 </span>
-              ) : result.score >= 50 ? (
+              ) : result.score >= 65 ? (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-yellow-500/15 text-yellow-600 dark:text-yellow-400 border border-yellow-500/30">
-                  {result.score}% · Moderate Flaws
+                  {result.score}% · Needs Refinement
                 </span>
-              ) : result.score >= 25 ? (
+              ) : result.score >= 40 ? (
                 <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-bold bg-orange-500/15 text-orange-600 dark:text-orange-400 border border-orange-500/30">
                   {result.score}% · Poor Form
                 </span>
